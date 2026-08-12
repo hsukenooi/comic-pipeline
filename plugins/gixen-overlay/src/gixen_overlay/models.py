@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field, field_validator
 
-from gixen_overlay.db import COMPS_POOLS, COMPS_PROVENANCES
+from gixen_overlay.db import COMPS_POOLS, COMPS_PROVENANCES, FMV_PROVENANCES
 
 # Every needs_manual reason `comic-fmv` may post as `fmv_flag_reason` (BUI-593).
 #
@@ -46,6 +46,19 @@ class UpsertComicRequest(BaseModel):
     # here must land in the same commit as its fmv_runner.py counterpart.
     fmv_ungraded_anchor: float | None = None
     fmv_ungraded_anchor_n: int | None = None
+    # BUI-769: how this row's number was arrived at — 'hand' for an operator's
+    # own priced band, 'machine' for `comic-fmv`'s pooled answer. The durable
+    # replacement for claiming provenance in the `fmv_notes` PREFIX, which
+    # fails open to any reword. Omitting it is SAFE and means "no claim": the
+    # upsert leaves whatever the row already carries (see upsert_fmv), so a
+    # caller that has never heard of this field cannot strip a hand claim.
+    #
+    # Unlike fmv_flag_reason/fmv_ungraded_anchor above, fmv_runner is NOT the
+    # sole producer — an operator hand-pricing a row posts `"hand"` here by
+    # hand, which is the entire point (provenance is claimed, not inferred;
+    # see CONCEPTS.md). What the closed vocabulary buys over the old prefix is
+    # that a mistyped claim now 422s loudly instead of silently failing open.
+    fmv_provenance: str | None = None
     locg_id: int | None = None
     locg_variant_id: int | None = None
 
@@ -66,6 +79,25 @@ class UpsertComicRequest(BaseModel):
         if v is not None and v not in FMV_FLAG_REASONS:
             raise ValueError(
                 "fmv_flag_reason must be one of: " + ", ".join(FMV_FLAG_REASONS)
+            )
+        return v
+
+    @field_validator("fmv_provenance")
+    @classmethod
+    def validate_provenance(cls, v: str | None) -> str | None:
+        # BUI-769. Empty string normalizes to None (no claim), mirroring
+        # validate_flag_reason. Anything else outside the vocabulary is a
+        # LOUD failure, not a silent pass-through: the whole defect being
+        # fixed is a provenance claim that could be misspelled into
+        # invisibility, so `"Hand"`, `"hand-priced"` and `"OVERRIDE"` must all
+        # 422 rather than be stored as an unreadable claim. (The row is still
+        # protected while the operator re-posts — the 422 discards the whole
+        # upsert, so nothing is overwritten either.)
+        if v is not None and v.strip() == "":
+            return None
+        if v is not None and v not in FMV_PROVENANCES:
+            raise ValueError(
+                "fmv_provenance must be one of: " + ", ".join(FMV_PROVENANCES)
             )
         return v
 

@@ -601,15 +601,85 @@ _HAND_PRICE_PREFIX_RE = re.compile(
 
 def _is_hand_priced(notes: str | None) -> bool:
     """True when `notes` (a row's persisted fmv_notes) OPENS with a hand-priced
-    provenance marker, in any capitalization. A default batch run must never
-    silently recompute over a row this returns True for (see
-    `_split_by_db_cache`).
+    provenance marker, in any capitalization.
+
+    BUI-769 demoted this from THE provenance test to the FALLBACK one — call
+    `_row_is_hand_priced` on a whole row instead, which reads the first-class
+    `fmv.provenance` column and only falls back here. This is kept, unchanged
+    and still tested against the 12-row live census, because a row whose
+    `provenance` is NULL *because it predates the column* must stay protected:
+    protection must not depend on the backfill having run.
 
     Matches the operator conventions actually observed on live rows:
     `hand § …`, `hand OVERRIDE …`, `hand §direct (BUI-720): …`, `manual: …`,
     `Manual: …`, `manual (BUI-720): …`.
     """
     return notes is not None and _HAND_PRICE_PREFIX_RE.match(notes) is not None
+
+
+# BUI-769: the closed vocabulary of `fmv.provenance` — a CROSS-PACKAGE CONTRACT
+# with `gixen_overlay.db.FMV_PROVENANCES`, which owns the CHECK constraint and
+# the pydantic validator. apps/fmv is not a workspace member, so there is no
+# import edge to enforce it; the values are pinned on both sides by tests.
+_PROVENANCE_HAND = "hand"
+_PROVENANCE_MACHINE = "machine"
+_KNOWN_PROVENANCES = frozenset({_PROVENANCE_HAND, _PROVENANCE_MACHINE})
+
+
+def _row_is_hand_priced(row: object) -> bool:
+    """True when the stored FMV `row` must be treated as hand-priced — i.e. a
+    default batch run must never silently recompute over it (see
+    `_split_by_db_cache`).
+
+    BUI-769 — the provenance claim lives in a COLUMN now. `fmv.provenance`
+    ('hand' | 'machine' | NULL), served as `fmv_provenance` by
+    `GET /api/comics`, replaces reading the claim out of the `fmv_notes`
+    prefix. The prefix was a hand-typed marker in a freetext field, and it
+    failed OPEN to any reword — `OVERRIDE:`, `priced by hand`, a non-English
+    phrase, a well-meaning edit — in the expensive direction: a human's priced
+    band replaced by the pooled answer they had already rejected, with no
+    signal. Twice the marker set turned out to be a guess at a human
+    convention (BUI-533 sampled half of it, BUI-759 found the other half seven
+    rows in). A column cannot be lost to a reword, and there is no third guess.
+
+    Three inputs, and every ambiguity resolves toward PROTECT:
+
+    - `provenance == 'hand'` → protected, whatever the notes say. This is the
+      regression the column exists to prevent.
+    - `provenance` NULL or absent → the BUI-533/759 notes matcher decides.
+      NULL is "never claimed", NOT "machine": it is what every row written
+      before the column existed carries, and what an older comics-server build
+      (which does not select the column at all) returns for every row. Keeping
+      the fallback for one release is why a deploy-order skew between
+      `comic-fmv` and the server cannot un-protect anything.
+    - `provenance` present but UNREADABLE — not a string, or a value outside
+      the closed vocabulary — → protected outright. That is BUI-544/775's
+      fail-closed posture applied to the new field: "don't know" is "might be
+      hand-priced", whether the not-knowing came from an outage, an
+      under-specified key, or a claim written in a spelling this build cannot
+      read. The cost of being wrong here is a stale machine row that the run
+      summary NAMES as a hand-priced skip; the cost of the other direction is
+      a destroyed judgment on a book expensive enough to have been priced by
+      hand.
+
+    Note the notes fallback is an OR, never a veto: an explicit
+    `provenance='machine'` on a row whose notes still open with `hand §` still
+    reads as protected. Adding the column can only ever widen protection
+    during the grace period, never narrow it.
+    """
+    if not isinstance(row, dict):
+        # Cannot even read the row — the same "don't know" as a failed lookup.
+        return True
+    provenance = row.get("fmv_provenance")
+    if provenance is not None:
+        if not isinstance(provenance, str):
+            return True
+        claim = provenance.strip().lower()
+        if claim not in _KNOWN_PROVENANCES:
+            return True
+        if claim == _PROVENANCE_HAND:
+            return True
+    return _is_hand_priced(row.get("fmv_notes"))
 
 
 # ─── Step 1 — DB cache reuse ──────────────────────────────────────────────────
@@ -636,6 +706,15 @@ def _split_by_db_cache(books: list[dict], *, server_url: str,
     - skipped_lookup_error_by_idx (BUI-544/BUI-775): original input index → why
       the hand-priced provenance check could not be ANSWERED — a failed lookup
       (BUI-544) or an undecidable one (BUI-775). See below.
+
+    BUI-769 — the provenance CLAIM is read from a column, not a notes prefix.
+    `_row_is_hand_priced` (which replaced the bare `_is_hand_priced(notes)`
+    call at both decision points below) reads `fmv.provenance` and falls back
+    to the BUI-533/759 notes matcher only when no claim is stored. Nothing
+    about the bucketing changes; what changes is that an operator rewording
+    their own note can no longer silently move a row out of `skipped_hand`.
+    Read that function's docstring for the three inputs and why each ambiguity
+    resolves toward protection.
 
     BUI-775 — the provenance check is keyed on the WRITE's key, not on
     `locg_id`. `upsert_comic` keys a comics row on `(title, issue, variant)`;
@@ -729,8 +808,7 @@ def _split_by_db_cache(books: list[dict], *, server_url: str,
             skipped_lookup_error[i] = str(exc)
             continue
 
-        hand_rows = [r for r in candidates
-                     if _is_hand_priced(r.get("fmv_notes"))]
+        hand_rows = [r for r in candidates if _row_is_hand_priced(r)]
         if hand_rows:
             if force:
                 # BUI-533's contract is overwrite-AND-echo. With several
@@ -783,7 +861,7 @@ def _hand_price_candidates(server_url: str, book: dict, *,
         row = _db_lookup(server_url, locg_id=book["locg_id"], grade=grade,
                          locg_variant_id=book.get("locg_variant_id"),
                          max_age_days=None, strict=True)
-        if row is not None and _is_hand_priced(row.get("fmv_notes")):
+        if row is not None and _row_is_hand_priced(row):
             return [row]
 
     identity = _write_identity(book)
@@ -2333,6 +2411,20 @@ def _upsert_fmv(server_url: str, inp: dict, fmv: dict,
         "fmv_flag_reason": fmv.get("flag_reason"),
         "fmv_ungraded_anchor": anchor["median"] if anchor else None,
         "fmv_ungraded_anchor_n": anchor["n"] if anchor else None,
+        # BUI-769: every number this function posts was computed by the pool,
+        # so claim it as such. Posted unconditionally, and that is safe in both
+        # directions:
+        #   - A default run can only reach this line for a book the hand-priced
+        #     guard did NOT protect, i.e. a machine row — the claim is true.
+        #   - A --force run reaching it has already found, and echoed, the hand
+        #     notes it is licensed to overwrite (BUI-533). Demoting the claim
+        #     alongside the number it describes is what keeps --force
+        #     idempotent; leaving 'hand' behind on a machine-computed band
+        #     would make every later default run skip a row nobody hand-priced.
+        # An older comics-server build ignores this field (pydantic drops
+        # unknown keys), so a deploy-order skew degrades to today's behavior
+        # rather than 422-ing the whole upsert.
+        "fmv_provenance": _PROVENANCE_MACHINE,
     }
     if inp.get("locg_id"):
         body["locg_id"] = inp["locg_id"]

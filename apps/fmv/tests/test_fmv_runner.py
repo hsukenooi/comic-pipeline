@@ -849,6 +849,264 @@ class TestSplitByDbCacheHandPricedWithoutLocgId:
         assert skipped_hand == {0: _ASM50_ROW}
 
 
+# BUI-769: what the 12 live operator rows look like once an operator rewords
+# their own note — the reword the notes-prefix matcher fails OPEN to, and the
+# entire reason `fmv.provenance` exists. Derived from the same census the
+# predicate tests use, so the two can't drift: same rows, notes replaced by a
+# provenance claim the matcher cannot see.
+_REWORDED_NOTES = [
+    "OVERRIDE: operator band, CLI pool rejected",
+    "priced by hand off the lone 4.0 sale",
+    "set manually after reviewing the slab ladder",
+    "Preisfestsetzung von Hand (non-English operator)",
+    "$600-680 — my number, not the pool's",
+]
+
+
+class TestRowIsHandPricedReadsTheProvenanceColumn:
+    """BUI-769 at the PREDICATE. These are necessary, not sufficient — the
+    binding evidence is the bucketing class below, because a correct predicate
+    that is never consulted is exactly what BUI-775 found (twice)."""
+
+    def test_provenance_hand_protects_a_reworded_note(self):
+        row = {"fmv_provenance": "hand",
+               "fmv_notes": "OVERRIDE: operator band, CLI pool rejected"}
+        assert fmv_runner._row_is_hand_priced(row) is True
+
+    def test_null_provenance_falls_back_to_the_notes_matcher(self):
+        """A row that predates the column must stay protected — protection
+        must not depend on the backfill having run."""
+        assert fmv_runner._row_is_hand_priced(
+            {"fmv_provenance": None,
+             "fmv_notes": "Manual: CGC-proxy + genuine raw comps"}) is True
+
+    def test_absent_provenance_key_falls_back_to_the_notes_matcher(self):
+        """An older comics-server build does not SELECT the column at all, so
+        the key is missing rather than null. Same verdict, or a deploy-order
+        skew would un-protect every row at once."""
+        assert fmv_runner._row_is_hand_priced(
+            {"fmv_notes": "hand § anchored on the lone 4.0 sale"}) is True
+
+    def test_machine_provenance_with_machine_notes_is_not_protected(self):
+        """The gate must not be inverted: an ordinary pipeline row still
+        refreshes, or the whole table would freeze."""
+        assert fmv_runner._row_is_hand_priced(
+            {"fmv_provenance": "machine",
+             "fmv_notes": "window=±0.5 | cv=20% | label=HIGH"}) is False
+
+    def test_machine_provenance_does_not_veto_the_notes_fallback(self):
+        """The fallback is an OR, never a veto. During the grace period the
+        column can only WIDEN protection — a row still carrying the marker in
+        its notes stays protected even if something claimed it as machine."""
+        assert fmv_runner._row_is_hand_priced(
+            {"fmv_provenance": "machine",
+             "fmv_notes": "hand § anchored on the lone 4.0 sale"}) is True
+
+    @pytest.mark.parametrize("claim", [
+        "operator",        # a plausible-but-wrong vocabulary word
+        "Hand-priced",     # the old prefix, mistaken for a column value
+        "",                # written empty by something that meant "unknown"
+        123,               # not a string at all
+        {"by": "hand"},    # a JSON shape this build cannot read
+    ])
+    def test_unreadable_provenance_fails_closed(self, claim):
+        """BUI-544/775's posture, applied to the new field: a claim this build
+        cannot read is "don't know", and "don't know" is "might be
+        hand-priced". Note the notes here are plainly machine-written, so
+        ONLY the unreadable claim can produce the protection."""
+        row = {"fmv_provenance": claim,
+               "fmv_notes": "window=±0.5 | cv=20% | label=HIGH"}
+        assert fmv_runner._row_is_hand_priced(row) is True
+
+    def test_a_non_dict_row_fails_closed(self):
+        assert fmv_runner._row_is_hand_priced("not a row") is True
+        assert fmv_runner._row_is_hand_priced(None) is True
+
+    def test_case_and_whitespace_variants_of_the_claim_are_read(self):
+        for claim in ("HAND", " hand ", "Hand"):
+            assert fmv_runner._row_is_hand_priced(
+                {"fmv_provenance": claim,
+                 "fmv_notes": "window=±0.5"}) is True
+
+
+class TestSplitByDbCacheReadsTheProvenanceColumn:
+    """BUI-769 at the DECISION function — the only evidence that counts.
+
+    Every test here neutralizes the upstream short-circuits the way BUI-775's
+    post-mortem requires: `max_age_days=0` so no fresh cache hit can make the
+    run look protected without the guard ever being exercised, and books with
+    no `locg_id` (the shape 11 of the 12 live rows actually have).
+    """
+
+    def _book(self):
+        return _make_book("1", "Amazing Spider-Man", "50", 1967, 6.5)
+
+    def _bucket(self, server_url, rows, force=False):
+        with patch("fmv_runner._db_lookup_by_identity", return_value=rows):
+            return fmv_runner._split_by_db_cache(
+                [self._book()], server_url=server_url, max_age_days=0,
+                force=force)
+
+    @pytest.mark.parametrize("notes", _REWORDED_NOTES)
+    def test_reworded_notes_still_bucket_into_skipped_hand(self, server_url,
+                                                           notes):
+        """THE regression the column exists to prevent. Before BUI-769 every
+        one of these rows lands in `needs` — one default run from having a
+        human's $600-680 band replaced by the pooled answer."""
+        row = dict(_ASM50_ROW, fmv_provenance="hand", fmv_notes=notes)
+        cached, needs, skipped_hand, force_notes, lookup_err = self._bucket(
+            server_url, [row])
+        assert needs == [], f"reworded note {notes!r} reached recompute"
+        assert skipped_hand == {0: row}
+        assert cached == {} and force_notes == {} and lookup_err == {}
+
+    def test_the_full_live_census_survives_a_reword(self, server_url):
+        """The census as a whole, at the DECISION level: 12 rows, each with a
+        provenance claim and a note the matcher cannot read. A partial
+        regression must NAME the unprotected rows — "11 of 12 protected" is
+        precisely the finding BUI-775 exists for, and `assert False` would not
+        say it."""
+        unprotected = []
+        for i, original in enumerate(_LIVE_OPERATOR_NOTES_PREFIXES):
+            reworded = _REWORDED_NOTES[i % len(_REWORDED_NOTES)]
+            row = dict(_ASM50_ROW, fmv_id=1000 + i, fmv_provenance="hand",
+                       fmv_notes=reworded)
+            _, needs, skipped_hand, _, _ = self._bucket(server_url, [row])
+            if skipped_hand != {0: row} or needs:
+                unprotected.append((original, reworded))
+        protected = len(_LIVE_OPERATOR_NOTES_PREFIXES) - len(unprotected)
+        assert not unprotected, (
+            f"{protected} of {len(_LIVE_OPERATOR_NOTES_PREFIXES)} live "
+            f"operator rows bucket into skipped_hand after a reword; "
+            f"UNPROTECTED: {unprotected}")
+
+    def test_a_pre_column_row_still_buckets_into_skipped_hand(self, server_url):
+        """The one-release fallback, at the decision level: NULL provenance
+        (the row predates the column, or the backfill has not run yet) plus
+        the old notes prefix must still be protected."""
+        row = dict(_ASM50_ROW, fmv_provenance=None)
+        _, needs, skipped_hand, _, lookup_err = self._bucket(server_url, [row])
+        assert needs == []
+        assert skipped_hand == {0: row}
+        assert lookup_err == {}
+
+    def test_an_older_server_without_the_column_still_protects(self, server_url):
+        """Deploy-order skew: `comic-fmv` updated before the comics server, so
+        `GET /api/comics` returns rows with no `fmv_provenance` key at all."""
+        row = {k: v for k, v in _ASM50_ROW.items() if k != "fmv_provenance"}
+        assert "fmv_provenance" not in row  # the premise, not an assumption
+        _, needs, skipped_hand, _, _ = self._bucket(server_url, [row])
+        assert needs == []
+        assert skipped_hand == {0: row}
+
+    def test_a_machine_row_still_buckets_into_needs(self, server_url):
+        """The gate is replaced, not inverted — a normal row must still
+        refresh, or the fix freezes the whole table."""
+        row = dict(_ASM50_ROW, fmv_provenance="machine",
+                   fmv_notes="window=±0.5 | cv=20% | label=HIGH")
+        cached, needs, skipped_hand, _, lookup_err = self._bucket(
+            server_url, [row])
+        assert [b["_idx"] for b in needs] == [0]
+        assert skipped_hand == {} and cached == {} and lookup_err == {}
+
+    def test_an_unreadable_claim_buckets_out_of_needs(self, server_url):
+        """Fail-closed at the decision, not just at the predicate: a claim
+        this build cannot read must never reach recompute."""
+        row = dict(_ASM50_ROW, fmv_provenance="operator",
+                   fmv_notes="window=±0.5 | cv=20% | label=HIGH")
+        _, needs, skipped_hand, _, _ = self._bucket(server_url, [row])
+        assert needs == []
+        assert skipped_hand == {0: row}
+
+    def test_force_still_echoes_and_overwrites_a_column_claimed_row(
+            self, server_url, capsys):
+        """BUI-533's overwrite-AND-echo contract on the column path. The echo
+        carries the row's notes — reworded or not, they are the reasoning, and
+        that is the part a recompute cannot reconstruct."""
+        row = dict(_ASM50_ROW, fmv_provenance="hand",
+                   fmv_notes="OVERRIDE: operator band, CLI pool rejected")
+        _, needs, skipped_hand, force_notes, _ = self._bucket(
+            server_url, [row], force=True)
+        assert skipped_hand == {}
+        assert [b["_idx"] for b in needs] == [0]
+        assert force_notes == {0: "OVERRIDE: operator band, CLI pool rejected"}
+        fmv_runner._echo_hand_override_notes(force_notes, [self._book()])
+        assert "OVERRIDE: operator band" in capsys.readouterr().err
+
+    def test_ambiguity_still_fails_closed_on_the_column_path(self, server_url):
+        """BUI-775's undecidable case must not be quietly resolved by the new
+        column: two candidate rows, one claimed 'hand', still means we cannot
+        say which row a write lands on (GET /api/comics does not expose
+        `variant`, which IS part of the write key)."""
+        hand = dict(_ASM50_ROW, fmv_provenance="hand",
+                    fmv_notes="OVERRIDE: operator band")
+        other = dict(_ASM50_ROW, fmv_id=999, fmv_provenance="machine",
+                     fmv_notes="window=±0.5")
+        _, needs, skipped_hand, _, lookup_err = self._bucket(
+            server_url, [hand, other])
+        assert needs == []
+        assert skipped_hand == {}
+        assert list(lookup_err) == [0]
+        assert "undecidable" in lookup_err[0]
+
+    def test_seam_free_over_http_the_column_reaches_the_decision(
+            self, server_url, real_identity_lookup):
+        """Patches only the HTTP layer, so `_db_lookup_by_identity`,
+        `_get_json_or_warn`, `_row_is_hand_priced` and the call site all run
+        for real. The stubbed-helper tests above would still pass if the
+        column were read under a field name `GET /api/comics` does not serve;
+        this one would not."""
+        row = dict(_ASM50_ROW, fmv_provenance="hand",
+                   fmv_notes="OVERRIDE: operator band, CLI pool rejected")
+        with patch("fmv_runner.requests.get", side_effect=_fake_get([row])):
+            _, needs, skipped_hand, _, _ = fmv_runner._split_by_db_cache(
+                [self._book()], server_url=server_url, max_age_days=0,
+                force=False)
+        assert needs == []
+        assert skipped_hand == {0: row}
+
+    def test_locg_keyed_shortcut_also_reads_the_column(self, server_url):
+        """The `locg_id` shortcut in `_hand_price_candidates` ends the search
+        only when the row it found is hand-priced — that test must read the
+        column too, or a claimed row found by the shortcut would fall through
+        to the identity lookup and (finding nothing) recompute."""
+        book = _make_book("1", "Amazing Spider-Man", "50", 1967, 6.5,
+                          locg_id=999)
+        row = dict(_ASM50_ROW, fmv_provenance="hand",
+                   fmv_notes="OVERRIDE: operator band")
+        with patch("fmv_runner._db_lookup",
+                   side_effect=_stale_hand_lookup(row)), \
+             patch("fmv_runner._db_lookup_by_identity", return_value=[]):
+            _, needs, skipped_hand, _, _ = fmv_runner._split_by_db_cache(
+                [book], server_url=server_url, max_age_days=0, force=False)
+        assert needs == []
+        assert skipped_hand == {0: row}
+
+
+class TestRunLeavesAColumnClaimedRowUntouched:
+    """BUI-769 acceptance criterion 4, end to end (mocked network): a default
+    `comic-fmv` run over a row whose notes were reworded but whose provenance
+    column says 'hand' must fetch nothing, write nothing, and REPORT the skip
+    (a silent skip is indistinguishable from a silent overwrite in a log)."""
+
+    def test_no_fetch_no_upsert_and_the_skip_is_reported(self, server_url,
+                                                         capsys):
+        batch = [{"item_id": "1", "title": "Amazing Spider-Man", "issue": "50",
+                  "year": 1967, "grade": 6.5}]
+        row = dict(_ASM50_ROW, fmv_provenance="hand",
+                   fmv_notes="OVERRIDE: operator band, CLI pool rejected")
+        with patch("fmv_runner._read_batch", return_value=batch), \
+             patch("fmv_runner._db_lookup_by_identity", return_value=[row]), \
+             patch("fmv_runner._fetch_comps") as fetch_mock, \
+             patch("fmv_runner._upsert_fmv") as upsert_mock:
+            fmv_runner.run(batch_path="x.json", out_path=None,
+                           max_age_days=7, force=False, quiet=True,
+                           server_url=server_url)
+        fetch_mock.assert_not_called()
+        upsert_mock.assert_not_called()
+        assert "skipped 1 hand-priced row(s)" in capsys.readouterr().err
+
+
 class TestSplitByDbCacheAmbiguousIdentityFailsClosed:
     """BUI-775: `variant` is part of the write's key, but `GET /api/comics`
     neither filters on it nor returns it — so the fallback lookup can answer
@@ -2307,6 +2565,28 @@ class TestUpsertFmv:
         assert body["fmv_high"] == 150
         assert body["fmv_confidence"] == "high"
         assert body["locg_id"] == 42
+
+    def test_posts_machine_provenance(self, server_url):
+        """BUI-769: every band this function posts came out of the pool, so it
+        must claim `fmv_provenance='machine'`. That is what keeps `--force`
+        idempotent — a forced overwrite of a hand-priced row leaves behind a
+        machine number, and a row still claiming 'hand' would be skipped by
+        every later default run forever."""
+        inp = {"title": "X", "issue": "1", "year": 1990, "grade": 9.0}
+        fmv = {"fmv_low": 100, "fmv_high": 150, "n": 8, "confidence": "HIGH",
+               "window": 0.5, "cv_pct": "20%"}
+
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {"id": 1}
+        with patch("fmv_runner.requests.post", return_value=mock_resp) as post:
+            fmv_runner._upsert_fmv(server_url, inp, fmv)
+            body = post.call_args.kwargs["json"]
+        assert body["fmv_provenance"] == "machine"
+        # Pinned against the reader's own vocabulary, so a rename on one side
+        # cannot leave the writer posting a value the guard reads as unknown
+        # (which would fail CLOSED and freeze the table).
+        assert body["fmv_provenance"] in fmv_runner._KNOWN_PROVENANCES
 
     def test_posts_structured_ungraded_anchor_fields(self, server_url):
         """BUI-712: the ungraded anchor is posted as structured fields
