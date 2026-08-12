@@ -98,6 +98,70 @@ class TestParseGrade:
         """Bare numeric grades with non-unit trailing words must still be detected."""
         assert sc.parse_grade(title) == expected
 
+    # ── Word-form "near mint" ────────────────────────────────────────────────
+    #
+    # `NM`/`NM-` always parsed; the spelled-out forms did not, while every other
+    # word-form grade ("very good", "good", "fair", "poor") did. The corpus
+    # titles that motivated this are underscore-delimited, which is why the
+    # patterns use alphanumeric lookarounds rather than `\b` — `_` is a word
+    # character, so `\b` never fires at either edge of "_NEAR MINT MINUS_".
+
+    @pytest.mark.parametrize("title,expected", [
+        # Plain word form maps to the same value as the NM abbreviation.
+        ("Amazing Spider-Man 300 Near Mint", 9.4),
+        ("web of spider-man #8 (nov 1985 marvel) near mint", 9.4),
+        # "near mint minus" must beat plain "near mint" (Tier 2 before Tier 3).
+        ("X-Men #190 NEAR MINT MINUS Jim Lee", 9.2),
+        # Real corpus shape: underscore delimiters on both edges, where `\b`
+        # cannot fire. Both of these are verbatim stored titles.
+        ("UNCANNY X-MEN #190_FEBRUARY 1985_NEAR MINT MINUS_AMAZING SPIDER-MAN!", 9.2),
+        ("UNCANNY X-MEN #250_LATE OCT 1989_NEAR MINT MINUS_KA-ZAR!", 9.2),
+        # Hyphen as separator.
+        ("Invincible #77 High Grade - Near-Mint", 9.4),
+        # A numeric grade still wins over the word form.
+        ("ASM #300 Near Mint 9.8", 9.8),
+    ])
+    def test_near_mint_word_form(self, title, expected):
+        assert sc.parse_grade(title) == expected
+
+    @pytest.mark.parametrize("title", [
+        # Bare "mint" is seller vocabulary, not a grade. Every one of these is a
+        # verbatim stored title, and none of them is a graded comic.
+        "Hasbro Marvel Legends X-Men '97 MAGNETO NEW MINT IN BOX MIB",
+        "1994 Marvel Masterpieces Gold Signature Phoenix X-Men #89 BGS 9 Mint POP 1",
+        "2025 Samoa Batman #251 Joker Comic Cover 1oz .999 Silver - Mintage 250",
+        "X-Men #104 Mint Condition White Pages Pristine",
+        # Must not match inside a longer alphanumeric run.
+        "Peppermint Patty #1 1985",
+    ])
+    def test_bare_mint_is_not_a_grade(self, title):
+        assert sc.parse_grade(title) is None
+
+    # ── Spelled-out slash combos (Tier 1b) ───────────────────────────────────
+    #
+    # A combo's second half is itself a valid grade word, so without a Tier 1
+    # entry the bare-word pattern wins and reports the component's value. Two
+    # of these were wrong before word-form near mint was added at all.
+
+    @pytest.mark.parametrize("title,expected", [
+        # Must equal their abbreviated equivalents, NOT the trailing component.
+        ("The X-Men #72 VERY FINE/NEAR MINT 1971 Marvel", 9.0),   # not 9.4
+        ("Fantastic Four #48 Fine/Very Fine 1966", 7.0),          # not 6.0
+        ("Hulk #181 Very Good/Fine", 5.0),                        # not 4.0
+        ("Batman #1 Good/Very Good", 3.0),                        # not 2.0
+        ("Detective #27 Fair/Good", 1.5),                         # not 1.0
+        ("ASM #300 Near Mint/Mint", 9.6),                         # not 9.4
+        # Separator variants observed in the corpus.
+        ("SPAWN #1 1992 VERY FINE-NEAR MINT IMAGE", 9.0),
+        ("The X-Men #79 ~ VERY FINE - NEAR MINT NM ~ 1972 Marvel", 9.0),
+        ("UNCANNY X-MEN #280_SEPT 1991_VERY FINE/NEAR MINT_PROFESSOR X!", 9.0),
+        # Abbreviated forms must be unaffected by the spelled-out additions.
+        ("X-Men #1 VF/NM", 9.0),
+        ("X-Men #1 FN/VF", 7.0),
+    ])
+    def test_spelled_out_slash_combos(self, title, expected):
+        assert sc.parse_grade(title) == expected
+
 
 # ─── Hard excludes ────────────────────────────────────────────────────────────
 
