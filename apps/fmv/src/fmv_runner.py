@@ -365,6 +365,31 @@ def run(*, batch_path: str | None, out_path: str | None,
                 err=True,
             )
 
+    # BUI-778: BUI-775 routes EVERY book (not just `locg_id`-bearing ones)
+    # through the provenance lookup above, so a comics-server outage that
+    # used to leave the `locg_id`-less majority pricing straight through now
+    # can, and routinely will (the server is single-process and its event
+    # loop blocks for tens of seconds per row during e.g. a backfill —
+    # BUI-765), land the WHOLE BATCH in skipped_lookup_error. The per-book
+    # loop just above already explains each row, but nothing until now said
+    # so at RUN level — an operator scanning for "did this run price
+    # anything" has to count bullet points to notice zero did, and the
+    # wording never once used the word "outage". Fire ONE unmissable extra
+    # line, but ONLY in that total-stoppage case (every single book skipped
+    # this exact way — none cached, computed, hand-protected, or rejected
+    # either): a PARTIAL skip already has the per-bucket counts above and
+    # needs no escalation.
+    if books and len(skipped_lookup_error) == len(books):
+        click.echo(
+            f"⚠️  RUN SUMMARY: priced 0 of {len(books)} book(s) this run — "
+            "every book was skipped because its hand-priced provenance could "
+            "NOT be verified (see the per-book reasons above), consistent "
+            "with the comics server being unreachable for the whole run. "
+            "This is NOT \"no comps found\" for these books — nothing was "
+            "fetched, computed, or written.",
+            err=True,
+        )
+
     # BUI-639: a THIRD skip class, reported separately from both above and
     # worded so it can never be read as either. Unlike skipped_lookup_error
     # (nothing was priced), this book WAS priced in-memory — the write that

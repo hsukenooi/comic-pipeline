@@ -1299,6 +1299,97 @@ class TestRunFailsClosedOnLookupError:
         assert "X-Men #39: comics-server lookup failed" in cap.err
 
 
+class TestRunReportsTotalOutageStoppage:
+    """BUI-778: BUI-775 routes EVERY book through the provenance lookup, so a
+    full comics-server outage now lands the WHOLE BATCH in
+    skipped_lookup_error rather than a subset — a run that priced literally
+    nothing. The per-book reasons (BUI-544/BUI-775) already say why each row
+    was skipped, but nothing at run level says "you priced zero books" in a
+    way that can't be mistaken for "no comps found" across N books. This adds
+    exactly that one extra headline, and only in the total-stoppage case."""
+
+    def _batch(self, n=2):
+        return [
+            {"item_id": str(i), "title": f"Book {i}", "issue": "1",
+             "year": 1990, "grade": 9.0, "locg_id": 100 + i}
+            for i in range(n)
+        ]
+
+    def test_total_outage_emits_run_level_summary(self, server_url, capsys):
+        with patch("fmv_runner._read_batch", return_value=self._batch()), \
+             patch("fmv_runner._db_lookup",
+                   side_effect=_failing_provenance_lookup()), \
+             patch("fmv_runner._fetch_comps") as fetch_mock:
+            fmv_runner.run(batch_path="x.json", out_path=None,
+                           max_age_days=7, force=False, quiet=True,
+                           server_url=server_url)
+        fetch_mock.assert_not_called()
+        cap = capsys.readouterr()
+        assert "priced 0 of 2 book(s)" in cap.err
+        assert "comics server being unreachable" in cap.err
+        assert "NOT" in cap.err and "no comps found" in cap.err
+
+    def test_healthy_run_does_not_emit_the_outage_summary(
+            self, server_url, capsys):
+        """Same shape of batch, but the provenance lookup succeeds (server is
+        healthy, nothing is hand-priced) — the outage headline must not fire
+        just because nothing needed pricing help."""
+        comps = [_make_comp(p, 9.0) for p in [50, 55, 60, 65, 70]]
+        fresh_results = [
+            {"input": {"_req_id": i, "title": f"Book {i}", "issue": "1",
+                       "year": 1990, "grade": 9.0, "item_id": str(i)},
+             "comps": comps,
+             "queries_used": [{"tier": "base", "cached": False}]}
+            for i in range(2)
+        ]
+        with patch("fmv_runner._read_batch", return_value=self._batch()), \
+             patch("fmv_runner._db_lookup", return_value=None), \
+             patch("fmv_runner._fetch_comps", return_value=fresh_results), \
+             patch("fmv_runner._upsert_fmv",
+                   return_value={"comic_id": 1, "fmv_id": 1}):
+            fmv_runner.run(batch_path="x.json", out_path=None,
+                           max_age_days=7, force=False, quiet=True,
+                           server_url=server_url)
+        cap = capsys.readouterr()
+        assert "priced 0 of" not in cap.err
+        assert "comics server being unreachable" not in cap.err
+
+    def test_partial_outage_does_not_emit_the_total_stoppage_summary(
+            self, server_url, capsys):
+        """One book skipped by the outage, one genuinely hand-priced (a
+        legitimate, expected skip) — this is NOT the total-stoppage case
+        BUI-778 is about, so the new headline must stay silent; the existing
+        per-bucket counts (already covered by BUI-533/BUI-544 tests) are
+        enough."""
+        batch = [{"item_id": "1", "title": "Batman", "issue": "251",
+                  "year": 1972, "grade": 5.5, "locg_id": 100},
+                 {"item_id": "2", "title": "X-Men", "issue": "39",
+                  "year": 1967, "grade": 9.0, "locg_id": 200}]
+        hand_row = {"id": 1, "fmv_low": 250, "fmv_high": 300, "fmv_comps": 1,
+                    "fmv_confidence": "low",
+                    "fmv_notes": "hand § anchored on the lone 4.0 sale",
+                    "fmv_updated_at": "2020-01-01T00:00:00"}
+
+        def _lookup(server, *, locg_id, grade, locg_variant_id=None,
+                    max_age_days, strict=False):
+            if not strict:
+                return None
+            if locg_id == 200:
+                raise fmv_runner._DbLookupFailed("comics-server lookup failed")
+            return hand_row
+
+        with patch("fmv_runner._read_batch", return_value=batch), \
+             patch("fmv_runner._db_lookup", side_effect=_lookup), \
+             patch("fmv_runner._fetch_comps") as fetch_mock:
+            fmv_runner.run(batch_path="x.json", out_path=None,
+                           max_age_days=7, force=False, quiet=True,
+                           server_url=server_url)
+        fetch_mock.assert_not_called()
+        cap = capsys.readouterr()
+        assert "priced 0 of" not in cap.err
+        assert "comics server being unreachable" not in cap.err
+
+
 class TestRunSkipsPermanentWriteRejection:
     """BUI-639 end-to-end (mocked network): a 422 write rejection (e.g.
     BUI-625's multi-issue-lot refusal) on one book must skip only that book,
