@@ -237,8 +237,10 @@ class TestSplitByDbCache:
              lookup_err) = fmv_runner._split_by_db_cache(
                 books, server_url=server_url, max_age_days=7, force=False)
             lookup.assert_not_called()
+            # BUI-777: `variant` completes the write's key, and a book with no
+            # variant asks about the BASE edition (None) — not "any variant".
             identity.assert_called_once_with(
-                server_url, title="X", issue="1", grade=9.0)
+                server_url, title="X", issue="1", grade=9.0, variant=None)
         assert cached == {}
         assert len(needs) == 1
         assert skipped_hand == {}
@@ -1183,29 +1185,297 @@ class TestSplitByDbCacheAmbiguousIdentityFailsClosed:
         assert force_notes[0] == "hand §direct: VG 4.0 $35 | hand §interp: $30-40"
 
 
+class TestSplitByDbCacheVariantNarrowsTheKey:
+    """BUI-777 at the DECISION function — the only evidence that counts.
+
+    BUI-759 proved a widened marker set against all 999 live `fmv` rows, green,
+    zero false positives, and the guard still protected 1 of 12 because an
+    upstream gate meant it never ran. So every test here calls
+    `_split_by_db_cache` with `max_age_days=0` (the fresh-cache short-circuit
+    neutralized — a cache hit would make the run look protected for the wrong
+    reason) and asserts on the BUCKET, never on a predicate.
+
+    The rows carry a `variant` KEY, which is what a BUI-777 server serves. Rows
+    without it (every other test in this file, and `_ASM50_ROW`) exercise the
+    deploy-skew fallback below.
+    """
+
+    BASE = dict(_ASM50_ROW, id=661, fmv_id=733, title="X-Men", issue="96",
+                year=1975, grade=4.0, variant=None,
+                fmv_notes="hand §direct: VG 4.0 $35")
+    NEWSSTAND = dict(_ASM50_ROW, id=662, fmv_id=901, title="X-Men", issue="96",
+                     year=1975, grade=4.0, variant="Newsstand",
+                     fmv_notes="window=±0.5 | cv=20%")
+
+    @pytest.fixture(autouse=True)
+    def _use_the_real_lookup(self, real_identity_lookup):
+        """Opt every test in this class out of the file's
+        `_no_identity_rows_by_default` stub — see `_split`."""
+
+    def _split(self, books, rows, force=False):
+        """Fakes the HTTP layer ONLY — the real `_db_lookup_by_identity` does
+        the narrowing, so the mechanism under test actually runs. Stubbing that
+        function and re-implementing the filter in the stub would assert the
+        test's own arithmetic and pass against unfixed code; the first draft of
+        this helper did exactly that, and only one of these seven tests failed
+        the counterfactual until it was fixed."""
+        with patch("fmv_runner.requests.get", side_effect=_fake_get(rows)):
+            return fmv_runner._split_by_db_cache(
+                books, server_url="http://test-server:8080", max_age_days=0,
+                force=force)
+
+    def _book(self, variant=None):
+        book = _make_book("1", "X-Men", "96", 1975, 4.0)
+        if variant is not None:
+            book["variant"] = variant
+        return book
+
+    def test_a_hand_priced_base_with_a_variant_sibling_is_now_decidable(self):
+        """THE regression this ticket exists to fix. Before BUI-777 these two
+        rows shared the guard's whole key, so a hand-priced one made the book
+        UNDECIDABLE — protected, but left unpriced and unpriceable without
+        `--force`. Narrowed by `variant`, the base cover resolves to the one
+        row the write would land on and is skipped as hand-priced."""
+        (cached, needs, skipped_hand, force_notes, lookup_err) = self._split(
+            [self._book()], [self.BASE, self.NEWSSTAND])
+        assert list(skipped_hand) == [0]
+        assert skipped_hand[0]["fmv_id"] == 733
+        assert lookup_err == {} and needs == []
+
+    def test_the_variant_sibling_of_a_hand_priced_base_recomputes(self):
+        """Not a weakening of protection: the write for the Newsstand book
+        keys on `(X-Men, 96, 'Newsstand')` and lands on comic_id 662, so the
+        hand-priced base row at 661 is untouched whichever way this goes.
+        Freezing it would be protecting a row that was never at risk."""
+        (cached, needs, skipped_hand, force_notes, lookup_err) = self._split(
+            [self._book("Newsstand")], [self.BASE, self.NEWSSTAND])
+        assert [b["_idx"] for b in needs] == [0]
+        assert skipped_hand == {} and lookup_err == {}
+
+    def test_a_variant_book_is_not_handed_the_base_covers_hand_priced_band(
+            self):
+        """The quieter BUI-139-shaped leak in the opposite direction. With one
+        variant-blind candidate the old key had exactly one answer and reused
+        it: a Newsstand book took the BASE cover's hand-priced $600-680 band
+        verbatim as its own FMV. That is a wrong number, not a missing one."""
+        (cached, needs, skipped_hand, force_notes, lookup_err) = self._split(
+            [self._book("Newsstand")], [self.BASE])
+        assert skipped_hand == {}, "must not reuse the base cover's band"
+        assert [b["_idx"] for b in needs] == [0]
+
+    def test_variant_is_matched_case_sensitively_like_the_write(self):
+        """`comics.variant` has no COLLATE NOCASE and the identity indexes key
+        on COALESCE(variant,'') with no LOWER, so `newsstand` and `Newsstand`
+        are two rows to the write. Folding case here would claim a row the
+        write cannot land on."""
+        hand_newsstand = dict(self.NEWSSTAND, fmv_notes="hand §: $80-95")
+        (cached, needs, skipped_hand, force_notes, lookup_err) = self._split(
+            [self._book("newsstand")], [self.BASE, hand_newsstand])
+        assert [b["_idx"] for b in needs] == [0]
+        assert skipped_hand == {} and lookup_err == {}
+
+    def test_a_blank_variant_asks_about_the_base_edition(self):
+        """`_upsert_fmv` posts a whitespace-only variant and the server strips
+        it to NULL, so the write lands on the base row — the guard must ask
+        the same question."""
+        (cached, needs, skipped_hand, force_notes, lookup_err) = self._split(
+            [self._book("   ")], [self.BASE, self.NEWSSTAND])
+        assert list(skipped_hand) == [0]
+        assert skipped_hand[0]["fmv_id"] == 733
+
+    def test_duplicate_year_siblings_still_fail_closed(self):
+        """`year` is NOT part of `upsert_comic`'s key, so it must not narrow
+        the guard's. The live table's 10 residual duplicate-year groups stay
+        undecidable, which is the correct bucket for them — narrowing by year
+        would hide a hand-priced row the write can still hit."""
+        twin = dict(self.BASE, id=999, fmv_id=998, year=1976,
+                    fmv_notes="window=±0.5 | cv=20%")
+        (cached, needs, skipped_hand, force_notes, lookup_err) = self._split(
+            [self._book()], [self.BASE, twin])
+        assert needs == [] and skipped_hand == {}
+        assert list(lookup_err) == [0]
+        assert "undecidable" in lookup_err[0]
+
+    def test_force_still_echoes_the_hand_notes_it_will_overwrite(self):
+        """BUI-533's overwrite-AND-echo contract must survive the narrower
+        key — and now echoes only the row `--force` can actually overwrite,
+        rather than every same-title candidate."""
+        (cached, needs, skipped_hand, force_notes, lookup_err) = self._split(
+            [self._book()], [self.BASE, self.NEWSSTAND], force=True)
+        assert [b["_idx"] for b in needs] == [0]
+        assert force_notes[0] == "hand §direct: VG 4.0 $35"
+
+
+class TestDbLookupByIdentityVariantDeploySkew:
+    """BUI-777's deploy-skew safety property, at the decision function.
+
+    A pre-BUI-777 comics server omits `variant` from its SELECT, so its rows
+    lack the KEY — indistinguishable on a `.get()` from a base-edition row
+    whose variant is genuinely NULL. Reading that silence as "everything is the
+    base edition" would make a named-variant book match nothing, and an empty
+    candidate set RECOMPUTES: a hand-priced Newsstand row would go from
+    protected to overwritten by a version skew alone.
+    """
+
+    OLD_HAND_ROW = dict(_ASM50_ROW, id=662, fmv_id=901, title="X-Men",
+                        issue="96", year=1975, grade=4.0,
+                        fmv_notes="hand §direct: VG 4.0 $35")
+
+    def test_a_variant_book_stays_protected_against_an_old_server(self,
+                                                                  server_url,
+                                                                  real_identity_lookup):
+        """The skew regression, asserted through the REAL lookup with only the
+        HTTP layer faked — the narrowing lives there, so stubbing it out would
+        test nothing. One hand-priced row with no `variant` key: the book must
+        still be skipped as hand-priced, not recomputed."""
+        book = _make_book("1", "X-Men", "96", 1975, 4.0)
+        book["variant"] = "Newsstand"
+        assert "variant" not in self.OLD_HAND_ROW  # the old server's shape
+        with patch("fmv_runner.requests.get",
+                   side_effect=_fake_get([self.OLD_HAND_ROW])):
+            (cached, needs, skipped_hand, force_notes,
+             lookup_err) = fmv_runner._split_by_db_cache(
+                [book], server_url=server_url, max_age_days=0, force=False)
+        assert needs == [], "a version skew must never un-protect a hand row"
+        assert list(skipped_hand) == [0]
+
+    def test_an_old_server_keeps_the_bui_775_ambiguity_bucket(
+            self, server_url, real_identity_lookup):
+        """Against an old server the guard degrades to exactly BUI-775 —
+        variant-blind, failing closed on several candidates — rather than
+        pretending it can tell the rows apart."""
+        sibling = dict(self.OLD_HAND_ROW, id=663, fmv_id=902,
+                       fmv_notes="window=±0.5 | cv=20%")
+        book = _make_book("1", "X-Men", "96", 1975, 4.0)
+        with patch("fmv_runner.requests.get",
+                   side_effect=_fake_get([self.OLD_HAND_ROW, sibling])):
+            (cached, needs, skipped_hand, force_notes,
+             lookup_err) = fmv_runner._split_by_db_cache(
+                [book], server_url=server_url, max_age_days=0, force=False)
+        assert needs == [] and skipped_hand == {}
+        assert list(lookup_err) == [0]
+        assert "undecidable" in lookup_err[0]
+
+    def test_a_new_server_row_with_a_null_variant_is_the_base_edition(
+            self, server_url, real_identity_lookup):
+        """The other side of the discriminator: the key PRESENT and None is a
+        real answer — the base edition — and must narrow, not fall back."""
+        base = dict(self.OLD_HAND_ROW, variant=None)
+        book = _make_book("1", "X-Men", "96", 1975, 4.0)
+        book["variant"] = "Newsstand"
+        with patch("fmv_runner.requests.get", side_effect=_fake_get([base])):
+            (cached, needs, skipped_hand, force_notes,
+             lookup_err) = fmv_runner._split_by_db_cache(
+                [book], server_url=server_url, max_age_days=0, force=False)
+        assert [b["_idx"] for b in needs] == [0]
+        assert skipped_hand == {} and lookup_err == {}
+
+
+class TestVariantKey:
+    """BUI-777: mirrors `upsert_comic`'s `(variant or "").strip() or None`."""
+
+    def test_blank_and_missing_normalize_to_the_base_edition(self):
+        for value in (None, "", "   ", "\t"):
+            assert fmv_runner._variant_key(value) is None
+
+    def test_falsy_non_strings_normalize_like_the_servers_or_empty(self):
+        """The server's normalization is `(variant or "").strip() or None` —
+        FALSINESS-based, so a batch carrying `variant: 0` or `variant: false`
+        stores NULL, and `_upsert_fmv`'s `if inp.get("variant")` does not even
+        post it. Stringifying those to `"0"` would make the guard ask about a
+        variant the write never stores, match nothing, and recompute — quietly
+        overwriting the base row it was supposed to check."""
+        for value in (0, False, [], {}):
+            assert fmv_runner._variant_key(value) is None, repr(value)
+
+    def test_a_falsy_variant_still_finds_a_hand_priced_base_row(
+            self, server_url, real_identity_lookup):
+        """The bucket-level version of the above: `variant: 0` must resolve to
+        the base edition and stay protected, not recompute over it."""
+        base = dict(_ASM50_ROW, variant=None)
+        book = _make_book("1", "Amazing Spider-Man", "50", 1967, 6.5)
+        book["variant"] = 0
+        with patch("fmv_runner.requests.get", side_effect=_fake_get([base])):
+            (cached, needs, skipped_hand, force_notes,
+             lookup_err) = fmv_runner._split_by_db_cache(
+                [book], server_url=server_url, max_age_days=0, force=False)
+        assert list(skipped_hand) == [0]
+        assert needs == []
+
+    def test_surrounding_whitespace_is_stripped_like_the_server(self):
+        assert fmv_runner._variant_key("  Newsstand ") == "Newsstand"
+
+    def test_case_is_not_folded(self):
+        assert fmv_runner._variant_key("newsstand") != \
+            fmv_runner._variant_key("Newsstand")
+
+    def test_write_identity_carries_the_normalized_variant(self):
+        assert fmv_runner._write_identity(
+            {"title": "X-Men", "issue": "96", "variant": " Newsstand "}
+        ) == ("X-Men", "96", "Newsstand")
+
+
+# BUI-777: the (title, issue) pairs that pin the `#<issue>` token rule shared
+# by this package's `_write_identity` and the comics server's `_find_issue_token`.
+# A CROSS-PACKAGE CONTRACT with `gixen_overlay.db`, pinned by a twin table in
+# `plugins/gixen-overlay/tests/test_list_comics_variant.py` — apps/fmv is not a
+# workspace member, so there is no import edge to enforce it.
+#
+# Why it must hold: `_write_identity` predicts the variant the server will
+# store as `_variant_key(book["variant"])`, which is only true while BUI-625's
+# `_extract_edition_designation` cannot fire. That rule runs iff
+# `_find_issue_token` matches — so if these two regexes ever diverge, the
+# client would predict a variant the server does not store, and the guard would
+# look up the wrong row. That is the BUI-775 failure class exactly.
+_ISSUE_TOKEN_PRESENT = [
+    ("Iron Man #126 (Marvel Comics 1979) VF", "126"),
+    ("Absolute Flash #10 Nick Robles Cover", "10"),
+    ("X-Men # 96", "96"),          # space after the hash
+    ("x-men #96 newsstand", "96"),  # case-insensitive
+]
+_ISSUE_TOKEN_ABSENT = [
+    ("Amazing Spider-Man", "50"),
+    ("Amazing Spider-Man 300", "300"),   # bare trailing number, no hash
+    ("X-Men #960", "96"),                # \b: #960 is not #96
+    ("Batman", "245"),
+]
+
+
 class TestWriteIdentity:
     """BUI-775: the guard's key must be the key the WRITE uses. The comics
     server re-normalizes `title` inside `upsert_comic` before it becomes row
     identity, so the client cannot just query with what it holds."""
 
+    def test_the_issue_token_regex_matches_the_servers(self):
+        """BUI-777: `_write_identity`'s variant prediction is only sound while
+        the server's edition-designation rule cannot fire, and that rule is
+        gated on the SAME `#<issue>` token this function declines on. Pin both
+        directions here; the overlay pins the other half of the table."""
+        for title, issue in _ISSUE_TOKEN_PRESENT:
+            assert fmv_runner._write_identity(
+                {"title": title, "issue": issue}) is None, title
+        for title, issue in _ISSUE_TOKEN_ABSENT:
+            assert fmv_runner._write_identity(
+                {"title": title, "issue": issue}) is not None, title
+
     def test_returns_the_title_and_issue_the_server_will_store(self):
         assert fmv_runner._write_identity(
             {"title": "Amazing Spider-Man", "issue": "50"}
-        ) == ("Amazing Spider-Man", "50")
+        ) == ("Amazing Spider-Man", "50", None)
 
     def test_issue_is_stringified_like_the_upsert_body(self):
         """`_upsert_fmv` posts `str(inp["issue"])`, and `list_comics` matches
         `c.issue = ?` exactly — an int here would query a value the write
         never stores."""
         assert fmv_runner._write_identity(
-            {"title": "Batman", "issue": 245}) == ("Batman", "245")
+            {"title": "Batman", "issue": 245}) == ("Batman", "245", None)
 
     def test_a_trailing_bare_issue_token_is_stripped_as_the_server_does(self):
         """Mirrors the server's `_strip_embedded_issue`, the one branch of its
         `_normalize_comic_title` that a comic-fmv post can still reach."""
         assert fmv_runner._write_identity(
             {"title": "Amazing Spider-Man 300", "issue": "300"}
-        ) == ("Amazing Spider-Man", "300")
+        ) == ("Amazing Spider-Man", "300", None)
 
     def test_declines_when_the_title_still_carries_its_issue_token(self):
         """With `#<issue>` present the server's OTHER two rules (BUI-599's
@@ -1252,7 +1522,8 @@ class TestDbLookupByIdentity:
         with patch("fmv_runner.requests.get",
                    side_effect=_fake_get([other, _ASM50_ROW])):
             rows = fmv_runner._db_lookup_by_identity(
-                server_url, title="Amazing Spider-Man", issue="50", grade=6.5)
+                server_url, title="Amazing Spider-Man", issue="50", grade=6.5,
+                variant=None)
         assert rows == [_ASM50_ROW]
 
     def test_a_stub_row_is_still_examined_for_provenance(
@@ -1264,7 +1535,8 @@ class TestDbLookupByIdentity:
         stub = dict(_ASM50_ROW, fmv_low=None, fmv_high=None)
         with patch("fmv_runner.requests.get", side_effect=_fake_get([stub])):
             rows = fmv_runner._db_lookup_by_identity(
-                server_url, title="Amazing Spider-Man", issue="50", grade=6.5)
+                server_url, title="Amazing Spider-Man", issue="50", grade=6.5,
+                variant=None)
         assert rows == [stub]
 
     def test_a_failed_get_raises_rather_than_reading_as_no_row(
@@ -1277,13 +1549,13 @@ class TestDbLookupByIdentity:
                    side_effect=requests.ConnectionError("down")):
             with pytest.raises(fmv_runner._DbLookupFailed):
                 fmv_runner._db_lookup_by_identity(
-                    server_url, title="X", issue="1", grade=9.0)
+                    server_url, title="X", issue="1", grade=9.0, variant=None)
 
     def test_an_empty_answer_is_a_genuine_miss(self, server_url,
                                                real_identity_lookup):
         with patch("fmv_runner.requests.get", side_effect=_fake_get([])):
             assert fmv_runner._db_lookup_by_identity(
-                server_url, title="X", issue="1", grade=9.0) == []
+                server_url, title="X", issue="1", grade=9.0, variant=None) == []
 
     def test_a_non_list_body_fails_closed(self, server_url,
                                           real_identity_lookup):
@@ -1294,7 +1566,7 @@ class TestDbLookupByIdentity:
                    side_effect=_fake_get({"detail": "nope"})):
             with pytest.raises(fmv_runner._DbLookupFailed):
                 fmv_runner._db_lookup_by_identity(
-                    server_url, title="X", issue="1", grade=9.0)
+                    server_url, title="X", issue="1", grade=9.0, variant=None)
 
     def test_a_string_grade_still_matches_the_stored_float(
             self, server_url, real_identity_lookup):

@@ -747,16 +747,40 @@ def _split_by_db_cache(books: list[dict], *, server_url: str,
     and an operator must never mistake an outage for normal protection.
 
     BUI-775 extends the same posture to AMBIGUITY, the other way this check
-    can fail to reach a verdict. `variant` is part of the write's key but
-    `GET /api/comics` neither filters on it nor returns it, so a
-    `(title, issue, grade)` lookup can answer with SEVERAL rows — different
-    variants, or yeared/yearless siblings. When one of them is hand-priced we
-    cannot say which row a recompute would land on, so the book is skipped
-    into the same not-a-verdict bucket rather than recomputed. "Don't know" is
-    not "not hand-priced", whether the not-knowing came from an outage or from
-    an under-specified key. (When NO candidate is hand-priced the count is
+    can fail to reach a verdict. A `(title, issue, grade)` lookup can answer
+    with SEVERAL rows; when one of them is hand-priced we cannot say which row
+    a recompute would land on, so the book is skipped into the same
+    not-a-verdict bucket rather than recomputed. "Don't know" is not "not
+    hand-priced", whether the not-knowing came from an outage or from an
+    under-specified key. (When NO candidate is hand-priced the count is
     irrelevant: whichever row the write hits, it is not one this guard
     protects, so the book recomputes normally.)
+
+    BUI-777 removes the LARGEST source of that ambiguity rather than merely
+    handling it. `variant` is the third component of `upsert_comic`'s key, and
+    `GET /api/comics` now returns it, so `_db_lookup_by_identity` narrows to
+    the rows the write can actually resolve onto and a base cover no longer
+    shares a candidate set with its Newsstand sibling. Two consequences worth
+    stating, because neither is a loosening:
+
+    - A variant sibling that used to make a hand-priced book UNDECIDABLE now
+      resolves — to `skipped_hand` when the hand-priced row is the one the
+      write would hit, and to a normal recompute when it is not. The second is
+      not a weakening: the write lands on a different `comic_id` entirely, so
+      the hand-priced row is untouched either way.
+    - It also closes a quieter BUI-139-shaped leak in the opposite direction.
+      With exactly one variant-blind candidate, a Newsstand book used to be
+      handed the BASE cover's hand-priced band verbatim as its own answer.
+      That is a wrong number, not a missing one, and narrowing the key ends it.
+
+    What is deliberately NOT added to the key is `year`. It is available
+    client-side and this endpoint has always filtered on it, but it is not part
+    of `upsert_comic`'s identity — a yearless write is reconciled ONTO a yeared
+    row. Narrowing by year would make the guard's key strictly narrower than
+    the write's and hide a hand-priced row the write can still hit: the BUI-775
+    failure mode exactly, re-introduced from the other end. The residual
+    duplicate-year pairs (10 groups live, none hand-priced) therefore stay in
+    the fail-closed bucket, which is the correct place for them.
 
     Fail-closed applies under `--force` too. `--force` is licensed to overwrite
     a hand-priced row, but BUI-533's contract is "overwrite AND echo the old
@@ -770,6 +794,41 @@ def _split_by_db_cache(books: list[dict], *, server_url: str,
     which sees a superset of the same rows, so hand-priced protection is still
     decided correctly. The only cost is possibly recomputing a still-fresh
     machine-priced row — wasteful, never unsafe.
+
+    ── A KNOWN, ACCEPTED TOCTOU WINDOW (BUI-777) ───────────────────────────
+    This function reads provenance at SPLIT time; the write it authorizes lands
+    after the comps fetch, minutes later. A row hand-priced inside that window
+    is overwritten by a run that decided correctly when it looked. The window
+    is real and is NOT closed here. Recorded rather than fixed, with the
+    reasoning, so the next reader inherits the decision instead of the doubt:
+
+    - A client-side re-check just before the upsert NARROWS the window to one
+      round trip but cannot close it, doubles the lookup cost, and adds a new
+      failure mode with a real price — a re-check that fails must fail closed,
+      discarding comps already paid for out of the provider budget (BUI-565/570).
+      Bad trade: strictly more machinery, still a TOCTOU.
+    - Closing it properly means moving the decision into the same transaction
+      as the write, server-side in `upsert_fmv`. BUI-769's `fmv.provenance`
+      column makes that cheap, and the shape that does NOT regress anything is
+      compare-and-swap, not a blocking rule: the client sends the provenance it
+      OBSERVED at split time, and the server refuses the write if the stored
+      value has since changed. Purely additive — a request omitting the field
+      keeps today's behavior, so an older server ignoring it degrades to today
+      rather than 422-ing, exactly the property BUI-769 relied on. A blocking
+      rule keyed on "stored is hand, incoming is machine" must NOT be used: it
+      would reject `--force`, which is licensed to overwrite and posts
+      'machine', and an old `comic-fmv` against a new server would have
+      `--force` break outright until both sides deploy.
+    - Not done in this ticket because it is a cross-package contract with its
+      own rejection path and run-summary category, and it is a strictly
+      separable second change on top of the key fix above. The exposure it
+      leaves is bounded by an operator hand-pricing a book while a batch run is
+      mid-fetch on that same book.
+
+    Note this fix slightly WIDENS that exposure and says so plainly: books that
+    used to freeze in the undecidable bucket now proceed to a write. Each one
+    was proven not-hand-priced at its exact write key, so the only thing left
+    between the verdict and the write is the window above.
     """
     cached: dict[int, dict] = {}
     needs: list[dict] = []
@@ -822,16 +881,17 @@ def _split_by_db_cache(books: list[dict], *, server_url: str,
                 continue
             else:
                 # BUI-775: hand-priced, but we cannot say WHICH row a write
-                # would land on (see the docstring: `variant` is part of the
-                # write key and `GET /api/comics` neither filters on nor
-                # returns it). Skip without reusing an arbitrary candidate's
+                # would land on. Skip without reusing an arbitrary candidate's
                 # price — a guess here is a wrong number, not a missing one.
+                # BUI-777 narrowed the key by `variant`, so reaching this now
+                # means the rows are indistinguishable on the write's FULL
+                # identity — duplicate-year siblings, or a server too old to
+                # report `variant` at all.
                 skipped_lookup_error[i] = (
-                    f"{len(candidates)} stored rows share this book's write "
-                    f"identity and {len(hand_rows)} of them is hand-priced, so "
-                    "which row a recompute would overwrite is undecidable "
-                    "(GET /api/comics does not expose `variant`, which IS part "
-                    "of the write key)"
+                    f"{len(candidates)} stored rows share this book's full "
+                    f"write identity (title, issue, variant) and "
+                    f"{len(hand_rows)} of them is hand-priced, so which row a "
+                    "recompute would overwrite is undecidable"
                 )
                 continue
 
@@ -867,19 +927,48 @@ def _hand_price_candidates(server_url: str, book: dict, *,
     identity = _write_identity(book)
     if identity is None:
         raise _DbLookupFailed(
-            "cannot derive the (title, issue) this book would be written "
-            f"under, so its hand-priced provenance is unverifiable: "
+            "cannot derive the (title, issue, variant) this book would be "
+            f"written under, so its hand-priced provenance is unverifiable: "
             f"title={book.get('title')!r} issue={book.get('issue')!r}"
         )
-    title, issue = identity
+    title, issue, variant = identity
     return _db_lookup_by_identity(server_url, title=title, issue=issue,
-                                  grade=grade)
+                                  grade=grade, variant=variant)
 
 
-def _write_identity(book: dict) -> tuple[str, str] | None:
-    """The `(title, issue)` the comics server will STORE for *book* — i.e. the
-    identity `upsert_comic` keys the write on — or None when that cannot be
-    derived, which the caller must treat as fail-closed.
+def _variant_key(value: object) -> str | None:
+    """Normalize a `variant` the way `upsert_comic` does before it becomes row
+    identity: `(variant or "").strip() or None`.
+
+    BUI-777. Applied to BOTH sides of the comparison — the book we are about to
+    write and the row the server returned — so the guard compares variants the
+    way the write's own index will.
+
+    Case is deliberately NOT folded, and that is the safe direction rather than
+    an oversight: `comics.variant` has no `COLLATE NOCASE` and the identity
+    indexes key on `COALESCE(variant,'')` with no `LOWER`, so `"Newsstand"` and
+    `"newsstand"` are two different rows to the write. Folding case here would
+    make the guard claim a row the write cannot land on — and, worse, could
+    protect the wrong one of a pair.
+
+    The FALSY check is `not value`, not `value is None`, because the server's
+    `or ""` is falsiness-based: a batch file carrying `variant: 0` or
+    `variant: false` stores NULL (the base edition), and `_upsert_fmv`'s own
+    `if inp.get("variant")` does not even post it. Stringifying those to `"0"`
+    would make the guard ask about a variant the write never stores, match
+    nothing, and recompute — silently overwriting the base row it was supposed
+    to check. Fails in the expensive direction, so it is mirrored exactly.
+    """
+    if not value:
+        return None
+    text = value if isinstance(value, str) else str(value)
+    return text.strip() or None
+
+
+def _write_identity(book: dict) -> tuple[str, str, str | None] | None:
+    r"""The `(title, issue, variant)` the comics server will STORE for *book* —
+    i.e. the identity `upsert_comic` keys the write on — or None when that
+    cannot be derived, which the caller must treat as fail-closed.
 
     BUI-775's whole point is that the guard's key must be the SAME key the
     write uses, so this mirrors the server's `_normalize_comic_title` rather
@@ -900,10 +989,27 @@ def _write_identity(book: dict) -> tuple[str, str] | None:
       the server's transform exactly, including the `or title` fail-open a
       title that is nothing but its own issue token relies on.
 
-    `variant` is deliberately NOT part of what this returns: it IS part of the
-    server's key, but `GET /api/comics` can neither filter on it nor report
-    it, so the lookup is variant-blind by construction. That gap is handled
-    where it must be — as ambiguity, failing closed — not papered over here.
+    BUI-777 completes the key with `variant`, which BUI-775 had to leave out
+    because `GET /api/comics` neither filtered on it nor returned it. It now
+    returns it, so the guard's key can be the write's key exactly instead of a
+    prefix of it, and the "several candidates, one of them hand-priced,
+    undecidable" bucket stops being reachable for a genuine variant sibling.
+
+    The variant the server stores is `(variant or "").strip() or None` — EXCEPT
+    that when the caller supplies none, BUI-625's `_extract_edition_designation`
+    may recover one out of the title. That rule cannot fire on a book this
+    function answers for, and the reason is the `#<issue>` guard immediately
+    below rather than an argument about call order: `_extract_edition_designation`
+    runs only when the server's `_find_issue_token` matches, and that helper is
+    the SAME regex — `rf'#\s*{re.escape(issue)}\b'`, IGNORECASE — this function
+    already declines on. So every book that gets an identity here is one whose
+    stored variant is exactly `_variant_key(book["variant"])`. (Asserted, not
+    argued: see `test_the_issue_token_regex_matches_the_servers`.)
+
+    `_upsert_fmv` only puts `variant` in the POST body when it is truthy, so a
+    whitespace-only value is posted and then stripped to NULL server-side —
+    `_variant_key` reproduces both steps, and a missing/empty variant maps to
+    None, the base edition.
     """
     title = book.get("title")
     issue = book.get("issue")
@@ -914,7 +1020,8 @@ def _write_identity(book: dict) -> tuple[str, str] | None:
         return None
     if re.search(rf'#\s*{re.escape(issue_str)}\b', title, flags=re.IGNORECASE):
         return None
-    return (_strip_embedded_issue(title, issue_str) or title, issue_str)
+    return (_strip_embedded_issue(title, issue_str) or title, issue_str,
+            _variant_key(book.get("variant")))
 
 
 def _grade_key(value: object) -> object:
@@ -936,9 +1043,35 @@ def _grade_key(value: object) -> object:
 
 
 def _db_lookup_by_identity(server_url: str, *, title: str, issue: str,
-                           grade: float) -> list[dict]:
-    """Every stored FMV row at `(title, issue, grade)` — ALL of them, not the
-    freshest one. Raises `_DbLookupFailed` if the GET fails.
+                           grade: float, variant: str | None) -> list[dict]:
+    """Every stored FMV row a write at `(title, issue, variant)` + `grade`
+    could land on — ALL of them, not the freshest one. Raises `_DbLookupFailed`
+    if the GET fails.
+
+    BUI-777 — `variant` narrows the result to the rows the write can ACTUALLY
+    resolve onto. It is REQUIRED, with no default, on purpose: `None` here is a
+    real value (the base edition), not "no filter", so a caller that forgot it
+    would silently ask a narrower question than the write asks and could miss
+    the hand-priced row it is meant to find. Making it explicit at every call
+    site is the difference between a key that matches the write and one that
+    merely resembles it. It is applied client-side, not as a query param, because an
+    absent param cannot express "the base edition" (variant IS NULL) to the
+    server, only "no filter" — the same reason BUI-139 does base/variant
+    disambiguation caller-side for `locg_variant_id`. One code path then covers
+    base covers and named variants alike.
+
+    The narrowing is gated on the server ACTUALLY SERVING the column, and that
+    gate is the whole deploy-skew safety property. A pre-BUI-777 comics server
+    omits `variant` from its SELECT, so every row it returns lacks the key —
+    indistinguishable, on a `.get()`, from a base-edition row whose variant is
+    genuinely NULL. Reading the older server's silence as "every row is the
+    base edition" would make a named-variant book match NOTHING, and a book
+    whose candidate set is empty RECOMPUTES: a hand-priced Newsstand row would
+    go from protected to overwritten by a version skew alone. So absence of the
+    key means "this server cannot answer about variants" and the lookup stays
+    variant-blind, i.e. exactly BUI-775's behavior, ambiguity and all. Adding
+    the column can only narrow a candidate set the server itself described;
+    it can never widen protection's blind spot.
 
     Always strict, and never age-filtered: the only caller is the hand-priced
     provenance check, for which a soft-failed lookup is the BUI-544 trap and a
@@ -980,11 +1113,19 @@ def _db_lookup_by_identity(server_url: str, *, title: str, issue: str,
             f"comics-server returned a non-list body for title={title!r} "
             f"issue={issue!r} grade={grade}"
         )
-    return [r for r in rows
-            if isinstance(r, dict)
-            and str(r.get("title") or "").lower() == title.lower()
-            and str(r.get("issue")) == issue
-            and _grade_key(r.get("grade")) == _grade_key(grade)]
+    matched = [r for r in rows
+               if isinstance(r, dict)
+               and str(r.get("title") or "").lower() == title.lower()
+               and str(r.get("issue")) == issue
+               and _grade_key(r.get("grade")) == _grade_key(grade)]
+    # BUI-777: narrow to the write's own variant, but ONLY over rows that
+    # actually carry the field. `"variant" in r` — never `r.get("variant")` —
+    # is the discriminator; see the docstring for why conflating "absent" with
+    # "NULL" would un-protect a hand-priced variant row under deploy skew.
+    if all("variant" in r for r in matched):
+        return [r for r in matched
+                if _variant_key(r.get("variant")) == _variant_key(variant)]
+    return matched
 
 
 def _echo_hand_override_notes(force_overwrite_notes: dict[int, str],
@@ -3254,9 +3395,10 @@ def _print_table(rows: list[dict]) -> None:
 # and they legitimately price differently. Grouping on title/issue/year would
 # compare across them and manufacture inversions (in the live table 8
 # title/issue/year groups span two comic_ids, and 7 of the 8 are distinguished
-# only by `comics.variant` — a column `GET /api/comics` does not even return).
-# comic_id is the true identity, so grouping on it sidesteps the ambiguity
-# entirely rather than trying to reconstruct it.
+# only by `comics.variant`). comic_id is the true identity, so grouping on it
+# sidesteps the ambiguity entirely rather than trying to reconstruct it —
+# still the right call now that BUI-777 makes `variant` readable here, since
+# reconstructing an identity the server already hands us is strictly worse.
 
 def fetch_inversions(server_url: str) -> list[dict] | None:
     """Every cross-grade inversion currently persisted, or None if the read failed.
