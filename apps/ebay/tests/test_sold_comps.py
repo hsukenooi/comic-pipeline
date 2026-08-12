@@ -517,6 +517,115 @@ class TestHardExclude:
         assert not comic_identity._comp_later_printing_reject("")
         assert not comic_identity._comp_later_printing_reject(None)  # type: ignore[arg-type]
 
+    @pytest.mark.parametrize("title", [
+        # BUI-770 sub-case B: the real seller typography that defeated the
+        # singular-only lexicon. All four are live corpus titles.
+        "X-Men 97 Action Figures Wave 1 factory sealed box + 3 2025 2 packs complete",
+        '(1) Custom Box Protector for RETRO MARVEL LEGENDS 6" & X-Men \'97 Action Figures',
+        "Marvel Legends Wolverine 50th Anniversary Patch/Joe Fixit 2 Pack Action Figures",
+        "X- Men 90s Action Figures 19 + Projector Cyclops, Jeep, Small Danger Room Set",
+        # The singular forms must keep firing — this is an addition, not a swap.
+        "Amazing Spider-Man Marvel Legends action figure lot VF",
+        "X-Men Collectible Figures Series 1 sealed",
+        "X-Men Collectible Figure Series 1 sealed",
+    ])
+    def test_plural_collectible_markers_are_excluded(self, title):
+        """BUI-770 sub-case B: _marker_hit's (?!\\w) blocks the plural, so a
+        singular-only entry never sees "Action Figures".
+
+        _TRADING_CARD_MARKERS already carried both "trading card" and "trading
+        cards"; this sibling set did not, and nothing designed that asymmetry.
+        Shipped as correctness, not pricing: the oracle moves fmv_high in 0 of
+        926 corpus pools in BOTH directions, because all four corpus hits are
+        grade-less and fmv_math.build_pool drops them before pricing (BUI-638's
+        mechanism). A graded one WOULD reach a priced pool, which is the case
+        this closes.
+        """
+        assert sc.hard_exclude(title)
+
+    def test_plural_collectible_rule_stays_comp_only(self):
+        """BUI-770/BUI-239: sub-case B must not reach the purchase path.
+
+        _FMV_COLLECTIBLE_MARKERS is read only by is_comp_excluded (BUI-269), so
+        widening it adds no purchase-decision behavior. This title is the clean
+        discriminator: nothing else in either lexicon fires on it, so the two
+        paths must disagree — excluded as a COMP, untouched as a PURCHASE.
+        """
+        title = "X-Men #97 Action Figures Wave 1 VF"
+        assert comic_identity._marker_hit(title, comic_identity._FMV_COLLECTIBLE_MARKERS)
+        assert comic_identity.is_comp_excluded(title)
+        # Nothing on the purchase path sees it: not the lot regex, not the
+        # trading-card set, and so not should_reject/hard_reject either.
+        assert not comic_identity._LOT_RE.search(title)
+        assert not comic_identity._marker_hit(title, comic_identity._TRADING_CARD_MARKERS)
+        assert not comic_identity.hard_reject(title, "X-Men", "97")
+        assert not comic_identity.should_reject(title, "X-Men", "97")
+
+    @pytest.mark.parametrize("title", [
+        # BUI-770 sub-case A, MEASURED AND DECLINED. Both are live comp-ledger
+        # rows. "UKPV" is the abbreviation sellers use for a UK pence variant,
+        # and the spelled-out forms below ARE excluded — so this pins a real,
+        # known gap, not an oversight.
+        "Amazing Spider-Man #17 2nd Appearance of Green Goblin Marvel Comics UKPV VG 1964",
+        "Amazing Spider-Man #45 3rd Appearance Lizard UKPV FN+ Marvel Comics 1967",
+    ])
+    def test_ukpv_abbreviation_is_deliberately_not_excluded(self, title):
+        """BUI-770 sub-case A: the fix is precision 1.000 and still costs money.
+
+        Oracle over 926 offline-corpus pools: fmv_high UP 1 / DOWN 0 / NULLED 1
+        at each pool's median comp grade; sharp test 0. The up-move is a $75 cap
+        RAISE on a 1964 ASM #17 key — dropping the $255.63 UKPV comp shrinks the
+        window pool below MIN_NARROW_POOL, build_pool widens, and a $415.00 comp
+        enters (BUI-646 mechanism A). The null is a 2-comp ASM #45 pool going
+        too_sparse, i.e. priceable -> needs_manual.
+
+        The class does sit above its pools' MEDIANS (step 4b) but at or below
+        their Q75, and fmv_high is a weighted Q75 — so it was holding the cap
+        down, not inflating it. Same verdict as BUI-668's withheld half. Pinned
+        so a future "obvious" fix is a decision, not an accident; re-open only
+        with corpus evidence of UKPV comps landing above a pool's Q75.
+        """
+        assert not comic_identity.is_comp_excluded(title)
+        assert not sc.hard_exclude(title)
+
+    def test_spelled_out_uk_variants_stay_excluded(self):
+        """BUI-770 sub-case A: the declined abbreviation must not be read as
+        "UK price variants are kept". Every spelled-out form still fires."""
+        for title in (
+            "Marvel Fantastic Four #240 VF UK Price Variant",
+            "Amazing Spider-Man #45 Pence Variant FN 1967",
+            "X-Men #101 UK Edition VG 1975",
+        ):
+            assert comic_identity.is_comp_excluded(title)
+
+    def test_digit_glued_marker_is_deliberately_not_matched(self):
+        """BUI-770 sub-case C: _marker_hit's (?<!\\w) treats a digit as a word
+        char, so a marker fused to a preceding number is invisible.
+
+        Declined on two independent grounds. (1) BUI-239: _marker_hit is shared
+        with _reprint_reject/_digital_reject/_trading_card_reject/
+        _foreign_edition_reject, which feed should_reject and identify_comic —
+        loosening the boundary here widens the purchase-decision path, where a
+        false reject drops a book you wanted. (2) The comp-path value is ~zero
+        and points the wrong way: 0 of 926 pools move at the headline sampling,
+        and the class sits at 0.12x its pools' median — BUI-667's declined
+        "correct on identity, depressing not inflating" shape.
+
+        The spaced spelling is and stays excluded; only the glued one leaks.
+        """
+        glued = "X-MEN #101 2024FACSIMILE DAVE COCKRUM UNKNOWN COMICS EXCLUSIVE FOIL VARIANT VF+"
+        spaced = "X-MEN #101 2024 FACSIMILE DAVE COCKRUM UNKNOWN COMICS EXCLUSIVE FOIL VARIANT VF+"
+        assert not comic_identity._reprint_reject(glued)
+        assert not comic_identity.is_comp_excluded(glued)
+        assert comic_identity._reprint_reject(spaced)
+        assert comic_identity.is_comp_excluded(spaced)
+        # The purchase path is the reason this stays put. should_reject routes
+        # through _reprint_reject (step 3), so loosening _marker_hit's boundary
+        # would flip the FIRST of these two — a purchase-decision change, which
+        # is exactly what BUI-239 forbids this ticket from making.
+        assert not comic_identity.should_reject(glued, "X-Men", "101")
+        assert comic_identity.should_reject(spaced, "X-Men", "101")
+
 
 # ─── Comp parsing ─────────────────────────────────────────────────────────────
 

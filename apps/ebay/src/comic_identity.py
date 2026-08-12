@@ -807,6 +807,37 @@ def should_reject(
 # shrinks the comp pool slightly, a much cheaper mistake. So the two paths
 # share the same reprint/trading-card/foreign-edition base but the
 # comp-exclusion path additionally unions in these higher-risk markers.
+#
+# BUI-770 sub-case A — "ukpv" MEASURED AND DELIBERATELY NOT ADDED.  The bare
+# "uk" below catches every spelled-out form ("UK Price Variant", "UK Edition"),
+# and _marker_hit's trailing (?!\w) makes it blind to "UKPV", the abbreviation
+# sellers actually use.  The gap is real and the fix is a one-token addition at
+# precision 1.000 (5 of 5 corpus hits are genuine UK pence variants).  It is not
+# shipped because the ORACLE says it costs money in the wrong direction:
+#
+#   Headline (926 offline-corpus pools, each priced at its own median comp
+#   grade): fmv_high UP 1 / DOWN 0 / NULLED 1.  The single up-move is the whole
+#   finding — on "Amazing Spider-Man 17" (1964) dropping the $255.63 UKPV comp
+#   takes the ±0.5 window below MIN_NARROW_POOL, so build_pool WIDENS and admits
+#   a $415.00 and a $161.46 comp: trimmed pool [250, 255.63, 300, 375] becomes
+#   [161.46, 250, 300, 375, 415], fmv_high 325 -> 400, max_bid $250 -> $325.
+#   Excluding the wrong-market comp RAISES the cap on a Silver Age key by $75
+#   (BUI-646 mechanism A).  The nulled pool is the other cost: a 2-comp
+#   "Amazing Spider-Man 45" pool [47.00, 73.99] loses its second member and goes
+#   too_sparse, i.e. priceable -> needs_manual.
+#
+#   Sharp test (members above their pool's Q75 at >=3x the pool median): 0.
+#
+# The ticket's premise was step 4b — the class sits ABOVE its pools' medians
+# (4 of 5, at 1.22x), therefore on the inflating side.  That is true and it is
+# not sufficient, which is the transferable part: fmv_high is a weighted Q75,
+# not the median, and every member of this class sits AT OR BELOW its pool's
+# Q75 ($255.63 vs Q75 $255.63 and $300; $73.99 vs Q75 $90.00 and $67.24).  A
+# comp between the median and Q75 is holding the Q75 DOWN, so removing it
+# raises the cap.  Read step 4b against the quantile the number is actually
+# built from.  Same verdict and same reason as BUI-668's withheld half: a
+# genuine precision-1.000 regex bug whose fix buys no downside protection.
+# Pinned by test_ukpv_abbreviation_is_deliberately_not_excluded.
 _FMV_FOREIGN_MARKET_MARKERS: frozenset[str] = frozenset({
     "uk",
     "pence",
@@ -829,10 +860,29 @@ _FMV_FOREIGN_MARKET_MARKERS: frozenset[str] = frozenset({
 # (the purchase-decision path), and BUI-269's scope is comp-pool exclusion, so
 # a comp-only marker belongs in this comp-only set — not a widening of the
 # conservative purchase-reject lexicon.
+#
+# BUI-770 sub-case B: the PLURAL spellings. _marker_hit's trailing (?!\w) makes
+# a singular-only entry blind to "Action Figures", which is how sellers actually
+# title a multi-figure lot. _TRADING_CARD_MARKERS above already carries both
+# "trading card" and "trading cards"; this sibling set was left singular-only, so
+# the two lexicons disagreed about a spelling neither of them meant to allow.
+#
+# Shipped as a CORRECTNESS fix with a measured-zero price effect, not a pricing
+# win. Oracle over the 926-pool offline provider corpus (18,628 kept comps):
+# 4 newly-excluded titles, 3 pools touched, and fmv_high moves in 0 of 926 pools
+# at each pool's median comp grade AND at every point of the 13-point CGC ladder
+# — in BOTH directions. The mechanism is BUI-638's: all 4 carry no parseable
+# grade, so fmv_math.build_pool drops them before pricing (they read 2.86x their
+# pools' median and 2 clear the sharp test, which is exactly why the grade-less
+# check has to be run rather than assumed). The value is that the lexicon stops
+# lying about what it covers: a seller who writes "X-Men #97 Action Figures ...
+# VF 8.0" WOULD reach a priced pool, and the singular-only entry would miss it.
 _FMV_COLLECTIBLE_MARKERS: frozenset[str] = frozenset({
     "action figure",
+    "action figures",
     "1:6 scale",
     "collectible figure",
+    "collectible figures",
     "johnny lightning",
 })
 
@@ -1405,7 +1455,36 @@ class ComicIdentity:
 
 def _marker_hit(title: str, markers: "frozenset[str]") -> bool:
     """Whole-word/phrase, case-insensitive membership check (same mechanism
-    as _reprint_reject et al.)."""
+    as _reprint_reject et al.).
+
+    BUI-770 sub-case C — the (?<!\\w) lookbehind treats a DIGIT as a word
+    character, so a marker a seller fused to a preceding number is invisible
+    ("X-MEN #101 2024FACSIMILE", "Marvel Feature #1facsimile", "2TPB").
+    Loosening it to (?<![^\\W\\d]) — "not preceded by a LETTER" — was measured
+    and is deliberately NOT applied, for two independent reasons:
+
+    1. IT CANNOT BE DONE HERE WITHOUT WIDENING THE PURCHASE PATH (BUI-239).
+       This helper is shared: _reprint_reject / _digital_reject /
+       _trading_card_reject / _foreign_edition_reject all route through it into
+       should_reject and identify_comic, and comic_identity_year's
+       _classify_edition_kind calls it directly.  Changing the boundary changes
+       when every one of those fires, and a false reject there drops a book you
+       wanted to buy.  Only _FMV_FOREIGN_MARKET_MARKERS and
+       _FMV_COLLECTIBLE_MARKERS are comp-only; the lookbehind is not.
+
+    2. THE COMP-PATH VALUE IS ~ZERO AND POINTS THE WRONG WAY.  Over the
+       926-pool offline corpus the loosened boundary newly excludes 2 distinct
+       titles of 18,628 kept comps, and fmv_high moves in 0 of 926 pools at
+       each pool's median comp grade.  The class sits at 0.12x its pools'
+       median (0 of 4 members above it) — the "correct on identity, depressing
+       not inflating" shape BUI-667 measured and declined.  The only ladder
+       moves are 3 grade-points on one "X-Men 101" pool, and they are a
+       widening artifact rather than the comp's own weight: removing the $7.49
+       facsimile takes n from 4 to 8 at grade 8.0, which is what carries
+       fmv_high 625 -> 575.
+
+    Pinned by test_digit_glued_marker_is_deliberately_not_matched.
+    """
     t = (title or "").lower()
     return any(
         re.search(r"(?<!\w)" + re.escape(m) + r"(?!\w)", t) for m in markers
