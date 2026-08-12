@@ -1131,6 +1131,20 @@ def _write_payload_atomic(path: Path, payload: dict[str, Any]) -> None:
     )
 
 
+# Per-process de-dup state for the series_name_index staleness warning
+# (BUI-771). CollectionCache is constructed fresh per request/command (see
+# commands.py and routes.py — every call site does `CollectionCache()`,
+# never a shared instance), so an instance attribute can't dedupe repeat
+# warnings across calls; this module-level, path-keyed dict is what makes
+# "warn once" possible. It remembers the (stale, total) signature last
+# WARNED for a given store path — a repeat load() against the same on-disk
+# staleness is a no-op. A signature change (index rebuilt fresh and then
+# drifts again later, or the drift count itself changes) re-arms it, since
+# that's new information. Process restart also re-arms it, which is
+# intentional — a freshly started server has emitted nothing yet.
+_stale_index_warned_signature: dict[str, tuple[int, int]] = {}
+
+
 class CollectionCache:
     """Row store for the local LOCG collection cache.
 
@@ -1244,6 +1258,14 @@ class CollectionCache:
         touches — a name with none looks identical under both normalizer
         versions, so a small sample can land entirely on unaffected keys and
         miss real drift sitting in the rest of the index.
+
+        The check itself still runs on every ``load()`` (the cost above is
+        why that's fine), but the LOG EMISSION is deduped per distinct
+        ``(stale, total)`` signature for this store path (BUI-771) — the
+        finding is a property of the on-disk index, not of any individual
+        call, so re-warning identically on every one of thousands of calls
+        against an unchanged store is pure noise that trains operators to
+        ignore it. See ``_stale_index_warned_signature`` above.
         """
         index = payload.get("series_name_index")
         if not isinstance(index, dict) or not index:
@@ -1260,22 +1282,38 @@ class CollectionCache:
             if _normalize_series_key(series_name) != key:
                 stale += 1
 
-        if stale:
-            logger.warning(
-                "series_name_index at %s is stale: %d/%d stored keys no "
-                "longer match what _normalize_series_key currently produces "
-                "(likely a normalizer change since the index was last built, "
-                "e.g. BUI-546's punctuation fold). Impact is bounded: "
-                "_resolve_volume only uses this index as an optional lookup "
-                "hint and falls back safely on a miss, so this cannot cause a "
-                "wrong match — but lookups against these %d keys are slower "
-                "until the index is rebuilt. Fix: re-import the collection "
-                "(run /comic:collection-sync, or `locg collection import "
-                "<export.xlsx>` against this store) — collection import "
-                "rebuilds series_name_index from the current locg_export "
-                "rows on every run.",
-                self.path, stale, total, stale,
-            )
+        path_key = str(self.path)
+        if not stale:
+            # Fresh again (e.g. a rebuild landed since the last stale load) —
+            # clear any remembered signature so a FUTURE staleness that
+            # happens to land on the same (stale, total) numbers is not
+            # mistaken for the one already warned about and silently
+            # swallowed.
+            _stale_index_warned_signature.pop(path_key, None)
+            return
+
+        signature = (stale, total)
+        if _stale_index_warned_signature.get(path_key) == signature:
+            return
+        _stale_index_warned_signature[path_key] = signature
+
+        logger.warning(
+            "series_name_index at %s is stale: %d/%d stored keys no "
+            "longer match what _normalize_series_key currently produces "
+            "(likely a normalizer change since the index was last built, "
+            "e.g. BUI-546's punctuation fold). Impact is bounded: "
+            "_resolve_volume only uses this index as an optional lookup "
+            "hint and falls back safely on a miss, so this cannot cause a "
+            "wrong match — but lookups against these %d keys are slower "
+            "until the index is rebuilt. Fix: re-import the collection "
+            "(run /comic:collection-sync, or `locg collection import "
+            "<export.xlsx>` against this store) — collection import "
+            "rebuilds series_name_index from the current locg_export "
+            "rows on every run. (This warning is logged once per distinct "
+            "staleness signature for this store — see server log history "
+            "for earlier occurrences.)",
+            self.path, stale, total, stale,
+        )
 
     def _handle_migration_flag(self, payload: dict[str, Any]) -> None:
         """Resolve a migration_in_progress=True flag found on disk load.

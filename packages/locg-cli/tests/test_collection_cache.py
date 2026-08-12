@@ -1729,6 +1729,103 @@ def test_stale_series_name_index_warning_never_becomes_an_exception(tmp_path, ca
     assert any("stale" in msg for msg in warnings)
 
 
+def test_stale_series_name_index_warns_only_once_across_many_loads(tmp_path, caplog):
+    """BUI-771: the same on-disk staleness produced 2,083 identical log lines
+    in production because CollectionCache is instantiated fresh per request
+    and load() re-ran the check every time. Repeated load() calls against an
+    unchanged stale store (whether through one CollectionCache instance, or
+    through many fresh ones pointed at the same path — the real-world shape,
+    since every call site does `CollectionCache()`) must emit the warning
+    exactly once, not once per load()."""
+    stale_index = {
+        "2001: a space odyssey": "2001: A Space Odyssey (1976)",
+    }
+
+    N = 20
+    with caplog.at_level(logging.WARNING, logger="locg"):
+        for i in range(N):
+            # A fresh instance each time, matching every real call site
+            # (commands.py / routes.py never share a CollectionCache) —
+            # the dedup must survive that, not just repeat calls on one
+            # instance.
+            cache = make_cache(tmp_path)
+            if i == 0:
+                _write_store(cache, series_name_index=stale_index)
+            cache.load()
+
+    warnings = [
+        r.message for r in caplog.records
+        if r.levelno == logging.WARNING and "series_name_index" in r.message and "stale" in r.message
+    ]
+    assert len(warnings) == 1
+
+
+def test_stale_series_name_index_rewarns_on_signature_change(tmp_path, caplog):
+    """A dedup keyed on the (stale, total) signature must not permanently
+    silence the warning: if the drift count changes (e.g. more keys go
+    stale, or the index gets rebuilt fresh and later drifts again), that is
+    new information and must be re-reported."""
+    cache = make_cache(tmp_path)
+    _write_store(cache, series_name_index={
+        "2001: a space odyssey": "2001: A Space Odyssey (1976)",
+    })
+
+    with caplog.at_level(logging.WARNING, logger="locg"):
+        cache.load()
+        cache.load()  # same signature — deduped
+
+        # Widen the drift: a second stale key added to the same store.
+        _write_store(cache, series_name_index={
+            "2001: a space odyssey": "2001: A Space Odyssey (1976)",
+            "spider man": "Spider-Man (1990)",
+        })
+        cache.load()  # new (stale, total) signature — must re-warn
+
+    warnings = [
+        r.message for r in caplog.records
+        if r.levelno == logging.WARNING and "series_name_index" in r.message and "stale" in r.message
+    ]
+    assert len(warnings) == 2
+
+
+def test_stale_series_name_index_rewarns_after_fresh_interval_same_signature(tmp_path, caplog):
+    """Regression: the dedup must not key ONLY on the (stale, total) numbers
+    with no memory of intervening freshness. If the index goes stale, gets
+    rebuilt fresh (e.g. via `collection import`), and later drifts back to
+    the exact same (stale, total) counts, that is still new information and
+    must be re-reported — not silently swallowed because the old numeric
+    signature happens to recur."""
+    cache = make_cache(tmp_path)
+    stale_index = {
+        "2001: a space odyssey": "2001: A Space Odyssey (1976)",
+    }
+
+    with caplog.at_level(logging.WARNING, logger="locg"):
+        _write_store(cache, series_name_index=stale_index)
+        cache.load()  # warns: signature (1, 1)
+
+        # Rebuilt fresh — index now matches the current normalizer.
+        from locg.collection_cache import _normalize_series_key
+        fresh_name = "2001: A Space Odyssey (1976)"
+        _write_store(cache, series_name_index={_normalize_series_key(fresh_name): fresh_name})
+        cache.load()  # no warning
+
+        # Drifts back to the identical (1, 1) signature via an unrelated
+        # key — "spider-man" (hyphen kept) no longer matches what
+        # _normalize_series_key produces for "Spider-Man (1990)" today
+        # ("spider man", hyphen folded to space).
+        _write_store(cache, series_name_index={
+            "spider-man": "Spider-Man (1990)",
+        })
+        cache.load()  # must warn again — this is a NEW staleness event
+
+    warnings = [
+        r.message for r in caplog.records
+        if r.levelno == logging.WARNING and "series_name_index" in r.message and "stale" in r.message
+    ]
+    assert len(warnings) == 2
+
+
 # ---------------------------------------------------------------------------
 # identity_collision_groups (BUI-650): the store noticing that its identity key
 # has stopped being a key. Three tuples on the live store were in exactly this
