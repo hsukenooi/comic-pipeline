@@ -416,6 +416,7 @@ async def api_upsert_comic(req: UpsertComicRequest, request: Request):
             flag_reason=req.fmv_flag_reason,
             ungraded_anchor=req.fmv_ungraded_anchor,
             ungraded_anchor_n=req.fmv_ungraded_anchor_n,
+            provenance=req.fmv_provenance,  # BUI-769
         )
         # BUI-659: append an immutable snapshot of the row upsert_fmv just
         # wrote to fmv_history. Runs AFTER upsert_fmv's own commit — the fmv

@@ -55,9 +55,10 @@ def _print_version(ctx: click.Context, param: click.Parameter, value: bool) -> N
 @click.option("--force", is_flag=True,
               help="Bypass both the SerpApi response cache and the DB FMV cache; "
                    "recompute everything. Without --force, a hand-priced row "
-                   "(fmv_notes OPENING with 'hand' or 'manual', any case — e.g. "
-                   "'hand §', 'hand OVERRIDE', 'manual:', 'Manual:') is always "
-                   "skipped, even if stale (BUI-533/759); --force overwrites it and "
+                   "(fmv.provenance='hand', or — for a row that predates that "
+                   "column — fmv_notes OPENING with 'hand' or 'manual', any "
+                   "case, e.g. 'hand §', 'manual:') is always "
+                   "skipped, even if stale (BUI-533/759/769); --force overwrites it and "
                    "echoes the old notes to stderr. If the comics-server lookup "
                    "that answers 'is this hand-priced?' FAILS, the book is "
                    "skipped and left untouched instead — reported separately "

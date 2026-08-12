@@ -27,6 +27,44 @@ _comps_provenances_sql = ", ".join(f"'{p}'" for p in COMPS_PROVENANCES)
 FMV_HISTORY_SOURCES = ("upsert", "backfill")
 _fmv_history_sources_sql = ", ".join(f"'{s}'" for s in FMV_HISTORY_SOURCES)
 
+# BUI-769: how the number on an `fmv` row was arrived at. 'hand' is an
+# operator's own priced band (a judgment the pipeline cannot recompute);
+# 'machine' is `comic-fmv`'s pooled answer. NULL means "never claimed" — a row
+# written before this column existed, or by a writer that does not set it.
+#
+# This replaces reading provenance out of the `fmv.notes` PREFIX (BUI-533,
+# widened BUI-759, finally reached by BUI-775). A prefix in a freetext field
+# fails OPEN to any reword — `OVERRIDE:`, `priced by hand`, a translated
+# phrase — and the failure direction is the expensive one: a hand-priced
+# number silently replaced by the pooled answer the operator already rejected.
+# A column cannot be lost to a reword.
+#
+# Same closed-vocabulary + single-source treatment as COMPS_POOLS above:
+# `models.UpsertComicRequest` imports this tuple so the pydantic validator and
+# the CHECK constraint here cannot drift.
+FMV_PROVENANCES = ("machine", "hand")
+FMV_PROVENANCE_HAND = "hand"
+_fmv_provenances_sql = ", ".join(f"'{p}'" for p in FMV_PROVENANCES)
+
+# The BUI-533/759 notes-prefix matcher, kept as a FALLBACK for one release
+# (BUI-769) so a row whose `provenance` is NULL because it predates the column
+# is still protected. A deliberate verbatim twin of
+# `apps/fmv/src/fmv_runner.py`'s `_HAND_PRICE_MARKERS` /
+# `_HAND_PRICE_PREFIX_RE`: apps/fmv is not a workspace member, so there is no
+# import edge to share it across. `test_fmv_provenance.py` pins both copies
+# against the same 12-row live-operator census that
+# `apps/fmv/tests/test_fmv_runner.py` uses, so a widening on one side that
+# never lands on the other fails loudly here.
+#
+# Used ONLY by the one-time backfill below — never at read time on this side.
+# The markers must stay BARE WORDS for the same `\b` reason documented on the
+# apps/fmv copy.
+HAND_PRICE_NOTES_MARKERS = ("hand", "manual", "manually")
+HAND_PRICE_NOTES_PREFIX_RE = re.compile(
+    r"\s*(?:" + "|".join(re.escape(m) for m in HAND_PRICE_NOTES_MARKERS) + r")\b",
+    re.IGNORECASE,
+)
+
 
 # ---------------------------------------------------------------------------
 # Table creation (called from register_db_tables hookimpl)
@@ -53,7 +91,7 @@ def create_tables(conn: sqlite3.Connection) -> None:
             created_at      TEXT DEFAULT (datetime('now'))
         )
     """)
-    conn.execute("""
+    conn.execute(f"""
         CREATE TABLE IF NOT EXISTS fmv (
             id                 INTEGER PRIMARY KEY,
             comic_id           INTEGER NOT NULL REFERENCES comics(id) ON DELETE CASCADE,
@@ -74,6 +112,12 @@ def create_tables(conn: sqlite3.Connection) -> None:
             -- low/high must NOT NULL these two.
             ungraded_anchor    REAL,
             ungraded_anchor_n  INTEGER,
+            -- BUI-769: how this row's number was arrived at ('hand' | 'machine'
+            -- | NULL = never claimed). The durable replacement for reading an
+            -- operator's provenance out of the `notes` PREFIX — see
+            -- FMV_PROVENANCES at the top of this module for why a prefix in a
+            -- freetext field is the wrong place to keep a money-relevant claim.
+            provenance         TEXT CHECK(provenance IN ({_fmv_provenances_sql}) OR provenance IS NULL),
             updated_at         TEXT,
             UNIQUE(comic_id, grade)
         )
@@ -224,6 +268,11 @@ def create_tables(conn: sqlite3.Connection) -> None:
     # Same ordering requirement as flag_reason above: must run after the
     # fmv-split / year-nullable rebuilds so it survives them on an existing DB.
     _migrate_add_fmv_ungraded_anchor_columns(conn)
+    # BUI-769: same ordering requirement again, plus one of its own — the
+    # backfill reads and writes the column the line above it adds, so the two
+    # are ordered, not merely adjacent.
+    _migrate_add_fmv_provenance_column(conn)
+    _migrate_backfill_fmv_provenance(conn)
     _migrate_lowercase_title_indexes(conn)
     # Partial unique indexes go AFTER migrations so the legacy duplicate-row
     # cleanup (fmv-split collapses (title, issue, year, grade) duplicates into
@@ -392,6 +441,94 @@ def _migrate_add_fmv_ungraded_anchor_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE fmv ADD COLUMN ungraded_anchor REAL")
     if "ungraded_anchor_n" not in cols:
         conn.execute("ALTER TABLE fmv ADD COLUMN ungraded_anchor_n INTEGER")
+
+
+def _migrate_add_fmv_provenance_column(conn: sqlite3.Connection) -> None:
+    """Add the nullable `provenance` column to fmv if absent (BUI-769).
+
+    Promotes how a row was PRICED — by an operator's hand, or by the pooled
+    machine answer — from a hand-typed prefix in `fmv.notes` to a first-class
+    column with a closed vocabulary. Third instance of the same move in this
+    module (`flag_reason` BUI-132, `ungraded_anchor` BUI-712), and the first
+    where the token being promoted guards money rather than describing it: the
+    prefix is what `comic-fmv` reads to decide whether a default run may
+    overwrite a human's priced band.
+
+    Additive and idempotent, same PRAGMA table_info guard as the two
+    migrations above — safe on every startup, including against a live
+    WAL-mode DB with concurrent readers, since ADD COLUMN never rewrites
+    existing rows.
+
+    The CHECK travels with the ADD COLUMN (SQLite permits a column-level CHECK
+    here; only PRIMARY KEY/UNIQUE are refused). Existing rows land NULL, which
+    the constraint admits explicitly — NULL means "provenance never claimed",
+    not "machine", and the reader must treat the two differently: an unclaimed
+    row still falls back to the BUI-533/759 notes matcher.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(fmv)")}
+    if "provenance" not in cols:
+        conn.execute(
+            "ALTER TABLE fmv ADD COLUMN provenance TEXT "
+            f"CHECK(provenance IN ({_fmv_provenances_sql}) "
+            "OR provenance IS NULL)"
+        )
+
+
+def _migrate_backfill_fmv_provenance(conn: sqlite3.Connection) -> None:
+    """One-time backfill of `fmv.provenance='hand'` from the notes prefix (BUI-769).
+
+    The 12 operator-priced rows measured on the live Mini 2026-08-12 (fmv 767,
+    the ASM #50 1st-Kraven row at $600-680, among them) claim their provenance
+    only in their notes prefix. Without this they would carry NULL provenance
+    and depend entirely on the fallback matcher — i.e. the column would protect
+    nothing that exists today, and the reword this ticket exists to survive
+    would still lose them.
+
+    Gated by a `migration_state` marker (mirroring `_migrate_seed_fmv_history`)
+    rather than by `WHERE provenance IS NULL` alone, deliberately: a marker
+    makes this a ONE-TIME translation of the old convention, so the notes
+    matcher can actually be retired after its one-release grace period instead
+    of being quietly re-armed by every server restart.
+
+    Direction of error, both cheap by construction:
+      - over-match → a machine row is claimed 'hand' and stops auto-refreshing,
+        which the run summary reports as a hand-priced skip (visible, and
+        clearable by `--force` + a re-post).
+      - under-match → nothing is lost at all; the row is exactly as protected
+        as it was yesterday, by the notes matcher that remains the fallback.
+
+    Matched in PYTHON against `HAND_PRICE_NOTES_PREFIX_RE`, not in SQL: the
+    guard's own predicate is a regex, and a SQL LIKE/GLOB approximation of it
+    is precisely the "an approximation of a predicate shares none of the
+    predicate's bugs" trap documented in
+    docs/solutions/best-practices/a-shipped-guard-is-not-a-running-guard.md.
+    999 rows and a compiled regex is microseconds, once.
+
+    IMPORTANT: raw conn.execute() only — no conn.commit(). Runs inside the
+    host's per-plugin SAVEPOINT (same constraint as every _migrate_* above).
+    """
+    row = conn.execute(
+        "SELECT 1 FROM migration_state WHERE migration='backfill_fmv_provenance'"
+    ).fetchone()
+    if row is not None:
+        return
+
+    claimed = 0
+    for r in conn.execute(
+        "SELECT id, notes FROM fmv WHERE provenance IS NULL AND notes IS NOT NULL"
+    ).fetchall():
+        if HAND_PRICE_NOTES_PREFIX_RE.match(r["notes"]) is None:
+            continue
+        conn.execute(
+            "UPDATE fmv SET provenance=? WHERE id=?",
+            (FMV_PROVENANCE_HAND, r["id"]),
+        )
+        claimed += 1
+    logger.info(
+        "_migrate_backfill_fmv_provenance: claimed %d hand-priced row(s) "
+        "from their notes prefix", claimed
+    )
+    _set_migration_marker(conn, "backfill_fmv_provenance")
 
 
 # ---------------------------------------------------------------------------
@@ -1670,6 +1807,7 @@ def upsert_fmv(
     flag_reason: str | None = None,
     ungraded_anchor: float | None = None,
     ungraded_anchor_n: int | None = None,
+    provenance: str | None = None,
 ) -> int:
     """Upsert a per-grade FMV row. Returns the fmv id.
 
@@ -1706,10 +1844,47 @@ def upsert_fmv(
     `excluded.ungraded_anchor(_n)` outright rather than forcing NULL. The n=0
     stub guard still applies (second WHEN): a bare stub must not blank out a
     previously-stored anchor on a priced row.
+
+    `provenance` (BUI-769) records HOW this row's number was arrived at
+    ('hand' | 'machine'), and is the durable replacement for the `fmv.notes`
+    prefix `comic-fmv`'s hand-priced guard used to read. Its ON CONFLICT
+    treatment is the only one in this statement that is deliberately
+    ASYMMETRIC, because the two error directions cost wildly different
+    amounts (the same asymmetry CONCEPTS.md states for the guard itself):
+
+    - An OMITTED provenance (None) NEVER demotes a stored claim. Every caller
+      written before this column existed — and any future one that doesn't
+      know about it — posts NULL here, and a routine write must not silently
+      strip the one durable record that a human priced this row. This is the
+      fail-closed core: forgetting the field is safe, in the protecting
+      direction.
+    - A bare n=0 STUB does not rewrite it either, for the BUI-599 reason: a
+      failed re-lookup posts `fmv_comps: 0` with real-looking metadata, and it
+      must not degrade a priced row. Note the deliberate boundary this shares
+      verbatim with `notes`/`comps`/`confidence`: the stub guard is scoped to
+      a row that currently HOLDS a price (`low IS NOT NULL`), so a stub CAN
+      still overwrite the claim on an unpriced row. That is the chosen
+      trade: scoping it wider would silently swallow an operator's
+      `{grade, fmv_provenance: "hand"}` post on an unpriced (n=0) book — a
+      claim that vanishes without a word, which is the very failure class
+      this column exists to end. The narrow scope costs only this: a machine
+      stub landing on an unpriced row that a human had claimed, which a
+      default run cannot reach at all (the guard buckets such a row into
+      `skipped_hand` — `_db_lookup_by_identity` deliberately does not filter
+      on `fmv_low`), and which under `--force` is licensed anyway.
+    - An EXPLICIT value otherwise wins, including 'machine'. That is what
+      keeps `--force` honest and idempotent: `--force` is licensed to replace
+      a hand-priced band (it echoes the old notes first, BUI-533), and after
+      it does, the number on the row genuinely IS the machine's — leaving it
+      claiming 'hand' would make every later default run skip a machine row
+      forever. Nothing is weakened by allowing this: `comic-fmv`'s reader ORs
+      the column with the notes-prefix fallback, so a row whose notes still
+      carry the marker stays protected either way.
     """
     if grade is None:
         raise ValueError("grade is required for upsert_fmv")
     flag_reason = flag_reason or None
+    provenance = provenance or None
     has_value = any(
         v is not None for v in (low, high, comps, confidence, notes, flag_reason)
     )
@@ -1717,8 +1892,9 @@ def upsert_fmv(
     conn.execute(
         """
         INSERT INTO fmv (comic_id, grade, low, high, comps, confidence, notes,
-                          flag_reason, ungraded_anchor, ungraded_anchor_n, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                          flag_reason, ungraded_anchor, ungraded_anchor_n,
+                          provenance, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(comic_id, grade) DO UPDATE SET
             -- A flagged incoming row clears the stale auto-priced number; an
             -- unflagged incoming row (a fresh price OR a bare n=0 stub)
@@ -1768,12 +1944,20 @@ def upsert_fmv(
             flag_reason = CASE WHEN excluded.flag_reason IS NOT NULL THEN excluded.flag_reason
                                WHEN excluded.low IS NOT NULL THEN NULL
                                ELSE flag_reason END,
+            -- BUI-769: omission never demotes a stored provenance claim, and a
+            -- bare n=0 stub never rewrites one (the BUI-599 guard, applied
+            -- here too). An explicit value otherwise wins. See the docstring
+            -- for why this one column's treatment is deliberately asymmetric.
+            provenance  = CASE WHEN excluded.provenance IS NULL THEN provenance
+                               WHEN excluded.low IS NULL AND excluded.flag_reason IS NULL
+                                    AND low IS NOT NULL THEN provenance
+                               ELSE excluded.provenance END,
             updated_at  = CASE WHEN excluded.low IS NOT NULL OR excluded.flag_reason IS NOT NULL
                                THEN excluded.updated_at
                                ELSE updated_at END
         """,
         (comic_id, grade, low, high, comps, confidence, notes, flag_reason,
-         ungraded_anchor, ungraded_anchor_n, now),
+         ungraded_anchor, ungraded_anchor_n, provenance, now),
     )
     conn.commit()
     row = conn.execute(
@@ -2140,6 +2324,12 @@ def list_comics(
                f.low AS fmv_low, f.high AS fmv_high, f.comps AS fmv_comps,
                f.confidence AS fmv_confidence, f.notes AS fmv_notes,
                f.flag_reason AS fmv_flag_reason,
+               -- BUI-769: `comic-fmv`'s hand-priced guard reads this to decide
+               -- whether a default run may overwrite the row. It must be
+               -- served on EVERY row this endpoint returns, not just the ones
+               -- the dashboard renders — the guard's whole failure mode is a
+               -- check that is correct but never reaches the data (BUI-775).
+               f.provenance AS fmv_provenance,
                f.updated_at AS fmv_updated_at
         FROM comics c
         LEFT JOIN fmv f ON f.comic_id = c.id
