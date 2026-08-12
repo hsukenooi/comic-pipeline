@@ -1609,6 +1609,60 @@ def test_backfill_year_offset_pages_past_unresolvable_head(api, monkeypatch):
     assert len(seen) == len(comic_ids)
 
 
+def test_backfill_year_dry_run_paging_terminates(api, monkeypatch):
+    """BUI-721: `next_offset` must advance by the whole page in a dry run.
+
+    The paging recurrence `next_offset = offset + unresolved` is only correct
+    when a resolved row LEAVES the `year IS NULL` population — i.e. when it was
+    written. A dry run writes nothing, so every scanned row stays. Advancing by
+    the unresolved count alone re-scans the resolvable ones, and when a whole
+    page resolves it advances by ZERO: the caller loops forever, spending a
+    Metron call per row per round. That is the same stall BUI-721 exists to
+    fix, and `dry_run=True` is this endpoint's default, so it sits on the
+    default path rather than in a corner.
+    """
+    from gixen_overlay import routes
+    from gixen_overlay.locg_lookup import LocgResolution
+
+    comic_ids = []
+    for i, item_id in enumerate(["700000021", "700000022", "700000023", "700000024"]):
+        api.post("/api/bids", json={"item_id": item_id, "max_bid": 20.0})
+        r = api.post("/api/comics", json={
+            "title": f"Resolvable Book {i}", "issue": "1",
+            "grade": 8.0, "fmv_low": 10.0, "fmv_high": 15.0,
+        })
+        comic_id = r.json()["id"]
+        comic_ids.append(comic_id)
+        api.post(f"/api/bids/{item_id}/link-fmv", json={"comic_id": comic_id, "grade": 8.0})
+
+    # Every row resolves — the case that pins next_offset at 0.
+    monkeypatch.setattr(
+        routes, "resolve_year_and_locg",
+        lambda series, issue: LocgResolution(year=1999, locg_id=None, locg_variant_id=None),
+    )
+
+    seen: list[int] = []
+    offset = 0
+    for _ in range(10):
+        r = api.post("/api/comics/backfill-year",
+                     params={"limit": 2, "offset": offset, "dry_run": "true"})
+        assert r.status_code == 200
+        body = r.json()
+        if body["scanned"] == 0:
+            break
+        seen.extend(e["comic_id"] for e in body["results"])
+        offset = body["next_offset"]
+    else:
+        pytest.fail(
+            "dry-run backfill-year did not terminate within 10 rounds — "
+            "next_offset does not advance when a page fully resolves"
+        )
+
+    # Each in-scope row previewed exactly once: no re-scan, none skipped.
+    assert sorted(cid for cid in seen if cid in comic_ids) == sorted(comic_ids)
+    assert len(seen) == len(comic_ids)
+
+
 # ---------------------------------------------------------------------------
 # GET /api/dashboard-tabs
 # ---------------------------------------------------------------------------

@@ -1547,7 +1547,10 @@ async def api_backfill_year(
     `limit`, so a naive multiple skips over never-scanned rows. Instead pass
     the previous response's `next_offset` verbatim as this call's `offset`;
     it already accounts for exactly how many rows from prior calls remain
-    unresolved and stayed in the population. Repeat with `offset=0` on the
+    unresolved and stayed in the population. (In a `dry_run` pass `next_offset`
+    advances by the whole page instead: a preview writes nothing, so *no* row
+    leaves the population and every scanned row would otherwise be re-served
+    at the head.) Repeat with `offset=0` on the
     first call and `offset=<previous next_offset>` on each subsequent call
     until a response comes back with `scanned: 0` — at that point every row
     in scope has been visited exactly once (full coverage), whether it wrote,
@@ -1649,11 +1652,22 @@ async def api_backfill_year(
         results.append(entry)
 
     unresolved_count = len(rows) - resolved_count
+    # `next_offset` must advance by however many of THIS page's rows are still
+    # in the `year IS NULL` population on the next call — those are the ones a
+    # plain LIMIT would otherwise re-serve at the head. In a real run that is
+    # the unresolved ones (a written row leaves the population). In a DRY RUN
+    # nothing is written, so *every* scanned row stays — advancing by
+    # `unresolved_count` there re-scans the resolvable ones, and when a whole
+    # page resolves it advances by zero and the caller loops forever burning a
+    # Metron call per row per round. `dry_run=True` is this endpoint's default
+    # and the paging protocol above says to call until `scanned: 0`, so that
+    # loop is the reachable default path, not a corner case.
+    consumed = len(rows) if dry_run else unresolved_count
     return {
         "dry_run": dry_run,
         "active_only": active_only,
         "offset": offset,
-        "next_offset": offset + unresolved_count,
+        "next_offset": offset + consumed,
         "scanned": len(rows),
         "resolved": resolved_count,
         "unresolved": unresolved_count,
