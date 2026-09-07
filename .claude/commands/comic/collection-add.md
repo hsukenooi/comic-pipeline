@@ -92,14 +92,12 @@ failure or other unexpected status is a hard stop (BUI-352).
 `needs_review` is the **only** gate. An entry lands here when
 `comic-identify` returned a null `series`/`issue`, an `"error"`, a lot with
 empty/unparseable `constituent_issues`, **or** a null `year` — unconditionally,
-regardless of price (`REASON_MISSING_YEAR`, BUI-422/BUI-475 — a win's era
+regardless of price (`REASON_MISSING_YEAR`, BUI-422/BUI-475: a win's era
 can't be confirmed without a year, and vintage no-year titles are
-disproportionately prone to a downstream volume mis-resolution; BUI-422's
-original `$25` price threshold was removed in BUI-475 after the server-side
-auto-resolve it was meant to lean on was shown to fail open — see the
-rationale doc). There is deliberately no confidence threshold —
+disproportionately prone to a downstream volume mis-resolution). There is
+deliberately no price threshold and no confidence threshold —
 `comic-identify`'s baseline confidence (0.5) would fire on nearly every real
-title (BUI-354; rationale doc has the full story of both).
+title (BUI-354; the rationale doc has the full story of both).
 
 Resolve the same scratch dir Step 1 used:
 
@@ -319,8 +317,8 @@ This writes a CSV at `~/Downloads/locg-bulk-import-<timestamp>.csv` plus a `.not
 
 ## Step 5: Report
 
-No separate status call needed (BUI-428 collapsed it into Step 3): read
-`pending_push_count`/`oldest_pending_days` straight out of Step 3's response.
+No separate status call is needed: read `pending_push_count`/
+`oldest_pending_days` straight out of Step 3's response (BUI-428).
 **Do not use Step 0's status read** — it predates this run's wins and would
 undercount by exactly the rows you just added (BUI-156). **Exception:** if
 Step 3 timed out and Step 3b determined the commit landed anyway, Step 3's

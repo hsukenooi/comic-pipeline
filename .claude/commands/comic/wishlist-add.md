@@ -42,7 +42,7 @@ hand-rolled `curl` (that doc has the rate-limit/retry rationale):
 source "$(git rev-parse --show-toplevel)/scripts/metron-curl.sh"
 ```
 
-Also resolve and health-gate the comics server (the wish-list now lives there)
+Also resolve and health-gate the comics server (the wish-list lives there)
 via `comics-api` (BUI-510, `docs/conventions/comics-server-call.md`) — every
 call below is independently self-resolving, so this is just a fail-fast
 pre-flight check, not a shared env-var setup:
@@ -191,11 +191,9 @@ correlate by key (don't rely on order). Per item:
   (BUI-372, Pattern E from `/comic:collection-check` — BUI-364).** The match
   was satisfied by a row whose `full_title` names a printing this query never
   asked for ("2nd Printing", "Reprint", …). Printings are distinct
-  collectibles — owning the reprint is NOT owning the base printing (the
-  confirmed AMM #1 incident: *Absolute Martian Manhunter #1* read as owned off
-  an owned "2nd Printing" row while the base sat wish-listed; unpatched, Step 3
-  would have silently skipped wish-listing that explicitly wanted base
-  printing). Put this issue in a THIRD bucket — **printing-conflict (needs a
+  collectibles — owning the reprint is NOT owning the base printing (e.g. an
+  owned *Absolute Martian Manhunter #1* "2nd Printing" while the base is the
+  one wanted). Put this issue in a THIRD bucket — **printing-conflict (needs a
   decision)** — instead of already-owned, carrying `full_title_matched` and
   `printing_candidates` forward to Step 4. Do not decide for the user; the
   candidates list (with each row's `printing_ordinal`/`in_collection`/
@@ -214,7 +212,7 @@ recover it:
   yet — cannot determine ownership"); when you see that, warn the user
   ("couldn't check ownership — collection not imported") and proceed with all
   issues. (The export fix is the safety net: even a wrongly-wished owned book is
-  no longer deleted — but flag it so the user knows the check was skipped.)
+  not deleted — but flag it so the user knows the check was skipped.)
 - **Any other failure** (500, network error, timeout) → hard-fail; do not
   wish-list anything from a failed check (R11 — a failed call must never read
   as "not owned").
@@ -226,13 +224,12 @@ auto-skipped and never auto-added).
 
 ## Step 3b: Skip issues already on the wish-list (single in-memory scan)
 
-The wish-list endpoint is idempotent as of BUI-285 (a re-added series+issue is a
+The wish-list endpoint is idempotent (BUI-285: a re-added series+issue is a
 200 no-op returning `{"status": "exists", ...}`, not a duplicate row), but still
 filter duplicates out up front — the client-side scan avoids N redundant POSTs
 and keeps the "already wished" list accurate for the Step 6 report. Fetch the
-wish-list **once** and scan it **in memory** (BUI-204), not re-fetched or
-re-grepped per issue. A real wish-list is large (685 items in the motivating
-run); a per-issue grep over that payload is the redundant work this step removes.
+wish-list **once** and scan it **in memory** (BUI-204) — a real wish-list runs
+to several hundred items, so a per-issue re-fetch or grep is the expensive part.
 
 ```bash
 comics-api GET /api/comics/wish-list || exit 1
@@ -280,27 +277,26 @@ reprint, `null` an unspecified bare "Reprint"/"Re-Print" row). Ask the user per 
 into the same add list Step 5 writes; one they decline moves to "already
 owned" for the report. Never auto-resolve this bucket either way — a false
 "add" risks a redundant wish-list entry the owned-guard would 409 anyway (safe
-direction), but a false "skip" reproduces the AMM #1 incident (a missed wish
-for a book actually wanted).
+direction), but a false "skip" silently loses a wish for a book actually
+wanted.
 
 ## Step 5: Add every issue in one batch call
 
-On confirmation, add every issue in **one** request (BUI-447) — this replaces
-the old per-issue `curl` loop, which turned a 40-issue run into 40 sequential
-POSTs. Build a single items list covering both the original to-add list and
+On confirmation, add every issue in **one** request (BUI-447), never a
+per-issue loop. Build a single items list covering both the original to-add list and
 any printing-conflict issues the user confirmed adding in Step 4, and POST it
 once:
 
 Include each issue's **cover year** (Step 2) in its item. It does double duty:
 the server-side owned-guard's masthead fallback (BUI-184) gets the same catch
-the Step 3 filter does, AND as of **BUI-387** the year is now **persisted** on
-the wish entry (a separate `year` field). That persisted Cover Year is what lets
+the Step 3 filter does, AND the year is **persisted** on the wish entry (a
+separate `year` field, BUI-387). That persisted Cover Year is what lets
 the later conflicts audit (`/comic:collection-sync`, wish-list conflicts) match a
 vintage want only against its matching-volume owned copy — so a grail like "The
 X-Men #1" (1963) stops re-flagging every audit against an owned modern volume.
 Omit `year` only for an issue Metron had no `cover_date` for (it is then added
-unstamped — safe, year-blind, exactly as before). **Never pass `year_began`
-(BUI-129)** — it must be THIS issue's cover year, or the wish is mis-scoped.
+unstamped — safe, year-blind). It must be THIS issue's cover year, never
+`year_began` (Step 3 owns the BUI-129 rule).
 
 **`force: true` is per item, never batch-wide.** Set it ONLY on an issue the
 user explicitly confirmed adding despite a Step 4 printing-conflict decision —
@@ -372,8 +368,8 @@ fixed — they're re-appended, not wiped). To get them onto LOCG itself, run
 touches owned books. See
 `packages/locg-cli/docs/processes/locg-collection-wishlist-sync.md`.
 
-**Removing a wished issue:** the wish-list also has a DELETE endpoint (BUI-128),
-so you no longer need to SSH into the Mac Mini to run `locg wish-list remove`:
+**Removing a wished issue:** use the wish-list DELETE endpoint (BUI-128) — never
+SSH to the Mac Mini for `locg wish-list remove`:
 
 ```bash
 comics-api DELETE /api/comics/wish-list -G \
@@ -407,7 +403,7 @@ before running either command for the first time.
 | Mistake | Fix |
 |---|---|
 | Re-running the whole range after a partial failure | Safe to re-add — the wish-list endpoint is idempotent (BUI-285): a duplicate series+issue is a 200 no-op (`{"status": "exists"}`), not a second row |
-| Writing to `data/locg/wish-list.json` directly | Adds go to the server via `POST /api/comics/wish-list` — the repo file is no longer the source of truth (BUI-93) |
+| Writing to `data/locg/wish-list.json` directly | Adds go to the server via `POST /api/comics/wish-list` — the repo file is not the source of truth (BUI-93) |
 | Wish-listing issues you already own | Collection-check each issue first (Step 3) and skip owned ones — wishing an owned book is what deleted collection rows in BUI-122 |
 | Passing `year` (Metron's `year_began`) to `collection/check` | `year` is a *per-issue cover year* gated on `release_date.startswith(year)`, not a series disambiguator. Forwarding a series start-year filters out every owned mid-run issue and returns a false `not_in_cache`, so an owned book gets wish-listed (BUI-129/BUI-131). Check by series + issue only |
 | Enumerating a creator's run from memory — even for a plain question, not just a wish-list add | Memory silently drops DISCONTINUOUS stints (JR JR's 1993 Uncanny X-Men return; BUI-340's Erik Larsen Spider-Man #19–43 vs. actual #18–23). Just answering a question → `locg creator-run --creator … --series-id …` (read-only, BUI-340). Actually adding to the wish-list → `locg wish-list add --creator … --series-id …` (BUI-134) |

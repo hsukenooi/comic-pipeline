@@ -5,11 +5,11 @@ description: Check if identified comics are already in your collection via the c
 
 # Comic Collection Check
 
-Check whether identified comics are already in your collection. As of BUI-504
-the whole check is **one CLI call** — `locg collection check-batch` mechanizes
-what used to be a ~450-line prose executor (server resolve → health gate →
-status → batch check → stale-cache downgrade → the false-match flags). The
-skill is now just the input shape, the decision gate, and carry-forward.
+Check whether identified comics are already in your collection. The whole check
+is **one CLI call** — `locg collection check-batch` (BUI-504) does the server
+resolve, health gate, status read, batch check, stale-cache downgrade, and the
+false-match flags. This skill is the input shape, the decision gate, and
+carry-forward.
 
 > **Hard-fail rule (R11) is enforced by the exit code.** `check-batch` exits
 > **non-zero** on ANY failure — unreachable server, non-200, timeout, or the
@@ -53,7 +53,7 @@ a false **not-owned** when the stored copy is a different edition of the same
 issue — that buys a duplicate, and a duplicate purchase can't be undone.
 Omitting `variant` asks the issue-level question instead; it risks the
 opposite, a false **owned**, but that only causes a skip the user can reverse
-at the Step 4 decision gate below — recoverable. Under R11 (never render a
+at the decision gate below — recoverable. Under R11 (never render a
 verdict that could cause a duplicate purchase), that asymmetry favors
 omitting: an earlier check on X-Force #19 passed no `variant` and still
 matched the stored `X-Force #19 Newsstand Edition`, correctly reporting it
@@ -71,7 +71,7 @@ semantics live in `packages/locg-cli/src/locg/check_batch.py`. **Flags FLAG,
 they never DECIDE (R11)** — the CLI never flips a verdict or invents ownership;
 the user resolves each flagged row at the decision gate below.
 
-## Step 4: Decision gate
+## Decision gate
 
 Present the table, then ask the user how to handle results:
 

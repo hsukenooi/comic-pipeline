@@ -60,7 +60,7 @@ alongside 2+ sellers.
 
 ## Scanning multiple / known sellers (BUI-298)
 
-When the user asks to scan several sellers, or to scan "all known sellers", pass **every** seller as a positional arg to **one** `seller_scan.py` invocation in a **single Bash tool call** — do **not** spawn a `Task`/`Agent` subagent per seller. (Rationale for why a subagent-per-seller fan-out is both wasteful and unreliable: `docs/solutions/workflow-issues/seller-scan-verification-batching-seen-tracking-rationale.md`.)
+When the user asks to scan several sellers, or to scan "all known sellers", pass **every** seller as a positional arg to **one** `seller-scan` invocation in a **single Bash tool call** — do **not** spawn an `Agent` subagent per seller. (Rationale for why a subagent-per-seller fan-out is both wasteful and unreliable: `docs/solutions/workflow-issues/seller-scan-verification-batching-seen-tracking-rationale.md`.)
 
 - Pull the store names straight from `apps/ebay/src/seller_aliases.json`'s
   keys when the user says "scan all known sellers."
@@ -154,7 +154,7 @@ seller-scan <seller> 2>/dev/null
 }
 ```
 
-`sellers[*].skipped_cached_candidates` (BUI-317) counts candidates skipped entirely — no Claude CLI call — because that exact (listing, wish) pair was already rejected within the last 14 days. Always `0` when `--no-reject-cache` or `--all` is passed (either bypasses the cache; BUI-542 split `--all` into `--show-seen` + `--no-reject-cache` — `--show-seen` alone does NOT zero this out). See `docs/solutions/workflow-issues/seller-scan-verification-batching-seen-tracking-rationale.md` for why a nonzero count here is expected/healthy rather than a problem.
+`sellers[*].skipped_cached_candidates` (BUI-317) counts candidates skipped entirely — no Claude CLI call — because that exact (listing, wish) pair was already rejected within the last 14 days. Always `0` when `--no-reject-cache` or `--all` is passed (either bypasses the cache; `--show-seen` alone does NOT zero this out). See `docs/solutions/workflow-issues/seller-scan-verification-batching-seen-tracking-rationale.md` for why a nonzero count here is expected/healthy rather than a problem.
 
 **Parse exit-code-first, then drill in:**
 

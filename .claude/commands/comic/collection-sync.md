@@ -144,11 +144,11 @@ the bulk of a normal sync is safe regardless.
 
 ## Step 2a: The export is wins-only by default (machine gate)
 
-**No client-side split needed.** As of BUI-208 the export ships **only wins**
-(`In Collection=1`) — the server's `generate_csv` *refuses* to emit any
-`In Collection=0` row unless `?push_wishes=true` is explicitly requested. So
-the Step 2 file **is** your wins file, and the default sync is structurally
-incapable of deleting a collection book. Wishes (the only rows that can
+The export ships **only wins** (`In Collection=1`, BUI-208) — the server's
+`generate_csv` *refuses* to emit any `In Collection=0` row unless
+`?push_wishes=true` is explicitly requested. So the Step 2 file **is** your
+wins file, and the default sync is structurally incapable of deleting a
+collection book. Wishes (the only rows that can
 delete) go up solely via the separate, opt-in Step 3b, after the wish-list has
 been conflict-cleaned (Step 2b). `wish_list_count` will be `0` on a default
 export — expected.
@@ -181,8 +181,8 @@ release date) before uploading. Partial or wrong rows import as "Not Found";
 an all-dateless batch hangs. **Rows must be complete and exact: publisher +
 canonical series + exact full_title (no decoration) + accurate release date.**
 
-**BUI-466: a Jan-1 date no longer hard-stops the sync by shape alone.** The
-audit reads the collection store to tell a genuine BUI-105 placeholder
+**A Jan-1 date is a hard-stop only when confirmed as a placeholder (BUI-466).**
+The audit reads the collection store to tell a genuine BUI-105 placeholder
 (`source == agent_win`, no `metron_id`) apart from a real January cover date
 (same string, but `metron_id` set or store-unconfirmable) — only a *confirmed*
 placeholder counts toward `flagged_count`. A confirmed-genuine or
@@ -250,10 +250,9 @@ comics-api POST /api/comics/wish-list/remove-conflicts \
   -d '{"names": ["<exact name from the audit>", "..."]}'
 ```
 
-**The unscoped POST (no body) no longer removes anything (BUI-266 foot-gun
-guard)** — it returns a non-mutating dry-run preview. `{"confirm": true}` still
-performs the original remove-every-conflict sweep, but that reintroduces the
-decoy risk above — prefer scoped `names`.
+**An unscoped POST (no body) is a non-mutating dry-run preview (BUI-266
+foot-gun guard).** `{"confirm": true}` performs a remove-every-conflict sweep,
+but that reintroduces the decoy risk above — prefer scoped `names`.
 
 Both endpoints 409 if the collection was never imported. **Do not proceed to a
 wish push (Step 3b) until every *genuine* conflict has been dropped** — decoys
@@ -288,9 +287,9 @@ comics-api POST /api/comics/collection/restore \
 ```
 
 Only after a clean probe, upload the rest. **Data completeness is the
-constraint, not row count** — there is no row limit (the earlier "≤20 rows per
-batch" belief was a misdiagnosis of incomplete/dateless rows, not batch size;
-see `docs/solutions/integration-issues/locg-sync-unified-model-2026-06-22.md`).
+constraint, not row count** — there is no row limit (a hang blamed on batch
+size is really incomplete/dateless rows; see
+`docs/solutions/integration-issues/locg-sync-unified-model-2026-06-22.md`).
 Every row must be complete and exact — Step 2b already audited this. An
 **incomplete or all-dateless batch hangs** the importer regardless of size.
 
@@ -439,19 +438,14 @@ Assert all of:
   can't account for.
 - **No book is owned twice (BUI-548):** the Step 5 import response must carry
   `owned_duplicate_identities == 0`. **This is a separate hard-stop, and the
-  arithmetic above cannot substitute for it.** On the 2026-07-27 sync the row
-  count balanced to the row (`2902 + 46 − 3 = 2945`, exact) while the import
-  had silently created a *second* owned row for 28 books: every duplicate is
-  one `added` row, so the arithmetic counts it as expected growth and reports
-  clean. `owned_duplicate_identities` counts titles carried by **two owned
-  rows of any kind** (matched punctuation-, whitespace- and
-  article-insensitively, and only when their release dates are compatible so
-  two genuine volumes of one masthead aren't falsely paired). BUI-554 removed
-  the `agent_win`-vs-`locg_export` partition this used to require: once a sync
-  had round-tripped every pending win back through LOCG as an export row, that
-  partition was empty and the check reported 0 while 60 identities collided —
-  a vacuous pass indistinguishable from a clean one. Non-zero means the
-  reconciler missed — those rows stay
+  arithmetic above cannot substitute for it:** every unreconciled duplicate is
+  one `added` row, so the row count balances exactly while books quietly
+  become owned twice (28 books on the 2026-07-27 sync).
+  `owned_duplicate_identities` counts titles carried by **two owned rows of
+  any kind** — no `agent_win`-vs-`locg_export` partition (BUI-554), matched
+  punctuation-, whitespace- and article-insensitively, and only when their
+  release dates are compatible so two genuine volumes of one masthead aren't
+  falsely paired. Non-zero means the reconciler missed — those rows stay
   pending and the next sync re-uploads them, so it compounds. The warning
   names the affected titles.
 - **`owned_duplicate_identities_cross_edition` is ADVISORY — report it, never
@@ -470,13 +464,12 @@ Assert all of:
   (BUI-650):** a *different* question from the two above. Those ask "is a book
   owned twice?"; this one asks whether the store's identity key
   `(publisher, series, full_title, release_date)` is still a key at all.
-  Counted over **all** rows, not owned rows — the owned-scoping is exactly why
-  the three live collisions (all wish-side `Absolute Martian Manhunter`) sat
-  invisible for months. Non-zero means the import can only ever reach the
+  Counted over **all** rows, not owned rows — owned-only scoping hides
+  wish-side collisions. Non-zero means the import can only ever reach the
   **last** row per identity, so the others can be duplicated but never updated.
-  Its first reading is **3**, and the remedy — `collection_io.rekey_sweep` — is
-  a separate user-gated operation, so blocking on it would stop every sync from
-  the day it shipped (the BUI-563 lesson). Never fold it into
+  The remedy — `collection_io.rekey_sweep` — is a separate user-gated
+  operation, so blocking on it would stop every sync (the BUI-563 lesson).
+  Never fold it into
   `owned_duplicate_identities`. Report the number and the warning that names
   the titles; do not attempt to fix collisions by hand-editing the store.
 
