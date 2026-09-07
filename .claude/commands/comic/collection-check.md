@@ -105,7 +105,7 @@ comics-api GET /api/comics/collection/check -G \
   --data-urlencode "year=1988"
 ```
 
-> Never use the `locg collection check` CLI (no `-batch`) for ownership — it
-> reads the MacBook's local store, which is never seeded and always returns
-> `not_in_cache`. `check-batch` and the curl above both hit the Mac Mini's
-> authoritative store.
+> Never use the `locg collection check` CLI (no `-batch`) for ownership — on
+> either machine it reads a local store that is not the server's, so it
+> returns a false `not_in_cache`. `check-batch` and the curl above both hit
+> the Mac Mini's authoritative store.
