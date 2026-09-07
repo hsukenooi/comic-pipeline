@@ -17,7 +17,7 @@ CLI for [League of Comic Geeks](https://leagueofcomicgeeks.com). Scraping-based 
 
 ## CLI Usage
 
-Run with `PYTHONPATH=src python3 -m locg <command>` (or `locg <command>` if installed).
+Run with `locg <command>` (installed by `./scripts/install.sh`; from a bare checkout, `PYTHONPATH=src python3 -m locg <command>`).
 
 All output is JSON to stdout. Use `--pretty` for human-readable output, `--debug` for HTTP details.
 

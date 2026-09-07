@@ -15,13 +15,13 @@ One or more eBay listing URLs or item IDs. No seller-stated grade needed — thi
 
 Use the eBay Browse API via `~/Projects/comic-pipeline/apps/ebay/src/ebay_fetch.py` — the `get_item_by_legacy_id` endpoint returns `image` and `additionalImages` with direct `i.ebayimg.com` URLs that are downloadable without bot detection. Do not scrape eBay HTML pages (returns 400/CAPTCHA).
 
-Run the downloader script (BUI-279 — extracted from this skill so the OAuth + Browse API logic isn't re-read into context on every grade run; same OAuth flow, same `get_item_by_legacy_id` calls, same image-download logic):
+Run the installed `grade-photos` console script (BUI-279 — it owns the OAuth, Browse API, and download logic so none of it is read into context):
 
 ```bash
-python3 ~/Projects/comic-pipeline/apps/ebay/src/grade_photos.py 178057470740 178057488707 ...
+grade-photos 178057470740 178057488707 ...
 ```
 
-Item IDs are labeled `comic-1`, `comic-2`, ... in the order given. **BUI-440:** when `--workdir` is not passed, each run gets its own fresh directory under `/tmp/comic-grading` (not the bare shared root) so a prior run's `comic-N` dirs never leak into a smaller later run, and two overlapping runs (a `/comic:buy` run + a standalone `/comic:grade` run) never collide on `comic-1`/`comic-2`. The script prints the resolved directory as its first line — read that line to get the base path for Step 2's IMAGE FOLDER inputs:
+Item IDs are labeled `comic-1`, `comic-2`, ... in the order given. When `--workdir` is not passed, each run gets its own fresh directory under `/tmp/comic-grading` (BUI-440) so a prior run's `comic-N` dirs never leak into a smaller later run, and two overlapping runs never collide on `comic-1`/`comic-2`. The script prints the resolved directory as its first line — read that line to get the base path for Step 2's IMAGE FOLDER inputs:
 
 ```
 WORKDIR: /tmp/comic-grading/run-a1b2c3
@@ -29,7 +29,7 @@ comic-1: FETCH FAILED — <error>
 comic-1: Fantastic Four #48 (1966) 9.0 VF/NM — 8 images — current bid $42.50 (5 bids) — tier: not-cheap
 ```
 
-The printed **tier** (`cheap` / `not-cheap`) is the **value signal for the Step 2 value gate** — record it alongside the item id from the printed line so escalation can branch on listing value without re-deriving anything. `grade_photos.py` owns the threshold and computes the tier from the auction's current bid or, for a fixed-price (BIN) listing, its Buy-It-Now price — both count the same way (a $40 BIN prints `not-cheap` just like a $40 auction). A listing with no price field at all prints `cheap` (BUI-165).
+The printed **tier** (`cheap` / `not-cheap`) is the **value signal for the Step 2 value gate** — record it alongside the item id from the printed line so escalation can branch on listing value without re-deriving anything. `grade-photos` owns the threshold and computes the tier from the auction's current bid or, for a fixed-price (BIN) listing, its Buy-It-Now price — both count the same way (a $40 BIN prints `not-cheap` just like a $40 auction). A listing with no price field at all prints `cheap` (BUI-165).
 
 **A `FETCH FAILED` line is not an image-less listing (BUI-147).** If the download script prints `FETCH FAILED` for a comic (a down/429/404 eBay API), do **not** feed it to the triage pre-pass or drop it as "un-gradeable" — that's an API failure, not a photo-quality verdict. Re-run that item (the script retries 429 automatically); surface the failure to the user rather than silently grading 0 images.
 
@@ -73,7 +73,7 @@ Run **one** cheap agent over the whole candidate list (title + first image + pho
 Don't fan out 3 graders for every comic — most listings in a seller scan are cheap, and 3-per-comic burns agents where 1 will do. **Run 1 grader first, then escalate to a 3-grader panel only when the comic earns it.** Each grader is the **`comic-grader` subagent** (`.claude/agents/comic-grader.md`) — it carries the full grading persona, criteria, and OUTPUT FORMAT contract, scoped read-only (`Read, Bash`) so a grader can never write. You only pass it the dynamic inputs (see [Grader Agent](#grader-agent) below); the persona is identical whether you run 1 or 3, so panel grades stay independent and comparable.
 
 **Tunable gate constants** (stated here so they're easy to adjust):
-- **Value tier** — `grade_photos.py` (Step 1) owns `VALUE_THRESHOLD` ($25) and prints `tier: cheap|not-cheap` per comic. Read the printed tier directly; don't re-derive the split from `current_price` here. A `not-cheap` tier always gets the full 3-grader panel; an expensive book justifies the rigor.
+- **Value tier** — `grade-photos` (Step 1) owns `VALUE_THRESHOLD` ($25) and prints `tier: cheap|not-cheap` per comic. Read the printed tier directly; don't re-derive the split from `current_price` here. A `not-cheap` tier always gets the full 3-grader panel; an expensive book justifies the rigor.
 - `CAP_BAND = 0.5` — if the single grader's grade sits within this many points of a grade-capping threshold (the spine-split / missing-piece / detached-cover ceilings), treat it as boundary-ambiguous.
 - `BATCH_MAX = 5` — how many cheap-tier books one grader agent grades in a single context before opening another. Caps context bleed / grader fatigue across books.
 - `CAP_DECISION_TOLERANCE = 10%` — in the decision-sensitivity gate (below), two bid caps computed at the ends of a grade range count as "the same decision" if they're within this much of each other (and the buy/no-buy call doesn't flip).
@@ -89,11 +89,11 @@ Don't fan out 3 graders for every comic — most listings in a seller scan are c
 
 **Dispatch mechanics:**
 - Split the candidates by the printed **tier** from Step 1 (`cheap` / `not-cheap`) — a known key always counts as not-cheap regardless of its printed tier.
-- **Cheap books → batch them (U9).** A cheap book only ever earns 1 grade unless a gate trips, so there is no cross-grader independence to preserve — grade several in **one** agent context instead of one agent each. Group the cheap books into batches of up to `BATCH_MAX` and give each batch a single grader agent that grades every book in the group **independently** and returns one full OUTPUT FORMAT block per book (clearly delimited, labelled by item id). This is the main first-pass cost saver on a thin-photo seller scan (e.g. 7 cheap books → 2 agents, not 7).
+- **Cheap books → batch them.** A cheap book only ever earns 1 grade unless a gate trips, so there is no cross-grader independence to preserve — grade several in **one** agent context instead of one agent each. Group the cheap books into batches of up to `BATCH_MAX` and give each batch a single grader agent that grades every book in the group **independently** and returns one full OUTPUT FORMAT block per book (clearly delimited, labelled by item id). This is the main first-pass cost saver on a thin-photo seller scan (e.g. 7 cheap books → 2 agents, not 7).
 - **Not-cheap books → 1 grader each, first pass**, run in parallel (separate agents).
 - **Escalation (both kinds).** After the first pass, any book that tripped a gate (Step 2 triggers) gets the **remaining 2** graders as separate, independent agents — dispatched together in one parallel batch. A batched cheap book's first grade counts as grader A; pull it out and add B + C. (The grader prompt and criteria are identical across passes so the panel grades stay independent and comparable.)
 - **Batching guardrails:** keep each book's images and OUTPUT FORMAT block fully separate in the batched prompt; never let one book's defects bleed into another's grade; if a batch would exceed `BATCH_MAX`, open another agent. When in doubt about a specific cheap book (e.g. it looks near a cap), grade it on its own rather than in the batch.
-- **Anti-anchoring:** batched grades must not drift toward the batch's overall quality. The `comic-grader` agent def owns this rule (grade each book on the **absolute** CGC scale; BUI-81 U9) and its own guard enforces it — nothing to restate here.
+- **Anti-anchoring:** batched grades must not drift toward the batch's overall quality. The `comic-grader` agent def owns this rule (grade each book on the **absolute** CGC scale; BUI-81) and its own guard enforces it — nothing to restate here.
 
 **Required per-comic reporting (no silent caps):** for every comic, state how many graders ran and why — e.g. `1 grader (──$6, range wide but coverage-driven at MEDIUM-LOW)` or `1 grader (──$6, unambiguous)` or `3 graders (──$40 ≥ $25 value threshold)` or `3 graders (grade 5.0 within 0.5 of the 1/2" spine-split cap)`. The user must be able to see where rigor was and wasn't spent.
 

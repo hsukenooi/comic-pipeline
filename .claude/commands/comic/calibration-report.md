@@ -136,18 +136,10 @@ below) so you can tell which admit path fired without knowing the
 
 ## Prerequisites
 
-**`COMICS_SERVER_URL` must be set.** Set it once in `~/.zshrc`:
-
-```bash
-# MacBook (connects to Mac Mini over Tailscale)
-export COMICS_SERVER_URL=http://mac-mini.tail9b7fa5.ts.net:8080
-
-# Mac Mini (running locally)
-export COMICS_SERVER_URL=http://localhost:8080
-```
-
-`GIXEN_SERVER_URL` is a deprecated alias — it still works but emits a
-warning. Migrate to `COMICS_SERVER_URL`.
+`comics-api` resolves the comics server itself (`COMICS_SERVER_URL` if set,
+else the Mac Mini / MacBook hostname convention in `scripts/comics-server.sh`)
+and health-gates it before every call, so no per-shell setup is needed. On an
+unrecognised machine, export `COMICS_SERVER_URL` explicitly.
 
 ## Run the report
 

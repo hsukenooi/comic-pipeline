@@ -1,6 +1,6 @@
 --- a/.claude/commands/comic/calibration-report.md
 +++ b/.claude/commands/comic/calibration-report.md
-@@ -136,19 +136,11 @@
+@@ -136,18 +136,10 @@ below) so you can tell which admit path fired without knowing the
  
  ## Prerequisites
  
@@ -13,20 +13,19 @@
 -# Mac Mini (running locally)
 -export COMICS_SERVER_URL=http://localhost:8080
 -```
+-
+-`GIXEN_SERVER_URL` is a deprecated alias — it still works but emits a
+-warning. Migrate to `COMICS_SERVER_URL`.
 +`comics-api` resolves the comics server itself (`COMICS_SERVER_URL` if set,
 +else the Mac Mini / MacBook hostname convention in `scripts/comics-server.sh`)
 +and health-gates it before every call, so no per-shell setup is needed. On an
 +unrecognised machine, export `COMICS_SERVER_URL` explicitly.
  
--`GIXEN_SERVER_URL` is a deprecated alias — it still works but emits a
--warning. Migrate to `COMICS_SERVER_URL`.
--
  ## Run the report
  
- Per the shared comics-server call convention (BUI-172/BUI-510,
 --- a/.claude/commands/comic/grade.md
 +++ b/.claude/commands/comic/grade.md
-@@ -15,13 +15,13 @@
+@@ -15,13 +15,13 @@ One or more eBay listing URLs or item IDs. No seller-stated grade needed — thi
  
  Use the eBay Browse API via `~/Projects/comic-pipeline/apps/ebay/src/ebay_fetch.py` — the `get_item_by_legacy_id` endpoint returns `image` and `additionalImages` with direct `i.ebayimg.com` URLs that are downloadable without bot detection. Do not scrape eBay HTML pages (returns 400/CAPTCHA).
  
@@ -43,7 +42,7 @@
  
  ```
  WORKDIR: /tmp/comic-grading/run-a1b2c3
-@@ -29,7 +29,7 @@
+@@ -29,7 +29,7 @@ comic-1: FETCH FAILED — <error>
  comic-1: Fantastic Four #48 (1966) 9.0 VF/NM — 8 images — current bid $42.50 (5 bids) — tier: not-cheap
  ```
  
@@ -52,7 +51,7 @@
  
  **A `FETCH FAILED` line is not an image-less listing (BUI-147).** If the download script prints `FETCH FAILED` for a comic (a down/429/404 eBay API), do **not** feed it to the triage pre-pass or drop it as "un-gradeable" — that's an API failure, not a photo-quality verdict. Re-run that item (the script retries 429 automatically); surface the failure to the user rather than silently grading 0 images.
  
-@@ -73,7 +73,7 @@
+@@ -73,7 +73,7 @@ Run **one** cheap agent over the whole candidate list (title + first image + pho
  Don't fan out 3 graders for every comic — most listings in a seller scan are cheap, and 3-per-comic burns agents where 1 will do. **Run 1 grader first, then escalate to a 3-grader panel only when the comic earns it.** Each grader is the **`comic-grader` subagent** (`.claude/agents/comic-grader.md`) — it carries the full grading persona, criteria, and OUTPUT FORMAT contract, scoped read-only (`Read, Bash`) so a grader can never write. You only pass it the dynamic inputs (see [Grader Agent](#grader-agent) below); the persona is identical whether you run 1 or 3, so panel grades stay independent and comparable.
  
  **Tunable gate constants** (stated here so they're easy to adjust):
@@ -61,7 +60,7 @@
  - `CAP_BAND = 0.5` — if the single grader's grade sits within this many points of a grade-capping threshold (the spine-split / missing-piece / detached-cover ceilings), treat it as boundary-ambiguous.
  - `BATCH_MAX = 5` — how many cheap-tier books one grader agent grades in a single context before opening another. Caps context bleed / grader fatigue across books.
  - `CAP_DECISION_TOLERANCE = 10%` — in the decision-sensitivity gate (below), two bid caps computed at the ends of a grade range count as "the same decision" if they're within this much of each other (and the buy/no-buy call doesn't flip).
-@@ -89,11 +89,11 @@
+@@ -89,11 +89,11 @@ Don't fan out 3 graders for every comic — most listings in a seller scan are c
  
  **Dispatch mechanics:**
  - Split the candidates by the printed **tier** from Step 1 (`cheap` / `not-cheap`) — a known key always counts as not-cheap regardless of its printed tier.
@@ -77,7 +76,7 @@
  
 --- a/.claude/commands/comic/seller-scan.md
 +++ b/.claude/commands/comic/seller-scan.md
-@@ -37,28 +37,21 @@
+@@ -37,19 +37,13 @@ them all in one invocation (BUI-298) — see "Scanning multiple / known sellers"
  ## Run the scan
  
  ```bash
@@ -91,17 +90,17 @@
 +is not on PATH). For JSON output (useful for piping to `/comic:buy`):
  ```bash
 -cd ~/Projects/comic-pipeline/apps/ebay && python3 -m venv .venv && .venv/bin/pip install -e . -q
-+seller-scan <seller> --json
- ```
- 
+-```
+-
 -For JSON output (useful for piping to `/comic:buy`):
 -```bash
 -cd ~/Projects/comic-pipeline/apps/ebay && \
 -  .venv/bin/python src/seller_scan.py <seller> --json
--```
--
++seller-scan <seller> --json
+ ```
+ 
  **Scan multiple sellers in ONE invocation** (BUI-298) — pass them all as
- positional args to a single call. This fetches the wish list + OAuth token
+@@ -57,8 +51,7 @@ positional args to a single call. This fetches the wish list + OAuth token
  ONCE and loops internally, instead of redoing both per seller:
  
  ```bash
@@ -111,7 +110,7 @@
  ```
  
  `--username`/`--add-alias` only make sense for exactly one seller (they'd be
-@@ -73,10 +66,8 @@
+@@ -73,10 +66,8 @@ When the user asks to scan several sellers, or to scan "all known sellers", pass
    keys when the user says "scan all known sellers."
  
  ```bash
@@ -124,7 +123,7 @@
  ```
  
  ## Only-new-matches by default (BUI-113)
-@@ -109,11 +100,11 @@
+@@ -109,11 +100,11 @@ machine won't re-surface the same matches.
    per-run display option. It does not touch the rejected-candidate cache.
  
  ```bash
@@ -141,7 +140,7 @@
  ```
  
  Seen-tracking is **best-effort**: if the comics server is unreachable, the scan warns and shows all matches rather than aborting. This is deliberately the opposite of the **wish-list fetch below, which hard-fails** — see `docs/solutions/workflow-issues/seller-scan-verification-batching-seen-tracking-rationale.md` for why each side made the opposite choice. `--forget` follows the same best-effort posture (a failed removal just means already-seen matches stay hidden as before), but — since it's an explicit action rather than an automatic side effect — reports success or failure to stderr either way.
-@@ -140,7 +131,7 @@
+@@ -140,7 +131,7 @@ forced header).
  
  Progress info (listing count, match count) prints to stderr. Redirect to suppress:
  ```bash
@@ -150,7 +149,7 @@
  ```
  
  **`--json` (BUI-298 — always a top-level object, never a bare array):**
-@@ -191,7 +182,7 @@
+@@ -191,7 +182,7 @@ inline (BUI-298) — no need to scrape stderr for them under `--json`.
  
  ## Verification is already done inside the script (BUI-149)
  
@@ -161,7 +160,7 @@
  
 --- a/.claude/commands/comic/wishlist-sellers.md
 +++ b/.claude/commands/comic/wishlist-sellers.md
-@@ -13,18 +13,13 @@
+@@ -13,18 +13,13 @@ The skill is **read-only against your collection and wish list** — it writes o
  
  ## Prerequisites
  
@@ -185,7 +184,7 @@
  ```bash
 --- a/packages/gixen-cli/CLAUDE.md
 +++ b/packages/gixen-cli/CLAUDE.md
-@@ -9,41 +9,32 @@
+@@ -9,41 +9,32 @@ A Python CLI for managing eBay snipes on Gixen.com. Since Gixen's official API i
  ## Commands
  
  ```bash
@@ -207,14 +206,21 @@
  
  # Run integration tests (requires GIXEN_USERNAME and GIXEN_PASSWORD in .env)
 -pytest -m integration
-+uv run pytest -m integration
- 
+-
 -# Run the CLI (direct mode)
 -python cli.py list
 -python cli.py add <item_id> <max_bid> [--offset 6] [--group 0]
 -python cli.py edit <item_id> <max_bid>
 -python cli.py remove <item_id>
 -python cli.py purge
+-
+-# Run the CLI (thin-client mode — set COMICS_SERVER_URL in .env)
+-python cli.py add <item_id> <max_bid> [--offset 6] [--group 0]
+-python cli.py add-batch <rows.json> [--verify] [--json-out results.json]  # BUI-360: batch add, server-mode only (no direct-Gixen fallback)
+-python cli.py build-batch <brief.json> <working_list.json> [--overrides overrides.json] [--out rows.json]  # BUI-435: build add-batch's rows.json deterministically
+-python cli.py sync                  # pull latest Gixen state into server DB
++uv run pytest -m integration
++
 +# The CLI is the `gixen` console script (installed by ./scripts/install.sh).
 +# Direct mode (COMICS_SERVER_URL unset — talks to Gixen itself)
 +gixen list
@@ -222,12 +228,7 @@
 +gixen edit <item_id> <max_bid>
 +gixen remove <item_id>
 +gixen purge
- 
--# Run the CLI (thin-client mode — set COMICS_SERVER_URL in .env)
--python cli.py add <item_id> <max_bid> [--offset 6] [--group 0]
--python cli.py add-batch <rows.json> [--verify] [--json-out results.json]  # BUI-360: batch add, server-mode only (no direct-Gixen fallback)
--python cli.py build-batch <brief.json> <working_list.json> [--overrides overrides.json] [--out rows.json]  # BUI-435: build add-batch's rows.json deterministically
--python cli.py sync                  # pull latest Gixen state into server DB
++
 +# Thin-client mode (COMICS_SERVER_URL set in .env or the environment)
 +gixen add <item_id> <max_bid> [--offset 6] [--group 0]
 +gixen add-batch <rows.json> [--verify] [--json-out results.json]  # BUI-360: batch add, server-mode only (no direct-Gixen fallback)
@@ -245,9 +246,15 @@
  ```
  
  ## Architecture
+@@ -92,4 +83,4 @@ The overlay (`plugins/gixen-overlay/src/gixen_overlay/policy.py`) contributes it
+ - The HTML parsing in `_parse_snipe_table` is fragile by nature — it relies on specific HTML patterns from Gixen's desktop table (hidden inputs named `edititemid_<ID>`, `editmaxbid_<ID>`, etc.). Changes to Gixen's HTML will break parsing.
+ - Modify and remove operations require a `dbidid` (Gixen's internal row ID), which is obtained by first listing all snipes and finding the matching item.
+ - Exception hierarchy: `GixenError` is the base; `GixenLoginError`, `GixenSessionExpiredError`, `GixenItemError` (has `.code` and `.message`), `GixenSnipeNotFoundError`, `GixenParseError`, `GixenAddNotConfirmedError` (POST returned no error but the snipe never appeared in the list) all inherit from it.
+-- **Direct-mode CLI writes are not safe to run concurrently against the same `item_id` (BUI-414).** Server-mode edits serialize under `_api_lock` (BUI-402) because the FastAPI server is one long-lived process — one `asyncio.Lock` instance can gate every request. Direct mode has no equivalent: `python cli.py edit` (run with `COMICS_SERVER_URL` unset) is a short-lived, stateless process that does its own `list_snipes` resolve + `modify_snipe` with no lock manager, so two concurrent direct-mode invocations on the same `item_id` can interleave and race. An in-process lock can't fix this — there's no shared process for it to live in; a real fix would need an OS-level file lock, with the stale-lock/cleanup complexity that implies. This is deliberately not built: direct mode is a single-human-terminal fallback path (used when the comics server is unreachable), not a concurrent service, and triggering the race requires deliberately running two overlapping edits on the same item by hand. Don't run direct-mode `edit`/`add`/`remove` concurrently against the same `item_id` from multiple terminals or scripts.
++- **Direct-mode CLI writes are not safe to run concurrently against the same `item_id` (BUI-414).** Server-mode edits serialize under `_api_lock` (BUI-402) because the FastAPI server is one long-lived process — one `asyncio.Lock` instance can gate every request. Direct mode has no equivalent: `gixen edit` (run with `COMICS_SERVER_URL` unset) is a short-lived, stateless process that does its own `list_snipes` resolve + `modify_snipe` with no lock manager, so two concurrent direct-mode invocations on the same `item_id` can interleave and race. An in-process lock can't fix this — there's no shared process for it to live in; a real fix would need an OS-level file lock, with the stale-lock/cleanup complexity that implies. This is deliberately not built: direct mode is a single-human-terminal fallback path (used when the comics server is unreachable), not a concurrent service, and triggering the race requires deliberately running two overlapping edits on the same item by hand. Don't run direct-mode `edit`/`add`/`remove` concurrently against the same `item_id` from multiple terminals or scripts.
 --- a/packages/locg-cli/CLAUDE.md
 +++ b/packages/locg-cli/CLAUDE.md
-@@ -13,7 +13,7 @@
+@@ -17,7 +17,7 @@ CLI for [League of Comic Geeks](https://leagueofcomicgeeks.com). Scraping-based
  
  ## CLI Usage
  

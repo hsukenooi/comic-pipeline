@@ -37,19 +37,13 @@ them all in one invocation (BUI-298) — see "Scanning multiple / known sellers"
 ## Run the scan
 
 ```bash
-cd ~/Projects/comic-pipeline/apps/ebay && \
-  .venv/bin/python src/seller_scan.py <seller-username-or-url>
+seller-scan <seller-username-or-url>
 ```
 
-If the venv doesn't exist yet:
+`seller-scan` is the installed console script (run `./scripts/install.sh` if it
+is not on PATH). For JSON output (useful for piping to `/comic:buy`):
 ```bash
-cd ~/Projects/comic-pipeline/apps/ebay && python3 -m venv .venv && .venv/bin/pip install -e . -q
-```
-
-For JSON output (useful for piping to `/comic:buy`):
-```bash
-cd ~/Projects/comic-pipeline/apps/ebay && \
-  .venv/bin/python src/seller_scan.py <seller> --json
+seller-scan <seller> --json
 ```
 
 **Scan multiple sellers in ONE invocation** (BUI-298) — pass them all as
@@ -57,8 +51,7 @@ positional args to a single call. This fetches the wish list + OAuth token
 ONCE and loops internally, instead of redoing both per seller:
 
 ```bash
-cd ~/Projects/comic-pipeline/apps/ebay && \
-  .venv/bin/python src/seller_scan.py <seller1> <seller2> <seller3> --json
+seller-scan <seller1> <seller2> <seller3> --json
 ```
 
 `--username`/`--add-alias` only make sense for exactly one seller (they'd be
@@ -73,10 +66,8 @@ When the user asks to scan several sellers, or to scan "all known sellers", pass
   keys when the user says "scan all known sellers."
 
 ```bash
-cd ~/Projects/comic-pipeline/apps/ebay && \
-  .venv/bin/python src/seller_scan.py beatlebluecat blissard comichunterlv \
-    comics4less davesvintagecomics hodagent ka-761233 punkscrapscomics \
-    tunerscomics --json
+seller-scan beatlebluecat blissard comichunterlv comics4less davesvintagecomics \
+  hodagent ka-761233 punkscrapscomics tunerscomics --json
 ```
 
 ## Only-new-matches by default (BUI-113)
@@ -109,11 +100,11 @@ machine won't re-surface the same matches.
   per-run display option. It does not touch the rejected-candidate cache.
 
 ```bash
-.venv/bin/python src/seller_scan.py <seller>                # only new matches
-.venv/bin/python src/seller_scan.py <seller> --show-seen    # every match, cache still active
-.venv/bin/python src/seller_scan.py <seller> --no-reject-cache  # only new matches, force re-verify
-.venv/bin/python src/seller_scan.py <seller> --all          # every match, force re-verify
-.venv/bin/python src/seller_scan.py <seller> --forget       # clear this seller's seen-set, then scan
+seller-scan <seller>                    # only new matches
+seller-scan <seller> --show-seen        # every match, cache still active
+seller-scan <seller> --no-reject-cache  # only new matches, force re-verify
+seller-scan <seller> --all              # every match, force re-verify
+seller-scan <seller> --forget           # clear this seller's seen-set, then scan
 ```
 
 Seen-tracking is **best-effort**: if the comics server is unreachable, the scan warns and shows all matches rather than aborting. This is deliberately the opposite of the **wish-list fetch below, which hard-fails** — see `docs/solutions/workflow-issues/seller-scan-verification-batching-seen-tracking-rationale.md` for why each side made the opposite choice. `--forget` follows the same best-effort posture (a failed removal just means already-seen matches stay hidden as before), but — since it's an explicit action rather than an automatic side effect — reports success or failure to stderr either way.
@@ -140,7 +131,7 @@ forced header).
 
 Progress info (listing count, match count) prints to stderr. Redirect to suppress:
 ```bash
-seller_scan.py <seller> 2>/dev/null
+seller-scan <seller> 2>/dev/null
 ```
 
 **`--json` (BUI-298 — always a top-level object, never a bare array):**
@@ -191,7 +182,7 @@ inline (BUI-298) — no need to scrape stderr for them under `--json`.
 
 ## Verification is already done inside the script (BUI-149)
 
-**`seller_scan.py` already guards the seller-scan → `/comic:buy` seam itself — do not run a second verifier from the skill.** Before emitting anything, it runs an internal Claude (haiku) pass over **every** candidate and keeps only the genuine matches, so the rows in the table/JSON are already post-verified. A `general-purpose` subagent here would just re-verify an already-verified set.
+**`seller-scan` already guards the seller-scan → `/comic:buy` seam itself — do not run a second verifier from the skill.** Before emitting anything, it runs an internal Claude (haiku) pass over **every** candidate and keeps only the genuine matches, so the rows in the table/JSON are already post-verified. A `general-purpose` subagent here would just re-verify an already-verified set.
 
 **No silent drops:** rejected candidates are printed to stderr as `Filtered N likely false positive(s)` (one-line reason each) and returned inline per-seller in `--json` as `sellers[*].filtered` (`{item_id, title, wish_name, reason}`) — surface this to the user alongside the match table so they can override a wrong rejection. Run without `2>/dev/null` so you see the stderr version too.
 

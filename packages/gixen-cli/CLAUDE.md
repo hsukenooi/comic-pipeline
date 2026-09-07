@@ -9,41 +9,32 @@ A Python CLI for managing eBay snipes on Gixen.com. Since Gixen's official API i
 ## Commands
 
 ```bash
-# Run unit tests (mocked, no credentials needed)
-pytest tests/test_gixen_client.py
-pytest tests/test_server_api.py
-pytest tests/test_server_db.py
-pytest tests/test_add_batch.py
-pytest tests/test_cli_add_batch.py
-pytest tests/test_cli_build_batch.py
-pytest tests/test_cli_record_win_prep.py
-pytest tests/test_ebay_fallback.py
-pytest tests/test_log_config.py
-pytest tests/test_record_win_prep.py
-pytest tests/test_skill_migration.py
-pytest tests/test_standalone_server.py
+# Run unit tests (mocked, no credentials needed) — the whole suite, from this directory
+uv run pytest -m "not integration"
 
 # Run integration tests (requires GIXEN_USERNAME and GIXEN_PASSWORD in .env)
-pytest -m integration
+uv run pytest -m integration
 
-# Run the CLI (direct mode)
-python cli.py list
-python cli.py add <item_id> <max_bid> [--offset 6] [--group 0]
-python cli.py edit <item_id> <max_bid>
-python cli.py remove <item_id>
-python cli.py purge
+# The CLI is the `gixen` console script (installed by ./scripts/install.sh).
+# Direct mode (COMICS_SERVER_URL unset — talks to Gixen itself)
+gixen list
+gixen add <item_id> <max_bid> [--offset 6] [--group 0]
+gixen edit <item_id> <max_bid>
+gixen remove <item_id>
+gixen purge
 
-# Run the CLI (thin-client mode — set COMICS_SERVER_URL in .env)
-python cli.py add <item_id> <max_bid> [--offset 6] [--group 0]
-python cli.py add-batch <rows.json> [--verify] [--json-out results.json]  # BUI-360: batch add, server-mode only (no direct-Gixen fallback)
-python cli.py build-batch <brief.json> <working_list.json> [--overrides overrides.json] [--out rows.json]  # BUI-435: build add-batch's rows.json deterministically
-python cli.py sync                  # pull latest Gixen state into server DB
+# Thin-client mode (COMICS_SERVER_URL set in .env or the environment)
+gixen add <item_id> <max_bid> [--offset 6] [--group 0]
+gixen add-batch <rows.json> [--verify] [--json-out results.json]  # BUI-360: batch add, server-mode only (no direct-Gixen fallback)
+gixen build-batch <brief.json> <working_list.json> [--overrides overrides.json] [--out rows.json]  # BUI-435: build add-batch's rows.json deterministically
+gixen sync                  # pull latest Gixen state into server DB
 
 # Run the server (development)
 uvicorn server.main:app --reload
 
-# Deploy the server on Mac Mini
-bash server/install.sh
+# Deploy on the Mac Mini after a merge: ./scripts/deploy.sh (BUI-612) reinstalls every
+# console script, syncs the workspace, kickstarts the launchd job, and asserts the deployed
+# SHA. server/install.sh is only the first-time LaunchAgent installer.
 ```
 
 ## Architecture
@@ -92,4 +83,4 @@ The overlay (`plugins/gixen-overlay/src/gixen_overlay/policy.py`) contributes it
 - The HTML parsing in `_parse_snipe_table` is fragile by nature — it relies on specific HTML patterns from Gixen's desktop table (hidden inputs named `edititemid_<ID>`, `editmaxbid_<ID>`, etc.). Changes to Gixen's HTML will break parsing.
 - Modify and remove operations require a `dbidid` (Gixen's internal row ID), which is obtained by first listing all snipes and finding the matching item.
 - Exception hierarchy: `GixenError` is the base; `GixenLoginError`, `GixenSessionExpiredError`, `GixenItemError` (has `.code` and `.message`), `GixenSnipeNotFoundError`, `GixenParseError`, `GixenAddNotConfirmedError` (POST returned no error but the snipe never appeared in the list) all inherit from it.
-- **Direct-mode CLI writes are not safe to run concurrently against the same `item_id` (BUI-414).** Server-mode edits serialize under `_api_lock` (BUI-402) because the FastAPI server is one long-lived process — one `asyncio.Lock` instance can gate every request. Direct mode has no equivalent: `python cli.py edit` (run with `COMICS_SERVER_URL` unset) is a short-lived, stateless process that does its own `list_snipes` resolve + `modify_snipe` with no lock manager, so two concurrent direct-mode invocations on the same `item_id` can interleave and race. An in-process lock can't fix this — there's no shared process for it to live in; a real fix would need an OS-level file lock, with the stale-lock/cleanup complexity that implies. This is deliberately not built: direct mode is a single-human-terminal fallback path (used when the comics server is unreachable), not a concurrent service, and triggering the race requires deliberately running two overlapping edits on the same item by hand. Don't run direct-mode `edit`/`add`/`remove` concurrently against the same `item_id` from multiple terminals or scripts.
+- **Direct-mode CLI writes are not safe to run concurrently against the same `item_id` (BUI-414).** Server-mode edits serialize under `_api_lock` (BUI-402) because the FastAPI server is one long-lived process — one `asyncio.Lock` instance can gate every request. Direct mode has no equivalent: `gixen edit` (run with `COMICS_SERVER_URL` unset) is a short-lived, stateless process that does its own `list_snipes` resolve + `modify_snipe` with no lock manager, so two concurrent direct-mode invocations on the same `item_id` can interleave and race. An in-process lock can't fix this — there's no shared process for it to live in; a real fix would need an OS-level file lock, with the stale-lock/cleanup complexity that implies. This is deliberately not built: direct mode is a single-human-terminal fallback path (used when the comics server is unreachable), not a concurrent service, and triggering the race requires deliberately running two overlapping edits on the same item by hand. Don't run direct-mode `edit`/`add`/`remove` concurrently against the same `item_id` from multiple terminals or scripts.
