@@ -193,11 +193,11 @@ cover date must be kept exactly as-is.
 **If `dateless_count` is non-zero, backfill those rows' Release Date before
 uploading** — do **not** upload a dateless batch (`all_dateless: true` is the
 importer-hang scenario at 0%; surface the response's `dateless_warning` and
-`dateless_titles`). The durable fix is record-win populating dates (BUI-210);
-until then, follow the tiered procedure in **`references/date-backfill.md`**
-(cadence/Metron first, web-research sub-agent only for the residual). Fill the
-dates into the already-generated CSV (don't re-export — the export re-blanks
-placeholders), then continue.
+`dateless_titles`). record-win dates wins from Metron (BUI-210), so dateless
+rows are the residual Metron could not supply; follow the tiered procedure in
+**`references/date-backfill.md`** (cadence/Metron first, web-research sub-agent
+only for the residual). Fill the dates into the already-generated CSV (don't
+re-export — the export re-blanks placeholders), then continue.
 
 Then also clean the
 wish-list itself so no owned-but-wished entry survives to be pushed in Step 3b:
