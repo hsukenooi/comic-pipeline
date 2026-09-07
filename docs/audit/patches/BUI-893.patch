@@ -1,0 +1,258 @@
+--- a/.claude/commands/comic/calibration-report.md
++++ b/.claude/commands/comic/calibration-report.md
+@@ -136,19 +136,11 @@
+ 
+ ## Prerequisites
+ 
+-**`COMICS_SERVER_URL` must be set.** Set it once in `~/.zshrc`:
+-
+-```bash
+-# MacBook (connects to Mac Mini over Tailscale)
+-export COMICS_SERVER_URL=http://mac-mini.tail9b7fa5.ts.net:8080
+-
+-# Mac Mini (running locally)
+-export COMICS_SERVER_URL=http://localhost:8080
+-```
++`comics-api` resolves the comics server itself (`COMICS_SERVER_URL` if set,
++else the Mac Mini / MacBook hostname convention in `scripts/comics-server.sh`)
++and health-gates it before every call, so no per-shell setup is needed. On an
++unrecognised machine, export `COMICS_SERVER_URL` explicitly.
+ 
+-`GIXEN_SERVER_URL` is a deprecated alias — it still works but emits a
+-warning. Migrate to `COMICS_SERVER_URL`.
+-
+ ## Run the report
+ 
+ Per the shared comics-server call convention (BUI-172/BUI-510,
+--- a/.claude/commands/comic/grade.md
++++ b/.claude/commands/comic/grade.md
+@@ -15,13 +15,13 @@
+ 
+ Use the eBay Browse API via `~/Projects/comic-pipeline/apps/ebay/src/ebay_fetch.py` — the `get_item_by_legacy_id` endpoint returns `image` and `additionalImages` with direct `i.ebayimg.com` URLs that are downloadable without bot detection. Do not scrape eBay HTML pages (returns 400/CAPTCHA).
+ 
+-Run the downloader script (BUI-279 — extracted from this skill so the OAuth + Browse API logic isn't re-read into context on every grade run; same OAuth flow, same `get_item_by_legacy_id` calls, same image-download logic):
++Run the installed `grade-photos` console script (BUI-279 — it owns the OAuth, Browse API, and download logic so none of it is read into context):
+ 
+ ```bash
+-python3 ~/Projects/comic-pipeline/apps/ebay/src/grade_photos.py 178057470740 178057488707 ...
++grade-photos 178057470740 178057488707 ...
+ ```
+ 
+-Item IDs are labeled `comic-1`, `comic-2`, ... in the order given. **BUI-440:** when `--workdir` is not passed, each run gets its own fresh directory under `/tmp/comic-grading` (not the bare shared root) so a prior run's `comic-N` dirs never leak into a smaller later run, and two overlapping runs (a `/comic:buy` run + a standalone `/comic:grade` run) never collide on `comic-1`/`comic-2`. The script prints the resolved directory as its first line — read that line to get the base path for Step 2's IMAGE FOLDER inputs:
++Item IDs are labeled `comic-1`, `comic-2`, ... in the order given. When `--workdir` is not passed, each run gets its own fresh directory under `/tmp/comic-grading` (BUI-440) so a prior run's `comic-N` dirs never leak into a smaller later run, and two overlapping runs never collide on `comic-1`/`comic-2`. The script prints the resolved directory as its first line — read that line to get the base path for Step 2's IMAGE FOLDER inputs:
+ 
+ ```
+ WORKDIR: /tmp/comic-grading/run-a1b2c3
+@@ -29,7 +29,7 @@
+ comic-1: Fantastic Four #48 (1966) 9.0 VF/NM — 8 images — current bid $42.50 (5 bids) — tier: not-cheap
+ ```
+ 
+-The printed **tier** (`cheap` / `not-cheap`) is the **value signal for the Step 2 value gate** — record it alongside the item id from the printed line so escalation can branch on listing value without re-deriving anything. `grade_photos.py` owns the threshold and computes the tier from the auction's current bid or, for a fixed-price (BIN) listing, its Buy-It-Now price — both count the same way (a $40 BIN prints `not-cheap` just like a $40 auction). A listing with no price field at all prints `cheap` (BUI-165).
++The printed **tier** (`cheap` / `not-cheap`) is the **value signal for the Step 2 value gate** — record it alongside the item id from the printed line so escalation can branch on listing value without re-deriving anything. `grade-photos` owns the threshold and computes the tier from the auction's current bid or, for a fixed-price (BIN) listing, its Buy-It-Now price — both count the same way (a $40 BIN prints `not-cheap` just like a $40 auction). A listing with no price field at all prints `cheap` (BUI-165).
+ 
+ **A `FETCH FAILED` line is not an image-less listing (BUI-147).** If the download script prints `FETCH FAILED` for a comic (a down/429/404 eBay API), do **not** feed it to the triage pre-pass or drop it as "un-gradeable" — that's an API failure, not a photo-quality verdict. Re-run that item (the script retries 429 automatically); surface the failure to the user rather than silently grading 0 images.
+ 
+@@ -73,7 +73,7 @@
+ Don't fan out 3 graders for every comic — most listings in a seller scan are cheap, and 3-per-comic burns agents where 1 will do. **Run 1 grader first, then escalate to a 3-grader panel only when the comic earns it.** Each grader is the **`comic-grader` subagent** (`.claude/agents/comic-grader.md`) — it carries the full grading persona, criteria, and OUTPUT FORMAT contract, scoped read-only (`Read, Bash`) so a grader can never write. You only pass it the dynamic inputs (see [Grader Agent](#grader-agent) below); the persona is identical whether you run 1 or 3, so panel grades stay independent and comparable.
+ 
+ **Tunable gate constants** (stated here so they're easy to adjust):
+-- **Value tier** — `grade_photos.py` (Step 1) owns `VALUE_THRESHOLD` ($25) and prints `tier: cheap|not-cheap` per comic. Read the printed tier directly; don't re-derive the split from `current_price` here. A `not-cheap` tier always gets the full 3-grader panel; an expensive book justifies the rigor.
++- **Value tier** — `grade-photos` (Step 1) owns `VALUE_THRESHOLD` ($25) and prints `tier: cheap|not-cheap` per comic. Read the printed tier directly; don't re-derive the split from `current_price` here. A `not-cheap` tier always gets the full 3-grader panel; an expensive book justifies the rigor.
+ - `CAP_BAND = 0.5` — if the single grader's grade sits within this many points of a grade-capping threshold (the spine-split / missing-piece / detached-cover ceilings), treat it as boundary-ambiguous.
+ - `BATCH_MAX = 5` — how many cheap-tier books one grader agent grades in a single context before opening another. Caps context bleed / grader fatigue across books.
+ - `CAP_DECISION_TOLERANCE = 10%` — in the decision-sensitivity gate (below), two bid caps computed at the ends of a grade range count as "the same decision" if they're within this much of each other (and the buy/no-buy call doesn't flip).
+@@ -89,11 +89,11 @@
+ 
+ **Dispatch mechanics:**
+ - Split the candidates by the printed **tier** from Step 1 (`cheap` / `not-cheap`) — a known key always counts as not-cheap regardless of its printed tier.
+-- **Cheap books → batch them (U9).** A cheap book only ever earns 1 grade unless a gate trips, so there is no cross-grader independence to preserve — grade several in **one** agent context instead of one agent each. Group the cheap books into batches of up to `BATCH_MAX` and give each batch a single grader agent that grades every book in the group **independently** and returns one full OUTPUT FORMAT block per book (clearly delimited, labelled by item id). This is the main first-pass cost saver on a thin-photo seller scan (e.g. 7 cheap books → 2 agents, not 7).
++- **Cheap books → batch them.** A cheap book only ever earns 1 grade unless a gate trips, so there is no cross-grader independence to preserve — grade several in **one** agent context instead of one agent each. Group the cheap books into batches of up to `BATCH_MAX` and give each batch a single grader agent that grades every book in the group **independently** and returns one full OUTPUT FORMAT block per book (clearly delimited, labelled by item id). This is the main first-pass cost saver on a thin-photo seller scan (e.g. 7 cheap books → 2 agents, not 7).
+ - **Not-cheap books → 1 grader each, first pass**, run in parallel (separate agents).
+ - **Escalation (both kinds).** After the first pass, any book that tripped a gate (Step 2 triggers) gets the **remaining 2** graders as separate, independent agents — dispatched together in one parallel batch. A batched cheap book's first grade counts as grader A; pull it out and add B + C. (The grader prompt and criteria are identical across passes so the panel grades stay independent and comparable.)
+ - **Batching guardrails:** keep each book's images and OUTPUT FORMAT block fully separate in the batched prompt; never let one book's defects bleed into another's grade; if a batch would exceed `BATCH_MAX`, open another agent. When in doubt about a specific cheap book (e.g. it looks near a cap), grade it on its own rather than in the batch.
+-- **Anti-anchoring:** batched grades must not drift toward the batch's overall quality. The `comic-grader` agent def owns this rule (grade each book on the **absolute** CGC scale; BUI-81 U9) and its own guard enforces it — nothing to restate here.
++- **Anti-anchoring:** batched grades must not drift toward the batch's overall quality. The `comic-grader` agent def owns this rule (grade each book on the **absolute** CGC scale; BUI-81) and its own guard enforces it — nothing to restate here.
+ 
+ **Required per-comic reporting (no silent caps):** for every comic, state how many graders ran and why — e.g. `1 grader (──$6, range wide but coverage-driven at MEDIUM-LOW)` or `1 grader (──$6, unambiguous)` or `3 graders (──$40 ≥ $25 value threshold)` or `3 graders (grade 5.0 within 0.5 of the 1/2" spine-split cap)`. The user must be able to see where rigor was and wasn't spent.
+ 
+--- a/.claude/commands/comic/seller-scan.md
++++ b/.claude/commands/comic/seller-scan.md
+@@ -37,28 +37,21 @@
+ ## Run the scan
+ 
+ ```bash
+-cd ~/Projects/comic-pipeline/apps/ebay && \
+-  .venv/bin/python src/seller_scan.py <seller-username-or-url>
++seller-scan <seller-username-or-url>
+ ```
+ 
+-If the venv doesn't exist yet:
++`seller-scan` is the installed console script (run `./scripts/install.sh` if it
++is not on PATH). For JSON output (useful for piping to `/comic:buy`):
+ ```bash
+-cd ~/Projects/comic-pipeline/apps/ebay && python3 -m venv .venv && .venv/bin/pip install -e . -q
++seller-scan <seller> --json
+ ```
+ 
+-For JSON output (useful for piping to `/comic:buy`):
+-```bash
+-cd ~/Projects/comic-pipeline/apps/ebay && \
+-  .venv/bin/python src/seller_scan.py <seller> --json
+-```
+-
+ **Scan multiple sellers in ONE invocation** (BUI-298) — pass them all as
+ positional args to a single call. This fetches the wish list + OAuth token
+ ONCE and loops internally, instead of redoing both per seller:
+ 
+ ```bash
+-cd ~/Projects/comic-pipeline/apps/ebay && \
+-  .venv/bin/python src/seller_scan.py <seller1> <seller2> <seller3> --json
++seller-scan <seller1> <seller2> <seller3> --json
+ ```
+ 
+ `--username`/`--add-alias` only make sense for exactly one seller (they'd be
+@@ -73,10 +66,8 @@
+   keys when the user says "scan all known sellers."
+ 
+ ```bash
+-cd ~/Projects/comic-pipeline/apps/ebay && \
+-  .venv/bin/python src/seller_scan.py beatlebluecat blissard comichunterlv \
+-    comics4less davesvintagecomics hodagent ka-761233 punkscrapscomics \
+-    tunerscomics --json
++seller-scan beatlebluecat blissard comichunterlv comics4less davesvintagecomics \
++  hodagent ka-761233 punkscrapscomics tunerscomics --json
+ ```
+ 
+ ## Only-new-matches by default (BUI-113)
+@@ -109,11 +100,11 @@
+   per-run display option. It does not touch the rejected-candidate cache.
+ 
+ ```bash
+-.venv/bin/python src/seller_scan.py <seller>                # only new matches
+-.venv/bin/python src/seller_scan.py <seller> --show-seen    # every match, cache still active
+-.venv/bin/python src/seller_scan.py <seller> --no-reject-cache  # only new matches, force re-verify
+-.venv/bin/python src/seller_scan.py <seller> --all          # every match, force re-verify
+-.venv/bin/python src/seller_scan.py <seller> --forget       # clear this seller's seen-set, then scan
++seller-scan <seller>                    # only new matches
++seller-scan <seller> --show-seen        # every match, cache still active
++seller-scan <seller> --no-reject-cache  # only new matches, force re-verify
++seller-scan <seller> --all              # every match, force re-verify
++seller-scan <seller> --forget           # clear this seller's seen-set, then scan
+ ```
+ 
+ Seen-tracking is **best-effort**: if the comics server is unreachable, the scan warns and shows all matches rather than aborting. This is deliberately the opposite of the **wish-list fetch below, which hard-fails** — see `docs/solutions/workflow-issues/seller-scan-verification-batching-seen-tracking-rationale.md` for why each side made the opposite choice. `--forget` follows the same best-effort posture (a failed removal just means already-seen matches stay hidden as before), but — since it's an explicit action rather than an automatic side effect — reports success or failure to stderr either way.
+@@ -140,7 +131,7 @@
+ 
+ Progress info (listing count, match count) prints to stderr. Redirect to suppress:
+ ```bash
+-seller_scan.py <seller> 2>/dev/null
++seller-scan <seller> 2>/dev/null
+ ```
+ 
+ **`--json` (BUI-298 — always a top-level object, never a bare array):**
+@@ -191,7 +182,7 @@
+ 
+ ## Verification is already done inside the script (BUI-149)
+ 
+-**`seller_scan.py` already guards the seller-scan → `/comic:buy` seam itself — do not run a second verifier from the skill.** Before emitting anything, it runs an internal Claude (haiku) pass over **every** candidate and keeps only the genuine matches, so the rows in the table/JSON are already post-verified. A `general-purpose` subagent here would just re-verify an already-verified set.
++**`seller-scan` already guards the seller-scan → `/comic:buy` seam itself — do not run a second verifier from the skill.** Before emitting anything, it runs an internal Claude (haiku) pass over **every** candidate and keeps only the genuine matches, so the rows in the table/JSON are already post-verified. A `general-purpose` subagent here would just re-verify an already-verified set.
+ 
+ **No silent drops:** rejected candidates are printed to stderr as `Filtered N likely false positive(s)` (one-line reason each) and returned inline per-seller in `--json` as `sellers[*].filtered` (`{item_id, title, wish_name, reason}`) — surface this to the user alongside the match table so they can override a wrong rejection. Run without `2>/dev/null` so you see the stderr version too.
+ 
+--- a/.claude/commands/comic/wishlist-sellers.md
++++ b/.claude/commands/comic/wishlist-sellers.md
+@@ -13,18 +13,13 @@
+ 
+ ## Prerequisites
+ 
+-**`COMICS_SERVER_URL` must be set.** The script fetches your wish list over HTTP and hard-fails if the server is unreachable. Set it once in `~/.zshrc`:
++**Resolve the comics server first.** The script fetches your wish list over HTTP from `COMICS_SERVER_URL` and hard-fails if it is unset or unreachable. It is a child process, so the variable must be exported into this shell — use the shared resolver (BUI-172), which honours a preset value or infers it from the Mac Mini / MacBook hostname:
+ 
+ ```bash
+-# MacBook (connects to Mac Mini over Tailscale)
+-export COMICS_SERVER_URL=http://mac-mini.tail9b7fa5.ts.net:8080
+-
+-# Mac Mini (running locally)
+-export COMICS_SERVER_URL=http://localhost:8080
++source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
++comics_resolve_server || exit 1   # exports COMICS_SERVER_URL for wishlist-sellers below
+ ```
+ 
+-`GIXEN_SERVER_URL` is a deprecated alias — it still works but emits a warning. Migrate to `COMICS_SERVER_URL`.
+-
+ **The `wishlist-sellers` console script must be on PATH.** After pulling this feature, re-run `./scripts/install.sh` to install it:
+ 
+ ```bash
+--- a/packages/gixen-cli/CLAUDE.md
++++ b/packages/gixen-cli/CLAUDE.md
+@@ -9,41 +9,32 @@
+ ## Commands
+ 
+ ```bash
+-# Run unit tests (mocked, no credentials needed)
+-pytest tests/test_gixen_client.py
+-pytest tests/test_server_api.py
+-pytest tests/test_server_db.py
+-pytest tests/test_add_batch.py
+-pytest tests/test_cli_add_batch.py
+-pytest tests/test_cli_build_batch.py
+-pytest tests/test_cli_record_win_prep.py
+-pytest tests/test_ebay_fallback.py
+-pytest tests/test_log_config.py
+-pytest tests/test_record_win_prep.py
+-pytest tests/test_skill_migration.py
+-pytest tests/test_standalone_server.py
++# Run unit tests (mocked, no credentials needed) — the whole suite, from this directory
++uv run pytest -m "not integration"
+ 
+ # Run integration tests (requires GIXEN_USERNAME and GIXEN_PASSWORD in .env)
+-pytest -m integration
++uv run pytest -m integration
+ 
+-# Run the CLI (direct mode)
+-python cli.py list
+-python cli.py add <item_id> <max_bid> [--offset 6] [--group 0]
+-python cli.py edit <item_id> <max_bid>
+-python cli.py remove <item_id>
+-python cli.py purge
++# The CLI is the `gixen` console script (installed by ./scripts/install.sh).
++# Direct mode (COMICS_SERVER_URL unset — talks to Gixen itself)
++gixen list
++gixen add <item_id> <max_bid> [--offset 6] [--group 0]
++gixen edit <item_id> <max_bid>
++gixen remove <item_id>
++gixen purge
+ 
+-# Run the CLI (thin-client mode — set COMICS_SERVER_URL in .env)
+-python cli.py add <item_id> <max_bid> [--offset 6] [--group 0]
+-python cli.py add-batch <rows.json> [--verify] [--json-out results.json]  # BUI-360: batch add, server-mode only (no direct-Gixen fallback)
+-python cli.py build-batch <brief.json> <working_list.json> [--overrides overrides.json] [--out rows.json]  # BUI-435: build add-batch's rows.json deterministically
+-python cli.py sync                  # pull latest Gixen state into server DB
++# Thin-client mode (COMICS_SERVER_URL set in .env or the environment)
++gixen add <item_id> <max_bid> [--offset 6] [--group 0]
++gixen add-batch <rows.json> [--verify] [--json-out results.json]  # BUI-360: batch add, server-mode only (no direct-Gixen fallback)
++gixen build-batch <brief.json> <working_list.json> [--overrides overrides.json] [--out rows.json]  # BUI-435: build add-batch's rows.json deterministically
++gixen sync                  # pull latest Gixen state into server DB
+ 
+ # Run the server (development)
+ uvicorn server.main:app --reload
+ 
+-# Deploy the server on Mac Mini
+-bash server/install.sh
++# Deploy on the Mac Mini after a merge: ./scripts/deploy.sh (BUI-612) reinstalls every
++# console script, syncs the workspace, kickstarts the launchd job, and asserts the deployed
++# SHA. server/install.sh is only the first-time LaunchAgent installer.
+ ```
+ 
+ ## Architecture
+--- a/packages/locg-cli/CLAUDE.md
++++ b/packages/locg-cli/CLAUDE.md
+@@ -13,7 +13,7 @@
+ 
+ ## CLI Usage
+ 
+-Run with `PYTHONPATH=src python3 -m locg <command>` (or `locg <command>` if installed).
++Run with `locg <command>` (installed by `./scripts/install.sh`; from a bare checkout, `PYTHONPATH=src python3 -m locg <command>`).
+ 
+ All output is JSON to stdout. Use `--pretty` for human-readable output, `--debug` for HTTP details.
+ 

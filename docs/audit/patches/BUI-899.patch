@@ -1,0 +1,74 @@
+--- a/.claude/commands/comic/collection-add.md
++++ b/.claude/commands/comic/collection-add.md
+@@ -123,35 +123,22 @@
+ history). Pass the two arrays **separately** — do not merge them yourself:
+ 
+ **Expected duration — a multi-minute wait here is normal, not a hang
+-(BUI-472).** `cmd_collection_record_win` paces Metron traffic to
+-`METRON_REQUESTS_PER_MINUTE` (20 req/min, BUI-465) and spends **up to** 3 HTTP
+-requests per win — `REQUESTS_RESOLVE_SERIES` (1) + `REQUESTS_ISSUE_IN_SERIES`
+-(1) for the R36 step-2 series lookup (or the BUI-210 date-only lookup;
+-mutually exclusive, never both), plus `REQUESTS_LOOKUP_ISSUE_DETAIL` (1,
+-publisher/variant) — so pacing alone costs up to `60s / 20 req/min × 3
+-requests ≈ 9s/win` in the worst case. **BUI-473: a run of wins from the SAME
+-series only pays `REQUESTS_RESOLVE_SERIES` once** — the resolved series is
+-cached for the rest of the batch, so every subsequent issue of that series
+-spends only `REQUESTS_ISSUE_IN_SERIES` + `REQUESTS_LOOKUP_ISSUE_DETAIL` (2
+-requests, ~6s/win). The **worst case is unchanged and still the number to
+-plan around**: a batch where every win is a genuinely distinct series gets no
+-reuse, so the bound below still holds. A transient Metron trip additionally
+-costs up to `METRON_MAX_TRANSIENT_TRIPS` (3) cooldowns of
+-`METRON_TRANSIENT_COOLDOWN_SEC` (60s) each. Worst case for a batch of N
+-wins: **N × 9s + 3 × 60s**. A 40-win batch: `40 × 9 + 180 = 540s (~9 min)` —
+-same-series batches (the common manual-series backlog shape) finish faster
+-than this bound in practice, but the timeout must still cover it.
++(BUI-472).** `cmd_collection_record_win` paces Metron traffic to 20 req/min
++(BUI-465) and spends up to 3 requests per win (series resolve, issue-in-series,
++issue detail), so the worst case is **~9s per win plus up to 3 × 60s
++transient-trip cooldowns** — about 9 minutes for 40 wins. Same-series runs
++reuse the series resolve (BUI-473) and finish faster, but size the timeout on
++the worst case.
+ 
+ The server side cannot stall on this — the blocking call runs off the event
+ loop via `asyncio.to_thread` (BUI-428) — so the only real risk is the
+ **calling harness's own Bash-invocation timeout** (the `curl` below has no
+ `--max-time` of its own, and shouldn't grow one — the call is slow on
+ purpose). **Invoke this bash block with an explicit timeout of 600000ms
+-(10 minutes)** — the harness's own maximum for a single Bash call (it
+-cannot be raised further), and comfortably covers the 40-win worst case
+-above with ~60s of margin. A batch large enough to exceed even that ceiling
+-(roughly N > 46 wins) can still time out at the harness level — see Step 3b
+-below for what to do when that happens.
++(10 minutes)**, the harness's maximum for a foreground Bash call, which covers
++~46 wins. For a larger batch run the block with `run_in_background` instead —
++a background command is not subject to that ceiling and re-invokes you when it
++exits. If a foreground call did time out, see Step 3b.
+ 
+ ```bash
+ source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
+@@ -167,16 +154,8 @@
+ # this run's result (belt-and-suspenders on BUI-430's scratch dir).
+ rm -f "$SCRATCH/commit_response.json"
+ # BUI-472: this call is slow ON PURPOSE (BUI-465 pacing) — do not add
+-# --max-time here. Worst case = batch_size x ~9s (pacing: 3 Metron requests
+-# per win / 20 req-per-min budget = 60/20*3 = 9s/win) + up to 3 x 60s
+-# transient-trip cooldowns (METRON_MAX_TRANSIENT_TRIPS x
+-# METRON_TRANSIENT_COOLDOWN_SEC). A 40-win batch: 40*9 + 3*60 = 540s. BUI-473:
+-# same-series wins only pay the full 3 requests on the FIRST issue of that
+-# series (2 requests, ~6s/win, thereafter) — this worst case assumes no
+-# reuse (every win a distinct series) and is still the right number to size
+-# the timeout on. The risk is the HARNESS's Bash-invocation timeout, not this
+-# curl — that must be set explicitly on the tool call that runs this block
+-# (see the prose above: 600000ms, the harness's max).
++# --max-time here; the timeout to set is the tool call's own (see the prose
++# above: 600000ms, or run_in_background for a large batch).
+ # Not `curl -f` (discards the error body) — a partial_failure needs
+ # rows_written out of the 500 body. %{http_code} is 000 if never connected
+ # — OR if the connection was cut mid-flight while the server kept working
+@@ -365,5 +344,5 @@
+ | Re-deriving the ENDED+WON filter / dedup / seen-subtract / positional-identify-mapping by hand | Use `gixen record-win-prep` (BUI-353) — it owns that join in one tested place |
+ | Asking the user "if confidence is low" | Not a real gate — baseline confidence is 0.5 for every clean parse; `needs_review` (Step 2) is the only gate (BUI-354) |
+ | Assuming `needs_review` only covers null series/issue/lot parsing | It also gates a null `year` unconditionally, regardless of price (`REASON_MISSING_YEAR`, BUI-422/BUI-475 — vintage-key mis-resolution risk; the original `$25` price threshold was removed in BUI-475) |
+-| Invoking Step 3's Bash block without an explicit long timeout | It can legitimately run several minutes (BUI-465 pacing); set the tool call's timeout to 600000ms (the harness max) or it may hit the harness's own default timeout mid-write (BUI-472). Same-series batches finish faster in practice (BUI-473 reuses one series resolution per series), but the worst-case bound — and so the 600000ms recommendation — is unchanged: it assumes no reuse |
++| Invoking Step 3's Bash block without an explicit long timeout | It can legitimately run several minutes (BUI-465 pacing); set the tool call's timeout to 600000ms, or use `run_in_background` for a batch above ~46 wins (BUI-472) |
+ | Reporting "nothing to do" right after a Step 3 timeout / code-000 response | That is ambiguous, not confirmed failure — BUI-428 marks seen only on full success, so the timed-out call may have already landed; run Step 3b before saying anything (BUI-472) |

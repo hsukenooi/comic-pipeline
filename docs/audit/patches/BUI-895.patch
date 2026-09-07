@@ -1,0 +1,81 @@
+--- a/.claude/commands/comic/snipe-add.md
++++ b/.claude/commands/comic/snipe-add.md
+@@ -14,16 +14,13 @@
+ ./scripts/install.sh
+ ```
+ 
+-## Role in /comic:buy (BUI-360 / BUI-361)
++## Role in /comic:buy
+ 
+ The orchestrated buy flow does **not** dispatch this skill as a sub-agent:
+-`/comic:buy` Step 5 calls `gixen add-batch` inline, with this skill's pre-flight
+-bid sanity check and user approval gate folded into that step and the BUI-168
+-failure semantics enforced by the CLI itself. This file therefore has **no
+-EXECUTOR CONTRACT / ORCHESTRATOR NOTES split** (unlike `collection-check.md` and
+-`verify.md`, BUI-361) — with no orchestrated dispatch, an ORCHESTRATOR NOTES
+-section would have no reader. The whole file is the contract for its two
+-remaining callers:
++`/comic:buy` Step 5 calls `gixen add-batch` inline (BUI-360), with this skill's
++pre-flight bid sanity check and user approval gate folded into that step and
++the BUI-168 failure semantics enforced by the CLI itself. This file is the whole
++contract for its two callers:
+ 
+ - a **standalone `/comic:snipe-add`** invocation (user-approved item_ids + max
+   bids, outside the buy flow), and
+@@ -32,9 +29,9 @@
+ 
+ Both callers use the same routing rule as `/comic:buy` (BUI-436): **2+
+ approved items with the comics server up → `gixen add-batch`** (§ Add to
+-Gixen) is the primary path — the hand-looped per-item `gixen add` + BUI-168
+-prose discipline is now scoped to a single add or the direct-Gixen fallback,
+-where `add-batch` (server-mode-only) doesn't apply.
++Gixen). The per-item `gixen add` loop and its BUI-168 discipline apply only to
++a single add or the direct-Gixen fallback, where `add-batch` (server-mode-only)
++doesn't exist.
+ 
+ `buy.md` references specific parts of this file (§ Bid groups, the CGC-float
+ grade conversion under *Available `add` flags*, the pre-flight bid sanity
+@@ -66,24 +63,21 @@
+ 
+ **1. Server health**
+ 
+-Before doing anything else, verify the server is configured and up.
+-
+-Check that `COMICS_SERVER_URL` is set:
++Before doing anything else, resolve and health-gate the comics server through
++`comics-api` (BUI-510 — it resolves the URL from the environment or the
++Mac Mini / MacBook hostname, checks `/health`, and exits non-zero on either
++failure):
+ 
+ ```bash
+-echo "${COMICS_SERVER_URL:-UNSET}"
++comics-api GET /health >/dev/null
+ ```
+ 
+-If it is not set, **stop immediately** with: "`COMICS_SERVER_URL` is not set. Snipes cannot be recorded in the DB. Set the variable and confirm the server is running before continuing." Do not proceed.
++If that fails, **stop** with: "The comics server is not reachable. Snipes cannot
++be recorded in the DB. Confirm the server is running before continuing." The
++only exception is direct-Gixen mode (§ Fallback invocations), which the user
++must ask for explicitly — an unrecorded snipe is invisible to FMV linking,
++`/comic:verify`, and `/comic:collection-add`.
+ 
+-Verify the server is responding:
+-
+-```bash
+-curl -sf "$COMICS_SERVER_URL/health"
+-```
+-
+-If this fails or returns non-200, **stop immediately** with: "The comics server at `$COMICS_SERVER_URL` is not responding. Snipes cannot be recorded in the DB. Confirm the server is running before continuing." Do not proceed.
+-
+ **2. Bid amounts**
+ 
+ Compare each auction's current bid against the proposed max bid. If current bid ≥ max bid, surface it to the user — Gixen will still register the snipe but it fires below market and won't win. Ask whether to raise the max or skip before proceeding.
+@@ -145,7 +139,7 @@
+ 
+ 1. **Do not** record that item as `✅ Added` or silently continue as if it
+    succeeded — mark it `❌ Failed` in the output table with the error.
+-2. **Re-check server health** before the next item (`curl -sf "$COMICS_SERVER_URL/health"`).
++2. **Re-check server health** before the next item (`comics-api GET /health >/dev/null`).
+    If the server is down, STOP the batch and report which items were added and
+    which remain unattempted — don't keep firing adds at a dead server.
+ 3. At the end, **summarize added vs. failed vs. remaining** so the user knows
