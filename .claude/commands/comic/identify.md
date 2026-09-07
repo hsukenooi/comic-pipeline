@@ -18,7 +18,7 @@ dispatch the **`comic-identifier` subagent** with:
 - **NAME** — give the subagent a name at spawn (e.g. `comic-identifier`, BUI-366)
   so it stays addressable for follow-ups later in the run (see § Follow-ups below)
 
-The subagent runs `ebay_fetch.py --json`, parses the JSON, and returns **only** the
+The subagent runs `ebay-fetch --identify` (one call, BUI-900) and returns **only** the
 formatted identification table. Raw JSON and intermediate parse steps never appear in
 this context.
 
@@ -28,7 +28,8 @@ The subagent returns a fully-formatted identification table — columns `# | Com
 | Issue | Year | Grade | Variant | Type | Current Price | Bids | Seller | Ends |
 Notes`, with the `#` cell linking to the eBay listing. The per-column derivation
 contract (confidence-gating, Ends computation, grade signals, no extra API call
-for price/bids) is owned by `.claude/agents/comic-identifier.md`. Present the
+for price/bids) is owned by `ebay-fetch --identify` in
+`apps/ebay/src/ebay_fetch.py` (BUI-900); the agent passes its output through. Present the
 table as-is; two columns carry weight downstream:
 
 - **Year** — forward it verbatim into `/comic:collection-check` (blank stays
@@ -46,22 +47,21 @@ This table is the input for `/comic:collection-check` and `/comic:fmv`.
 
 ## Follow-ups: message the same agent (BUI-366)
 
-The identifier agent keeps the full `ebay_fetch.py` JSON in its context after it
-returns the table — item specifics, description text, printing/variant evidence
-none of which entered the caller's context. For a follow-up question about a
-listing it already fetched (e.g. "does item N's item specifics say first
-printing?", "what does the description say about the variant?"), SendMessage
-the **same named** agent (§ Step 1 — naming it at spawn is the precondition
-that makes this addressable) rather than dispatching a fresh one — the answer
-is one tool call from JSON it already holds; a fresh spawn re-fetches and
-re-parses everything (in the 2026-07-16 run: 1 tool call vs 9).
+The identifier agent stays addressable after it returns the table. For a
+follow-up question about a listing it already identified (e.g. "does item N's
+item specifics say first printing?", "what does the description say about the
+variant?"), SendMessage the **same named** agent (§ Step 1 — naming it at spawn
+is the precondition that makes this addressable) rather than dispatching a
+fresh one: it answers from one `ebay-fetch --json <id>` call for that listing,
+whose item specifics and description snippet never enter the caller's context,
+where a fresh spawn re-runs the whole identify step.
 
 ## Common Mistakes
 
 | Mistake | Fix |
 |---|---|
-| Running `ebay_fetch.py` inline instead of dispatching the subagent | Dispatch `comic-identifier` — keeps raw JSON out of this context |
-| Using firecrawl browser on eBay | `ebay_fetch.py` calls the Browse API directly, no bot detection |
+| Running `ebay-fetch` inline instead of dispatching the subagent | Dispatch `comic-identifier` — keeps the fetch, its stderr, and any follow-up JSON out of this context, and keeps the agent addressable for follow-ups |
+| Using firecrawl browser on eBay | `ebay-fetch` calls the Browse API directly, no bot detection |
 | Assuming grade when `grade_source` is `"missing"` | The subagent flags it — don't override without evidence |
 | Missing variants | The subagent checks both `variant` field and `item_specifics` |
 | Treating `condition` field as grade | `condition` is eBay's generic label (e.g. "Like New"); the subagent uses the parsed `grade` field |

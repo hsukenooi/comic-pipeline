@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -1892,6 +1893,24 @@ class TestCLIPlumbingFromRecordedFixture:
         assert "SPIDER-MAN" in captured.out.upper()
         assert _RECORDED_ITEM_ID in captured.out
 
+    def test_identify_output(self, capsys):
+        """BUI-900: --identify prints the /comic:identify markdown table from
+        one fetch — the row links the listing, series/issue come from
+        comic_identity, and the Ends cell is relative to --now."""
+        captured = self._run_main(
+            ["--identify", "--now", "2020-01-01T00:00:00Z", _RECORDED_ITEM_ID], capsys
+        )
+        lines = captured.out.strip().splitlines()
+        assert lines[0] == "| " + " | ".join(ebay_fetch.IDENTIFY_COLUMNS) + " |"
+        assert lines[1] == "|" + "---|" * len(ebay_fetch.IDENTIFY_COLUMNS)
+        assert lines[2].startswith(f"| [1](https://www.ebay.com/itm/{_RECORDED_ITEM_ID}) | ")
+        cells = [c.strip() for c in lines[2].strip().strip("|").split(" | ")]
+        assert "SPIDER-MAN" in cells[1].upper()
+        assert cells[2] == "#300"
+        assert cells[6] == "Auction"
+        assert re.fullmatch(r"\d+d", cells[10])   # fixture auction ends years after --now: a plain day count
+        assert len(lines) == 3
+
     def test_json_output(self, capsys):
         captured = self._run_main(["--json", _RECORDED_ITEM_ID], capsys)
         data = json.loads(captured.out)
@@ -2238,3 +2257,230 @@ class TestGetItemAspects:
 
         cached = ebay_fetch._aspects_cache_get("42")
         assert cached == {"Publication Year": "1975"}
+
+
+
+# --- BUI-900: the identification table, built by the CLI ---------------------
+
+class TestFormatTimeRemaining:
+    NOW = datetime(2026, 9, 7, 12, 0, 0, tzinfo=timezone.utc)
+
+    def test_under_an_hour_is_minutes_with_warning(self):
+        assert ebay_fetch.format_time_remaining("2026-09-07T12:47:30Z", self.NOW) == "\u26a0\ufe0f 47m"
+
+    def test_under_a_day_is_hours_with_warning(self):
+        assert ebay_fetch.format_time_remaining("2026-09-08T06:00:00Z", self.NOW) == "\u26a0\ufe0f 18h"
+
+    def test_a_day_or_more_is_days_without_warning(self):
+        assert ebay_fetch.format_time_remaining("2026-09-09T13:00:00Z", self.NOW) == "2d"
+
+    def test_ended_auction_says_so(self):
+        assert ebay_fetch.format_time_remaining("2026-09-07T11:59:00Z", self.NOW) == "\u26a0\ufe0f ended"
+
+    def test_seconds_left_rounds_up_to_one_minute(self):
+        assert ebay_fetch.format_time_remaining("2026-09-07T12:00:20Z", self.NOW) == "\u26a0\ufe0f 1m"
+
+    def test_offset_timestamps_are_honoured(self):
+        # 14:00 at +02:00 is 12:00Z + 0 -> ended? No: 14:00+02:00 == 12:00Z, so ended.
+        assert ebay_fetch.format_time_remaining("2026-09-07T14:00:00+02:00", self.NOW) == "\u26a0\ufe0f ended"
+        assert ebay_fetch.format_time_remaining("2026-09-08T14:00:00+02:00", self.NOW) == "1d"
+
+    @pytest.mark.parametrize("bad", [None, "", "not-a-date", 12345])
+    def test_unusable_end_date_is_none(self, bad):
+        assert ebay_fetch.format_time_remaining(bad, self.NOW) is None
+
+
+def _identify_item(**overrides):
+    base = {
+        "item_id": "298217294954",
+        "title": "AMAZING SPIDER-MAN #300 NM Marvel 1988 VENOM",
+        "listing_type": "Auction",
+        "current_price": "$102.50",
+        "bid_count": 12,
+        "end_date_iso": "2026-09-09T13:00:00Z",
+        "grade": "NM",
+        "grade_source": "item_specifics",
+        "grade_from_description": None,
+        "variant": None,
+        "cover_year": 1988,
+        "seller": "beatlebluecat",
+    }
+    base.update(overrides)
+    return base
+
+
+class TestIdentifyRow:
+    NOW = datetime(2026, 9, 7, 12, 0, 0, tzinfo=timezone.utc)
+
+    def _cells(self, row):
+        return [c.strip() for c in row.strip().strip("|").split(" | ")]
+
+    def test_clean_auction_row(self):
+        row = ebay_fetch.identify_row(1, _identify_item(), self.NOW)
+        cells = self._cells(row)
+        assert cells == [
+            "[1](https://www.ebay.com/itm/298217294954)", "AMAZING SPIDER-MAN", "#300",
+            "1988", "NM", "\u2014", "Auction", "$102.50", "12", "beatlebluecat", "2d", "\u2014",
+        ]
+
+    def test_grade_from_title_is_noted(self):
+        row = ebay_fetch.identify_row(1, _identify_item(grade="VF", grade_source="title"), self.NOW)
+        cells = self._cells(row)
+        assert cells[4] == "VF"
+        assert cells[11] == "grade from title"
+
+    def test_description_grade_is_a_weak_signal_not_no_grade(self):
+        row = ebay_fetch.identify_row(
+            1, _identify_item(grade=None, grade_source="missing", grade_from_description="FN+"), self.NOW
+        )
+        cells = self._cells(row)
+        assert cells[4] == "FN+"
+        assert cells[11] == "grade from description only"   # light note, no warning mark
+
+    def test_no_grade_anywhere_is_flagged(self):
+        row = ebay_fetch.identify_row(
+            1, _identify_item(grade=None, grade_source="missing", grade_from_description=None), self.NOW
+        )
+        cells = self._cells(row)
+        assert cells[4] == "\u2014"
+        assert "\u26a0\ufe0f Grade not stated" in cells[11]
+
+    def test_bin_listing_has_dash_ends_and_a_flag(self):
+        row = ebay_fetch.identify_row(
+            1, _identify_item(listing_type="BIN", bid_count=None, end_date_iso=None), self.NOW
+        )
+        cells = self._cells(row)
+        assert cells[6] == "BIN"
+        assert cells[8] == "\u2014"   # bids: null renders as dash
+        assert cells[10] == "\u2014"  # ends
+        assert "\u26a0\ufe0f Buy It Now" in cells[11]
+
+    def test_zero_bids_renders_zero_not_blank(self):
+        row = ebay_fetch.identify_row(1, _identify_item(bid_count=0), self.NOW)
+        assert self._cells(row)[8] == "0"
+
+    def test_null_cover_year_is_a_dash_never_a_guess(self):
+        row = ebay_fetch.identify_row(1, _identify_item(cover_year=None), self.NOW)
+        assert self._cells(row)[3] == "\u2014"
+
+    def test_lot_listing_shows_range_and_flag(self):
+        row = ebay_fetch.identify_row(
+            1, _identify_item(title="Fantastic Four #48-50 lot Marvel 1966"), self.NOW
+        )
+        cells = self._cells(row)
+        assert cells[2] == "#48-50"
+        assert "Lot listing" in cells[11]
+
+    def test_unparseable_title_is_flagged_not_guessed(self):
+        row = ebay_fetch.identify_row(1, _identify_item(title="Ephemera and postcards, no title"), self.NOW)
+        cells = self._cells(row)
+        assert cells[2] == "\u2014"
+        assert "Could not parse series/issue from title" in cells[11]
+
+    def test_lot_with_unparsed_contents_is_still_flagged_as_a_lot(self):
+        row = ebay_fetch.identify_row(1, _identify_item(title="Huge Spider-Man Comic Lot!!"), self.NOW)
+        cells = self._cells(row)
+        assert cells[2] == "\u2014"
+        assert "Lot listing" in cells[11]
+
+    def test_non_contiguous_lot_lists_its_members_not_a_range(self):
+        row = ebay_fetch.identify_row(
+            1, _identify_item(title="Amazing Spider-Man 33,45,50,53 lot Marvel"), self.NOW
+        )
+        cells = self._cells(row)
+        assert cells[2] == "#33, #45, #50, #53"
+        assert "Lot listing" in cells[11]
+
+    def test_lot_issue_cell_shapes(self):
+        assert ebay_fetch._lot_issue_cell([]) is None
+        assert ebay_fetch._lot_issue_cell(["7"]) == "#7"
+        assert ebay_fetch._lot_issue_cell(["48", "49", "50"]) == "#48-50"
+        assert ebay_fetch._lot_issue_cell(["66", "64", "65"]) == "#66, #64, #65"
+        assert ebay_fetch._lot_issue_cell(["1", "Annual 2"]) == "#1, #Annual 2"
+
+    def test_pipes_in_values_cannot_break_the_row(self):
+        row = ebay_fetch.identify_row(1, _identify_item(seller="a|b", variant="x|y"), self.NOW)
+        assert row.count(" | ") == len(ebay_fetch.IDENTIFY_COLUMNS) - 1
+        assert "a\\|b" in row
+
+
+class TestFormatIdentifyTable:
+    NOW = datetime(2026, 9, 7, 12, 0, 0, tzinfo=timezone.utc)
+
+    def test_header_rows_and_failure_lines(self):
+        out = ebay_fetch.format_identify_table(
+            [_identify_item(), _identify_item(item_id="111")], self.NOW, failed=["999"]
+        )
+        lines = out.splitlines()
+        assert lines[0] == "| " + " | ".join(ebay_fetch.IDENTIFY_COLUMNS) + " |"
+        assert lines[2].startswith("| [1](https://www.ebay.com/itm/298217294954) |")
+        assert lines[3].startswith("| [2](https://www.ebay.com/itm/111) |")
+        assert lines[4].startswith("\u26a0\ufe0f Item 999: fetch failed")
+        assert len(lines) == 5
+
+    def test_no_items_means_only_failure_lines_and_no_header(self):
+        out = ebay_fetch.format_identify_table([], self.NOW, failed=["1", ("junk", "could not parse an item id from this input")])
+        assert "| # |" not in out
+        assert out.count("fetch failed") == 1
+        assert "\u26a0\ufe0f Item junk: could not parse an item id from this input" in out
+
+
+class TestIdentifyMainFailures:
+    def _run(self, argv, capsys, responses):
+        """responses: item_id -> status code (200 uses the recorded body)."""
+        def fake_get(url, *a, **k):
+            resp = MagicMock()
+            item_id = str((k.get("params") or {}).get("legacy_item_id", ""))
+            code = responses.get(item_id, 200)
+            resp.status_code = code
+            resp.json.return_value = _recorded_auction_response() if code == 200 else {}
+            resp.text = ""
+            return resp
+        with patch("ebay_fetch.load_config", return_value=("id", "secret", ebay_fetch.PRODUCTION_BASE)):
+            with patch("ebay_fetch.get_token", return_value="tok"):
+                with patch("ebay_fetch.requests.get", side_effect=fake_get):
+                    with patch("ebay_fetch.time.sleep"):
+                        try:
+                            ebay_fetch.main(argv)
+                            code = 0
+                        except SystemExit as exc:
+                            code = exc.code
+        return code, capsys.readouterr()
+
+    def test_a_dropped_item_gets_a_failure_line_under_the_table(self, capsys):
+        code, captured = self._run(
+            ["--identify", "--now", "2020-01-01T00:00:00Z", _RECORDED_ITEM_ID, "123456789"],
+            capsys, {"123456789": 404},
+        )
+        assert code == 0
+        lines = captured.out.strip().splitlines()
+        assert lines[2].startswith(f"| [1](https://www.ebay.com/itm/{_RECORDED_ITEM_ID}) |")
+        assert lines[3].startswith("\u26a0\ufe0f Item 123456789: fetch failed")
+
+    def test_every_item_failing_exits_nonzero_with_no_table(self, capsys):
+        code, captured = self._run(
+            ["--identify", "--now", "2020-01-01T00:00:00Z", "123456789"], capsys, {"123456789": 404}
+        )
+        assert code == 1
+        assert "| # |" not in captured.out
+        assert "Item 123456789: fetch failed" in captured.out
+
+    def test_bad_now_is_a_usage_error_before_any_fetch(self, capsys):
+        calls = []
+        with patch("ebay_fetch.load_config", return_value=("id", "secret", ebay_fetch.PRODUCTION_BASE)):
+            with patch("ebay_fetch.get_token", side_effect=lambda *a, **k: calls.append("token") or "tok"):
+                with patch("ebay_fetch.requests.get", side_effect=lambda *a, **k: calls.append("get")):
+                    with pytest.raises(SystemExit) as exc:
+                        ebay_fetch.main(["--identify", "--now", "yesterday", _RECORDED_ITEM_ID])
+        assert exc.value.code == 2
+        assert "--now is not an ISO-8601 timestamp" in capsys.readouterr().err
+        assert calls == []   # rejected before auth and before any API call
+
+    def test_unparseable_input_gets_its_own_line_under_the_table(self, capsys):
+        code, captured = self._run(
+            ["--identify", "--now", "2020-01-01T00:00:00Z", _RECORDED_ITEM_ID, "not-an-item"], capsys, {}
+        )
+        assert code == 0
+        lines = captured.out.strip().splitlines()
+        assert lines[2].startswith(f"| [1](https://www.ebay.com/itm/{_RECORDED_ITEM_ID}) |")
+        assert lines[3] == "\u26a0\ufe0f Item not-an-item: could not parse an item id from this input"
