@@ -13,17 +13,12 @@ The skill is **read-only against your collection and wish list** — it writes o
 
 ## Prerequisites
 
-**`COMICS_SERVER_URL` must be set.** The script fetches your wish list over HTTP and hard-fails if the server is unreachable. Set it once in `~/.zshrc`:
+**Resolve the comics server first.** The script fetches your wish list over HTTP from `COMICS_SERVER_URL` and hard-fails if it is unset or unreachable. It is a child process, so the variable must be exported into this shell — use the shared resolver (BUI-172), which honours a preset value or infers it from the Mac Mini / MacBook hostname:
 
 ```bash
-# MacBook (connects to Mac Mini over Tailscale)
-export COMICS_SERVER_URL=http://mac-mini.tail9b7fa5.ts.net:8080
-
-# Mac Mini (running locally)
-export COMICS_SERVER_URL=http://localhost:8080
+source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
+comics_resolve_server || exit 1   # exports COMICS_SERVER_URL for wishlist-sellers below
 ```
-
-`GIXEN_SERVER_URL` is a deprecated alias — it still works but emits a warning. Migrate to `COMICS_SERVER_URL`.
 
 **The `wishlist-sellers` console script must be on PATH.** After pulling this feature, re-run `./scripts/install.sh` to install it:
 
