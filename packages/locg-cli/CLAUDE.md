@@ -2,6 +2,19 @@
 
 CLI for [League of Comic Geeks](https://leagueofcomicgeeks.com). Scraping-based (no official API).
 
+> **LOCG live access is blocked (standing state since 2026-08-10).** locg.com rejects all
+> programmatic/agent traffic, so every command that launches the Playwright client fails from
+> an agent session: `search`, `releases`, `comic`, `series`, `find`, `lookup`, `login`, `add`,
+> `remove`, `update`, `check`, `pull-list`, `read-list`, `collection has`, the bare
+> `collection` list view, and `wish-list` when no local cache exists. Do not attempt or
+> suggest automating LOCG. The collection and wish-list are read and written through the
+> comics server (`/api/comics/*`), and the LOCG sync is the manual CSV round-trip in
+> `/comic:collection-sync`. Unaffected: the Metron-backed `creator-run` and `resolve-year`,
+> the server-backed `collection check-batch`, the local-store `collection` subcommands
+> (`import`, `export`, `status`, `record-win`, `audit-*`, `backfill`, ...), the local
+> `wish-list add`/`remove`/`set-year`, and `cache`. The dispatch rule is `_needs_client` in
+> `cli.py`.
+
 ## CLI Usage
 
 Run with `PYTHONPATH=src python3 -m locg <command>` (or `locg <command>` if installed).
