@@ -10,13 +10,13 @@ import re
 import sys
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
 from urllib.parse import quote
 
-from comic_identity import confident_cover_year
+from comic_identity import confident_cover_year, identify_comic
 
 
 def _version_string() -> str:
@@ -1246,6 +1246,131 @@ def print_table(items, fields=None):
         print(line)
 
 
+# ---------------------------------------------------------------------------
+# BUI-900: the /comic:identify table, emitted by the CLI instead of an agent.
+# Everything the comic-identifier agent used to do by hand is deterministic:
+# series/issue via comic_identity.identify_comic (the one canonical parser),
+# the grade verdict ebay-fetch already computed, the confidence-gated cover
+# year, and time-to-end from a caller-supplied UTC reference.  The agent now
+# runs one `ebay-fetch --identify` call and returns this table verbatim.
+# ---------------------------------------------------------------------------
+
+IDENTIFY_COLUMNS = (
+    "#", "Comic", "Issue", "Year", "Grade", "Variant", "Type",
+    "Current Price", "Bids", "Seller", "Ends", "Notes",
+)
+_DASH = "\u2014"
+_WARN = "\u26a0\ufe0f"
+
+
+def parse_utc_timestamp(text):
+    """Parse an ISO-8601 timestamp (``Z`` or offset) into an aware datetime.
+
+    Naive input is taken as UTC.  Raises ValueError on anything unparseable so
+    a bad --now fails the call instead of silently computing wrong deadlines.
+    """
+    dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def format_time_remaining(end_iso, now):
+    """Relative time-to-end for the Ends column, per the identify contract:
+    ``<60 min -> "47m"``, ``<24h -> "18h"``, ``>=1 day -> "2d"``; anything
+    under 24h carries the warning mark; an already-ended auction says so.
+    Returns None when there is no usable end date (the caller renders a dash).
+    """
+    if not end_iso:
+        return None
+    try:
+        end = parse_utc_timestamp(end_iso)
+    except (ValueError, TypeError, AttributeError):
+        return None
+    secs = (end - now).total_seconds()
+    if secs <= 0:
+        return f"{_WARN} ended"
+    if secs < 3600:
+        return f"{_WARN} {max(1, int(secs // 60))}m"
+    if secs < 86400:
+        return f"{_WARN} {int(secs // 3600)}h"
+    return f"{int(secs // 86400)}d"
+
+
+def _cell(value):
+    """Render a table cell: None/empty -> dash, pipes escaped so a title or a
+    reason can never break the markdown row."""
+    if value is None or value == "":
+        return _DASH
+    return str(value).replace("|", "\\|")
+
+
+def identify_row(index, item, now):
+    """One markdown row of the identification table for a parsed listing."""
+    notes = []
+    ident = identify_comic(item.get("title"))
+
+    series = ident.series
+    if ident.is_lot and ident.constituent_issues:
+        nums = [str(n) for n in ident.constituent_issues]
+        issue = f"#{nums[0]}-{nums[-1]}" if len(nums) > 1 else f"#{nums[0]}"
+        notes.append(f"{_WARN} Lot listing, not a single-issue identification")
+    elif ident.issue:
+        issue = f"#{ident.issue}"
+    else:
+        issue = None
+    if not series or not issue or (ident.confidence is not None and ident.confidence <= 0.3):
+        notes.append(f"{_WARN} Could not parse series/issue from title")
+
+    grade = item.get("grade")
+    if grade:
+        grade_cell = grade
+        if item.get("grade_source") == "title":
+            notes.append("grade from title")
+    elif item.get("grade_from_description"):
+        grade_cell = item.get("grade_from_description")
+        notes.append(f"{_WARN} Grade from description only")
+    else:
+        grade_cell = None
+        notes.append(f"{_WARN} Grade not stated")
+
+    listing_type = item.get("listing_type")
+    if listing_type == "BIN":
+        notes.append(f"{_WARN} Buy It Now")
+        ends = None
+    else:
+        ends = format_time_remaining(item.get("end_date_iso"), now)
+
+    bids = item.get("bid_count")
+    bids_cell = _DASH if bids is None else str(bids)
+
+    item_id = item.get("item_id")
+    link = f"[{index}](https://www.ebay.com/itm/{item_id})"
+    cells = [
+        link, _cell(series), _cell(issue), _cell(item.get("cover_year")),
+        _cell(grade_cell), _cell(item.get("variant")), _cell(listing_type),
+        _cell(item.get("current_price")), bids_cell, _cell(item.get("seller")),
+        _cell(ends), _cell("; ".join(notes)),
+    ]
+    return "| " + " | ".join(cells) + " |"
+
+
+def format_identify_table(items, now, failed_item_ids=()):
+    """The full /comic:identify markdown table plus one warning line per
+    listing that could not be fetched (never silently dropped, BUI-166)."""
+    lines = []
+    if items:
+        lines.append("| " + " | ".join(IDENTIFY_COLUMNS) + " |")
+        lines.append("|" + "---|" * len(IDENTIFY_COLUMNS))
+        for i, item in enumerate(items, 1):
+            lines.append(identify_row(i, item, now))
+    for item_id in failed_item_ids:
+        lines.append(
+            f"{_WARN} Item {item_id}: fetch failed \u2014 see the ebay-fetch error line on stderr"
+        )
+    return "\n".join(lines)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Fetch structured listing data from eBay.",
@@ -1275,6 +1400,20 @@ def main(argv=None):
         type=str,
         default=None,
         help="Comma-separated fields to include",
+    )
+    parser.add_argument(
+        "--identify",
+        action="store_true",
+        help="Print the /comic:identify markdown table (series/issue via "
+             "comic-identify, cover year, grade verdict, relative time to end) "
+             "instead of the plain listing table (BUI-900)",
+    )
+    parser.add_argument(
+        "--now",
+        type=str,
+        default=None,
+        help="ISO-8601 UTC reference time for the Ends column of --identify "
+             "(default: the current time)",
     )
     parser.add_argument(
         "--env",
@@ -1328,14 +1467,27 @@ def main(argv=None):
 
     # Fetch items
     results = []
+    failed_item_ids = []
     for item_id in item_ids:
         data = fetch_item(item_id, token, base_url)
         if data:
             parsed = parse_item(data)
             results.append(parsed)
+        else:
+            failed_item_ids.append(item_id)
 
     # Output
-    if args.json_output:
+    if args.identify:
+        try:
+            now = parse_utc_timestamp(args.now) if args.now else datetime.now(timezone.utc)
+        except ValueError:
+            print(f"Error: --now is not an ISO-8601 timestamp: {args.now!r}", file=sys.stderr)
+            sys.exit(2)
+        print(format_identify_table(results, now, failed_item_ids))
+        if not results:
+            # Every fetch failed: a hard failure, never an empty table (BUI-166).
+            sys.exit(1)
+    elif args.json_output:
         # Filter fields for JSON output only
         if args.fields:
             field_set = {f.strip() for f in args.fields.split(",")}
