@@ -121,7 +121,7 @@ locg login
 locg login -u <username> -p <password>
 ```
 
-Session cookies are stored at `~/.config/locg/cookies.json`. Sessions can expire server-side; if you get "Session expired", run `locg login` again.
+The session and `cf_clearance` cookies persist in the Playwright profile at `~/.config/locg/playwright-profile/`. Sessions can expire server-side; if you get "Session expired", run `locg login` again.
 Every authenticated command verifies the session server-side once per invocation (one extra GET). Expired sessions produce `{"error": "Session expired. Run: locg login"}` on stderr and exit 1.
 
 #### Auto-login from `.env`
@@ -177,5 +177,3 @@ PYTHONPATH=src python3 -m pytest tests/ -v
 - `beautifulsoup4` — HTML parsing
 - `python-dotenv` — load `~/.config/locg/.env` at startup for auto-login
 - `pytest` (test only)
-
-**Note:** Existing `~/.config/locg/cookies.json` is no longer read. Run `locg login` once after upgrading to populate the new Playwright profile.

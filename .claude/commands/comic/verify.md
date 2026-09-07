@@ -9,9 +9,9 @@ Walks the bid → bid_fmvs → fmv → comics chain for each comic in a working 
 
 This is a **warn-only** verification — it doesn't fix anything, just surfaces gaps so you (or future-you next session) can act.
 
-## How to read this file (BUI-361, updated BUI-507)
+## How to read this file
 
-**EXECUTOR CONTRACT** = run it; **ORCHESTRATOR NOTES** = the verdict ladder (meanings only — the endpoint returns the guidance text itself as of BUI-507, so `/comic:buy` Step 6 no longer reads this file at all). Standalone `/comic:verify` runs: do both, in order.
+**EXECUTOR CONTRACT** = run it; **ORCHESTRATOR NOTES** = the verdict ladder (meanings only — the endpoint returns the per-verdict guidance text itself, and `/comic:buy` Step 6 reads it from its add-batch output without opening this file). Standalone `/comic:verify` runs: do both, in order.
 
 ---
 
@@ -21,8 +21,7 @@ This is a **warn-only** verification — it doesn't fix anything, just surfaces 
 
 Resolve and health-gate the server via `comics-api` (BUI-510,
 `docs/conventions/comics-server-call.md`) — it resolves + health-gates +
-calls in one shot, so there's no shell-state to carry between blocks (the
-BUI-352/BUI-375 trap this structurally removes):
+calls in one shot, so there is no shell state to carry between blocks:
 
 ```bash
 comics-api GET /health >/dev/null
@@ -47,10 +46,12 @@ Lots (item_ids linked to multiple comics): pass one row per `(item_id, grade)` y
 
 ### Write the input
 
-Before the Call block below, write this run's working list to `working_list.verify.json`, **unconditionally overwriting** any file already at that path:
+Before the Call block below, write this run's working list to `working_list.verify.json` in the run's scratch dir (`comics_scratch_dir`, BUI-430 — never the repo working tree), **unconditionally overwriting** any file already at that path:
 
 ```bash
-cat > working_list.verify.json <<'EOF'
+source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
+SCRATCH="$(comics_scratch_dir)" || exit 1
+cat > "$SCRATCH/working_list.verify.json" <<'EOF'
 {
   "items": [
     {"item_id": "123456789", "grade": 9.2, "locg_id": 6977652}
@@ -69,9 +70,11 @@ surfaces the error body** instead of silently returning an empty string
 (BUI-169):
 
 ```bash
+source "$(git rev-parse --show-toplevel)/scripts/comics-server.sh"
+SCRATCH="$(comics_scratch_dir)" || exit 1
 comics-api POST /api/comics/verify \
   -H 'content-type: application/json' \
-  -d @working_list.verify.json || {
+  -d @"$SCRATCH/working_list.verify.json" || {
     echo "Verification call failed — could not confirm linkage. Do NOT report all-clear." >&2
     exit 1
   }
@@ -172,9 +175,9 @@ Verdicts (ladder — first failure wins):
 
 **A `ledger-advisory` book verifies as `no_comic`, and that is correct (BUI-663).** When `comic-fmv` cannot reach either sold-comps provider it may emit a degraded ADVISORY band priced from the comps ledger — `source: "ledger-advisory"` on its `--brief` line. That band is **never written to the comics server**: no `comics` row, no `fmv` row, no junction. So a bid for such a book lands here at the bottom of the ladder, exactly like a book that was never priced at all. Do **not** treat that as a linkage bug to chase, and do **not** try to link the advisory band by hand — the fix is to re-run `/comic:fmv` once the providers recover, which writes a real price and moves the row up the ladder. Nothing in this skill can see an advisory band, by design: `/comic:verify` reads the DB, and the whole point is that a ledger-derived number never reaches it.
 
-**Per-verdict guidance (BUI-507):** no longer duplicated here — the endpoint
-returns a `guidance` string on every result (see EXECUTOR CONTRACT § Output).
-Both this skill and `/comic:buy` Step 6 render that string directly.
+**Per-verdict guidance:** the endpoint returns a `guidance` string on every
+result (BUI-507; see EXECUTOR CONTRACT § Output). Both this skill and
+`/comic:buy` Step 6 render that string directly.
 
 ### Never report a false all-clear
 
@@ -186,14 +189,14 @@ call is "verification failed", never "nothing to flag" (BUI-169).
 
 ### When to invoke
 
-- **End of `/comic:buy`** — Step 6. Since BUI-360 the verify call itself rides
-  along with Step 5 (`gixen add-batch --verify`); since BUI-507 each row's
-  embedded `verify.guidance` is server-provided, so Step 6 reads it straight
-  off the JSON without opening this file. No executor dispatch, no second call.
+- **End of `/comic:buy`** — Step 6. The verify call rides along with Step 5
+  (`gixen add-batch --verify`, BUI-360) and each row's embedded
+  `verify.guidance` is server-provided (BUI-507), so Step 6 reads it straight
+  off the JSON without opening this file.
 - **After ad-hoc backfills** — when reconciling history (PER-70-style cleanup), pass the patched item_ids in to confirm.
 - **Sanity-check before `/comic:collection-add`** — if the FMV side is broken, the LOCG collection write is going to be confused too.
 
 ### Scope
 
 - Warn-only — surface gaps, don't block, don't fix.
-- **LOCG collection verification** (did the comic land in LOCG with the right state?) is handled by step 7 of `/comic:collection-add` — it runs inline in the same Playwright session and checks `in_collection`, `wish_removed`, and `db_linked`. This skill covers the bid→fmv→comic DB chain only.
+- **Collection-side verification** (did the win land in the collection store and clear pending?) belongs to `/comic:collection-add` (the record-win commit response) and `/comic:collection-sync` Step 6's post-import check. This skill covers the bid→fmv→comic DB chain only.
