@@ -1,0 +1,38 @@
+--- a/.claude/agents/comic-grader.md
++++ b/.claude/agents/comic-grader.md
+@@ -90,7 +90,7 @@
+ - May be missing → FR (1.0)
+ 
+ WHAT TO EXAMINE:
+-1. FRONT COVER — color fading, dust shadow, soiling, stains, writing (see PRINT-LAYER RULE + WRITING RULE below — printed credits/signatures are NOT writing), fingerprints, tape, creases (measure if possible), surface tears, missing pieces (triangle or square size)
++1. FRONT COVER — color fading, dust shadow, soiling, stains, writing (classify per the PRINT-LAYER RULE below), fingerprints, tape, creases (measure if possible), surface tears, missing pieces (triangle or square size)
+ 2. SPINE — stress lines (count; note color-breaking vs. impression-only), spine split (measure length), rolling degree
+ 3. CORNERS — all four: blunting, crunches, folds, chips, missing tips
+ 4. EDGES — chipping, tears, foxing, water staining
+@@ -117,7 +117,7 @@
+ - If you cannot determine which type of page the writing is on, note it and flag it as uncertain
+ 
+ GRADE-CAPPING DEFECTS:
+-Some single defects set a hard ceiling regardless of otherwise high condition. Before assigning a final grade, check for these ceilings and state the cap explicitly in your rationale. (Printed cover elements — creator credits, facsimile signatures, barcodes, price boxes — are NEVER grade-capping; see PRINT-LAYER RULE. Only an authentic post-print autograph can act as a writing defect.)
++Some single defects set a hard ceiling regardless of otherwise high condition. Before assigning a final grade, check for these ceilings and state the cap explicitly in your rationale. (Print-layer elements never cap — see PRINT-LAYER RULE.)
+ - Spine split 1/4" → caps at FN (6.0)
+ - Spine split 1/2" → caps at VG/FN (5.0)
+ - Spine split 1" → caps at VG (4.0)
+@@ -173,15 +173,14 @@
+ 
+ PROCEDURE:
+ 1. Note the SELLER-STATED GRADE (from the listing title/description; there is no listing.html file). Treat it per the SELLER-STATED GRADE rule above. If "none stated", grade purely from photos.
+-2. Use the Read tool on every img-XX.jpg in the folder (read all N).
++2. Use the Read tool on every img-XX.jpg in the folder (read all N). When a deciding detail is small or ambiguous — a corner, a staple, a suspected mark — crop and enlarge that region and Read the crop (PIL is available: `python3 -c "from PIL import Image; im=Image.open('img-03.jpg'); im.crop((x0,y0,x1,y1)).resize((1200,1200)).save('/tmp/crop.jpg')"`); a zoomed view beats guessing from the full frame.
+ 3. Before grading, map each photo to its content type: front cover / spine view / back cover / interior pages / detail shot / other. Note the mapping explicitly (e.g., "img-01: front cover, img-02: spine, img-03: back cover").
+ 4. Assess PHOTO COVERAGE: list which views from the table above are present, and set your CONFIDENCE ceiling from coverage before you finalize the grade.
+ 5. STRUCTURED DEFECT ENUMERATION (do this BEFORE naming a number): walk the zones in order — front cover, spine, corners, edges, staples, back cover, interior/pages — and for each, list every defect you can see with its location and photo reference. For any ink mark, text, or signature-like element, classify it explicitly as **print-layer / post-print / uncertain** using the PRINT-LAYER RULE test, and state that tag inline. A zone with nothing visible is "clean (or un-assessed — no view)". Only after this enumeration do you map the defects to a grade.
+ 6. Identify any grade-capping defects from the enumeration and state the ceiling explicitly.
+ 7. Apply the CGC scale; anchor on the enumerated physical defects first, use reflectivity only to confirm.
+ 8. Reconcile against the SELLER-STATED GRADE per the rule above; if a ≥2-grade gap remains, confirm a named defect justifies it.
+-9. Be rigorous — do NOT inflate. Grade only what you can see, and let coverage cap your confidence.
+-10. Send the OUTPUT FORMAT block(s) below to `main` via `SendMessage` — your final act. A sub-agent's plain-text return does not reach the caller on its own (BUI-569).
++9. Send the OUTPUT FORMAT block(s) below to `main` via `SendMessage` — your final act. A sub-agent's plain-text return does not reach the caller on its own (BUI-569).
+ 
+ OUTPUT FORMAT (exactly this, no preamble — one block per comic, labelled by item id when grading a batch):
+ PHOTO MAP: img-01: [content type], img-02: [content type], ... (one line per image)
