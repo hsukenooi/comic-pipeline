@@ -2171,6 +2171,17 @@ class TestVerifyViaClaudeCli:
             seller_scan._verify_via_claude_cli("some prompt")
         assert not isinstance(exc.value, seller_scan._VerifySchemaMiss)
 
+    @pytest.mark.parametrize("stdout", ["null", "[]", "\"just a string\""], ids=["null", "list", "string"])
+    def test_non_object_envelope_is_a_transport_failure(self, monkeypatch, stdout):
+        def fake_run(cmd, input, capture_output, text, timeout):
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+
+        monkeypatch.setattr(seller_scan.subprocess, "run", fake_run)
+
+        with pytest.raises(RuntimeError, match="non-object envelope") as exc:
+            seller_scan._verify_via_claude_cli("some prompt")
+        assert not isinstance(exc.value, seller_scan._VerifySchemaMiss)
+
     def test_json_schema_argument_is_valid_json_with_the_reject_shape(self, monkeypatch):
         seen = {}
 
