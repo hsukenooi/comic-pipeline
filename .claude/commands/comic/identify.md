@@ -28,7 +28,8 @@ The subagent returns a fully-formatted identification table — columns `# | Com
 | Issue | Year | Grade | Variant | Type | Current Price | Bids | Seller | Ends |
 Notes`, with the `#` cell linking to the eBay listing. The per-column derivation
 contract (confidence-gating, Ends computation, grade signals, no extra API call
-for price/bids) is owned by `.claude/agents/comic-identifier.md`. Present the
+for price/bids) is owned by `ebay-fetch --identify` in
+`apps/ebay/src/ebay_fetch.py` (BUI-900); the agent passes its output through. Present the
 table as-is; two columns carry weight downstream:
 
 - **Year** — forward it verbatim into `/comic:collection-check` (blank stays
@@ -59,7 +60,7 @@ where a fresh spawn re-runs the whole identify step.
 
 | Mistake | Fix |
 |---|---|
-| Running `ebay-fetch` inline instead of dispatching the subagent | Dispatch `comic-identifier` — keeps raw JSON out of this context |
+| Running `ebay-fetch` inline instead of dispatching the subagent | Dispatch `comic-identifier` — keeps the fetch, its stderr, and any follow-up JSON out of this context, and keeps the agent addressable for follow-ups |
 | Using firecrawl browser on eBay | `ebay-fetch` calls the Browse API directly, no bot detection |
 | Assuming grade when `grade_source` is `"missing"` | The subagent flags it — don't override without evidence |
 | Missing variants | The subagent checks both `variant` field and `item_specifics` |

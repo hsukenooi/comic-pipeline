@@ -4,6 +4,8 @@ date: 2026-07-19
 category: workflow-issues
 module: ".claude/commands/comic/buy.md (orchestrator) + collection-check.md / verify.md / fmv.md"
 problem_type: workflow_issue
+status: corrected
+superseded_by: "BUI-900 (PR #499): the identifier agent no longer holds the ebay-fetch JSON — `ebay-fetch --identify` builds the table and the agent answers follow-ups from a per-listing `ebay-fetch --json` call; the SendMessage-not-respawn rule stands, the 'data it already holds' rationale does not"
 component: development_workflow
 severity: medium
 related_components:
@@ -67,11 +69,13 @@ the token cost twice.
 
 Concretely, in `/comic:buy`:
 
-- **The identifier agent (Step 1)** holds the full `ebay_fetch.py` JSON for
-  every listing — item specifics, description text, printing/variant evidence
-  that never entered the orchestrator's own context. Route follow-ups like
-  "is item N a first print or a later printing?" to it via SendMessage — see
-  `identify.md` § Follow-ups for the worked 2026-07-16 example. Current Price
+- **The identifier agent (Step 1)** stays addressable after returning the
+  table. (Corrected by BUI-900: it no longer holds the `ebay-fetch` JSON — the
+  table comes from `ebay-fetch --identify`, and a follow-up costs the agent one
+  `ebay-fetch --json <id>` call whose item specifics and description text
+  never enter the orchestrator's context.) Route follow-ups like "is item N a
+  first print or a later printing?" to it via SendMessage — see `identify.md`
+  § Follow-ups. Current Price
   and Bids are *not* a reason to message it (BUI-359 already emits them in
   the Step 1 table).
 - **The collection-check executor (Step 2)** holds its loaded EXECUTOR

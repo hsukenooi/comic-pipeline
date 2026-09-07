@@ -1305,16 +1305,36 @@ def _cell(value):
     return str(value).replace("|", "\\|")
 
 
+def _lot_issue_cell(constituents):
+    """Issue cell for a lot: ``#48-50`` for a contiguous numeric run, the
+    listed members (``#33, #45, #50``) otherwise, None when unknown."""
+    nums = [str(n) for n in (constituents or [])]
+    if not nums:
+        return None
+    if len(nums) == 1:
+        return f"#{nums[0]}"
+    try:
+        first, last = int(nums[0]), int(nums[-1])
+        contiguous = nums == [str(n) for n in range(first, last + 1)]
+    except ValueError:
+        contiguous = False
+    if contiguous:
+        return f"#{nums[0]}-{nums[-1]}"
+    return ", ".join(f"#{n}" for n in nums)
+
+
 def identify_row(index, item, now):
     """One markdown row of the identification table for a parsed listing."""
     notes = []
     ident = identify_comic(item.get("title"))
 
     series = ident.series
-    if ident.is_lot and ident.constituent_issues:
-        nums = [str(n) for n in ident.constituent_issues]
-        issue = f"#{nums[0]}-{nums[-1]}" if len(nums) > 1 else f"#{nums[0]}"
+    if ident.is_lot:
+        # A lot is never a single-issue identification, even when its contents
+        # could not be parsed (constituent_issues == [] means "known bundle,
+        # contents unknown", not "not a lot").
         notes.append(f"{_WARN} Lot listing, not a single-issue identification")
+        issue = _lot_issue_cell(ident.constituent_issues)
     elif ident.issue:
         issue = f"#{ident.issue}"
     else:
@@ -1329,7 +1349,7 @@ def identify_row(index, item, now):
             notes.append("grade from title")
     elif item.get("grade_from_description"):
         grade_cell = item.get("grade_from_description")
-        notes.append(f"{_WARN} Grade from description only")
+        notes.append("grade from description only")
     else:
         grade_cell = None
         notes.append(f"{_WARN} Grade not stated")
@@ -1355,19 +1375,20 @@ def identify_row(index, item, now):
     return "| " + " | ".join(cells) + " |"
 
 
-def format_identify_table(items, now, failed_item_ids=()):
-    """The full /comic:identify markdown table plus one warning line per
-    listing that could not be fetched (never silently dropped, BUI-166)."""
+def format_identify_table(items, now, failed=()):
+    """The full /comic:identify markdown table plus one warning line per input
+    that produced no row (never silently dropped, BUI-166). ``failed`` holds
+    ``(item, reason)`` pairs; a bare string is a fetch failure."""
     lines = []
     if items:
         lines.append("| " + " | ".join(IDENTIFY_COLUMNS) + " |")
         lines.append("|" + "---|" * len(IDENTIFY_COLUMNS))
         for i, item in enumerate(items, 1):
             lines.append(identify_row(i, item, now))
-    for item_id in failed_item_ids:
-        lines.append(
-            f"{_WARN} Item {item_id}: fetch failed \u2014 see the ebay-fetch error line on stderr"
-        )
+    for entry in failed:
+        item, reason = entry if isinstance(entry, tuple) else (entry, None)
+        reason = reason or "fetch failed \u2014 see the ebay-fetch error line on stderr"
+        lines.append(f"{_WARN} Item {item}: {reason}")
     return "\n".join(lines)
 
 
@@ -1449,14 +1470,26 @@ def main(argv=None):
 
     # Extract item IDs
     item_ids = []
+    unparseable = []
     for arg in raw_items:
         item_id = extract_item_id(arg)
         if item_id:
             item_ids.append(item_id)
+        else:
+            unparseable.append(arg)
 
     if not item_ids:
         print("Error: No valid item IDs found.", file=sys.stderr)
         sys.exit(1)
+
+    # --identify's reference time: validate before spending any API call.
+    now = None
+    if args.identify:
+        try:
+            now = parse_utc_timestamp(args.now) if args.now else datetime.now(timezone.utc)
+        except ValueError:
+            print(f"Error: --now is not an ISO-8601 timestamp: {args.now!r}", file=sys.stderr)
+            sys.exit(2)
 
     # Auth
     client_id, client_secret, base_url = load_config()
@@ -1467,23 +1500,18 @@ def main(argv=None):
 
     # Fetch items
     results = []
-    failed_item_ids = []
+    failed = [(arg, "could not parse an item id from this input") for arg in unparseable]
     for item_id in item_ids:
         data = fetch_item(item_id, token, base_url)
         if data:
             parsed = parse_item(data)
             results.append(parsed)
         else:
-            failed_item_ids.append(item_id)
+            failed.append((item_id, None))
 
     # Output
     if args.identify:
-        try:
-            now = parse_utc_timestamp(args.now) if args.now else datetime.now(timezone.utc)
-        except ValueError:
-            print(f"Error: --now is not an ISO-8601 timestamp: {args.now!r}", file=sys.stderr)
-            sys.exit(2)
-        print(format_identify_table(results, now, failed_item_ids))
+        print(format_identify_table(results, now, failed))
         if not results:
             # Every fetch failed: a hard failure, never an empty table (BUI-166).
             sys.exit(1)

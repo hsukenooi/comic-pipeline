@@ -28,9 +28,10 @@ At each step, present results to the user and wait for approval before proceedin
 ### Sub-agent reuse — SendMessage, not respawn (BUI-366)
 
 The one long-lived sub-agent in this flow is the **identifier agent (Step 1)** —
-named at spawn, it holds the full `ebay_fetch.py` JSON (item specifics,
-description text, printing/variant evidence). Route follow-ups like "is item N a
-first print?" to it via `SendMessage({to: <name>, message: ...})` rather than
+named at spawn, it stays addressable and answers a follow-up like "is item N a
+first print?" from one `ebay-fetch --json <id>` call on that listing (item
+specifics, description text, printing/variant evidence that never enter this
+context). Route those via `SendMessage({to: <name>, message: ...})` rather than
 respawning; see identify.md § Follow-ups. There is no snipe-add sub-agent to
 reuse (Step 5 is inline). Reuse never skips a gate — routed work still goes
 through the same approvals as first-pass work. Full BUI-361/BUI-366 rationale:
