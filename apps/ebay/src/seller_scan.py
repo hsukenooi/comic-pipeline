@@ -510,6 +510,18 @@ class _VerifyTimeout(RuntimeError):
     """
 
 
+class _VerifySchemaMiss(RuntimeError):
+    """The `claude` CLI answered (exit 0, a JSON envelope) but the envelope
+    carries no schema-valid `structured_output.rejected` list — the model
+    hedged, refused, or never called the CLI's structured-output tool.
+
+    A subclass of RuntimeError so the fail-closed chunk drop still applies,
+    but distinct from a transport failure: the verifier IS reachable, so
+    `_verify_chunk` counts it toward `transport_ok` and the run continues
+    with the next chunk instead of tripping the BUI-297 circuit breaker.
+    """
+
+
 # JSON Schema the verifier's reply must satisfy. Passed to `claude -p
 # --json-schema`, so the CLI validates the model's output and hands back a
 # parsed object in the envelope's `structured_output` field — no prose to
@@ -522,14 +534,16 @@ _VERIFY_JSON_SCHEMA = json.dumps({
             "items": {
                 "type": "object",
                 "properties": {
-                    "id": {"type": "integer"},
+                    "id": {"type": "integer", "minimum": 1},
                     "reason": {"type": "string"},
                 },
                 "required": ["id", "reason"],
+                "additionalProperties": False,
             },
         }
     },
     "required": ["rejected"],
+    "additionalProperties": False,
 })
 
 
@@ -543,11 +557,16 @@ def _verify_via_claude_cli(prompt: str) -> str:
     `rejected` array re-serialised as JSON text (the contract the parser and
     every test fake already speak).
 
-    Raises _VerifyTimeout on a timeout and RuntimeError on any other transport
-    failure (nonzero exit, exec error, empty stdout, or an envelope with no
-    structured output) so the caller can fold it into the fail-closed
-    chunk-drop path — a CLI hiccup must never leak an unverified match —
-    while bisecting only on the timeout.
+    Raises _VerifyTimeout on a timeout, _VerifySchemaMiss when the CLI
+    answered but the envelope has no schema-valid `rejected` list (the model
+    replied; the chunk is dropped fail-closed without tripping the breaker),
+    and a plain RuntimeError on any transport failure (nonzero exit, exec
+    error, empty or non-JSON stdout) so the caller can fold every case into
+    the fail-closed chunk-drop path — a CLI hiccup must never leak an
+    unverified match — while bisecting only on the timeout.
+
+    Logs one line per call to stderr with the envelope's `total_cost_usd`
+    and token usage so a scan's verifier spend is visible (BUI-897).
     """
     try:
         result = subprocess.run(
@@ -565,14 +584,34 @@ def _verify_via_claude_cli(prompt: str) -> str:
         raise RuntimeError("claude CLI returned empty output")
     try:
         envelope = json.loads(result.stdout)
-        rejected = envelope["structured_output"]["rejected"]
-    except (json.JSONDecodeError, KeyError, TypeError) as exc:
-        raise RuntimeError(
-            f"claude CLI returned no structured output: {exc}"
-        ) from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"claude CLI returned non-JSON output: {exc}") from exc
+    if not isinstance(envelope, dict):
+        raise RuntimeError("claude CLI returned a non-object envelope")
+    _log_verify_call_cost(envelope)
+    structured = envelope.get("structured_output")
+    rejected = structured.get("rejected") if isinstance(structured, dict) else None
     if not isinstance(rejected, list):
-        raise RuntimeError("claude CLI structured output is not a list")
+        raise _VerifySchemaMiss(
+            "claude CLI returned no structured output (no schema-valid "
+            "`rejected` list in the envelope)"
+        )
     return json.dumps(rejected)
+
+
+def _log_verify_call_cost(envelope):
+    """One stderr line per verifier call: cost and tokens from the `claude -p`
+    JSON envelope (BUI-897). Every field is optional — a missing one prints
+    as n/a and never turns a good verdict into a failure."""
+    cost = envelope.get("total_cost_usd")
+    usage = envelope.get("usage") if isinstance(envelope.get("usage"), dict) else {}
+    cost_text = f"${cost:.4f}" if isinstance(cost, (int, float)) else "n/a"
+    tokens_in = usage.get("input_tokens", "n/a")
+    tokens_out = usage.get("output_tokens", "n/a")
+    print(
+        f"Verify call: cost {cost_text}, tokens in={tokens_in} out={tokens_out}",
+        file=sys.stderr,
+    )
 
 
 def _build_verification_prompt(chunk, edition_words, foreign_examples, later_printing_examples):
@@ -606,7 +645,7 @@ Reject if:
 - Numbered sequential run or complete multi-issue set (e.g. "Books 1-4", "Issues 1 through 6", "complete set", "full run") when the wish item is a single specific issue
 - Later printing / reprint of a key issue (e.g. {later_printing_examples}, or a bare "reprint") when the wish item means the original first print. Newsstand and Direct editions are NOT reprints — keep those
 
-List the ids you are REJECTING, each with a brief reason (e.g. "X-Factor not X-Men", "annual vs regular"). Any candidate id you do not reject is treated as genuine.
+List the ids you are REJECTING — the id is the pair number below — each with a brief reason (e.g. id 3, reason "X-Factor not X-Men"; id 7, reason "annual vs regular"). Any candidate id you do not reject is treated as genuine.
 
 Pairs:
 {pairs}"""
@@ -724,9 +763,12 @@ def _verify_chunk(chunk, base_index, prompt_ctx, depth=0):
       to the floor) or the response was unparseable.  These MUST be reported
       loudly and MUST NOT be marked seen, so they resurface on re-run.
 
-    `transport_ok` counts calls where the model actually returned text
-    (regardless of parseability) — it proves the verifier is reachable and
-    feeds the caller's global-failure safety net + circuit breaker.
+    `transport_ok` counts calls where the model actually answered — a
+    schema-valid verdict, an invalid one, or a reply with no structured
+    output at all (_VerifySchemaMiss) — it proves the verifier is reachable
+    and feeds the caller's global-failure safety net + circuit breaker.
+    Only a timeout, nonzero exit, exec error, or empty/non-JSON stdout
+    counts as a transport failure.
     """
     edition_words, foreign_examples, later_examples = prompt_ctx
     chunk_label = f"{base_index + 1}–{base_index + len(chunk)}"
@@ -771,6 +813,19 @@ def _verify_chunk(chunk, base_index, prompt_ctx, depth=0):
             file=sys.stderr,
         )
         return [], list(chunk), [], 0
+    except _VerifySchemaMiss as exc:
+        # The model answered, but not with a schema-valid verdict (hedge,
+        # refusal, no structured-output call).  Fail-closed drop of this chunk
+        # only: the transport is fine, so count the call as reachable and let
+        # the next chunk proceed — a reply we cannot read is not a dead CLI
+        # and must not trip the BUI-297 breaker or abort other sellers.
+        print(
+            f"Warning: claude CLI verification for candidates {chunk_label} "
+            f"returned no schema-valid verdict ({exc}); counting as DROPPED "
+            f"(not verified, not marked seen — will resurface on re-run)",
+            file=sys.stderr,
+        )
+        return [], list(chunk), [], 1
     except RuntimeError as exc:
         # Non-timeout transport failure (nonzero exit / empty output / exec
         # error).  BUI-297: bisection can't fix these — retrying smaller chunks

@@ -2123,10 +2123,11 @@ class TestVerifyViaClaudeCli:
 
         assert json.loads(result) == [{"id": 2, "reason": "annual vs regular"}]
 
-    def test_envelope_without_structured_output_raises_runtime_error(self, monkeypatch):
-        """A schema-validation miss or an error envelope has no
-        `structured_output`; that is a transport failure (fail-closed chunk
-        drop), never an empty rejection list."""
+    def test_envelope_without_structured_output_is_a_schema_miss(self, monkeypatch):
+        """A schema-validation miss has an exit-0 envelope with no
+        `structured_output`: the model answered, so it is a _VerifySchemaMiss
+        (fail-closed chunk drop that still counts as reachable), never an
+        empty rejection list and never a plain transport failure."""
         def fake_run(cmd, input, capture_output, text, timeout):
             return subprocess.CompletedProcess(
                 cmd, 0, stdout=json.dumps({"type": "result", "result": "[]"}), stderr=""
@@ -2134,8 +2135,91 @@ class TestVerifyViaClaudeCli:
 
         monkeypatch.setattr(seller_scan.subprocess, "run", fake_run)
 
-        with pytest.raises(RuntimeError, match="no structured output"):
+        with pytest.raises(seller_scan._VerifySchemaMiss, match="no structured output"):
             seller_scan._verify_via_claude_cli("some prompt")
+
+    @pytest.mark.parametrize(
+        "structured_output",
+        [None, {}, [], {"rejected": None}, {"rejected": "[]"}, {"rejected": {"id": 1}}],
+        ids=["null", "empty-object", "list", "rejected-null", "rejected-string", "rejected-object"],
+    )
+    def test_unusable_structured_output_is_a_schema_miss(self, monkeypatch, structured_output):
+        def fake_run(cmd, input, capture_output, text, timeout):
+            return subprocess.CompletedProcess(
+                cmd, 0,
+                stdout=json.dumps({"type": "result", "structured_output": structured_output}),
+                stderr="",
+            )
+
+        monkeypatch.setattr(seller_scan.subprocess, "run", fake_run)
+
+        with pytest.raises(seller_scan._VerifySchemaMiss):
+            seller_scan._verify_via_claude_cli("some prompt")
+
+    def test_non_json_stdout_is_a_transport_failure_not_a_schema_miss(self, monkeypatch):
+        """`--output-format json` always yields a JSON envelope; anything else
+        on stdout (a stray warning line, a crash dump) means the transport
+        broke, so it stays a plain RuntimeError that feeds the breaker."""
+        def fake_run(cmd, input, capture_output, text, timeout):
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="WARN: something\n{\"structured_output\": {\"rejected\": []}}", stderr=""
+            )
+
+        monkeypatch.setattr(seller_scan.subprocess, "run", fake_run)
+
+        with pytest.raises(RuntimeError, match="non-JSON") as exc:
+            seller_scan._verify_via_claude_cli("some prompt")
+        assert not isinstance(exc.value, seller_scan._VerifySchemaMiss)
+
+    def test_json_schema_argument_is_valid_json_with_the_reject_shape(self, monkeypatch):
+        seen = {}
+
+        def fake_run(cmd, input, capture_output, text, timeout):
+            seen["schema"] = cmd[cmd.index("--json-schema") + 1]
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=json.dumps({"structured_output": {"rejected": []}}), stderr=""
+            )
+
+        monkeypatch.setattr(seller_scan.subprocess, "run", fake_run)
+        seller_scan._verify_via_claude_cli("some prompt")
+
+        schema = json.loads(seen["schema"])
+        assert schema["required"] == ["rejected"]
+        assert schema["additionalProperties"] is False
+        item = schema["properties"]["rejected"]["items"]
+        assert item["properties"]["id"] == {"type": "integer", "minimum": 1}
+        assert item["required"] == ["id", "reason"]
+        assert item["additionalProperties"] is False
+
+    def test_cost_and_tokens_logged_to_stderr_per_call(self, monkeypatch, capsys):
+        """BUI-897: the envelope's total_cost_usd and usage are printed once
+        per call so a scan's verifier spend is visible."""
+        def fake_run(cmd, input, capture_output, text, timeout):
+            return subprocess.CompletedProcess(
+                cmd, 0,
+                stdout=json.dumps({
+                    "structured_output": {"rejected": []},
+                    "total_cost_usd": 0.004321,
+                    "usage": {"input_tokens": 1234, "output_tokens": 56},
+                }),
+                stderr="",
+            )
+
+        monkeypatch.setattr(seller_scan.subprocess, "run", fake_run)
+        seller_scan._verify_via_claude_cli("some prompt")
+
+        err = capsys.readouterr().err
+        assert "Verify call: cost $0.0043, tokens in=1234 out=56" in err
+
+    def test_cost_line_tolerates_missing_fields(self, monkeypatch, capsys):
+        def fake_run(cmd, input, capture_output, text, timeout):
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=json.dumps({"structured_output": {"rejected": []}}), stderr=""
+            )
+
+        monkeypatch.setattr(seller_scan.subprocess, "run", fake_run)
+        assert seller_scan._verify_via_claude_cli("some prompt") == "[]"
+        assert "Verify call: cost n/a, tokens in=n/a out=n/a" in capsys.readouterr().err
 
     def test_nonzero_exit_raises_runtime_error(self, monkeypatch):
         def fake_run(cmd, input, capture_output, text, timeout):
@@ -2378,6 +2462,34 @@ class TestVerifyBisectionAndDrops:
             seller_scan.verify_with_claude(matches)
         # Depth cap 3 → at most 1 + 2 + 4 + 8 = 15 calls for the one chunk.
         assert len(calls) <= 15
+
+    def test_schema_miss_drops_one_chunk_without_tripping_the_breaker(
+        self, monkeypatch, capsys
+    ):
+        """BUI-897: a reply with no schema-valid verdict on chunk 1 is the
+        model answering badly, not a dead transport. The chunk is dropped
+        loudly (fail-closed), the call still counts as reachable, and chunk 2
+        is verified normally — no SystemExit, no cancelled sellers."""
+        matches = self._make_matches(60)  # 2 chunks of 30
+        call_count = {"n": 0}
+
+        def fake_verify(prompt):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise seller_scan._VerifySchemaMiss("no structured output")
+            return "[]"
+
+        monkeypatch.setattr(seller_scan, "_verify_via_claude_cli", fake_verify)
+
+        kept, dropped, filtered = seller_scan.verify_with_claude(matches)
+
+        assert call_count["n"] == 2          # chunk 2 was attempted
+        assert len(dropped) == 30            # chunk 1, never verified
+        assert len(kept) == 30               # chunk 2, all genuine
+        assert filtered == []
+        err = capsys.readouterr().err
+        assert "returned no schema-valid verdict" in err
+        assert "counting as DROPPED" in err
 
     def test_model_rejection_and_drop_tracked_separately(self, monkeypatch, capsys):
         """AC #1: in one run, a genuine model rejection (silent) and a
