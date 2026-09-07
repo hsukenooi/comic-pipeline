@@ -54,7 +54,7 @@ cd ~/Projects/comic-pipeline/apps/ezship && npx tsx src/cli.ts new \
 
 Omit `-d` unless the user explicitly provides a declared value. `-d` is in **cents** — multiply a dollar amount by 100 (e.g. $25 → `-d 2500`); the CLI default `1000` = $10.
 
-Run one at a time. **Confirm success before the next (BUI-141):** mark `✅ Submitted` only if the command exits 0 *and* the printed `Response` does not carry `result: false` or an error `msg`/`message`. A non-zero exit or an error response means EZShip **rejected** the order — surface the message and mark it failed, never `✅ Submitted` (the CLI now exits non-zero on a `result: false` rejection).
+Run one at a time. **Confirm success before the next (BUI-141):** mark `✅ Submitted` only if the command exits 0 *and* the printed `Response` does not carry `result: false` or an error `msg`/`message`. A non-zero exit or an error response means EZShip **rejected** the order — surface the message and mark it failed, never `✅ Submitted` (the CLI exits non-zero on a `result: false` rejection).
 
 **Re-running is safe (BUI-180):** order submission is deduplicated by **tracking number** — a successfully-submitted tracking number is recorded locally (`~/.config/ezship/submitted-orders.json`), so re-running `new -t {same tracking}` is a no-op that refuses to create a second real shipment (it exits with an "already submitted" error). To deliberately re-submit a tracking number, remove its entry from that ledger file.
 

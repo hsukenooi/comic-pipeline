@@ -1,6 +1,6 @@
 --- a/.claude/commands/comic/buy.md
 +++ b/.claude/commands/comic/buy.md
-@@ -16,11 +16,11 @@
+@@ -16,11 +16,11 @@ Each leaf skill is also usable standalone. Use this when the user provides eBay
  Each step either reads a leaf skill inline and follows it (`identify.md` at
  Step 1, `grade.md` at Step 2.5) or calls a CLI directly and interprets its
  output (Steps 2, 3, 5, 6). No step dispatches a leaf skill's executor contract
@@ -17,7 +17,7 @@
  `~/Projects/comic-pipeline/.claude/commands/comic/grade.md`), not bare filenames.
  
  At each step, present results to the user and wait for approval before proceeding.
-@@ -60,11 +60,11 @@
+@@ -60,11 +60,11 @@ Read `~/Projects/comic-pipeline/.claude/commands/comic/identify.md` and follow i
  **Input:** eBay URLs from the user, or a `seller-scan --json` blob (BUI-576) — pull each match's `item_id` and fetch it fresh exactly as for a bare URL; the blob is an item_id source only, never a data source (carrying forward its title/price/end-time is the BUI-572 staleness trap). `wish_name` and `match_score` may ride along as display context — never as anything a later step reads or decides on.
  **Output:** Identification table (comic, issue, grade, variant, auction vs BIN, **current price**, **bid count**, **seller**).
  
@@ -31,7 +31,7 @@
  
  ```bash
  curl -s "$COMICS_SERVER_URL/api/seller-reliability?seller=<seller_username>"
-@@ -107,8 +107,8 @@
+@@ -107,8 +107,8 @@ verdicts (a `0` exit).
  
  Gate: user decides whether to skip duplicates or continue (condition upgrades
  are legitimate). Route stale-cache rows and flagged rows (Patterns A / C / D /
@@ -42,7 +42,7 @@
  act on the raw verdict of a flagged row.
  
  Remove skipped comics from the working list before Step 2.5.
-@@ -161,7 +161,7 @@
+@@ -161,7 +161,7 @@ Run `comic-fmv` directly — do not read `fmv.md` mid-flow. The CLI handles fetc
  comic-fmv --batch <working_list.json> --out <results.json> --brief
  ```
  
@@ -51,7 +51,7 @@
  
  **Output:** Human FMV table to stdout, followed by one compact JSON line per row (`--brief`, BUI-362; `fmv_low`/`fmv_high`/`fmv_notes` added BUI-505; `source` added BUI-549): `{item_id, comic_id, fmv_id, max_bid, fmv_low, fmv_high, fmv_notes, flag_reason, confidence, source}`. (Any skip-count summary lines print to stderr, not stdout — BUI-549 — so stdout under `--brief` is pure JSON Lines.) The full structured JSON still lands at `--out`, but **do not read the `--out` file into context** — it's dominated by `queries_used`/`trimmed_pool` (~6k tokens for 7 rows). The brief lines carry everything Steps 4–5 need; keep `--out` on disk for deep dives only (e.g. inspecting the comp pool when CV >100%).
  
-@@ -228,11 +228,9 @@
+@@ -228,11 +228,9 @@ Step 1 table carries each auction's **Current Price**, **Bids**, and **Ends**
  Compute the elapsed time between `identified_at` and now:
  
  - **Fresh run (elapsed < ~2h):** use those columns as-is here — do **not**
@@ -66,7 +66,7 @@
    1. **Re-fetch** `current_price` / `bid_count` / `end_date_iso` for every
       surviving row (re-run identify.md's fetch for just those item_ids, or a
       direct `ebay_fetch.py` call) and present the refreshed numbers below, or
-@@ -260,7 +258,7 @@
+@@ -260,7 +258,7 @@ Gate: user approves or overrides each max bid.
  
  ## Step 5: Snipe Add (Batch)
  
@@ -75,7 +75,7 @@
  
  If `gixen` isn't found, install the monorepo CLIs first: `./scripts/install.sh`.
  
-@@ -301,7 +299,7 @@
+@@ -301,7 +299,7 @@ neither an override nor `skip`. Fix the input and re-run rather than patching
  gixen add-batch <rows.json> --verify --json-out <results.json>
  ```
  
@@ -84,7 +84,7 @@
  
  A non-zero exit code means at least one row did not land — or, for `indeterminate`, is not *known* to have landed (failed, blocked by a policy check per BUI-623, left not-attempted after a mid-batch halt, or still indeterminate after BUI-697's reconcile) — **read the JSON, don't treat non-zero as total failure.** Present the human table the CLI printed (it now includes comic titles, BUI-506) and call out any `failed`/`blocked`/`not_attempted`/`indeterminate` rows explicitly.
  
-@@ -315,13 +313,13 @@
+@@ -315,13 +313,13 @@ When at least one row landed (`added`/`updated`), remind the user:
  > Run `/comic:collection-add` after auctions close to record wins. Check `locg collection status` for pending push count before uploading.
  
  If any rows shared a `group` (BUI-363), also remind the user:
@@ -102,7 +102,7 @@
  - **`rows[].verify.verdict != "fully_linked"`** — surface the row in a table plus its `rows[].verify.guidance` string, verbatim.
 --- a/.claude/commands/comic/collection-add.md
 +++ b/.claude/commands/comic/collection-add.md
-@@ -92,14 +92,12 @@
+@@ -92,14 +92,12 @@ failure or other unexpected status is a hard stop (BUI-352).
  `needs_review` is the **only** gate. An entry lands here when
  `comic-identify` returned a null `series`/`issue`, an `"error"`, a lot with
  empty/unparseable `constituent_issues`, **or** a null `year` — unconditionally,
@@ -121,7 +121,7 @@
  
  Resolve the same scratch dir Step 1 used:
  
-@@ -319,8 +317,8 @@
+@@ -319,8 +317,8 @@ This writes a CSV at `~/Downloads/locg-bulk-import-<timestamp>.csv` plus a `.not
  
  ## Step 5: Report
  
@@ -134,7 +134,7 @@
  Step 3 timed out and Step 3b determined the commit landed anyway, Step 3's
 --- a/.claude/commands/comic/collection-check.md
 +++ b/.claude/commands/comic/collection-check.md
-@@ -5,11 +5,11 @@
+@@ -5,11 +5,11 @@ description: Check if identified comics are already in your collection via the c
  
  # Comic Collection Check
  
@@ -151,7 +151,7 @@
  
  > **Hard-fail rule (R11) is enforced by the exit code.** `check-batch` exits
  > **non-zero** on ANY failure — unreachable server, non-200, timeout, or the
-@@ -53,7 +53,7 @@
+@@ -53,7 +53,7 @@ a false **not-owned** when the stored copy is a different edition of the same
  issue — that buys a duplicate, and a duplicate purchase can't be undone.
  Omitting `variant` asks the issue-level question instead; it risks the
  opposite, a false **owned**, but that only causes a skip the user can reverse
@@ -160,7 +160,7 @@
  verdict that could cause a duplicate purchase), that asymmetry favors
  omitting: an earlier check on X-Force #19 passed no `variant` and still
  matched the stored `X-Force #19 Newsstand Edition`, correctly reporting it
-@@ -71,7 +71,7 @@
+@@ -71,7 +71,7 @@ semantics live in `packages/locg-cli/src/locg/check_batch.py`. **Flags FLAG,
  they never DECIDE (R11)** — the CLI never flips a verdict or invents ownership;
  the user resolves each flagged row at the decision gate below.
  
@@ -171,7 +171,7 @@
  
 --- a/.claude/commands/comic/collection-sync.md
 +++ b/.claude/commands/comic/collection-sync.md
-@@ -144,11 +144,11 @@
+@@ -144,11 +144,11 @@ the bulk of a normal sync is safe regardless.
  
  ## Step 2a: The export is wins-only by default (machine gate)
  
@@ -188,7 +188,7 @@
  delete) go up solely via the separate, opt-in Step 3b, after the wish-list has
  been conflict-cleaned (Step 2b). `wish_list_count` will be `0` on a default
  export — expected.
-@@ -181,8 +181,8 @@
+@@ -181,8 +181,8 @@ release date) before uploading. Partial or wrong rows import as "Not Found";
  an all-dateless batch hangs. **Rows must be complete and exact: publisher +
  canonical series + exact full_title (no decoration) + accurate release date.**
  
@@ -199,7 +199,7 @@
  (`source == agent_win`, no `metron_id`) apart from a real January cover date
  (same string, but `metron_id` set or store-unconfirmable) — only a *confirmed*
  placeholder counts toward `flagged_count`. A confirmed-genuine or
-@@ -250,10 +250,9 @@
+@@ -250,10 +250,9 @@ comics-api POST /api/comics/wish-list/remove-conflicts \
    -d '{"names": ["<exact name from the audit>", "..."]}'
  ```
  
@@ -213,7 +213,7 @@
  
  Both endpoints 409 if the collection was never imported. **Do not proceed to a
  wish push (Step 3b) until every *genuine* conflict has been dropped** — decoys
-@@ -288,9 +287,9 @@
+@@ -288,9 +287,9 @@ comics-api POST /api/comics/collection/restore \
  ```
  
  Only after a clean probe, upload the rest. **Data completeness is the
@@ -226,7 +226,7 @@
  Every row must be complete and exact — Step 2b already audited this. An
  **incomplete or all-dateless batch hangs** the importer regardless of size.
  
-@@ -439,19 +438,14 @@
+@@ -439,19 +438,14 @@ Assert all of:
    can't account for.
  - **No book is owned twice (BUI-548):** the Step 5 import response must carry
    `owned_duplicate_identities == 0`. **This is a separate hard-stop, and the
@@ -254,7 +254,7 @@
    pending and the next sync re-uploads them, so it compounds. The warning
    names the affected titles.
  - **`owned_duplicate_identities_cross_edition` is ADVISORY — report it, never
-@@ -470,13 +464,12 @@
+@@ -470,13 +464,12 @@ Assert all of:
    (BUI-650):** a *different* question from the two above. Those ask "is a book
    owned twice?"; this one asks whether the store's identity key
    `(publisher, series, full_title, release_date)` is still a key at all.
@@ -275,7 +275,7 @@
  
 --- a/.claude/commands/comic/ezship-add.md
 +++ b/.claude/commands/comic/ezship-add.md
-@@ -54,7 +54,7 @@
+@@ -54,7 +54,7 @@ cd ~/Projects/comic-pipeline/apps/ezship && npx tsx src/cli.ts new \
  
  Omit `-d` unless the user explicitly provides a declared value. `-d` is in **cents** — multiply a dollar amount by 100 (e.g. $25 → `-d 2500`); the CLI default `1000` = $10.
  
@@ -286,7 +286,7 @@
  
 --- a/.claude/commands/comic/fmv.md
 +++ b/.claude/commands/comic/fmv.md
-@@ -39,25 +39,25 @@
+@@ -39,25 +39,25 @@ Literal example (build it directly — the shape is documented here, don't grep
  
  `publisher` and `variant` are optional but **load-bearing** (BUI-161). `variant` (e.g. `Newsstand`, `Direct`) gives base vs variant editions distinct `comic_id`s (BUI-28), so omitting it conflates two sub-markets onto one comic.
  
@@ -318,19 +318,18 @@
  - `--grade-window N` (default 2.0): raise or lower the comp-pool widening ceiling — does **not** bypass the one-sided/too-wide guards (a guarded book still flags `needs_manual`)
  - `--brief`: after the table, print one compact JSON object per row on stdout (`item_id`, `comic_id`, `fmv_id`, `max_bid`, `flag_reason`, `confidence`, `fmv_low`, `fmv_high`, `fmv_notes` — BUI-505; `source` — BUI-549) — the linkage + pricing fields to carry forward, without re-reading the full `--out` file. `source: "skipped_lookup_error"` marks a row the comics-server lookup FAILED for — left completely untouched, not a genuine zero-comps book — distinguishable from an ordinary unpriced row, which has the same null pricing fields but a different `source`. `source: "ledger-advisory"` (BUI-663) is the opposite shape and the one to watch: it has a real `fmv_low`/`fmv_high` and a `null` `flag_reason`, so it looks priced — but `max_bid` is `null` and nothing was persisted. See the `ledger-advisory` note below the `--out` schema.
  - `--quiet`: suppress the human table on stdout (combine with `--brief` for JSON lines only)
-@@ -100,10 +100,8 @@
+@@ -100,9 +100,7 @@ The sold-comps providers are a **shared, finite budget**, and a batch spends far
  
  **So don't chop a batch up, and don't probe-then-re-run.** Because the breaker is per-invocation, splitting 60 books into three runs of 20 re-arms the trip cost three times instead of paying it once. Run the full set in **one** `comic-fmv --batch` call and read the result. When investigating a suspected pricing problem, design that single pass to answer the question — a small probe followed by a large re-run is exactly what exhausts the budget.
  
 -**This "one batch" advice is safe at any batch size again (BUI-701).** It briefly wasn't. `ebay-sold-comps` sits *exactly* at sold-comps.com's 60 req/min ceiling at steady state (4 workers × ~4s responses = 60/min, zero headroom), so a single large-enough batch could itself burst past the ceiling and tip into a self-reinforcing 429 storm — an instant 429, retried on the old 2s/4s/8s schedule, fed straight back into the still-saturated window. That is exactly what happened 2026-08-07: one 202-book batch, run as one call the way this section already recommended, short-circuited 109 queries and killed the back half of the run. The emergency workaround was the *opposite* of this section's advice — manually chopping the batch into 4 runs of 10 books with 45s pauses between them (36/36 fresh, zero 429s) — which only worked around the gap, at the cost of re-arming the breaker's trip cost on every chunk it was trying to avoid. BUI-701 closed the actual gap instead of leaning on that workaround: `sold_comps.py` now paces its own sold-comps.com dispatch rate in code (~48 req/min, ~20% headroom under the ceiling, shared across all worker threads) and gives a 429 specifically a much longer, jittered backoff instead of the generic schedule, so the window-fitting the manual chunking used to buy by hand now happens automatically *inside* a single invocation, at any batch size — a 200-book batch is proven (a mocked-clock, fake-provider test with no live calls) to complete with zero terminal 429s. **Don't manually chunk a batch to dodge 429s anymore** — it no longer helps, and it still pays the breaker-reset cost this section warns against.
+-
+-> **Incident (2026-07-31):** ~107 book-queries across four runs in a few minutes — a 66-book batch, a 6-book re-run, a 5-book hypothesis test, then a 30-book fetch — tripped **both** providers' breakers. The last fetch returned `comps=0` for 27 of 30 books (the three with data were cache hits), and 30 books were dropped from the run.
 +**One batch is safe at any size (BUI-701).** `sold_comps.py` paces its own sold-comps.com dispatch in code (~48 req/min, ~20% under the provider's 60 req/min ceiling, shared across all worker threads) and gives a 429 a long, jittered backoff, so a single invocation fits the rate window on its own (a 200-book batch is covered by a mocked-clock test). **Don't chunk a batch by hand to dodge 429s** — it doesn't help, and it pays the breaker-reset cost this section warns against.
  
--> **Incident (2026-07-31):** ~107 book-queries across four runs in a few minutes — a 66-book batch, a 6-book re-run, a 5-book hypothesis test, then a 30-book fetch — tripped **both** providers' breakers. The last fetch returned `comps=0` for 27 of 30 books (the three with data were cache hits), and 30 books were dropped from the run.
--
  **There is no `--max-workers` on `comic-fmv`.** That flag exists on `ebay-sold-comps`, which `comic-fmv` invokes with a fixed command line, so it cannot be set from this path — do not offer it to the user. Batch composition and `--force` discipline are the only levers here; concurrency is not one of them (sold-comps.com is separately capped at 4 concurrent requests internally and, since BUI-701, paced below its rate ceiling in code — so the knob would be near-inert for the default primary anyway).
  
- **A budget-exhausted zero looks exactly like an illiquid book.** A breaker-tripped fetch returns `comps=0` — shape-identical to a genuine no-comps book. After any large or repeated run, check `breaker_tripped` before telling the user a book is illiquid, and watch stderr for `<provider> appears down — N consecutive errors, circuit breaker tripped (BUI-535)`. Same discipline as the `fetch-err` ≠ `n/a` rule above.
-@@ -127,7 +125,7 @@
+@@ -127,7 +125,7 @@ python3 -c "import json; r=json.load(open('<results.json>')); print(sum(1 for x
  
  When presenting the table to the user, always surface: the window the pool was built at, N and CV, whether the book flagged `needs_manual` (and why) vs. auto-priced, whether grade-curve interpolation was applied, suspect comps (with reason), and a hot-market signal if the current bid already exceeds the computed Q75.
  
@@ -341,7 +340,7 @@
  
 --- a/.claude/commands/comic/seller-scan.md
 +++ b/.claude/commands/comic/seller-scan.md
-@@ -60,7 +60,7 @@
+@@ -60,7 +60,7 @@ alongside 2+ sellers.
  
  ## Scanning multiple / known sellers (BUI-298)
  
@@ -350,7 +349,7 @@
  
  - Pull the store names straight from `apps/ebay/src/seller_aliases.json`'s
    keys when the user says "scan all known sellers."
-@@ -154,7 +154,7 @@
+@@ -154,7 +154,7 @@ seller-scan <seller> 2>/dev/null
  }
  ```
  
@@ -361,7 +360,7 @@
  
 --- a/.claude/commands/comic/wishlist-add.md
 +++ b/.claude/commands/comic/wishlist-add.md
-@@ -42,7 +42,7 @@
+@@ -42,7 +42,7 @@ hand-rolled `curl` (that doc has the rate-limit/retry rationale):
  source "$(git rev-parse --show-toplevel)/scripts/metron-curl.sh"
  ```
  
@@ -370,7 +369,7 @@
  via `comics-api` (BUI-510, `docs/conventions/comics-server-call.md`) — every
  call below is independently self-resolving, so this is just a fail-fast
  pre-flight check, not a shared env-var setup:
-@@ -191,11 +191,9 @@
+@@ -191,11 +191,9 @@ correlate by key (don't rely on order). Per item:
    (BUI-372, Pattern E from `/comic:collection-check` — BUI-364).** The match
    was satisfied by a row whose `full_title` names a printing this query never
    asked for ("2nd Printing", "Reprint", …). Printings are distinct
@@ -385,7 +384,16 @@
    decision)** — instead of already-owned, carrying `full_title_matched` and
    `printing_candidates` forward to Step 4. Do not decide for the user; the
    candidates list (with each row's `printing_ordinal`/`in_collection`/
-@@ -226,13 +224,12 @@
+@@ -214,7 +212,7 @@ recover it:
+   yet — cannot determine ownership"); when you see that, warn the user
+   ("couldn't check ownership — collection not imported") and proceed with all
+   issues. (The export fix is the safety net: even a wrongly-wished owned book is
+-  no longer deleted — but flag it so the user knows the check was skipped.)
++  not deleted — but flag it so the user knows the check was skipped.)
+ - **Any other failure** (500, network error, timeout) → hard-fail; do not
+   wish-list anything from a failed check (R11 — a failed call must never read
+   as "not owned").
+@@ -226,13 +224,12 @@ auto-skipped and never auto-added).
  
  ## Step 3b: Skip issues already on the wish-list (single in-memory scan)
  
@@ -402,7 +410,7 @@
  
  ```bash
  comics-api GET /api/comics/wish-list || exit 1
-@@ -280,27 +277,26 @@
+@@ -280,27 +277,26 @@ reprint, `null` an unspecified bare "Reprint"/"Re-Print" row). Ask the user per
  into the same add list Step 5 writes; one they decline moves to "already
  owned" for the report. Never auto-resolve this bucket either way — a false
  "add" risks a redundant wish-list entry the owned-guard would 409 anyway (safe
@@ -438,7 +446,7 @@
  
  **`force: true` is per item, never batch-wide.** Set it ONLY on an issue the
  user explicitly confirmed adding despite a Step 4 printing-conflict decision —
-@@ -372,8 +368,8 @@
+@@ -372,8 +368,8 @@ fixed — they're re-appended, not wiped). To get them onto LOCG itself, run
  touches owned books. See
  `packages/locg-cli/docs/processes/locg-collection-wishlist-sync.md`.
  
@@ -449,7 +457,7 @@
  
  ```bash
  comics-api DELETE /api/comics/wish-list -G \
-@@ -407,7 +403,7 @@
+@@ -407,7 +403,7 @@ before running either command for the first time.
  | Mistake | Fix |
  |---|---|
  | Re-running the whole range after a partial failure | Safe to re-add — the wish-list endpoint is idempotent (BUI-285): a duplicate series+issue is a 200 no-op (`{"status": "exists"}`), not a second row |
@@ -460,7 +468,7 @@
  | Enumerating a creator's run from memory — even for a plain question, not just a wish-list add | Memory silently drops DISCONTINUOUS stints (JR JR's 1993 Uncanny X-Men return; BUI-340's Erik Larsen Spider-Man #19–43 vs. actual #18–23). Just answering a question → `locg creator-run --creator … --series-id …` (read-only, BUI-340). Actually adding to the wish-list → `locg wish-list add --creator … --series-id …` (BUI-134) |
 --- a/CLAUDE.md
 +++ b/CLAUDE.md
-@@ -7,7 +7,7 @@
+@@ -7,12 +7,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
  `comic-pipeline` is a **monorepo** for the comic-collecting use case. It bundles two CLIs that used to live in separate repos (grafted under `packages/` with full history preserved) plus the comic-specific glue:
  
  - `packages/gixen-cli/` — eBay auction sniping: the FastAPI server + `bids` SQLite table + dashboard. Exposes the `gixen` console script.
@@ -469,7 +477,13 @@
  - `plugins/gixen-overlay/` — a gixen-cli **plugin** (Python) that adds the `/comics` dashboard tab, comic-specific tables, and `/api/comics/*` endpoints.
  - `apps/` — standalone CLIs: `ebay` + `fmv` (Python), `ezship` (TypeScript).
  - `.claude/commands/comic/` — the `/comic:*` Claude Code skills that orchestrate the whole buying workflow by shelling out to the console scripts (`gixen`, `locg`, `ebay-*`, `comic-fmv`) and endpoints.
-@@ -81,10 +81,10 @@
+ 
+-A root **uv workspace** (`packages/*` + `plugins/*`) editable-installs these into one shared environment, so imports resolve without path hacks. The overlay → gixen-cli coupling that used to span repos is now a normal intra-repo dependency: a rename and its caller change atomically in one commit, caught by one CI run. (`apps/*` stay `uv tool install`-managed — they shell out on PATH and have no cross-import problem; see `scripts/install.sh`.) The package boundaries still exist (`git subtree split` can re-extract them); they're just no longer separate repos.
++A root **uv workspace** (`packages/*` + `plugins/*`) editable-installs these into one shared environment, so imports resolve without path hacks. The overlay → gixen-cli coupling that used to span repos is now a normal intra-repo dependency: a rename and its caller change atomically in one commit, caught by one CI run. (`apps/*` stay `uv tool install`-managed — they shell out on PATH and have no cross-import problem; see `scripts/install.sh`.) The package boundaries still exist (`git subtree split` can re-extract them); they're just not separate repos.
+ 
+ ## Commands
+ 
+@@ -81,10 +81,10 @@ Unlike the host's `POLICY_EXPOSURE_CEILING` (no default — unset disables that
  **Soak gate:** do not set any `POLICY_BLOCK_*` flag until reviewing `GET /api/decisions` after real buys; keep `POLICY_BLOCK_OVER_FMV` off while lot briefs remain single-identity.
  
  ### The collection + wish-list are served from the comics server (BUI-87)
@@ -484,7 +498,7 @@
  `/comic:buy` is the orchestrator; it reads and runs the leaf skills in sequence with a user gate at each step: **identify → collection-check → (conditional) grade → fmv → snipe-add**. Leaf skills are also usable standalone. The skills shell out to:
 --- a/packages/locg-cli/CLAUDE.md
 +++ b/packages/locg-cli/CLAUDE.md
-@@ -64,16 +64,16 @@
+@@ -68,16 +68,16 @@ in the result). Pass `--no-cache` to bypass; use `locg cache stats` and
  `locg cache clear` to manage. For reads, the cache dir is resolved by
  `config._cache_dir` with precedence `LOCG_DATA_DIR` env → `<repo>/data/locg` →
  `~/.cache/locg` fallback (BUI-84); it also holds `collection.json` and
@@ -507,7 +521,7 @@
  
  Note on the 140-issue limit: `locg series <id>` returns at most 140 issues
  per call (date-desc by default). For series with more than 140 issues, the
-@@ -100,8 +100,8 @@
+@@ -104,8 +104,8 @@ locg collection has "Amazing Spider-Man #300"
  locg collection --fields name,id
  
  # Append a title to the local wish-list cache (no LOCG round-trip).
