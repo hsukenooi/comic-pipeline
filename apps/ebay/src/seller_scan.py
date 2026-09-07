@@ -510,20 +510,49 @@ class _VerifyTimeout(RuntimeError):
     """
 
 
+# JSON Schema the verifier's reply must satisfy. Passed to `claude -p
+# --json-schema`, so the CLI validates the model's output and hands back a
+# parsed object in the envelope's `structured_output` field — no prose to
+# regex a JSON array out of, no "respond with ONLY JSON" prompt scaffold.
+_VERIFY_JSON_SCHEMA = json.dumps({
+    "type": "object",
+    "properties": {
+        "rejected": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["id", "reason"],
+            },
+        }
+    },
+    "required": ["rejected"],
+})
+
+
 def _verify_via_claude_cli(prompt: str) -> str:
     """Run the verify prompt through the `claude` CLI (subscription auth, no
     ANTHROPIC_API_KEY needed — BUI-270). The prompt goes via stdin (not argv)
     to avoid ARG_MAX/escaping issues on a chunk of candidates.
 
+    Uses `--output-format json --json-schema` so the CLI returns a validated
+    `structured_output` object; this function returns that object's
+    `rejected` array re-serialised as JSON text (the contract the parser and
+    every test fake already speak).
+
     Raises _VerifyTimeout on a timeout and RuntimeError on any other transport
-    failure (nonzero exit, exec error, or empty stdout) so the caller can fold
-    it into the fail-closed chunk-drop path — a CLI hiccup must never leak an
-    unverified match — while bisecting only on the timeout.
+    failure (nonzero exit, exec error, empty stdout, or an envelope with no
+    structured output) so the caller can fold it into the fail-closed
+    chunk-drop path — a CLI hiccup must never leak an unverified match —
+    while bisecting only on the timeout.
     """
     try:
         result = subprocess.run(
             ["claude", "-p", "--model", "claude-haiku-4-5-20251001",
-             "--output-format", "text"],
+             "--output-format", "json", "--json-schema", _VERIFY_JSON_SCHEMA],
             input=prompt, capture_output=True, text=True, timeout=180,
         )
     except subprocess.TimeoutExpired as exc:
@@ -534,7 +563,16 @@ def _verify_via_claude_cli(prompt: str) -> str:
         raise RuntimeError(result.stderr.strip() or "claude CLI failed")
     if not result.stdout.strip():
         raise RuntimeError("claude CLI returned empty output")
-    return result.stdout
+    try:
+        envelope = json.loads(result.stdout)
+        rejected = envelope["structured_output"]["rejected"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise RuntimeError(
+            f"claude CLI returned no structured output: {exc}"
+        ) from exc
+    if not isinstance(rejected, list):
+        raise RuntimeError("claude CLI structured output is not a list")
+    return json.dumps(rejected)
 
 
 def _build_verification_prompt(chunk, edition_words, foreign_examples, later_printing_examples):
@@ -568,12 +606,7 @@ Reject if:
 - Numbered sequential run or complete multi-issue set (e.g. "Books 1-4", "Issues 1 through 6", "complete set", "full run") when the wish item is a single specific issue
 - Later printing / reprint of a key issue (e.g. {later_printing_examples}, or a bare "reprint") when the wish item means the original first print. Newsstand and Direct editions are NOT reprints — keep those
 
-Respond with a JSON array containing ONLY the ids you are REJECTING, each with a brief reason:
-[{{"id": 3, "reason": "X-Factor not X-Men"}}, {{"id": 7, "reason": "annual vs regular"}}]
-
-If nothing is rejected, return [].
-
-Any candidate id NOT present in your response is treated as genuine.
+List the ids you are REJECTING, each with a brief reason (e.g. "X-Factor not X-Men", "annual vs regular"). Any candidate id you do not reject is treated as genuine.
 
 Pairs:
 {pairs}"""
@@ -592,21 +625,23 @@ def _parse_verification_response(text, chunk, chunk_label):
     "drop this chunk" (fail-closed): catches json.JSONDecodeError plus
     KeyError/ValueError/TypeError during id validation, emits the warning
     messages, and prints the BUI-149 rejected-candidate stderr listing.
+
+    `text` is the JSON-serialised `rejected` array `_verify_via_claude_cli`
+    returns (schema-validated by the CLI), so it is parsed directly — there is
+    no prose to scan for a bracketed array.
     """
-    json_match = re.search(r"\[.*\]", text, re.DOTALL)
-    if not json_match:
+    try:
+        rejected_list = json.loads(text)
+    except json.JSONDecodeError:
         print(
-            f"Warning: could not parse Claude response for candidates "
+            f"Warning: invalid JSON in Claude response for candidates "
             f"{chunk_label}; dropping chunk (fail-closed)",
             file=sys.stderr,
         )
         return None
-
-    try:
-        rejected_list = json.loads(json_match.group())
-    except json.JSONDecodeError:
+    if not isinstance(rejected_list, list):
         print(
-            f"Warning: invalid JSON in Claude response for candidates "
+            f"Warning: could not parse Claude response for candidates "
             f"{chunk_label}; dropping chunk (fail-closed)",
             file=sys.stderr,
         )

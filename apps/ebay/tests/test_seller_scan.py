@@ -2101,19 +2101,41 @@ class TestVerifyViaClaudeCli:
     timeout, and empty output must all raise RuntimeError so verify_with_claude's
     fail-closed except clause catches them."""
 
-    def test_success_returns_stdout(self, monkeypatch):
+    def test_success_returns_rejected_array_from_structured_output(self, monkeypatch):
+        envelope = json.dumps({
+            "type": "result",
+            "result": "{\"rejected\":[{\"id\":2,\"reason\":\"annual vs regular\"}]}",
+            "structured_output": {"rejected": [{"id": 2, "reason": "annual vs regular"}]},
+        })
+
         def fake_run(cmd, input, capture_output, text, timeout):
             assert cmd[0] == "claude"
             assert "--model" in cmd
             assert "claude-haiku-4-5-20251001" in cmd
+            assert cmd[cmd.index("--output-format") + 1] == "json"
+            assert "--json-schema" in cmd
             assert input == "some prompt"
-            return subprocess.CompletedProcess(cmd, 0, stdout="[]\n", stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout=envelope + "\n", stderr="")
 
         monkeypatch.setattr(seller_scan.subprocess, "run", fake_run)
 
         result = seller_scan._verify_via_claude_cli("some prompt")
 
-        assert result == "[]\n"
+        assert json.loads(result) == [{"id": 2, "reason": "annual vs regular"}]
+
+    def test_envelope_without_structured_output_raises_runtime_error(self, monkeypatch):
+        """A schema-validation miss or an error envelope has no
+        `structured_output`; that is a transport failure (fail-closed chunk
+        drop), never an empty rejection list."""
+        def fake_run(cmd, input, capture_output, text, timeout):
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=json.dumps({"type": "result", "result": "[]"}), stderr=""
+            )
+
+        monkeypatch.setattr(seller_scan.subprocess, "run", fake_run)
+
+        with pytest.raises(RuntimeError, match="no structured output"):
+            seller_scan._verify_via_claude_cli("some prompt")
 
     def test_nonzero_exit_raises_runtime_error(self, monkeypatch):
         def fake_run(cmd, input, capture_output, text, timeout):
@@ -4406,8 +4428,8 @@ class TestVerifyWithClaudeRejectBulletsFromLexicons:
         matches_b = [{"title": "Y #99", "wish_name": "Y #99"}]
         prompt_a = self._capture_prompt(matches_a, monkeypatch)
         prompt_b = self._capture_prompt(matches_b, monkeypatch)
-        bullets_a = prompt_a.split("Reject if:")[1].split("Respond with")[0]
-        bullets_b = prompt_b.split("Reject if:")[1].split("Respond with")[0]
+        bullets_a = prompt_a.split("Reject if:")[1].split("List the ids")[0]
+        bullets_b = prompt_b.split("Reject if:")[1].split("List the ids")[0]
         assert bullets_a == bullets_b
 
 
