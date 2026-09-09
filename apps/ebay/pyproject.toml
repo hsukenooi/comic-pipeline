@@ -18,6 +18,7 @@ seller-scan = "seller_scan:main"
 wishlist-sellers = "wishlist_sellers:main"
 comic-identify = "comic_identify:main"
 grade-photos = "grade_photos:main"
+ebay-shipped = "shipped_orders:main"
 
 [tool.hatch.build.targets.wheel]
 # BUI-332: glob-based include so every src/*.py is shipped automatically —

@@ -1,0 +1,27 @@
+{
+  "id": "fixture-members-shipped-usps",
+  "threadId": "fixture-members-shipped-usps",
+  "snippet": "You can track your package!",
+  "internalDate": "1755094955000",
+  "payload": {
+    "headers": [
+      {
+        "name": "From",
+        "value": "eBay - othercomicshop <f0e9d8c7b6a5f4e3d2c1@members.ebay.com>"
+      },
+      {
+        "name": "Subject",
+        "value": "Your order has shipped"
+      },
+      {
+        "name": "Date",
+        "value": "Sat, 22 Aug 2026 09:15:00 -0700"
+      }
+    ],
+    "mimeType": "text/html",
+    "body": {
+      "size": 916,
+      "data": "PGh0bWw-PGJvZHk-Cjx0YWJsZT48dHI-PHRkPgogIDxoMT5Zb3VyIG9yZGVyIGhhcyBzaGlwcGVkLjwvaDE-CiAgPHA-UGxlYXNlIGFsbG93IDI0IGhvdXJzIGZvciBtb3N0IHRyYWNraW5nIHVwZGF0ZXMuPC9wPgogIDxhIGhyZWY9Imh0dHBzOi8vdG9vbHMudXNwcy5jb20vZ28vVHJhY2tDb25maXJtQWN0aW9uP3RMYWJlbHM9OTQwNTUxMTg5OTIyMzE5NzQyODQ5MCIgdGFyZ2V0PSJfYmxhbmsiPlRyYWNrIE15IFBhY2thZ2U8L2E-CiAgPHA-T3JkZXIgTm8uIDAyLTE1MDM5LTgwMzA1PC9wPgogIDx0YWJsZSBjbGFzcz0iaXRlbXMiPgogICAgPHRyPjx0ZD5UaGUgQW1hemluZyBTcGlkZXItTWFuICM3OSAoTWFydmVsIENvbWljcyAxOTY5KSBGTiBDb25kaXRpb24hPC90ZD4KICAgICAgICA8dGQ-UXR5OiAxPC90ZD48L3RyPgogICAgPHRyPjx0ZD5UaGUgQW1hemluZyBTcGlkZXItTWFuICM3MiAoTWFydmVsIENvbWljcyBNYXkgMTk2OSkgRk4gQ29uZGl0aW9uITwvdGQ-CiAgICAgICAgPHRkPlF0eTogMTwvdGQ-PC90cj4KICA8L3RhYmxlPgogIDx0YWJsZT48dHI-PHRkPlN1YnRvdGFsPC90ZD48dGQ-JDE5MS4wMDwvdGQ-PC90cj4KICAgICAgICAgPHRyPjx0ZD5TaGlwcGluZzwvdGQ-PHRkPiQ3Ljc0PC90ZD48L3RyPgogICAgICAgICA8dHI-PHRkPlRvdGFsPC90ZD48dGQ-JDE5OC43NDwvdGQ-PC90cj48L3RhYmxlPgogIDxwPlNoaXBwZWQgVmlhPC9wPjxwPlVTUFMgR3JvdW5kIEFkdmFudGFnZTwvcD4KICA8cD5TaGlwcGVkIFRvPC9wPjxwPmJ1eWVyLWhhbmRsZTxicj4xIEVYQU1QTEUgU1Q8YnI-UE9SVExBTkQsIE9SIDk3MjAwLTAwMDA8L3A-CiAgPHA-RGVhciBidXllci1oYW5kbGUsPC9wPgogIDxwPi0gdGltZW1hY2hpbmVjb21pY3M8L3A-CjwvdGQ-PC90cj48L3RhYmxlPgo8L2JvZHk-PC9odG1sPg=="
+    }
+  }
+}

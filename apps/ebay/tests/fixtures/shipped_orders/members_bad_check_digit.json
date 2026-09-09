@@ -1,0 +1,27 @@
+{
+  "id": "fixture-members-bad-check-digit",
+  "threadId": "fixture-members-bad-check-digit",
+  "snippet": "The package will be headed your way soon!",
+  "internalDate": "1755094955000",
+  "payload": {
+    "headers": [
+      {
+        "name": "From",
+        "value": "eBay - timemachinecomics <a1b2c3d4e5f6a7b8c9d0@members.ebay.com>"
+      },
+      {
+        "name": "Subject",
+        "value": "Your order is being prepared"
+      },
+      {
+        "name": "Date",
+        "value": "Fri, 21 Aug 2026 08:00:00 -0700"
+      }
+    ],
+    "mimeType": "text/html",
+    "body": {
+      "size": 914,
+      "data": "PGh0bWw-PGJvZHk-Cjx0YWJsZT48dHI-PHRkPgogIDxoMT5BTE1PU1QgUkVBRFkhPC9oMT4KICA8cD5QbGVhc2UgYWxsb3cgMjQgaG91cnMgZm9yIG1vc3QgdHJhY2tpbmcgdXBkYXRlcy48L3A-CiAgPGEgaHJlZj0iaHR0cDovL3d3d2FwcHMudXBzLmNvbS9XZWJUcmFja2luZy90cmFjaz90cmFjaz15ZXMmYW1wO3RyYWNrTnVtcz0xWjk5WDk5QTExUVExMjM0NTEiIHRhcmdldD0iX2JsYW5rIj5UcmFjayBNeSBQYWNrYWdlPC9hPgogIDxwPk9yZGVyIE5vLiAwMi0xNTAzOS04MDMwNTwvcD4KICA8dGFibGUgY2xhc3M9Iml0ZW1zIj4KICAgIDx0cj48dGQ-VGhlIEFtYXppbmcgU3BpZGVyLU1hbiAjNzkgKE1hcnZlbCBDb21pY3MgMTk2OSkgRk4gQ29uZGl0aW9uITwvdGQ-CiAgICAgICAgPHRkPlF0eTogMTwvdGQ-PC90cj4KICAgIDx0cj48dGQ-VGhlIEFtYXppbmcgU3BpZGVyLU1hbiAjNzIgKE1hcnZlbCBDb21pY3MgTWF5IDE5NjkpIEZOIENvbmRpdGlvbiE8L3RkPgogICAgICAgIDx0ZD5RdHk6IDE8L3RkPjwvdHI-CiAgPC90YWJsZT4KICA8dGFibGU-PHRyPjx0ZD5TdWJ0b3RhbDwvdGQ-PHRkPiQxOTEuMDA8L3RkPjwvdHI-CiAgICAgICAgIDx0cj48dGQ-U2hpcHBpbmc8L3RkPjx0ZD4kNy43NDwvdGQ-PC90cj4KICAgICAgICAgPHRyPjx0ZD5Ub3RhbDwvdGQ-PHRkPiQxOTguNzQ8L3RkPjwvdHI-PC90YWJsZT4KICA8cD5TaGlwcGVkIFZpYTwvcD48cD5VUFMmcmVnOyBHcm91bmQgU2F2ZXI8L3A-CiAgPHA-U2hpcHBlZCBUbzwvcD48cD5idXllci1oYW5kbGU8YnI-MSBFWEFNUExFIFNUPGJyPlBPUlRMQU5ELCBPUiA5NzIwMC0wMDAwPC9wPgogIDxwPkRlYXIgYnV5ZXItaGFuZGxlLDwvcD4KICA8cD4tIHRpbWVtYWNoaW5lY29taWNzPC9wPgo8L3RkPjwvdHI-PC90YWJsZT4KPC9ib2R5PjwvaHRtbD4="
+    }
+  }
+}

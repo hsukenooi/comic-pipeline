@@ -1,0 +1,27 @@
+{
+  "id": "fixture-members-shipped-ups",
+  "threadId": "fixture-members-shipped-ups",
+  "snippet": "You can track your package!",
+  "internalDate": "1755094955000",
+  "payload": {
+    "headers": [
+      {
+        "name": "From",
+        "value": "eBay - timemachinecomics <a1b2c3d4e5f6a7b8c9d0@members.ebay.com>"
+      },
+      {
+        "name": "Subject",
+        "value": "Your package is estimated to arrive Wednesday, August 19"
+      },
+      {
+        "name": "Date",
+        "value": "Thu, 13 Aug 2026 07:32:20 -0700"
+      }
+    ],
+    "mimeType": "text/html",
+    "body": {
+      "size": 924,
+      "data": "PGh0bWw-PGJvZHk-Cjx0YWJsZT48dHI-PHRkPgogIDxoMT5Zb3VyIG9yZGVyIGhhcyBzaGlwcGVkLjwvaDE-CiAgPHA-UGxlYXNlIGFsbG93IDI0IGhvdXJzIGZvciBtb3N0IHRyYWNraW5nIHVwZGF0ZXMuPC9wPgogIDxhIGhyZWY9Imh0dHA6Ly93d3dhcHBzLnVwcy5jb20vV2ViVHJhY2tpbmcvdHJhY2s_dHJhY2s9eWVzJmFtcDt0cmFja051bXM9MVo5OVg5OUExMVFRMTIzNDU5IiB0YXJnZXQ9Il9ibGFuayI-VHJhY2sgTXkgUGFja2FnZTwvYT4KICA8cD5PcmRlciBOby4gMDItMTUwMzktODAzMDU8L3A-CiAgPHRhYmxlIGNsYXNzPSJpdGVtcyI-CiAgICA8dHI-PHRkPlRoZSBBbWF6aW5nIFNwaWRlci1NYW4gIzc5IChNYXJ2ZWwgQ29taWNzIDE5NjkpIEZOIENvbmRpdGlvbiE8L3RkPgogICAgICAgIDx0ZD5RdHk6IDE8L3RkPjwvdHI-CiAgICA8dHI-PHRkPlRoZSBBbWF6aW5nIFNwaWRlci1NYW4gIzcyIChNYXJ2ZWwgQ29taWNzIE1heSAxOTY5KSBGTiBDb25kaXRpb24hPC90ZD4KICAgICAgICA8dGQ-UXR5OiAxPC90ZD48L3RyPgogIDwvdGFibGU-CiAgPHRhYmxlPjx0cj48dGQ-U3VidG90YWw8L3RkPjx0ZD4kMTkxLjAwPC90ZD48L3RyPgogICAgICAgICA8dHI-PHRkPlNoaXBwaW5nPC90ZD48dGQ-JDcuNzQ8L3RkPjwvdHI-CiAgICAgICAgIDx0cj48dGQ-VG90YWw8L3RkPjx0ZD4kMTk4Ljc0PC90ZD48L3RyPjwvdGFibGU-CiAgPHA-U2hpcHBlZCBWaWE8L3A-PHA-VVBTJnJlZzsgR3JvdW5kIFNhdmVyPC9wPgogIDxwPlNoaXBwZWQgVG88L3A-PHA-YnV5ZXItaGFuZGxlPGJyPjEgRVhBTVBMRSBTVDxicj5QT1JUTEFORCwgT1IgOTcyMDAtMDAwMDwvcD4KICA8cD5EZWFyIGJ1eWVyLWhhbmRsZSw8L3A-CiAgPHA-LSB0aW1lbWFjaGluZWNvbWljczwvcD4KPC90ZD48L3RyPjwvdGFibGU-CjwvYm9keT48L2h0bWw-"
+    }
+  }
+}
