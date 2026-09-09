@@ -1,7 +1,7 @@
 ---
 title: "A reopened ticket's premise may already be stale — verify it against the code before implementing"
 date: 2026-07-20
-last_updated: 2026-08-01
+last_updated: 2026-09-09
 category: conventions
 module: "general (Linear ticket handling, any package) — these batches: locg-cli, gixen-cli"
 problem_type: convention
@@ -27,6 +27,7 @@ applies_when:
   - "A ticket describes an ordering, precedence, or gating defect — measure how often it actually fires before designing the remedy"
   - "A ticket blames pollution or junk in a data pool — rank the junk by whether it can reach the output, not by how wrong it looks"
   - "A ticket asks to remediate rows produced by a writer that has not itself been fixed"
+  - "A ticket prescribes a data repair whose effect depends on a GUARD in the writer (a merge, an upsert, a promotion) — simulate the writer, do not reason about the SQL"
 tags:
   - process
   - linear
@@ -55,11 +56,13 @@ tags:
   - bui-592
   - bui-594
   - bui-597
+  - bui-789
   - post-mortem-sourced
   - license-to-stop
   - data-repair
   - measurement-first
   - falsified-signal
+  - silent-no-op
 related_docs:
   - "docs/solutions/design-patterns/guard-strictness-must-match-consequence.md"
 ---
@@ -524,6 +527,57 @@ A wrong diff gets reverted; a wrong write to production may not be reversible at
 BUI-514 ritual (independent `sqlite3 .backup` → apply → diff proving *only* the intended
 rows/fields changed → row-count check) is what makes the write safe **once the remedy is
 right** — it does nothing about a remedy that is confidently wrong.
+
+### Example 21 — the repair was right for 13 of 18 rows, and the other 3 would have silently done nothing (BUI-789)
+
+BUI-789 listed 16 `comics.title` rows as "measured resolvable" and prescribed the obvious
+remedy: rename each wrong title to the right one, and `backfill-year` then resolves it. The
+diagnosis was sound and the SQL was safe — no unique-index collision, no dangling reference.
+Reading the code would have confirmed all of that. It was still wrong for 3 of the 16, and
+wrong in the quietest possible way: **the rename applies, the row is left exactly as stuck as
+before, and nothing reports a failure.**
+
+The cause is a guard in the writer, not in the data. `upsert_comic` merges a yearless row into
+a yeared sibling only when the years agree; when the sibling sits at a *different* year, the
+PER-104 guard declines and the yearless row keeps `year IS NULL`. Three of the merge targets
+stored the series **start** year rather than the issue year (`Thor` #136 at 1966, `Thor` #166
+at 1966, `World's Finest Comics` #200 at 1941), so the rename delivered each row to a guard
+that refused it. Correcting those three sibling years was a **required part of the repair**,
+not the follow-up the ticket implied.
+
+What found this was not reading `upsert_comic` — it was **running** it. Executing the real
+writer against a `sqlite3 .backup` copy printed the outcome per row:
+
+```
+426 -> MERGED into 275     428 -> MERGED into 870     321 -> promoted in place
+431 -> GUARD-DECLINED: yeared_sibling_conflict
+434 -> GUARD-DECLINED: yeared_sibling_conflict
+423 -> GUARD-DECLINED: yeared_sibling_conflict
+```
+
+The same simulation corrected the population in the other direction too: 2 of the 4 rows the
+ticket wrote off as permanently dead **do** resolve, because Metron spells the series
+`2001, A Space Odyssey` with a comma rather than the colon the ticket assumed. The real
+population was **18, not 16**. Reasoning about the SQL would have shipped 13 of 18 and
+reported success.
+
+**For any data repair whose effect passes through a writer's guard, simulate the writer on a
+throwaway copy and read its per-row verdict.** The BUI-514 ritual proves you changed only the
+rows you meant to; it says nothing about whether changing them accomplished anything. A row
+that silently declines to move looks identical to a row that was never in scope.
+
+Two traps from the same measurement, both worth carrying:
+
+- **`POST /api/sweep-orphans` looks like the right tool here and is not.** Its
+  `_find_yearless_orphans` picks the survivor by **lowest id**
+  (`ORDER BY (locg_id IS NULL), id`), not by matching year — so wherever a wrong-year duplicate
+  has the lower id, it merges into the wrong twin. For `World's Finest Comics` #186 it would
+  have chosen the 1941 row over the correct 1969 one.
+- **Quiescing the single writer is what makes the verification diff mean something.** With the
+  server stopped (`launchctl stop com.comics.server`) there is no concurrent sync traffic to
+  attribute, so "only the intended rows changed" is a result rather than a plausible reading.
+  See `docs/solutions/best-practices/satisfy-the-invariant-when-a-safety-step-is-blocked.md`
+  for the shape to use when quiescing is *not* available.
 
 ### Example 17 — the proposed signal was anti-correlated with the failure (BUI-578)
 
