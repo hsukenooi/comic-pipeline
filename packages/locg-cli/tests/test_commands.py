@@ -2849,6 +2849,68 @@ def test_resolve_year_lookup_ambiguous_membership_errors(monkeypatch):
     result = cmd_resolve_year_lookup(series="X-Men", issue="6")
     assert "error" in result
     assert "X-Men" in result["error"]
+    # BUI-788: a genuine Metron "no" is terminal for this input.
+    assert result["reason"] == "unresolvable"
+
+
+# ---------------------------------------------------------------------------
+# BUI-788: a THROTTLED resolve-year must not be reported as UNRESOLVABLE.
+#
+# Both come back from resolve_issue_by_membership as a bare None, and before
+# BUI-788 both produced the identical "could not unambiguously resolve" error
+# string. That collapse is what made BUI-773's 90-row backfill-year residual
+# read as fully structural when 5 of the 90 resolved on the first retry: the
+# report understated what a re-run would recover. The two are told apart by
+# MetronClient.degraded (BUI-255), which is set only by a transient failure.
+# ---------------------------------------------------------------------------
+
+def test_resolve_year_lookup_throttled_is_distinguishable_from_unresolvable(monkeypatch):
+    from locg.commands import cmd_resolve_year_lookup
+
+    inst = _patch_metron_resolve_issue(monkeypatch, detail=None)
+    inst.degraded = True  # rate-limit / connection retry exhausted
+
+    result = cmd_resolve_year_lookup(series="Captain America", issue="101")
+
+    assert result["reason"] == "throttled"
+    assert "throttled" in result["error"].lower()
+    # The wording must not imply Metron gave a verdict on the book — the
+    # operator has to know this row is worth retrying.
+    assert "retry" in result["error"].lower()
+
+
+def test_resolve_year_lookup_not_degraded_stays_unresolvable(monkeypatch):
+    """The same None with degraded explicitly False is the terminal verdict."""
+    from locg.commands import cmd_resolve_year_lookup
+
+    inst = _patch_metron_resolve_issue(monkeypatch, detail=None)
+    inst.degraded = False
+
+    assert cmd_resolve_year_lookup(series="X-Men", issue="6")["reason"] == "unresolvable"
+
+
+def test_resolve_year_lookup_mock_degraded_attribute_cannot_fake_a_throttle(monkeypatch):
+    """A bare MagicMock's `.degraded` auto-vivifies as a truthy Mock. The
+    `is True` identity check (same discipline as _check_metron_degraded) keeps
+    that from silently relabelling every stubbed miss as retryable."""
+    from locg.commands import cmd_resolve_year_lookup
+
+    inst = _patch_metron_resolve_issue(monkeypatch, detail=None)
+    assert bool(inst.degraded) is True  # truthy, but not `True`
+
+    assert cmd_resolve_year_lookup(series="X-Men", issue="6")["reason"] == "unresolvable"
+
+
+def test_resolve_year_lookup_no_usable_date_is_unresolvable_not_throttled(monkeypatch):
+    """Metron answered and the answer is unusable — retrying changes nothing."""
+    from locg.commands import cmd_resolve_year_lookup
+
+    _patch_metron_resolve_issue(monkeypatch, detail={
+        "metron_id": 9, "cover_date": None, "store_date": None,
+        "series_id": 1, "series_name": "X-Men",
+    })
+    result = cmd_resolve_year_lookup(series="X-Men", issue="1")
+    assert result["reason"] == "unresolvable"
 
 
 def test_resolve_year_lookup_requires_series_and_issue(monkeypatch):
@@ -2874,6 +2936,9 @@ def test_resolve_year_lookup_credential_error_returns_error_dict(monkeypatch):
     result = cmd_resolve_year_lookup(series="X-Men", issue="1")
     assert "error" in result
     assert "METRON_USERNAME" in result["error"]
+    # BUI-788: a config fault, distinct from both "Metron said no" and
+    # "Metron was busy" — re-running without fixing the env changes nothing.
+    assert result["reason"] == "credentials"
 
 
 # ---------------------------------------------------------------------------

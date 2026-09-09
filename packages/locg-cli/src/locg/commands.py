@@ -1209,6 +1209,25 @@ def _year_from_metron_dates(
     return None
 
 
+# BUI-788: the failure taxonomy `cmd_resolve_year_lookup` reports in its
+# `reason` field. The load-bearing split is THROTTLED (transient — Metron said
+# "slow down" or was unreachable; a re-run can still resolve this row) versus
+# UNRESOLVABLE (terminal for this input — Metron has no matching issue, has an
+# unbreakable cross-volume tie, or has no date on the issue it did find; a
+# re-run cannot change any of those). Consumers key retry decisions off that
+# split, so the two must never be merged back into one string.
+RESOLVE_YEAR_REASON_THROTTLED = "throttled"
+RESOLVE_YEAR_REASON_UNRESOLVABLE = "unresolvable"
+RESOLVE_YEAR_REASON_CREDENTIALS = "credentials"
+RESOLVE_YEAR_REASON_INVALID_INPUT = "invalid_input"
+RESOLVE_YEAR_REASONS = (
+    RESOLVE_YEAR_REASON_THROTTLED,
+    RESOLVE_YEAR_REASON_UNRESOLVABLE,
+    RESOLVE_YEAR_REASON_CREDENTIALS,
+    RESOLVE_YEAR_REASON_INVALID_INPUT,
+)
+
+
 def cmd_resolve_year_lookup(series: str, issue: str) -> dict[str, Any]:
     """Resolve a ``(series, issue)`` pair's publication YEAR via Metron (BUI-719).
 
@@ -1240,32 +1259,62 @@ def cmd_resolve_year_lookup(series: str, issue: str) -> dict[str, Any]:
     :func:`_year_from_metron_dates`).
 
     Returns ``{"status": "ok", "series", "issue", "year", "metron_id",
-    "series_id", "series_name"}`` on success, or ``{"error": ...}`` on any
-    failure (ambiguous, no match, no usable date, missing Metron
+    "series_id", "series_name"}`` on success, or ``{"error": ..., "reason":
+    ...}`` on any failure (ambiguous, no match, no usable date, missing Metron
     credentials, or a Metron rate limit/connection/5xx failure exhausted
     past :func:`_retry_once_on_rate_limit`'s single capped retry).
+
+    **``reason`` classifies the failure (BUI-788)** — one of
+    :data:`RESOLVE_YEAR_REASONS`. Until BUI-788 every one of those failures
+    returned the SAME opaque error string, so a THROTTLED call (Metron said
+    "slow down"; a later re-run resolves the row fine) was indistinguishable
+    from an UNRESOLVABLE one (Metron genuinely has no such issue, or has two
+    equally-good volumes; a re-run changes nothing). BUI-773's 90-row
+    `backfill-year` residual read as fully structural for exactly that
+    reason — 5 of the 90 turned out to resolve on the first retry. The
+    throttled/unreachable case is detected off ``MetronClient.degraded``, the
+    BUI-255 flag whose whole purpose is telling a transient Metron failure
+    apart from an exception-free "no match"; ``is True`` (identity, not
+    truthiness) mirrors :func:`_check_metron_degraded` so a bare ``MagicMock``
+    stub's auto-vivified attribute cannot fake a throttle.
     """
     from locg.metron import MetronClient, MetronCredentialError
 
     series = (series or "").strip()
     issue = (issue or "").strip()
     if not series:
-        return {"error": "resolve-year: series must be non-empty"}
+        return {
+            "error": "resolve-year: series must be non-empty",
+            "reason": RESOLVE_YEAR_REASON_INVALID_INPUT,
+        }
     if not issue:
-        return {"error": "resolve-year: issue must be non-empty"}
+        return {
+            "error": "resolve-year: issue must be non-empty",
+            "reason": RESOLVE_YEAR_REASON_INVALID_INPUT,
+        }
 
     metron = MetronClient()
     try:
         detail = metron.resolve_issue_by_membership(series, issue)
     except MetronCredentialError as e:
-        return {"error": str(e)}
+        return {"error": str(e), "reason": RESOLVE_YEAR_REASON_CREDENTIALS}
 
     if detail is None:
+        if getattr(metron, "degraded", False) is True:
+            return {
+                "error": (
+                    f"Metron was throttled/unreachable while resolving {series!r} "
+                    f"#{issue} (rate-limit or connection retry exhausted). This row "
+                    "is NOT known-unresolvable — retry it."
+                ),
+                "reason": RESOLVE_YEAR_REASON_THROTTLED,
+            }
         return {
             "error": (
                 f"Could not unambiguously resolve {series!r} #{issue} on Metron "
                 "(no exact-name series contains that issue, or more than one does)."
-            )
+            ),
+            "reason": RESOLVE_YEAR_REASON_UNRESOLVABLE,
         }
 
     year = _year_from_metron_dates(detail.get("store_date"), detail.get("cover_date"))
@@ -1275,7 +1324,8 @@ def cmd_resolve_year_lookup(series: str, issue: str) -> dict[str, Any]:
                 f"Metron resolved {series!r} #{issue} to "
                 f"metron_id={detail.get('metron_id')} but has no cover_date/store_date "
                 "to derive a year from."
-            )
+            ),
+            "reason": RESOLVE_YEAR_REASON_UNRESOLVABLE,
         }
 
     return {

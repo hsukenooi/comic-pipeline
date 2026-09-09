@@ -48,6 +48,7 @@ from gixen_overlay.db import (
     DEFAULT_FMV_HISTORY_READ_LIMIT,
 )
 from gixen_overlay.ledger import LedgerRoute
+from gixen_overlay import locg_lookup
 from gixen_overlay.locg_lookup import resolve_year_and_locg
 from gixen_overlay.models import (
     UpsertComicRequest,
@@ -1566,9 +1567,15 @@ async def api_backfill_year(
     in scope has been visited exactly once (full coverage), whether it wrote,
     failed, or was guard-skipped. A row that failed for a transient reason
     (e.g. a rate limit) is not retried automatically within one such pass —
-    start a fresh pass at `offset=0` later to retry; `results` entries
-    without a `skipped` code are worth retrying, entries with one (below)
-    are not, since the guard will refuse the same write again. Keep
+    start a fresh pass at `offset=0` later to retry. **Which rows are worth
+    that retry is now stated, not inferred (BUI-788): every unresolved entry
+    carries `retryable`.** (The old rule of thumb here — "entries without a
+    `skipped` code are worth retrying" — was too generous in one direction:
+    a genuine Metron "no such issue" has no `skipped` code either, and
+    re-running it forever buys nothing.) A throttled row is unresolved, so it
+    stays in the `year IS NULL` population and is already accounted for by
+    `next_offset` exactly like any other unresolved row — the paging
+    arithmetic below is unaffected by this classification. Keep
     `dry_run` and `active_only` fixed for the whole paging sequence — each
     defines a different `year IS NULL` population (a dry_run preview never
     calls `upsert_comic`, so it can't see PER-104 guard skips the way a real
@@ -1577,10 +1584,21 @@ async def api_backfill_year(
     row's position under another.
 
     Returns `{dry_run, active_only, offset, next_offset, scanned, resolved,
-    unresolved, results}` — `results` entries that fail to resolve carry
+    unresolved, unresolved_by_reason, retryable_unresolved, results}` —
+    `results` entries that fail to resolve carry
     `resolved: false` and no `year`, so a caller can tell "nothing to do yet"
     apart from "this call did nothing" (the same fetch-err-vs-genuine-zero
-    distinction this project keeps re-learning elsewhere). A row whose
+    distinction this project keeps re-learning elsewhere).
+
+    **BUI-788:** every unresolved entry also carries `reason` and
+    `retryable`, and the response rolls those up as `unresolved_by_reason`
+    (counts per reason, summing to `unresolved`) and `retryable_unresolved`.
+    The load-bearing split is `throttled`/`timeout` — Metron never answered,
+    a re-run can still resolve the row — against `unresolvable`, where Metron
+    answered and the answer is no. Those were one indistinguishable verdict
+    until BUI-788, which is why BUI-773's 90-row residual read as fully
+    structural when 5 of the 90 resolved immediately on retry. See
+    `locg_lookup.RESOLVE_REASONS` for the full taxonomy. A row whose
     resolution succeeded but whose write was declined by `upsert_comic`'s
     PER-104 guard (a yeared sibling exists at a different year — see
     `upsert_comic`'s docstring) also reports `resolved: false`, plus
@@ -1605,17 +1623,31 @@ async def api_backfill_year(
 
     results: list[dict] = []
     resolved_count = 0
+    unresolved_by_reason: dict[str, int] = {}
+
+    def _note_unresolved(entry: dict, reason: str, retryable: bool) -> None:
+        """Stamp an unresolved entry with WHY, and count it (BUI-788)."""
+        entry["reason"] = reason
+        entry["retryable"] = retryable
+        unresolved_by_reason[reason] = unresolved_by_reason.get(reason, 0) + 1
+
     for row in rows:
-        resolution = resolve_year_and_locg(row["title"], row["issue"])
+        outcome: dict[str, object] = {}
+        resolution = resolve_year_and_locg(row["title"], row["issue"], outcome=outcome)
         if resolution is None:
-            results.append(
-                {
-                    "comic_id": row["id"],
-                    "title": row["title"],
-                    "issue": row["issue"],
-                    "resolved": False,
-                }
+            reason = str(outcome.get("reason") or locg_lookup.REASON_CLI_ERROR)
+            miss_entry: dict[str, Any] = {
+                "comic_id": row["id"],
+                "title": row["title"],
+                "issue": row["issue"],
+                "resolved": False,
+            }
+            _note_unresolved(
+                miss_entry,
+                reason,
+                bool(outcome.get("retryable", locg_lookup.is_retryable_reason(reason))),
             )
+            results.append(miss_entry)
             continue
         entry: dict[str, Any] = {
             "comic_id": row["id"],
@@ -1647,6 +1679,13 @@ async def api_backfill_year(
                 entry["resolved"] = False
                 entry["skipped"] = skip_reason["code"]
                 entry["year"] = resolution.year
+                # BUI-788: a guard skip is unresolved for a THIRD kind of
+                # reason — Metron answered fine, the write was refused. It is
+                # terminal (the guard refuses the same write every time), so
+                # it must not inflate the retryable count. Carrying its own
+                # code into the same `reason` field is what keeps
+                # `unresolved_by_reason` summing to `unresolved`.
+                _note_unresolved(entry, skip_reason["code"], False)
             else:
                 resolved_count += 1
                 entry["resolved"] = True
@@ -1681,6 +1720,16 @@ async def api_backfill_year(
         "scanned": len(rows),
         "resolved": resolved_count,
         "unresolved": unresolved_count,
+        # BUI-788: the unresolved count split by cause, and how much of it a
+        # re-run could still recover. `unresolved` alone reads as "Metron
+        # doesn't know these books" — which is what made BUI-773's 90-row
+        # residual look structural when 5 of the 90 resolved on a retry.
+        # These two always agree with `unresolved`: every unresolved row is
+        # counted under exactly one reason.
+        "unresolved_by_reason": unresolved_by_reason,
+        "retryable_unresolved": sum(
+            1 for e in results if e.get("resolved") is False and e.get("retryable") is True
+        ),
         "results": results,
     }
 

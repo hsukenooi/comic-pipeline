@@ -20,6 +20,53 @@ logger = logging.getLogger("locg")
 # intended behavior (BUI-260).
 _RATE_LIMIT_MAX_SLEEP = 60.0
 
+# BUI-788: the cap above is only meaningful if whoever is WAITING on this
+# process can afford it. `gixen_overlay.locg_lookup` runs `locg resolve-year`
+# as a subprocess under its own wall-clock budget
+# (`LOCG_TIMEOUT_SECONDS`, 30s) — shorter than this 60s cap, so a throttled
+# lookup was killed mid-sleep and reported identically to "Metron has never
+# heard of this issue". The long sleep could not help under that budget, and
+# its only effect was to burn the caller's entire budget producing no
+# information.
+#
+# So the cap is env-overridable: a caller that knows its own deadline sets
+# ``METRON_RATE_LIMIT_MAX_SLEEP`` below it, and a throttled call then gives up
+# IN BAND (returning None with ``degraded`` set — a reportable "throttled")
+# instead of being killed with nothing to say. The DEFAULT is unchanged, so
+# every in-process caller (record-win batches, creator-run, the audit sweeps)
+# keeps the 60s cap it has today; only a caller that opts in shortens it.
+_RATE_LIMIT_MAX_SLEEP_ENV = "METRON_RATE_LIMIT_MAX_SLEEP"
+
+
+def _rate_limit_max_sleep() -> float:
+    """The rate-limit retry sleep cap, honoring ``METRON_RATE_LIMIT_MAX_SLEEP``.
+
+    Read per call rather than cached at import (the repo-wide KTD2 env
+    convention) so the comics server picks up a change without a redeploy.
+    A missing, unparseable, or non-positive value falls back to the
+    :data:`_RATE_LIMIT_MAX_SLEEP` default — a bad env value must never
+    silently disable the cap or turn it into a zero-wait hot retry.
+    """
+    raw = os.environ.get(_RATE_LIMIT_MAX_SLEEP_ENV)
+    if raw is None:
+        return _RATE_LIMIT_MAX_SLEEP
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Ignoring unparseable %s=%r; using the %.1fs default.",
+            _RATE_LIMIT_MAX_SLEEP_ENV, raw, _RATE_LIMIT_MAX_SLEEP,
+        )
+        return _RATE_LIMIT_MAX_SLEEP
+    if value <= 0:
+        logger.warning(
+            "Ignoring non-positive %s=%r; using the %.1fs default.",
+            _RATE_LIMIT_MAX_SLEEP_ENV, raw, _RATE_LIMIT_MAX_SLEEP,
+        )
+        return _RATE_LIMIT_MAX_SLEEP
+    return value
+
+
 # mokkari's own hardcoded prefix (session.py: `_execute_http_request`) for a
 # ``requests`` ``ConnectionError``/``ReadTimeout`` it re-wraps as ``ApiError``
 # before it ever reaches us — the underlying timeout exception isn't
@@ -212,9 +259,10 @@ def _retry_once_on_rate_limit(func):
     silently got ``None`` either way and never actually asked Metron (BUI-260).
     This decorator intercepts ``RateLimitError`` before that blanket handler,
     logs at ``warning`` (a rate-limit event is not a routine miss), waits
-    ``min(exc.retry_after, _RATE_LIMIT_MAX_SLEEP)``, and retries once. Only a
-    second ``RateLimitError`` — from the retry itself — falls through to
-    ``None``.
+    ``min(exc.retry_after, _rate_limit_max_sleep())`` — the 60s default,
+    or a caller-supplied deadline-aware override (BUI-788) — and retries
+    once. Only a second ``RateLimitError`` — from the retry itself — falls
+    through to ``None``.
 
     Also maintains ``self.degraded`` (BUI-255): reset to ``False`` at the
     start of every decorated call, then flipped ``True`` only by a failure
@@ -241,7 +289,7 @@ def _retry_once_on_rate_limit(func):
         try:
             return func(self, *args, **kwargs)
         except RateLimitError as exc:
-            wait = min(max(exc.retry_after, 0), _RATE_LIMIT_MAX_SLEEP)
+            wait = min(max(exc.retry_after, 0), _rate_limit_max_sleep())
             logger.warning(
                 "Metron rate limit hit in %s; retrying once after %.1fs",
                 func.__name__, wait,
