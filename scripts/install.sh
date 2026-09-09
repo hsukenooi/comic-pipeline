@@ -6,7 +6,8 @@
 # Installs (uv-managed console scripts into ~/.local/bin — runtime model (a),
 # BUI-55: the apps AND the gixen/locg package CLIs live on PATH; the uv workspace
 # env is for development/server/tests only, not these user-facing commands):
-#   - ebay-tools  -> ebay-fetch, ebay-sold-comps, seller-scan, comic-identify, wishlist-sellers   (apps/ebay)
+#   - ebay-tools  -> ebay-fetch, ebay-sold-comps, seller-scan, comic-identify,
+#                   wishlist-sellers, ebay-shipped                             (apps/ebay)
 #   - comic-fmv   -> comic-fmv                                   (apps/fmv)
 #   - gixen-cli   -> gixen                                       (packages/gixen-cli, editable)
 #   - locg        -> locg                                        (packages/locg-cli, editable)
@@ -64,7 +65,7 @@ if ! command -v uv >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "Installing ebay-tools (ebay-fetch, ebay-sold-comps, seller-scan, comic-identify, wishlist-sellers)..."
+echo "Installing ebay-tools (ebay-fetch, ebay-sold-comps, seller-scan, comic-identify, wishlist-sellers, ebay-shipped)..."
 # BUI-241: --editable so the file-relative _load_dotenv() in seller_scan.py
 # resolves back into the source tree (apps/ebay/.env) regardless of caller cwd;
 # secrets stay out of the built wheel.
@@ -121,6 +122,6 @@ done
 
 echo
 echo "Done. CLIs installed via uv into $bin_dir:"
-for name in comic-fmv ebay-sold-comps ebay-fetch seller-scan comic-identify wishlist-sellers gixen locg comics-api premise-check; do
+for name in comic-fmv ebay-sold-comps ebay-fetch seller-scan comic-identify wishlist-sellers ebay-shipped gixen locg comics-api premise-check; do
   printf '  %-16s -> %s\n' "$name" "$(command -v "$name" 2>/dev/null || echo 'NOT ON PATH — add '"$bin_dir"' to PATH')"
 done

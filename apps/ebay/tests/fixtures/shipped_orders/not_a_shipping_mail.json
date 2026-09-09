@@ -1,0 +1,27 @@
+{
+  "id": "fixture-saved-search",
+  "threadId": "fixture-saved-search",
+  "snippet": "You've got new hits on your saved search!",
+  "internalDate": "1755094955000",
+  "payload": {
+    "headers": [
+      {
+        "name": "From",
+        "value": "eBay <ebay@ebay.com>"
+      },
+      {
+        "name": "Subject",
+        "value": "\"amazing spider-man #50\" -variant 1967: 1 NEW!"
+      },
+      {
+        "name": "Date",
+        "value": "Tue, 8 Sep 2026 02:04:15 -0700"
+      }
+    ],
+    "mimeType": "text/html",
+    "body": {
+      "size": 140,
+      "data": "PGh0bWw-PGJvZHk-PHA-WW91J3ZlIGdvdCBuZXcgaGl0cyBvbiB5b3VyIHNhdmVkIHNlYXJjaCE8L3A-PGEgaHJlZj0iaHR0cHM6Ly93d3cuZWJheS5jb20vc2NoL2kuaHRtbD9fbmt3PWFzbSs1MCI-U2VlIHRoZW08L2E-PC9ib2R5PjwvaHRtbD4="
+    }
+  }
+}

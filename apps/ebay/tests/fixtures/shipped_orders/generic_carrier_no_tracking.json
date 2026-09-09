@@ -1,0 +1,44 @@
+{
+  "id": "fixture-generic-carrier",
+  "threadId": "fixture-generic-carrier",
+  "snippet": "Shipped with UPS",
+  "internalDate": "1755094955000",
+  "payload": {
+    "headers": [
+      {
+        "name": "From",
+        "value": "eBay <ebay@ebay.com>"
+      },
+      {
+        "name": "Subject",
+        "value": "Your package is now with its carrier!"
+      },
+      {
+        "name": "Date",
+        "value": "Thu, 13 Aug 2026 19:44:45 -0700"
+      }
+    ],
+    "mimeType": "multipart/alternative",
+    "parts": [
+      {
+        "mimeType": "text/plain",
+        "body": {
+          "size": 31,
+          "data": "U2hpcHBlZCB3aXRoIFVQUwpUcmFjayBwYWNrYWdlCg=="
+        },
+        "headers": []
+      },
+      {
+        "mimeType": "text/html",
+        "body": {
+          "size": 364,
+          "data": "PGh0bWw-PGJvZHk-CjxwPkhpIGJ1eWVyLCBsZXQgdGhlIHRyYWNraW5nIGJlZ2luISBGb2xsb3cgcHJvZ3Jlc3MgaW4gcmVhbCB0aW1lLjwvcD4KPGEgaHJlZj0iaHR0cHM6Ly93d3cuZWJheS5jb20vdm9kL0ZldGNoT3JkZXJEZXRhaWxzP2l0ZW1JZD0xMzc1ODg3MzMxNTYmYW1wO3RyYW5zYWN0aW9uSWQ9MTAwODMwMDg2MDI1MjAiPlRyYWNrIHBhY2thZ2U8L2E-CjxwPkl0ZW0gSUQ6PC9wPjxwPjEzNzU4ODczMzE1NjwvcD4KPHA-T3JkZXIgbnVtYmVyOjwvcD48cD4wMi0xNTAzOS04MDMwNTwvcD4KPHA-U2VsbGVyOjwvcD48cD50aW1lbWFjaGluZWNvbWljczwvcD4KPHA-Q2Fycmllcjo8L3A-PHA-VVBTPC9wPgo8L2JvZHk-PC9odG1sPg=="
+        },
+        "headers": []
+      }
+    ],
+    "body": {
+      "size": 0
+    }
+  }
+}

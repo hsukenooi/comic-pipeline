@@ -1,8 +1,8 @@
-"""Tests for --version flag across all 6 console scripts (BUI-314).
+"""Tests for --version flag across all 7 console scripts (BUI-314).
 
 Each script (comic_identify, grade_photos, ebay_fetch, wishlist_sellers,
-sold_comps, seller_scan) should respond to --version with a version string
-and exit 0.
+sold_comps, seller_scan, shipped_orders) should respond to --version with a
+version string and exit 0.
 """
 
 import re
@@ -20,10 +20,11 @@ class TestVersionFlag:
         "wishlist-sellers",
         "ebay-sold-comps",
         "seller-scan",
+        "ebay-shipped",
     ]
 
     def test_version_flag_exists_and_exits_zero(self):
-        """All 6 scripts should respond to --version and exit 0."""
+        """All 7 scripts should respond to --version and exit 0."""
         for script in self.SCRIPTS:
             result = subprocess.run(
                 [sys.executable, "-m", f"{script.replace('-', '_')}", "--version"],
@@ -110,12 +111,22 @@ class TestVersionFlag:
         except SystemExit as e:
             assert e.code == 0
 
+    def test_version_string_format_for_shipped_orders(self):
+        """ebay-shipped --version prints version and git info."""
+        import shipped_orders
+
+        try:
+            shipped_orders.main(["--version"])
+        except SystemExit as e:
+            assert e.code == 0
+
     def test_version_string_pattern_for_all_scripts(self, capsys):
         """All version strings follow the pattern: <script> <version> (git <sha>, <date>)."""
         import comic_identify
         import ebay_fetch
         import grade_photos
         import seller_scan
+        import shipped_orders
         import sold_comps
         import wishlist_sellers
 
@@ -124,6 +135,7 @@ class TestVersionFlag:
             ebay_fetch,
             grade_photos,
             seller_scan,
+            shipped_orders,
             sold_comps,
             wishlist_sellers,
         ]
