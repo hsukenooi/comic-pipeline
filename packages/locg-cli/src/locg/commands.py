@@ -35,6 +35,7 @@ from locg.collection_cache import (
     matchable_rows,
     owned_match_keys,
     quarantine_marker,
+    rebuild_series_name_index,
     resolve_series_for_win,
     series_year_range,
 )
@@ -2555,9 +2556,10 @@ def _needs_explicit_store(cache: Optional[Any]) -> bool:
     "Usable" means non-blank AND actually expanded — see
     :func:`_unexpanded_store_path`.
 
-    **Scope (BUI-476 + BUI-489 + BUI-497):** every collection/wish-list
+    **Scope (BUI-476 + BUI-489 + BUI-497 + BUI-771):** every collection/wish-list
     MUTATOR now consults this — ``import``, ``record-win``, ``backfill``,
-    ``remediate-delete``, ``remediate-set-copies``, and the wish-list writers
+    ``remediate-delete``, ``remediate-set-copies``, ``rebuild-index``, and the
+    wish-list writers
     ``wish-list add``/``remove``/``set-year``/``add --creator`` (the
     wish-list writers pass ``cache`` straight through to this same check even
     though they resolve their OWN path via :func:`_resolve_wish_list_path`,
@@ -6344,6 +6346,142 @@ def cmd_collection_remediate_set_copies(
         "row": outcome["previous_row"],
         "previous_in_collection": outcome["current_in_collection"],
         "new_in_collection": outcome["new_in_collection"],
+    }
+
+
+def _index_staleness(index: Any) -> tuple[int, int]:
+    """Return (stale, total) for a `series_name_index` snapshot — the same
+    signature `_check_series_name_index_freshness` computes, recomputed here
+    so callers can report it without reaching into that private method.
+
+    Same defensive shape check as that method: a malformed on-disk value
+    (anything but a dict) reports (0, 0) rather than crashing."""
+    if not isinstance(index, dict):
+        return 0, 0
+    stale = 0
+    total = 0
+    for key, series_name in index.items():
+        if not isinstance(series_name, str):
+            continue
+        total += 1
+        if _normalize_series_key(series_name) != key:
+            stale += 1
+    return stale, total
+
+
+def _index_diff_count(old: dict[str, Any], new: dict[str, Any]) -> int:
+    """Count key-slots added, removed, or re-pointed between two index
+    snapshots. A stale key that gets renamed (the common BUI-771 case) counts
+    as 2 — the old key-value pair is removed AND the new one is added — since
+    both are real differences between the on-disk index before and after."""
+    keys = set(old) | set(new)
+    return sum(1 for key in keys if old.get(key) != new.get(key))
+
+
+def cmd_collection_rebuild_index(
+    *,
+    dry_run: bool = False,
+    cache: Optional[CollectionCache] = None,
+) -> dict[str, Any]:
+    """Rebuild `series_name_index` in place from rows already on disk (BUI-771).
+
+    `series_name_index` is only ever rebuilt by
+    :func:`locg.collection_cache.rebuild_series_name_index`, which normally
+    runs at the tail of `collection import` — so a normalizer change (e.g.
+    BUI-546's punctuation fold) leaves the on-disk keys stale until the next
+    import, and the ONLY previously-documented fix was "run another import",
+    which needs a fresh LOCG export.
+
+    That premise is wrong: :func:`rebuild_series_name_index` builds the index
+    purely from `source='locg_export'` rows already sitting in the payload's
+    `comics` list (see that function's own docstring — R61). Nothing has to
+    come from locg.com. This command reruns exactly that derivation against
+    the CURRENT on-disk rows and replaces `series_name_index` with the
+    result — no export file, no LOCG access, same production-write discipline
+    as every other collection mutator: it goes through `cache.apply()`'s
+    exclusive lock (never a bare read + direct file write), rebuilds the
+    index a SECOND time inside the lock so the applied result matches what a
+    concurrent writer might have left, and reports before/after counts.
+
+    Touches ONLY `payload["series_name_index"]` — `comics` rows, copy counts,
+    quarantine markers, and everything else in the payload pass through
+    `rebuild_series_name_index` read-only and land back in the payload
+    unchanged.
+
+    `dry_run=True` previews the rebuild (computed from the currently-loaded
+    payload, outside the lock) without mutating or writing an audit record.
+
+    Idempotent: a second run against an already-fresh index recomputes the
+    identical mapping from the same rows, so `changed` and `stale_before` are
+    both 0.
+
+    BUI-489: same wrong-store guard as the other collection mutators —
+    refuses with `{"status": "explicit_store_required"}` when no `cache` is
+    passed and `LOCG_DATA_DIR` is unset/unexpanded (see
+    `_needs_explicit_store`), checked before `dry_run` is consulted. Returns
+    `{"status": "not_imported"}` if the store has never been imported (R11).
+
+    On success: `{"status": "ok"|"preview", "total_before", "stale_before",
+    "total_after", "changed"}`.
+    """
+    if _needs_explicit_store(cache):
+        return _explicit_store_required_error("locg collection rebuild-index")
+
+    if cache is None:
+        cache = CollectionCache()
+    payload = cache.load()
+    if payload.get("last_full_import") is None:
+        return _not_imported_error()
+
+    current_index = payload.get("series_name_index")
+    if not isinstance(current_index, dict):
+        current_index = {}
+    stale_before, total_before = _index_staleness(current_index)
+
+    if dry_run:
+        rebuilt = rebuild_series_name_index(payload)
+        return {
+            "status": "preview",
+            "total_before": total_before,
+            "stale_before": stale_before,
+            "total_after": len(rebuilt),
+            "changed": _index_diff_count(current_index, rebuilt),
+        }
+
+    outcome: dict[str, Any] = {}
+
+    def _mutate(locked_payload: dict[str, Any]) -> None:
+        locked_current = locked_payload.get("series_name_index")
+        if not isinstance(locked_current, dict):
+            locked_current = {}
+        locked_stale, locked_total = _index_staleness(locked_current)
+        rebuilt = rebuild_series_name_index(locked_payload)
+        outcome["total_before"] = locked_total
+        outcome["stale_before"] = locked_stale
+        outcome["total_after"] = len(rebuilt)
+        outcome["changed"] = _index_diff_count(locked_current, rebuilt)
+        locked_payload["series_name_index"] = rebuilt
+
+    cache.apply(_mutate, command="collection-rebuild-index")
+
+    cache.append_audit({
+        "type": "collection_rebuild_index",
+        "ts": _utcnow_iso(),
+        "command": "collection-rebuild-index",
+        "details": {
+            "total_before": outcome["total_before"],
+            "stale_before": outcome["stale_before"],
+            "total_after": outcome["total_after"],
+            "changed": outcome["changed"],
+        },
+    })
+
+    return {
+        "status": "ok",
+        "total_before": outcome["total_before"],
+        "stale_before": outcome["stale_before"],
+        "total_after": outcome["total_after"],
+        "changed": outcome["changed"],
     }
 
 

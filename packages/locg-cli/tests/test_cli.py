@@ -742,3 +742,89 @@ def test_authority_check_invalid_request_exits_1(monkeypatch, capsys):
     with pytest.raises(SystemExit) as exc_info:
         main()
     assert exc_info.value.code == 1
+
+
+def test_rebuild_index_subcommand_parsed():
+    parser = create_parser()
+    args = parser.parse_args(["collection", "rebuild-index", "--dry-run"])
+    assert args.command == "collection"
+    assert args.collection_command == "rebuild-index"
+    assert args.dry_run is True
+
+
+def test_rebuild_index_skips_client_and_dispatches(monkeypatch, capsys):
+    """`locg collection rebuild-index` is a pure local-cache write (like
+    `remediate-set-copies`/`quarantine`) — must not construct LOCGClient, and
+    must dispatch to cmd_collection_rebuild_index with the parsed --dry-run."""
+    import locg.cli
+
+    client_constructed = []
+
+    class FakeClient:
+        def __init__(self):
+            client_constructed.append(True)
+        def close(self):
+            pass
+
+    calls = []
+
+    def fake_rebuild_index(*, dry_run=False):
+        calls.append(dry_run)
+        return {
+            "status": "ok",
+            "total_before": 307,
+            "stale_before": 139,
+            "total_after": 307,
+            "changed": 278,
+        }
+
+    monkeypatch.setattr(locg.cli, "LOCGClient", FakeClient)
+    monkeypatch.setattr(locg.cli, "cmd_collection_rebuild_index", fake_rebuild_index)
+    monkeypatch.setattr(sys, "argv", ["locg", "collection", "rebuild-index"])
+
+    try:
+        main()
+    except SystemExit as e:
+        assert e.code in (None, 0)
+
+    assert not client_constructed, "LOCGClient must not be constructed for rebuild-index"
+    assert calls == [False]
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "ok"
+    assert out["stale_before"] == 139
+
+
+def test_rebuild_index_threads_dry_run_flag(monkeypatch, capsys):
+    import locg.cli
+
+    calls = []
+
+    def fake_rebuild_index(*, dry_run=False):
+        calls.append(dry_run)
+        return {"status": "preview", "total_before": 1, "stale_before": 1, "total_after": 1, "changed": 2}
+
+    monkeypatch.setattr(locg.cli, "cmd_collection_rebuild_index", fake_rebuild_index)
+    monkeypatch.setattr(sys, "argv", ["locg", "collection", "rebuild-index", "--dry-run"])
+
+    try:
+        main()
+    except SystemExit as e:
+        assert e.code in (None, 0)
+
+    assert calls == [True]
+
+
+def test_rebuild_index_non_ok_status_exits_1(monkeypatch, capsys):
+    """A refusal (explicit_store_required / not_imported) must exit non-zero —
+    a chained caller must not read exit 0 as 'rebuilt'."""
+    import locg.cli
+
+    def fake_rebuild_index(*, dry_run=False):
+        return {"status": "not_imported", "error": "collection store has no import yet"}
+
+    monkeypatch.setattr(locg.cli, "cmd_collection_rebuild_index", fake_rebuild_index)
+    monkeypatch.setattr(sys, "argv", ["locg", "collection", "rebuild-index"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        main()
+    assert exc_info.value.code == 1
