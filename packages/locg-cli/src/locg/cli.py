@@ -34,6 +34,7 @@ from locg.commands import (
     cmd_collection_has,
     cmd_collection_import,
     cmd_collection_quarantine,
+    cmd_collection_rebuild_index,
     cmd_collection_record_win,
     cmd_collection_remediate_delete,
     cmd_collection_remediate_set_copies,
@@ -426,6 +427,24 @@ def create_parser() -> argparse.ArgumentParser:
     p_rem_set_count.add_argument("--delta", type=int, help="Adjust copies-owned by this signed amount")
     p_rem_set.add_argument("--dry-run", dest="dry_run", action="store_true", help="Preview the op without mutating")
 
+    # collection rebuild-index — clear series_name_index staleness in place (BUI-771)
+    p_rebuild_idx = coll_sub.add_parser(
+        "rebuild-index",
+        parents=[common],
+        help="Rebuild series_name_index from the currently-stored locg_export rows, in place",
+        epilog=(
+            "Reruns the same derivation `collection import` runs at its tail "
+            "(rebuild_series_name_index), against rows already on disk — no "
+            "fresh LOCG export needed. Goes through the same exclusive-lock "
+            "cache.apply() every other mutator uses; touches ONLY "
+            "series_name_index. --dry-run reports before/after counts "
+            "(total keys, how many were stale, how many would change) "
+            "without mutating. Idempotent — a second run against an "
+            "already-fresh index reports changed=0."
+        ),
+    )
+    p_rebuild_idx.add_argument("--dry-run", dest="dry_run", action="store_true", help="Preview the rebuild without mutating")
+
     # collection quarantine / unquarantine — the BUI-647 row state, set + lifted (BUI-648)
     _QUARANTINE_IDENTITY_HELP = (
         "The row is named by its full identity — --publisher, --series, "
@@ -782,7 +801,7 @@ def main() -> None:
     _LOCAL_COLLECTION_SUBCMDS = {
         "import", "export", "status", "check", "check-batch", "doctor", "record-win",
         "audit-pending", "audit-unscoped-lookup", "audit-metron-mismatch",
-        "remediate-delete", "remediate-set-copies", "backfill",
+        "remediate-delete", "remediate-set-copies", "rebuild-index", "backfill",
         "quarantine", "unquarantine", "authority-check",
     }
     _collection_sub = (
@@ -971,6 +990,13 @@ def main() -> None:
                     source=getattr(args, "source", None),
                     in_collection=getattr(args, "in_collection", None),
                     delta=getattr(args, "delta", None),
+                    dry_run=getattr(args, "dry_run", False),
+                )
+                if result.get("status") not in ("ok", "preview"):
+                    output(result, pretty=args.pretty, fields=fields)
+                    sys.exit(1)
+            elif sub_cmd == "rebuild-index":
+                result = cmd_collection_rebuild_index(
                     dry_run=getattr(args, "dry_run", False),
                 )
                 if result.get("status") not in ("ok", "preview"):
