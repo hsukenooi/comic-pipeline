@@ -1438,7 +1438,7 @@ def test_backfill_year_dry_run_resolves_without_writing(api, monkeypatch):
 
     monkeypatch.setattr(
         routes, "resolve_year_and_locg",
-        lambda series, issue: LocgResolution(year=2005, locg_id=555, locg_variant_id=None),
+        lambda series, issue, **_kw: LocgResolution(year=2005, locg_id=555, locg_variant_id=None),
     )
 
     r = api.post("/api/comics/backfill-year")  # dry_run defaults True
@@ -1472,7 +1472,7 @@ def test_backfill_year_commits_and_reports_resolved_count(api, monkeypatch):
 
     monkeypatch.setattr(
         routes, "resolve_year_and_locg",
-        lambda series, issue: LocgResolution(year=2009, locg_id=None, locg_variant_id=None),
+        lambda series, issue, **_kw: LocgResolution(year=2009, locg_id=None, locg_variant_id=None),
     )
 
     r = api.post("/api/comics/backfill-year", params={"dry_run": "false"})
@@ -1501,7 +1501,7 @@ def test_backfill_year_unresolved_is_reported_not_silently_dropped(api, monkeypa
     comic_id = r.json()["id"]
     api.post("/api/bids/700000003/link-fmv", json={"comic_id": comic_id, "grade": 9.0})
 
-    monkeypatch.setattr(routes, "resolve_year_and_locg", lambda *_: None)
+    monkeypatch.setattr(routes, "resolve_year_and_locg", lambda *_a, **_kw: None)
 
     r = api.post("/api/comics/backfill-year")
     assert r.status_code == 200
@@ -1509,6 +1509,180 @@ def test_backfill_year_unresolved_is_reported_not_silently_dropped(api, monkeypa
     entry = next(e for e in body["results"] if e["comic_id"] == comic_id)
     assert entry["resolved"] is False
     assert "year" not in entry
+
+
+# ---------------------------------------------------------------------------
+# BUI-788: a throttled row must be distinguishable from an unresolvable one.
+#
+# Before this, `unresolved` was one undifferentiated number and every entry
+# read as "Metron doesn't know this book". That understated what a re-run
+# would recover — BUI-773's 90-row residual looked fully structural when 5 of
+# the 90 resolved on the first retry.
+# ---------------------------------------------------------------------------
+
+def _resolver_failing_with(reason, retryable):
+    """A resolver double that fails the way locg_lookup would for `reason`."""
+    def fake(series, issue, *, outcome=None, **_kw):
+        if outcome is not None:
+            outcome["reason"] = reason
+            outcome["retryable"] = retryable
+        return None
+    return fake
+
+
+def _linked_yearless_comic(api, item_id, title):
+    api.post("/api/bids", json={"item_id": item_id, "max_bid": 20.0})
+    r = api.post("/api/comics", json={
+        "title": title, "issue": "1", "grade": 8.0, "fmv_low": 10.0, "fmv_high": 15.0,
+    })
+    comic_id = r.json()["id"]
+    api.post(f"/api/bids/{item_id}/link-fmv", json={"comic_id": comic_id, "grade": 8.0})
+    return comic_id
+
+
+def test_backfill_year_throttled_row_is_reported_as_retryable(api, monkeypatch):
+    from gixen_overlay import routes
+
+    comic_id = _linked_yearless_comic(api, "700000031", "Throttled Book")
+    monkeypatch.setattr(
+        routes, "resolve_year_and_locg", _resolver_failing_with("throttled", True)
+    )
+
+    body = api.post("/api/comics/backfill-year").json()
+    entry = next(e for e in body["results"] if e["comic_id"] == comic_id)
+
+    assert entry["resolved"] is False
+    assert entry["reason"] == "throttled"
+    assert entry["retryable"] is True
+    assert body["unresolved_by_reason"]["throttled"] == 1
+    assert body["retryable_unresolved"] == 1
+
+
+def test_backfill_year_unresolvable_row_is_not_retryable(api, monkeypatch):
+    """The contrast case: same `resolved: false`, opposite retry advice."""
+    from gixen_overlay import routes
+
+    comic_id = _linked_yearless_comic(api, "700000032", "Unknown Book")
+    monkeypatch.setattr(
+        routes, "resolve_year_and_locg", _resolver_failing_with("unresolvable", False)
+    )
+
+    body = api.post("/api/comics/backfill-year").json()
+    entry = next(e for e in body["results"] if e["comic_id"] == comic_id)
+
+    assert entry["reason"] == "unresolvable"
+    assert entry["retryable"] is False
+    assert body["retryable_unresolved"] == 0
+    assert "throttled" not in body["unresolved_by_reason"]
+
+
+def test_backfill_year_unlabelled_failure_defaults_to_retryable(api, monkeypatch):
+    """A resolver that returns a bare None (an older double, or a caller that
+    doesn't populate the out-param) must not be filed as unresolvable —
+    assuming terminal on no evidence is exactly the BUI-788 defect."""
+    from gixen_overlay import routes
+
+    comic_id = _linked_yearless_comic(api, "700000033", "Silent Failure Book")
+    monkeypatch.setattr(routes, "resolve_year_and_locg", lambda *_a, **_kw: None)
+
+    body = api.post("/api/comics/backfill-year").json()
+    entry = next(e for e in body["results"] if e["comic_id"] == comic_id)
+
+    assert entry["reason"] == "cli_error"
+    assert entry["retryable"] is True
+
+
+def test_backfill_year_reason_counts_account_for_every_unresolved_row(api, monkeypatch):
+    """`unresolved_by_reason` must sum to `unresolved` — otherwise the split
+    quietly loses rows and the roll-up is less trustworthy than the plain
+    count it replaces. Mixes all three unresolved shapes: a throttle, a
+    terminal miss, and a PER-104 guard skip (Metron answered; the WRITE was
+    refused), which is unresolved for a third reason entirely.
+    """
+    from gixen_overlay import routes
+    from gixen_overlay.locg_lookup import LocgResolution
+
+    # A yeared sibling at a DIFFERENT year, to fire upsert_comic's guard.
+    conn = sqlite3.connect(os.environ["DB_PATH"])
+    conn.execute(
+        "INSERT INTO comics (title, issue, year) VALUES (?, ?, ?)", ("Guarded Twin", "1", 1968)
+    )
+    cur = conn.execute(
+        "INSERT INTO comics (title, issue, year) VALUES (?, ?, NULL)", ("Guarded Twin", "1")
+    )
+    guarded_id = cur.lastrowid
+    conn.execute(
+        "INSERT INTO fmv (comic_id, grade, low, high) VALUES (?, ?, ?, ?)",
+        (guarded_id, 9.0, 50.0, 70.0),
+    )
+    conn.commit()
+    conn.close()
+    api.post("/api/bids", json={"item_id": "700000034", "max_bid": 50.0})
+    api.post("/api/bids/700000034/link-fmv", json={"comic_id": guarded_id, "grade": 9.0})
+
+    throttled_id = _linked_yearless_comic(api, "700000035", "Throttled Twin")
+    missing_id = _linked_yearless_comic(api, "700000036", "Missing Twin")
+
+    def fake(series, issue, *, outcome=None, **_kw):
+        if series == "Guarded Twin":
+            return LocgResolution(year=1999)  # resolves, then the guard refuses
+        reason = "throttled" if series == "Throttled Twin" else "unresolvable"
+        if outcome is not None:
+            outcome["reason"] = reason
+            outcome["retryable"] = reason == "throttled"
+        return None
+
+    monkeypatch.setattr(routes, "resolve_year_and_locg", fake)
+
+    body = api.post("/api/comics/backfill-year", params={"dry_run": "false"}).json()
+
+    assert sum(body["unresolved_by_reason"].values()) == body["unresolved"]
+    assert body["unresolved_by_reason"]["throttled"] == 1
+    assert body["unresolved_by_reason"]["unresolvable"] == 1
+    assert body["unresolved_by_reason"]["yeared_sibling_conflict"] == 1
+    # Only the throttled row is worth a re-run: the guard refuses the same
+    # write every time, and Metron's "no" does not change on retry.
+    assert body["retryable_unresolved"] == 1
+
+    guard_entry = next(e for e in body["results"] if e["comic_id"] == guarded_id)
+    assert guard_entry["skipped"] == "yeared_sibling_conflict"
+    assert guard_entry["reason"] == "yeared_sibling_conflict"
+    assert guard_entry["retryable"] is False
+    assert {throttled_id, missing_id} <= {e["comic_id"] for e in body["results"]}
+
+
+def test_backfill_year_throttled_row_still_advances_next_offset(api, monkeypatch):
+    """A throttled row does NOT write, so it stays in the `year IS NULL`
+    population and must keep counting toward `unresolved` — which is what
+    `next_offset` advances by in a real run (BUI-721). Classifying it must not
+    tempt anyone into excluding it from that count: doing so pins next_offset
+    and the caller re-scans the same throttled head forever.
+    """
+    from gixen_overlay import routes
+
+    ids = [
+        _linked_yearless_comic(api, "700000037", "Throttled Page A"),
+        _linked_yearless_comic(api, "700000038", "Throttled Page B"),
+    ]
+    monkeypatch.setattr(
+        routes, "resolve_year_and_locg", _resolver_failing_with("throttled", True)
+    )
+
+    seen = []
+    offset = 0
+    for _ in range(6):
+        body = api.post(
+            "/api/comics/backfill-year", params={"limit": 1, "offset": offset, "dry_run": "false"}
+        ).json()
+        if body["scanned"] == 0:
+            break
+        assert body["next_offset"] == offset + body["unresolved"] == offset + 1
+        seen.extend(e["comic_id"] for e in body["results"])
+        offset = body["next_offset"]
+    else:
+        pytest.fail("throttled rows stalled the paging sequence")
+
+    assert sorted(cid for cid in seen if cid in ids) == sorted(ids)
 
 
 def test_backfill_year_active_only_excludes_unlinked_comics(api, monkeypatch):
@@ -1524,7 +1698,7 @@ def test_backfill_year_active_only_excludes_unlinked_comics(api, monkeypatch):
     calls = []
     monkeypatch.setattr(
         routes, "resolve_year_and_locg",
-        lambda series, issue: calls.append((series, issue))
+        lambda series, issue, **_kw: calls.append((series, issue))
         or LocgResolution(year=1999, locg_id=None, locg_variant_id=None),
     )
 
@@ -1580,7 +1754,7 @@ def test_backfill_year_guard_skip_reports_unresolved_not_resolved(api, monkeypat
 
     monkeypatch.setattr(
         routes, "resolve_year_and_locg",
-        lambda series, issue: LocgResolution(year=1999, locg_id=None, locg_variant_id=None),
+        lambda series, issue, **_kw: LocgResolution(year=1999, locg_id=None, locg_variant_id=None),
     )
 
     r = api.post("/api/comics/backfill-year", params={"dry_run": "false"})
@@ -1626,7 +1800,7 @@ def test_backfill_year_offset_pages_past_unresolvable_head(api, monkeypatch):
         api.post(f"/api/bids/{item_id}/link-fmv", json={"comic_id": comic_id, "grade": 8.0})
 
     # Every row is permanently unresolvable — models the BUI-715 stall case.
-    monkeypatch.setattr(routes, "resolve_year_and_locg", lambda *_: None)
+    monkeypatch.setattr(routes, "resolve_year_and_locg", lambda *_a, **_kw: None)
 
     seen: list[int] = []
     offset = 0
@@ -1678,7 +1852,7 @@ def test_backfill_year_dry_run_paging_terminates(api, monkeypatch):
     # Every row resolves — the case that pins next_offset at 0.
     monkeypatch.setattr(
         routes, "resolve_year_and_locg",
-        lambda series, issue: LocgResolution(year=1999, locg_id=None, locg_variant_id=None),
+        lambda series, issue, **_kw: LocgResolution(year=1999, locg_id=None, locg_variant_id=None),
     )
 
     seen: list[int] = []

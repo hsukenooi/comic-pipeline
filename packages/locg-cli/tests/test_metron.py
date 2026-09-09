@@ -725,6 +725,68 @@ def test_lookup_issue_gives_up_after_second_rate_limit(caplog):
 
 
 # ---------------------------------------------------------------------------
+# BUI-788: METRON_RATE_LIMIT_MAX_SLEEP — a caller with its own deadline caps
+# the retry sleep below it.
+#
+# The 60s default is longer than gixen-overlay's 30s subprocess budget for
+# `locg resolve-year`, so a throttled lookup was killed mid-sleep and reported
+# as if Metron had never heard of the book. A sleep the caller cannot wait out
+# buys nothing; giving up sooner at least lets the child SAY it was throttled.
+# ---------------------------------------------------------------------------
+
+def test_rate_limit_sleep_cap_honors_env_override(monkeypatch):
+    from mokkari.exceptions import RateLimitError
+    monkeypatch.setenv("METRON_RATE_LIMIT_MAX_SLEEP", "7.5")
+    client, session = _make_client_with_session()
+    session.series_list.side_effect = RateLimitError("rate limited", retry_after=90)
+
+    with patch("locg.metron.time.sleep") as mock_sleep:
+        assert client.lookup_issue("Fantastic Four", "1") is None
+
+    mock_sleep.assert_called_once_with(7.5)
+    assert client.degraded is True
+
+
+def test_rate_limit_sleep_cap_env_never_lengthens_a_short_retry_after(monkeypatch):
+    """The env value is a CEILING, not a replacement — a retry_after under it
+    is still honored verbatim."""
+    from mokkari.exceptions import RateLimitError
+    monkeypatch.setenv("METRON_RATE_LIMIT_MAX_SLEEP", "7.5")
+    client, session = _make_client_with_session()
+    session.series_list.side_effect = RateLimitError("rate limited", retry_after=2)
+
+    with patch("locg.metron.time.sleep") as mock_sleep:
+        client.lookup_issue("Fantastic Four", "1")
+
+    mock_sleep.assert_called_once_with(2)
+
+
+@pytest.mark.parametrize("bad", ["", "abc", "0", "-5", "nan-ish"])
+def test_rate_limit_sleep_cap_falls_back_on_bad_env(monkeypatch, bad):
+    """A garbage or non-positive override must not disable the cap or turn the
+    retry into a zero-wait hot loop — it falls back to the 60s default."""
+    from mokkari.exceptions import RateLimitError
+    monkeypatch.setenv("METRON_RATE_LIMIT_MAX_SLEEP", bad)
+    client, session = _make_client_with_session()
+    session.series_list.side_effect = RateLimitError("rate limited", retry_after=90)
+
+    with patch("locg.metron.time.sleep") as mock_sleep:
+        client.lookup_issue("Fantastic Four", "1")
+
+    mock_sleep.assert_called_once_with(60)
+
+
+def test_rate_limit_sleep_cap_is_read_per_call_not_at_import(monkeypatch):
+    """KTD2: the comics server must pick up a change without a redeploy."""
+    from locg.metron import _rate_limit_max_sleep
+
+    monkeypatch.delenv("METRON_RATE_LIMIT_MAX_SLEEP", raising=False)
+    assert _rate_limit_max_sleep() == 60.0
+    monkeypatch.setenv("METRON_RATE_LIMIT_MAX_SLEEP", "3")
+    assert _rate_limit_max_sleep() == 3.0
+
+
+# ---------------------------------------------------------------------------
 # resolve_series / issue_in_series — BUI-473 per-series reuse
 #
 # lookup_issue's two HTTP requests (series_list, then issues_list) are split
