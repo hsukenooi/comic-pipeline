@@ -70,7 +70,7 @@ Run **one** cheap agent over the whole candidate list (title + first image + pho
 
 ## Step 2: Dispatch Grader Agents (value-gated)
 
-Don't fan out 3 graders for every comic — most listings in a seller scan are cheap, and 3-per-comic burns agents where 1 will do. **Run 1 grader first, then escalate to a 3-grader panel only when the comic earns it.** Each grader is the **`comic-grader` subagent** (`.claude/agents/comic-grader.md`) — it carries the full grading persona, criteria, and OUTPUT FORMAT contract, scoped read-only (`Read, Bash`) so a grader can never write. You only pass it the dynamic inputs (see [Grader Agent](#grader-agent) below); the persona is identical whether you run 1 or 3, so panel grades stay independent and comparable.
+Don't fan out 3 graders for every comic — most listings in a seller scan are cheap, and 3-per-comic burns agents where 1 will do. **Run 1 grader first, then escalate to a 3-grader panel only when the comic earns it.** Each grader is the **`comic-grader` subagent** (`.claude/agents/comic-grader.md`) — it carries the full grading persona, criteria, and OUTPUT FORMAT contract, scoped to `Read, Bash` (it writes nothing but scratch crops, and only inside the CROP DIRECTORY you assign it below — BUI-911). You only pass it the dynamic inputs (see [Grader Agent](#grader-agent) below); the persona is identical whether you run 1 or 3, so panel grades stay independent and comparable.
 
 **Tunable gate constants** (stated here so they're easy to adjust):
 - **Value tier** — `grade-photos` (Step 1) owns `VALUE_THRESHOLD` ($25) and prints `tier: cheap|not-cheap` per comic. Read the printed tier directly; don't re-derive the split from `current_price` here. A `not-cheap` tier always gets the full 3-grader panel; an expensive book justifies the rigor.
@@ -92,6 +92,7 @@ Don't fan out 3 graders for every comic — most listings in a seller scan are c
 - **Cheap books → batch them.** A cheap book only ever earns 1 grade unless a gate trips, so there is no cross-grader independence to preserve — grade several in **one** agent context instead of one agent each. Group the cheap books into batches of up to `BATCH_MAX` and give each batch a single grader agent that grades every book in the group **independently** and returns one full OUTPUT FORMAT block per book (clearly delimited, labelled by item id). This is the main first-pass cost saver on a thin-photo seller scan (e.g. 7 cheap books → 2 agents, not 7).
 - **Not-cheap books → 1 grader each, first pass**, run in parallel (separate agents).
 - **Escalation (both kinds).** After the first pass, any book that tripped a gate (Step 2 triggers) gets the **remaining 2** graders as separate, independent agents — dispatched together in one parallel batch. A batched cheap book's first grade counts as grader A; pull it out and add B + C. (The grader prompt and criteria are identical across passes so the panel grades stay independent and comparable.)
+- **Crop directories (BUI-911).** Every dispatched grader agent — a not-cheap single grader, a batched cheap-book agent, or one seat of the escalation panel — gets its own **CROP DIRECTORY** input (see [Grader Agent](#grader-agent) below): that book's `IMAGE FOLDER` plus a subdirectory suffixed with the agent's own distinct name (see Common Mistakes below on naming), e.g. `<workdir>/comic-1/crops-grader-c1-a`. Keying by book alone is not enough — the escalation panel's B and C are dispatched together and grade the **same book concurrently**, so a directory named only after the book would still let them collide on the same generic zone filenames (`f_spine_bot.jpg`, etc.); keying by agent name too is what prevents that. A batched cheap-book agent gets one such subdirectory per book in its batch (same agent name, different `comic-N` parent), so books within a batch never collide with each other or with any other agent's crops.
 - **Batching guardrails:** keep each book's images and OUTPUT FORMAT block fully separate in the batched prompt; never let one book's defects bleed into another's grade; if a batch would exceed `BATCH_MAX`, open another agent. When in doubt about a specific cheap book (e.g. it looks near a cap), grade it on its own rather than in the batch.
 - **Anti-anchoring:** batched grades must not drift toward the batch's overall quality. The `comic-grader` agent def owns this rule (grade each book on the **absolute** CGC scale; BUI-81) and its own guard enforces it — nothing to restate here.
 
@@ -99,7 +100,7 @@ Don't fan out 3 graders for every comic — most listings in a seller scan are c
 
 ### Grader Agent
 
-The grading persona — the full CGC/Overstreet scale, criteria, PRINT-LAYER / WRITING / GRADE-CAPPING / restoration rules, coverage-driven CONFIDENCE, the SELLER-STATED-GRADE prior, the procedure, and the **OUTPUT FORMAT contract** — lives in the **`comic-grader` subagent** (`.claude/agents/comic-grader.md`), scoped to `Read, Bash` so a grader can never write. Invoke it **by type** (`comic-grader`); do not paste a grading prompt inline. This keeps the most-tuned prompt (BUI-81 anti-anchoring) in one place and its OUTPUT FORMAT aligned with `/comic:fmv` input.
+The grading persona — the full CGC/Overstreet scale, criteria, PRINT-LAYER / WRITING / GRADE-CAPPING / restoration rules, coverage-driven CONFIDENCE, the SELLER-STATED-GRADE prior, the procedure, and the **OUTPUT FORMAT contract** — lives in the **`comic-grader` subagent** (`.claude/agents/comic-grader.md`), scoped to `Read, Bash`: it writes nothing except scratch crops, and only inside the CROP DIRECTORY you assign it (BUI-911, see below). Invoke it **by type** (`comic-grader`); do not paste a grading prompt inline. This keeps the most-tuned prompt (BUI-81 anti-anchoring) in one place and its OUTPUT FORMAT aligned with `/comic:fmv` input.
 
 The OUTPUT FORMAT block the agent returns (`GRADE`, `GRADE RANGE`, `CONFIDENCE`, `GRADE CAP`, defects, etc.) is the contract Step 3 parses — if you ever change it, change it in the agent def, not here.
 
@@ -107,11 +108,12 @@ The OUTPUT FORMAT block the agent returns (`GRADE`, `GRADE RANGE`, `CONFIDENCE`,
 
 - **COMIC + YEAR** — e.g. `Fantastic Four #48 (1966)`
 - **IMAGE FOLDER** — e.g. `<workdir>/comic-1`, where `<workdir>` is the path from Step 1's printed `WORKDIR:` line
+- **CROP DIRECTORY** (BUI-911) — e.g. `<workdir>/comic-1/crops-grader-c1-a`: this book's `IMAGE FOLDER` plus a subdirectory suffixed with **this agent's own distinct name** (see Common Mistakes below — every dispatched grader needs a distinct name regardless of this input, and that same name is what keeps this directory unique). Where this grader must write any crop it makes; see Dispatch mechanics above for why the agent-name suffix matters (it's what keeps two panel seats grading the same book from colliding).
 - **IMAGES** — `img-01.jpg` through `img-{N:02d}.jpg` (N photos)
 - **SELLER-STATED GRADE** — from the listing title/description if present, else `none stated`
 - **Item id label** — so batched output blocks are traceable
 
-For a **batched cheap-book agent** (see Dispatch mechanics), hand it the per-comic block above for each book in the group (up to `BATCH_MAX`) and tell it to grade each independently and return one OUTPUT FORMAT block per book, labelled by item id. The agent's own anti-anchoring guard keeps those batched grades on the absolute scale (§ Step 2 pointer above).
+For a **batched cheap-book agent** (see Dispatch mechanics), hand it the per-comic block above for each book in the group (up to `BATCH_MAX`) and tell it to grade each independently and return one OUTPUT FORMAT block per book, labelled by item id. Each book's block carries its own `IMAGE FOLDER`/`CROP DIRECTORY` pair (`<workdir>/comic-N/crops-<this-agent's-name>`, same agent name across the whole batch, different `comic-N` per book) — never one CROP DIRECTORY shared across the batch's books. The agent's own anti-anchoring guard keeps those batched grades on the absolute scale (§ Step 2 pointer above).
 
 ## Step 3: Synthesize Consensus
 
@@ -173,7 +175,8 @@ Structural photo-based caveats (staple rust, brittleness, restoration, the inher
 | Mistake | Fix |
 |---------|-----|
 | Grading from WebFetch text output | WebFetch returns markdown text, not images — useless for visual grading |
-| Giving all 3 agents the same agent name | Use distinct names (e.g., `grader-c1-a`, `grader-c1-b`) so results are traceable |
+| Giving two dispatched agents the same agent name | Use distinct names (e.g., `grader-c1-a`, `grader-c1-b`) for every grader you dispatch — panel seats, not-cheap singles, and batched-cheap agents alike — so results are traceable and each agent's CROP DIRECTORY (derived from its name) never collides with another's (BUI-911) |
+| Letting a grader write crops to a shared or hardcoded path (e.g. `/tmp/crop.jpg`) | Every grader gets its own CROP DIRECTORY (Dynamic inputs above); crops must be written there and nowhere else (BUI-911) — the write-side counterpart to the read-side `WORKDIR` namespacing (BUI-440) |
 | Escalating every 2-photo lot because its range is wide | A wide range at MEDIUM-LOW/LOW confidence is coverage-driven and does NOT escalate on its own (see Step 2 trigger 2) |
 | Auto-dropping a book in triage because it looks like a beater | Condition is not a triage kill — there's no FMV floor at grade time. FLAG suspected beaters for the user; only DROP un-gradeable photos or confirmed non-matches (Step 1.5). When unsure, KEEP |
 | Inflating grade because it's a key issue | Grade physical condition only — key issue premium belongs in FMV, not grade (criteria live in the `comic-grader` subagent, not this skill) |
