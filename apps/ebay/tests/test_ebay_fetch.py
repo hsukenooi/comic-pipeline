@@ -499,7 +499,10 @@ class TestExtractCertification:
         cert = ebay_fetch.extract_certification([], "Amazing Spider-Man #50 CGC AA SS 4.5 OWW 1967")
         assert cert.certifier == "cgc"
         assert cert.grade == 4.5
-        assert cert.label == "signature_series"
+        # BUI-941: "AA" (Authentic Autograph) beats the "SS" in the same
+        # title — this listing's description says the signature was
+        # authenticated after the fact, not witnessed at signing.
+        assert cert.label == "qualified"
         assert cert.page_quality == "ow_w"
         assert cert.mismatch_note is None
 
@@ -565,8 +568,16 @@ class TestExtractCertification:
         cert = ebay_fetch.extract_certification(specs, "SPIDER-MAN #300")
         assert cert.certifier is None
 
-    def test_signed_sets_signature_series_label(self):
+    def test_signed_sets_a_non_universal_label(self):
+        # BUI-941: a bare "Signed <name>" makes no witnessed-signing claim,
+        # so it reads as the green Qualified label. What matters to §7b is
+        # that it is not Universal.
         cert = ebay_fetch.extract_certification([], "ASM #300 CGC 9.8 Signed Todd McFarlane")
+        assert cert.label == "qualified"
+
+    def test_signature_series_token_keeps_the_yellow_label(self):
+        cert = ebay_fetch.extract_certification(
+            [], "ASM #300 CGC 9.8 Signature Series Signed Todd McFarlane")
         assert cert.label == "signature_series"
 
     def test_not_signed_does_not_set_label(self):
@@ -611,7 +622,7 @@ class TestParseItemCertification:
         assert result["grade"] == 4.5
         assert result["grade_source"] == "certified"
         assert result["certifier"] == "cgc"
-        assert result["label"] == "signature_series"
+        assert result["label"] == "qualified"  # BUI-941: AA outranks SS
         assert result["page_quality"] == "ow_w"
 
     def test_ambiguous_certifier_mention_yields_missing_grade(self):

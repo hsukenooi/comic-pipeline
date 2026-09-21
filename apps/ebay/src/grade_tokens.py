@@ -197,24 +197,149 @@ def resolve_certifier_from_specifics_value(value):
     return resolve_certifier_token(stripped) or "other"
 
 
-# ─── Label tokens (BUI-923) ─────────────────────────────────────────────────
+# ─── Label tokens (BUI-923; autograph split BUI-941) ────────────────────────
 #
 # "signed" reuses the exact `(?<!not\s)` fixed-width negative lookbehind that
 # sold_comps.LOCAL_EXCLUDE_RE already relies on (BUI-668): the corpus's one
 # residual false positive was a seller advertising a book as "NOT signed",
-# and the guard is what keeps that from being read as Signature Series.
-_LABEL_PATTERNS = (
-    (re.compile(r'\bqualified\b|\(q\)', re.I), "qualified"),
+# and the guard is what keeps that from being read as a signature at all.
+#
+# BUI-941 split the one signature pattern into three, because a single
+# `-> signature_series` mapping was wrong in both directions:
+#
+#   * `ULTIMATE FALLOUT #4 CGC 7.5 W/ AUTOGRAPHS` matched NOTHING -- the old
+#     `\bautograph(?:ed)?\b` has no plural branch, so the trailing "s" killed
+#     the trailing `\b` -- and an autographed slab therefore entered the
+#     UNIVERSAL comp pool at 7.5 (fmv-math-spec.md 7b pools on
+#     `(comic_id, certifier, label)`, and `parse_slab_fields` defaults a
+#     label-less slab to "universal").
+#   * `CGC AA SS 4.5 ... Signed by Stan Lee` matched `\bss\b` and read as
+#     Signature Series, although that listing's description says the
+#     autograph was authenticated after the fact by JSA -- which is exactly
+#     what CGC's yellow Signature Series label is NOT (it certifies a
+#     signature a CGC witness saw applied). An unwitnessed or after-market
+#     signature is what CGC's green Qualified label is for, so `qualified`
+#     is the vocabulary member that reading belongs to.
+#
+# The rule, in precedence order (see `resolve_label`):
+#   1. an explicit non-signature label word wins outright (unchanged);
+#   2. AFTER-MARKET authentication evidence (`AA` = Authentic Autograph, or
+#      JSA/PSA alongside a signature word) -> `qualified`, BEATING any
+#      witnessed token in the same text -- a seller who writes both "AA" and
+#      "SS" is describing an authenticated autograph, and the conservative
+#      reading is the one that does not claim CGC witnessed the signing;
+#   3. an explicit WITNESSED token (`Signature Series`, `SS`, `Yellow Label`)
+#      -> `signature_series`;
+#   4. a bare signature word with no witnessed token -> `qualified`.
+#
+# Step 4 is a deliberate behavior change and a deliberately COARSE reading: a
+# title alone cannot tell a witnessed signature from an unwitnessed one, so
+# the choice is which claim to make without evidence, and "CGC witnessed this"
+# is the stronger one. Both values are non-Universal, so for every consumer
+# that exists today the two are interchangeable -- 7b punts EVERY
+# non-Universal target to `needs_manual` before any fetch, and the comp pool
+# only ever filters `label == "universal"`. What step 4 buys is an honest
+# `label_qualified` punt reason and an honest ledger row; what it costs is
+# that a genuine yellow-label slab whose title only says "Signed by <name>"
+# is archived as `qualified`. `Yellow Label` is in step 3 precisely because
+# the corpus contains that case (`Batman #227 (1970) CGC 5.0 Signed By Neal
+# Adams Yellow Label`), and it is the one title-side evidence that settles it.
+#
+# MEASURED over the offline corpus at ~/.cache/ebay-sold-comps (1,116 cached
+# provider responses, 23,488 comp rows, 16,033 unique titles, 426 of them
+# naming CGC/CBCS), old `resolve_label` vs new:
+#
+#   * 17 slab titles carry any signature/autograph token. 243 titles change
+#     label, 11 of them slab titles, and 0 of the 426 slab titles move the
+#     other way (non-Universal -> Universal).
+#   * Exactly ONE title changes in the way that moves a pool: the ticket's own
+#     `... ULTIMATE FALLOUT #4 CGC 7.5 W/ AUTOGRAPHS` goes None -> `qualified`,
+#     i.e. `universal` -> `qualified` once `parse_slab_fields` applies its
+#     default. It is the lone sale in Ultimate Fallout #4's CGC 7.5 rung
+#     ($222.22, against genuine rungs 9.0 $349.95 / 9.2 $392.50 / 9.4 $383.50 /
+#     9.6 $537.00 / 9.8 $707.48). Per the graded-ladder section of
+#     docs/solutions/best-practices/size-the-oracle-ceiling-before-designing-a-
+#     classifier.md the question on a ladder is inversion, not which side of
+#     the median: this comp does not invert the ladder, it IS the bottom rung,
+#     so removing it does not move a cap -- it withdraws the only anchor below
+#     9.0, and a Universal 8.0/8.5 target refuses `outside_ladder` instead of
+#     interpolating off an autographed sale. A refusal, not a wrong number.
+#   * The other 10 slab flips are `signature_series` -> `qualified` (step 4).
+#     All 10 were ALREADY non-Universal, so not one of them changes pool
+#     membership anywhere; only the punt reason and the ledger label move.
+#   * The remaining 232 flips are on RAW titles, where no caller applies the
+#     result at all -- `ebay_fetch.extract_certification`,
+#     `sold_comps.parse_slab_fields` and `seller_scan.title_certification_fields`
+#     each resolve a label only after a certifier is confirmed.
+#
+# Three boundary decisions, each measured rather than assumed:
+#   * `AA` is bounded `(?<![-\w])aa(?![-\w])`, not `\baa\b`. `\b` fires inside
+#     a hyphen-glued run, and the corpus's only `\baa\b` hit is exactly that:
+#     `2026 Topps Chrome Marvel Andy Kubert Auto #AA-AK Ultimate X-Men /99`,
+#     a trading card. The bounded form rejects it -- 1 measured false positive
+#     killed, and 0 remaining corpus hits of either sign.
+#   * `SS` gets the same bounds for the same reason: `\bss\b` matches the
+#     seller stock numbers `SS-254` and `SS-12` (2 corpus titles, both raw);
+#     the bounded form drops both and loses no true positive.
+#   * JSA and PSA only count ALONGSIDE a signature word. Bare `\bjsa\b` is a
+#     trap -- JSA is the Justice Society of America, a DC series, so a
+#     `JSA #1 CGC 9.8` slab would be thrown out of its own Universal pool and
+#     its target punted. (Corpus: 0 JSA titles, so this costs nothing
+#     measurable and avoids an out-of-sample hazard. 82 titles carry PSA, 2 of
+#     them alongside a signature word, 0 of those naming CGC/CBCS -- and
+#     `\bpsa\b` is in both LOCAL_EXCLUDE_RE and _GRADED_MODE_EXCLUDE_RE
+#     anyway, so a PSA comp never reaches a pool in either mode.)
+#     The gate narrows the JSA collision without dissolving it: a SIGNED
+#     Justice Society slab (`JSA #1 CGC 9.8 SS Signed by Geoff Johns`) still
+#     reads `qualified` off its own series name. That residual is bounded to
+#     which non-Universal label it gets, never to Universal, so it cannot put
+#     a signed slab back in a blue-label pool.
+#
+# Two spellings measured and deliberately NOT added:
+#   * `\bautograph` as a bare PREFIX (the form LOCAL_EXCLUDE_RE itself uses).
+#     Over the corpus it adds exactly one title over the bounded form, and it
+#     is a seller's shop name -- `... READ FREE SHIP AutographDen` on a raw
+#     baseball-card listing. The bounded form's trailing `\b` rejects it, so
+#     "autograph(s|ed)" stays bounded here even though its sibling in
+#     LOCAL_EXCLUDE_RE is not.
+#   * bare `\bauto\b`, the card-hobby abbreviation. 9 corpus titles, every one
+#     a trading card and not one naming CGC/CBCS -- no slab evidence to
+#     support it and a word too common to spend on nothing.
+#
+# Not a trap, checked anyway: `\bsigned\b` cannot match inside "designed",
+# "consigned", "assigned" or "unsigned" -- the character before "signed" is a
+# word character in each, so no `\b` exists there (and the corpus has 0
+# occurrences of any of the four). A publisher's "signed edition" variant and
+# a title naming the signer both read as a signature, which is correct: on a
+# SLAB either one is a signed copy and so not Universal, and on a raw listing
+# the label is never applied. A title that merely NAMES the artist
+# (`X-Men #1 CGC 9.6 Jim Lee cover`) carries no signature word and stays
+# unlabelled, i.e. Universal.
+_EXPLICIT_LABEL_PATTERNS = (
+    # "Green label" is CGC's own name for the Qualified label. Spelled in
+    # full deliberately -- bare `\bgreen\b` hits 185 corpus titles (Green
+    # Goblin, Green Lantern, Green Arrow).
+    (re.compile(r'\bqualified\b|\(q\)|\bgreen\s+label\b', re.I), "qualified"),
     (re.compile(r'\brestored\b|\(r\)', re.I), "restored"),
     (re.compile(r'\bconserved\b', re.I), "conserved"),
-    (
-        re.compile(
-            r'\bss\b|\bsignature\s+series\b|(?<!not\s)\bsigned\b|\bautograph(?:ed)?\b|\bsignature\b',
-            re.I,
-        ),
-        "signature_series",
-    ),
 )
+
+# Any assertion that the book carries a signature, of any provenance.
+_SIGNATURE_RE = re.compile(
+    r'\bautograph(?:s|ed)?\b|(?<!not\s)\bsigned\b|\bsignature\b', re.I)
+
+# An assertion that CGC/CBCS WITNESSED the signing -- the yellow label.
+_WITNESSED_SIGNATURE_RE = re.compile(
+    r'\bsignature\s+series\b|\byellow\s+label\b|(?<![-\w])ss(?![-\w])', re.I)
+
+# "AA" -- Authentic Autograph: a signature authenticated after the fact
+# rather than witnessed at signing. Self-sufficient (it names the thing
+# outright), unlike the third-party authenticators below.
+_AUTHENTIC_AUTOGRAPH_RE = re.compile(r'(?<![-\w])aa(?![-\w])', re.I)
+
+# Third-party autograph authenticators. Only meaningful next to a signature
+# word -- see the JSA/Justice Society trap in the block comment above.
+_THIRD_PARTY_AUTHENTICATOR_RE = re.compile(r'\b(?:jsa|psa)\b', re.I)
 
 
 def resolve_label(text):
@@ -223,12 +348,27 @@ def resolve_label(text):
     grade value. Returns a LABEL_VALUES member, or None when nothing is
     found (the caller applies the "universal" default only once it has
     already decided the listing is certified -- a raw listing should stay
-    blank, not "universal")."""
+    blank, not "universal").
+
+    A signature of ANY provenance resolves to a non-Universal label, so an
+    autographed slab can never join a Universal comp pool (BUI-941). Which
+    non-Universal label depends on whether the text claims the signing was
+    witnessed; see the block comment above for the precedence and the corpus
+    measurement behind it.
+    """
     if not text:
         return None
-    for pattern, value in _LABEL_PATTERNS:
+    for pattern, value in _EXPLICIT_LABEL_PATTERNS:
         if pattern.search(text):
             return value
+    signed = bool(_SIGNATURE_RE.search(text))
+    if _AUTHENTIC_AUTOGRAPH_RE.search(text) or (
+            signed and _THIRD_PARTY_AUTHENTICATOR_RE.search(text)):
+        return "qualified"
+    if _WITNESSED_SIGNATURE_RE.search(text):
+        return "signature_series"
+    if signed:
+        return "qualified"
     return None
 
 
