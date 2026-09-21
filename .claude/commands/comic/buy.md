@@ -91,7 +91,7 @@ When `sample_size >= 1`, surface a line before the grade (Step 2.5) / bid-aggres
 
 The gate is already computed. Step 1's table carries a **`Defects`** column (between `Notes` and `Cert`), and `ebay-fetch --json` carries the same finding as `condition_defects` — a list of `{code, phrase, source}` where `code` is `moisture` / `rust` / `loose_staple`, `phrase` is the seller's own words that fired, and `source` is `condition_description` (the seller's free-text note, eBay's `conditionDescription`) or `title`. An **empty list means "scanned, nothing found"**, never "not checked": the field is always present. The raw note is echoed as `condition_description` for the same rows.
 
-**Drop every row whose `Defects` cell is non-blank, and print each drop with its reason.** Mirror `/comic:seller-scan`'s no-silent-drops format (seller-scan.md § "No silent drops") — one line per drop, naming the listing, the defect, and the phrase:
+**Drop every row whose `Defects` cell is non-blank, and print each drop with its reason.** Mirror `/comic:seller-scan`'s no-silent-drops format (the **No silent drops** paragraph in seller-scan.md § Verification is already done inside the script) — one line per drop, naming the listing, the defect, and the phrase:
 
 ```
 Dropped 4 listing(s) on the condition-defect rule (BUI-919):
