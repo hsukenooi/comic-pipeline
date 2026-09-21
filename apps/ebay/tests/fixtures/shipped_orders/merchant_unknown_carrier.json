@@ -1,0 +1,21 @@
+{
+  "id": "fixture-unknown-carrier",
+  "threadId": "fixture-unknown-carrier",
+  "internalDate": "1751500000000",
+  "payload": {
+    "mimeType": "text/html",
+    "headers": [
+      {
+        "name": "From",
+        "value": "Example Coffee <orders@example-coffee.test>"
+      },
+      {
+        "name": "Subject",
+        "value": "A shipment from order #14318 is on the way"
+      }
+    ],
+    "body": {
+      "data": "b3IgVmlzaXQgb3VyIHN0b3JlCiggaHR0cHM6Ly9leGFtcGxlLWNvZmZlZS50ZXN0P3N5Y2xpZD1jMmQ3YTBiYyApCgpTUFggRXhwcmVzcyB0cmFja2luZyBudW1iZXI6IFNQWFNHMDY1ODk5NTY3ODI3CiggaHR0cHM6Ly9zcHguZXhhbXBsZS90cmFjaz9TUFhTRzA2NTg5OTU2NzgyNyApCgpJdGVtcyBpbiB0aGlzIHNoaXBtZW50Ci0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KCkNvbG9tYmlhIEh1aWxhCg=="
+    }
+  }
+}

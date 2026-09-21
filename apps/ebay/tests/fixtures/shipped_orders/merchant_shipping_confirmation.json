@@ -1,0 +1,33 @@
+{
+  "id": "fixture-merchant-confirm",
+  "threadId": "fixture-merchant-confirm",
+  "internalDate": "1752630000000",
+  "payload": {
+    "mimeType": "multipart/alternative",
+    "headers": [
+      {
+        "name": "From",
+        "value": "\"Example Books\" <orders@t.example-books.test>"
+      },
+      {
+        "name": "Subject",
+        "value": "Your Example Books Shipping Confirmation #8001180496"
+      }
+    ],
+    "body": {},
+    "parts": [
+      {
+        "mimeType": "text/plain",
+        "body": {
+          "data": "WW91ciBvcmRlciBoYXMgc2hpcHBlZC4KClRyYWNraW5nIE51bWJlcjogOTIwMjAxOTAwMDAwMDAwMDAwMDAwMDEyMzcKClF1ZXN0aW9ucz8gVmlzaXQgb3VyIGhlbHAgY2VudHJlLgo="
+        }
+      },
+      {
+        "mimeType": "text/html",
+        "body": {
+          "data": "PGh0bWw-PGJvZHk-PHRhYmxlPjx0cj48dGQ-VHJhY2tpbmcgTnVtYmVyOjwvdGQ-PHRkPjkyMDIwMTkwMDAwMDAwMDAwMDAwMDAxMjM3PC90ZD48L3RyPjwvdGFibGU-PC9ib2R5PjwvaHRtbD4="
+        }
+      }
+    ]
+  }
+}

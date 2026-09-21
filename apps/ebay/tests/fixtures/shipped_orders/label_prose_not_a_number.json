@@ -1,0 +1,21 @@
+{
+  "id": "fixture-label-prose",
+  "threadId": "fixture-label-prose",
+  "internalDate": "1751000000000",
+  "payload": {
+    "mimeType": "text/html",
+    "headers": [
+      {
+        "name": "From",
+        "value": "\"seller@example.test\" <seller@30308279.example-mail.test>"
+      },
+      {
+        "name": "Subject",
+        "value": "BLIND BAGS TOMORROW + Shipping Update!"
+      }
+    ],
+    "body": {
+      "data": "dGhlIG9yaWdpbmFsIGUtbWFpbHMgZWFjaCBidXllciByZWNlaXZlZCwgdGhlIHNoaXBwaW5nIHRpbWVmcmFtZSB3YXMKNC02IHdlZWtzLiBJIGFudGljaXBhdGUgZXZlcnl0aGluZyBnb2luZyBvdXQgYnkgdGhlIGVuZCBvZiB0aGUKbW9udGg7IGFsbCB0cmFja2luZyBudW1iZXJzIGFyZSBmb3J3YXJkZWQgYXQgdGltZSBvZiBzaGlwcGluZy4gVGhhbmtzCmZvciB5b3VyIHBhdGllbmNlLCB0YWxrIHNvb24hCg=="
+    }
+  }
+}

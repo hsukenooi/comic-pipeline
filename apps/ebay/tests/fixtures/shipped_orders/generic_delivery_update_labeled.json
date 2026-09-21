@@ -1,0 +1,21 @@
+{
+  "id": "fixture-delivery-update",
+  "threadId": "fixture-delivery-update",
+  "internalDate": "1753718932000",
+  "payload": {
+    "mimeType": "text/html",
+    "headers": [
+      {
+        "name": "From",
+        "value": "eBay <ebay@ebay.com>"
+      },
+      {
+        "name": "Subject",
+        "value": "Delivery Update: Defenders # 10 - Hul..."
+      }
+    ],
+    "body": {
+      "data": "PGh0bWw-PGJvZHk-CjxwPk5ldyBlc3RpbWF0ZWQgZGVsaXZlcnk6IE1vbiwgQXVnIDAzLjwvcD4KPHA-SGkgSHN1LCBvbmUgaXRlbSBmcm9tIHlvdXIgb3JkZXIgaGFzIGEgbmV3IGVzdGltYXRlZCBkZWxpdmVyeSBkYXRlLjwvcD4KPHA-VHJhY2tpbmcgbnVtYmVyOjwvcD4KPHA-PGEgaHJlZj0iaHR0cHM6Ly93d3cuZWJheS5jb20vdm9kL0ZldGNoT3JkZXJEZXRhaWxzP2l0ZW1JZD04MDAzNzM4NDEwNzAmYW1wO3RyYW5zYWN0aW9uSWQ9MTAwODI0MzQxODExMjUmYW1wO21rZXZ0PTEmYW1wO3BsbXRJZD0xNzY0NjA1NjM3JmFtcDttZXNnSWQ9MjAwNCZhbXA7Y2g9b3Nnb29kJmFtcDtidT00Mzg0OTY1MDA4NyIgY2xhc3M9ImZvY3VzIG1oLU4xLXRyYW5zYWN0aW9uYWxHZW5lcmljIj48c3BhbiBjbGFzcz0iZm9jdXNfX2NvbnRlbnQiIHRhYmluZGV4PSItMSI-PCEtLVtpZiBtc29dPjxmb250IGNvbG9yPSIjMTkxOTE5Ij48IVtlbmRpZl0tLT4KPHN0eWxlIHR5cGU9InRleHQvY3NzIj4KLnNiX2NCTFVFIHtjb2xvcjojMDk2OEY2O2ZvbnQtd2VpZ2h0Om5vcm1hbCFpbXBvcnRhbnQ7fQpAbWVkaWEocHJlZmVycy1jb2xvci1zY2hlbWU6IGRhcmspIHsuc2JfY0JMVUUge2NvbG9yOiM0RDkzRkMhaW1wb3J0YW50O319Cjwvc3R5bGU-PHNwYW4gY2xhc3M9InNiX2NCTFVFIj48IS0tW2lmIG1zb10-PGZvbnQgY29sb3I9IiMwOTY4RjYiPjwhW2VuZGlmXS0tPjc3MDAxMjM0MDAwMDwhLS1baWYgbXNvXT48L2ZvbnQ-PCFbZW5kaWZdLS0-PC9zcGFuPjwhLS1baWYgbXNvXT48L2ZvbnQ-PCFbZW5kaWZdLS0-PC9zcGFuPjwvYT48L3A-CjxwPjxhIGhyZWY9Imh0dHBzOi8vd3d3LmViYXkuY29tL3ZvZC9GZXRjaE9yZGVyRGV0YWlscz9pdGVtSWQ9ODAwMzczODQxMDcwJmFtcDt0cmFuc2FjdGlvbklkPTEwMDgyNDM0MTgxMTI1JmFtcDtta2V2dD0xJmFtcDtwbG10SWQ9MTc2NDYwNTYzNyZhbXA7bWVzZ0lkPTIwMDQmYW1wO2NoPW9zZ29vZCZhbXA7YnU9NDM4NDk2NTAwODciPlRyYWNrIG9yZGVyPC9hPjwvcD4KPGltZyBzcmM9Imh0dHBzOi8vd3d3LmViYXlhZHNlcnZpY2VzLmNvbS9tYXJrZXRpbmd0cmFja2luZy92MS9pbXByZXNzaW9uP21rZXZ0PTQmYW1wO2J1PTQzODQ5NjUwMDg3Ij4KPC9ib2R5PjwvaHRtbD4="
+    }
+  }
+}
