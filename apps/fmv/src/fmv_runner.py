@@ -2877,12 +2877,128 @@ _CGC_PROXY_VINTAGE_YEAR_CUTOFF = 2000
 # "ungraded"/"not graded", which would false-positive on a bare substring).
 _SLAB_TITLE_RE = re.compile(r"\b(?:cgc|cbcs)\b", re.IGNORECASE)
 
+# ─── BUI-921: the ampersand-joined multi-book graded lot ───────────────────
+#
+# `Batman #227 CGC 4.0 OW Pages (1970) & Batman #232 CGC 6.0 White Pages
+# (1971)` — two books, one price, one parsed grade. Every gate in front of it
+# here is satisfied: ebay-sold-comps' `parse_grade` takes the FIRST grade
+# (4.0), `_SLAB_TITLE_RE` above sees a certifier, and its `_LOT_RE` needs the
+# two numeric members ADJACENT across the "&", where these are separated by
+# each book's own grade, page quality and year. So a $1,399.99 two-book lot
+# lands on the ladder's 4.0 rung, ABOVE the genuine 4.5 ($700), 5.5 ($899)
+# and 6.0 ($900) rungs — and `fmv_math.monotonicity_violations` then refuses
+# the WHOLE ladder as inverted. That is what made both graded tiers below go
+# silent on Batman #227 (1970) across three runs on 2026-09-19: the
+# graded-only second fetch fired and returned 12 slab comps, and every
+# verdict was thrown away by one contaminated rung.
+#
+# The check is BUI-922's, re-stated here rather than imported: ebay-sold-comps
+# runs it only in BUI-929 GRADED mode (`graded_target` set — a certified
+# TARGET), and the CGC-proxy/cross-check second pass is an `include_graded`
+# pass on a RAW target, which never reaches it. `comic-fmv` does not import
+# eBay code (it shells out to the console script), so the duplication is the
+# same deliberate trade `_SLAB_TITLE_RE` above already makes against
+# `sold_comps._is_slab_comp` — keep the two in sync by hand. The rule is "two
+# `#NNN` tokens joined by &/+/and, EACH carrying its own numeric grade";
+# requiring a grade on BOTH sides is what keeps it off the ordinary
+# single-issue title that merely mentions two things ("… #129 CGC 6.0 1st
+# Punisher & Jackal"). BUI-922 measured it over the offline corpus's 23,488
+# comps: it fires on 2 (the same listing, cached twice) and nothing else.
+# Re-measured for BUI-921 against this copy, over the 16,033 DISTINCT titles
+# in ~/.cache/ebay-sold-comps: 0 disagreements with `sold_comps`'s own
+# implementation, and it fires on exactly 1 title — the Batman #227 lot above.
+_MULTIBOOK_JOINER_RE = re.compile(r"\s(?:&|\+|and)\s", re.IGNORECASE)
+# One lot "member": `#NNN`, bounded so it can bind neither to a longer run
+# (a year, a cert number) nor to half of a decimal grade.
+_MULTIBOOK_ISSUE_RE = re.compile(r"#\s*\d{1,3}(?!\d)(?!\.\d)")
+# Copied verbatim from apps/ebay's `grade_tokens._NUMERIC_GRADE_RE` — a
+# LOOSER pattern here would drop real comps off a money-path ladder, so this
+# is a literal copy rather than a simplification.
+_NUMERIC_GRADE_RE = re.compile(
+    r'(?<!\$)(?<!x )(?<!X )'
+    r'\b([0-9]\.[02-9])'
+    r'(?!\w)'
+    r'(?!\s*(?:in(?:ch(?:es?)?)?\b|cm\b|mm\b|lbs?\b|oz\b|x\b|ship(?:ping)?\b|["\']))'
+)
+
+
+def _is_multibook_graded_lot(title: str | None) -> bool:
+    """True when `title` names two or more separately GRADED books joined by
+    "&" / "+" / "and" — see the block comment above (BUI-921/BUI-922)."""
+    if not title:
+        return False
+    graded_members = 0
+    for part in _MULTIBOOK_JOINER_RE.split(title):
+        if _MULTIBOOK_ISSUE_RE.search(part) and _NUMERIC_GRADE_RE.search(part):
+            graded_members += 1
+            if graded_members >= 2:
+                return True
+    return False
+
+
+def _drop_multibook_graded_lots(slabs: list[dict]) -> list[dict]:
+    """Drop the ampersand multi-book graded lots from an already-slab-filtered
+    pool (BUI-921). Applied to BOTH ladder sources — the graded-only second
+    fetch (via `_slab_comps_only`) and the BUI-524 inclusive tier's
+    pre-routed `slab_comps` — since the contaminant is a property of the
+    listing, not of which pass found it."""
+    return [c for c in slabs if not _is_multibook_graded_lot(c.get("title"))]
+
 
 def _slab_comps_only(comps: list[dict]) -> list[dict]:
-    """Keep only genuine CGC/CBCS slab comps (grade + price + certifier in title)."""
-    return [c for c in comps
-            if c.get("grade") is not None and c.get("price") is not None
-            and _SLAB_TITLE_RE.search(c.get("title") or "")]
+    """Keep only genuine CGC/CBCS slab comps of THIS book (grade + price +
+    certifier in title), dropping the BUI-921 multi-book graded lot — which
+    carries a certifier and a parsed grade but prices two books at once, so
+    it is neither a comp of this book nor a rung of its ladder. Also excluded
+    from what the caller posts to the comps ledger: a lot is not an
+    observation of this comic at that grade."""
+    return _drop_multibook_graded_lots(
+        [c for c in comps
+         if c.get("grade") is not None and c.get("price") is not None
+         and _SLAB_TITLE_RE.search(c.get("title") or "")])
+
+
+def _record_graded_pass(row: dict, result: dict, ladder: list[dict]) -> None:
+    """BUI-921: fold a graded-only SECOND fetch into the emitted row's own
+    trail — its `queries_used` entries appended, its ladder merged into
+    `slab_comps`.
+
+    Both tiers below fetch a second time and then reported NOTHING about it:
+    the pass's queries never reached `queries_used` and its slab comps never
+    reached `slab_comps`, so an emitted row that HAD run a graded query was
+    byte-indistinguishable from one that never did. That is what made BUI-921
+    read as "the graded fetch never fires" when it fired every time and the
+    ladder was being thrown away downstream — a diagnosis cost, paid on a
+    money path, for a field that is pure reporting.
+
+    `comp_count_total` is deliberately NOT bumped: BUI-143/`_is_fetch_error`
+    reads it as the RAW pool's size, and this fold must not restate a graded
+    pass's outcome as the raw pass's. Appending error-free graded queries to a
+    non-empty trail can only make that predicate's `all(q.get("error"))` arm
+    MORE false, so no such row changes its fetch-err classification. The one
+    shape that COULD flip is an empty raw trail plus an all-error graded one,
+    which would report a book whose raw fetch was fine as a provider outage —
+    so that append is dropped rather than allowed to misclassify. It is
+    unreachable today (ebay-sold-comps records a base-tier query whether it
+    succeeds, errors, or is refused by the breaker, and a pass that recorded
+    none carries `error`, which both tiers already exclude); the guard makes
+    that structural instead of inherited.
+
+    Merged, never replaced: a candidate may already carry a thin BUI-524
+    ladder that was too small to reuse but was still genuinely observed (and
+    already posted to the ledger by the primary pass). Deduped on
+    `product_id` so a listing both passes saw is listed once.
+    """
+    prior_queries = row.get("queries_used") or []
+    graded_queries = list(result.get("queries_used") or [])
+    if (not prior_queries and graded_queries
+            and all(q.get("error") for q in graded_queries)):
+        graded_queries = []
+    row["queries_used"] = list(prior_queries) + graded_queries
+    fetched_ids = {c.get("product_id") for c in ladder if c.get("product_id")}
+    prior = [c for c in (row.get("slab_comps") or [])
+             if not c.get("product_id") or c["product_id"] not in fetched_ids]
+    row["slab_comps"] = list(ladder) + prior
 
 
 def _combine_comps_posted(current: bool | None, latest: bool | None) -> bool | None:
@@ -3025,6 +3141,10 @@ def _apply_cgc_proxy_rescue(fresh_fmvs: dict[int, dict], books: list[dict], *,
         if result.get("breaker_tripped"):
             fresh_fmvs[idx]["breaker_tripped"] = True
         graded_comps = _slab_comps_only(result.get("comps") or [])
+        # BUI-921: report the pass on the row before anything below can
+        # `continue` past it — a fetch that happened must say so even when
+        # its ladder ends up unusable.
+        _record_graded_pass(fresh_fmvs[idx], result, graded_comps)
         # BUI-674: post the slab comps this second fetch just observed, to
         # the SAME comic identity the primary raw pass already resolved
         # (`comic_id` is already on `fresh_fmvs[idx]` from that pass's
@@ -3176,7 +3296,17 @@ def _apply_cgc_cross_check(fresh_fmvs: dict[int, dict], books: list[dict], *,
     have_ladder: dict[int, list[dict]] = {}
     need_fetch: list[int] = []
     for idx in candidates:
-        slabs = fresh_fmvs[idx].get("slab_comps") or []
+        # BUI-921: drop the multi-book graded lots BEFORE the ladder-trust
+        # count, not after — a lot is not a rung, so counting it would let a
+        # 2-rung ladder pass the >= CGC_PROXY_MIN_LADDER_COMPS floor and then
+        # be refused downstream (or, worse, priced off an inverted curve). A
+        # candidate whose BUI-524 slabs fall below the floor once the lots are
+        # gone correctly falls through to the dedicated fetch below, exactly
+        # as it would have had that tier found too few slab comps to begin
+        # with; the lot shape is rare enough (2 in 23,488 corpus comps) that
+        # this adds no measurable provider spend.
+        slabs = _drop_multibook_graded_lots(
+            fresh_fmvs[idx].get("slab_comps") or [])
         if len(slabs) >= fmv_math.CGC_PROXY_MIN_LADDER_COMPS:
             have_ladder[idx] = slabs
         else:
@@ -3204,6 +3334,10 @@ def _apply_cgc_cross_check(fresh_fmvs: dict[int, dict], books: list[dict], *,
             result = by_id.get(idx)
             if result is not None:
                 have_ladder[idx] = _slab_comps_only(result.get("comps") or [])
+                # BUI-921: same reporting fold as the rescue tier above — the
+                # pass's queries and ladder land on the emitted row whether or
+                # not `check` below produces a verdict.
+                _record_graded_pass(fresh_fmvs[idx], result, have_ladder[idx])
                 # BUI-676: this second, graded-only fetch just observed comps
                 # nothing has posted before — post the slab-filtered subset
                 # to the SAME comic identity the primary raw pass already
