@@ -26,11 +26,11 @@ this context.
 
 The subagent returns a fully-formatted identification table — columns `# | Comic
 | Issue | Year | Grade | Variant | Type | Current Price | Bids | Seller | Ends |
-Notes`, with the `#` cell linking to the eBay listing. The per-column derivation
+Notes | Cert | PQ`, with the `#` cell linking to the eBay listing. The per-column derivation
 contract (confidence-gating, Ends computation, grade signals, no extra API call
 for price/bids) is owned by `ebay-fetch --identify` in
 `apps/ebay/src/ebay_fetch.py` (BUI-900); the agent passes its output through. Present the
-table as-is; two columns carry weight downstream:
+table as-is; three columns carry weight downstream:
 
 - **Year** — forward it verbatim into `/comic:collection-check` (blank stays
   blank, never backfill a guess). It's a confidence-gated per-issue cover year
@@ -38,6 +38,17 @@ table as-is; two columns carry weight downstream:
   forwarding rule.
 - **Current Price / Bids** — carried forward for `/comic:buy` Steps 4–5; Step 4
   owns the no-re-fetch rule (BUI-359).
+- **Cert / PQ (BUI-923)** — `Cert` renders the certifier plus a non-Universal label
+  (e.g. `CGC`, `CGC SS`); `PQ` renders the page quality (e.g. `OW/W`); both are
+  blank for a raw (uncertified) listing. They summarize `--json`'s underlying
+  keys, which are what actually carry forward: `certifier` (`cgc`|`cbcs`|`other`),
+  `cert_number`, `label` (`universal`|`signature_series`|`qualified`|`restored`|
+  `conserved`|`other`), `page_quality` (`white`|`ow_w`|`ow`|`c_ow`|`cream`|
+  `unknown`), and `grade_source: "certified"` (item specifics win over the
+  title; `Uncertified`/`Not Graded`/`Raw`/blank all count as absent, and a
+  title-only "CGC ready" with no certification aspect stays raw at
+  `grade_source: "missing"`). A specifics-vs-title grade disagreement keeps the
+  specifics value and surfaces as a `grade_mismatch_note` in the Notes column.
 
 Flag Buy It Now listings — they're skipped at the Gixen step.
 

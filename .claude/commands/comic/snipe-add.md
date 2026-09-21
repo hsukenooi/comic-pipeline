@@ -114,6 +114,8 @@ maps to):
 ]
 ```
 
+A certified row's `rows.json` entry carries `certifier`/`cert_number`/`label` instead of `seller_grade`/`photo_grade` (BUI-926) — `add_batch.py` validates `certifier` against the same vocabulary as `--certifier` above and rejects an unrecognized value.
+
 Skip Buy It Now listings — leave them out of the rows file entirely.
 `/comic:buy` Step 5 builds this same rows JSON via `gixen build-batch`
 (BUI-435) from its comic-fmv brief output; for a standalone run with no
@@ -160,10 +162,14 @@ These are the flags that exist in `packages/gixen-cli/cli.py` today. Anything el
 | `--seller NAME` | str | eBay seller username (from `/comic:identify`). Stored lowercased on the snipe; the key for the seller-reliability advisory (BUI-78) |
 | `--seller-grade X.Y` | float | Seller's *stated* grade as a CGC float (convert "VF/NM" → `9.0`). Stored for deviation analytics (BUI-78) |
 | `--photo-grade X.Y` | float | Photo-assessed *consensus* grade as a CGC float — the **raw** Step 2.5 assessment, not any user override (BUI-78) |
+| `--certifier {none,cgc,cbcs,other}` | str | Certified grading company for a slab (BUI-926); omit for a raw comic |
+| `--cert-number VALUE` | str | Certification/cert number for a slab (BUI-926) |
 
 `--comic-id` and `--catalog-id` are mutually preferential: if both are given, the CLI uses `--comic-id` and warns that `--catalog-id` was ignored. Either flag triggers a `POST /api/bids/{item_id}/link-fmv` call **only when `--grade` is also present**.
 
 `--seller` / `--seller-grade` / `--photo-grade` are independent of FMV linking — they're written straight to the `bids` row at add time (omit any that are absent). They feed `/comic:buy`'s seller-reliability advisory; they do not affect the bid or FMV.
+
+**A certified row never sends `--seller-grade`/`--photo-grade` (BUI-926).** Pass `--certifier`/`--cert-number` instead — `build_bid_payload` hard-refuses to include `seller_grade`/`photo_grade` on a request that carries a certifier, since those columns are raw photo-assessed observations and a sealed CGC/CBCS grade has no photo grade to compare against. `--certifier`/`--cert-number` require `COMICS_SERVER_URL` (there's no direct-Gixen equivalent to store them against).
 
 ### Bid groups — duplicate listings of the same comic (BUI-363)
 
