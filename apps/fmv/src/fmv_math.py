@@ -1635,6 +1635,12 @@ def _graded_result(**over) -> dict:
         "graded_ladder": None,
         "page_quality": None,
         "page_quality_fallback": False,
+        # None while `page_quality_fallback` is False; otherwise
+        # "too_few_matches" (fewer than 2 same-quality comps — BUI-930) or
+        # "ladder_starved" (2+ same-quality comps, but scoping to them would
+        # leave the ladder tier too thin — BUI-939). Additive: a reader that
+        # only checks the boolean sees the same thing it always has.
+        "page_quality_fallback_reason": None,
         "exact_effective_n": 0.0,
         "exact_sales": [],
         "pool_n": 0,
@@ -1648,24 +1654,32 @@ def _graded_result(**over) -> dict:
 
 def _graded_page_quality_filter(
     pool: list[dict], page_quality: str | None,
-) -> tuple[list[dict], bool]:
+) -> tuple[list[dict], bool, str | None]:
     """Prefer comps whose page quality matches the target's.
 
-    Returns `(pool, fell_back)`. Applied ONLY when the target's page quality
-    is a real reading — `None`/`"unknown"` is the ABSENCE of one, and "prefer
-    the comps whose page quality we also failed to read" is not a quality
-    match, it is a filter on parser coverage (on the spike corpus it would
-    have thrown away the single graded-white rung of half the books). Falls
-    back to the whole pool, with `fell_back=True` so the caller can say so in
-    the notes, whenever fewer than two comps match — one match is a single
-    listing, not a market.
+    Returns `(pool, fell_back, reason)`. Applied ONLY when the target's page
+    quality is a real reading — `None`/`"unknown"` is the ABSENCE of one, and
+    "prefer the comps whose page quality we also failed to read" is not a
+    quality match, it is a filter on parser coverage (on the spike corpus it
+    would have thrown away the single graded-white rung of half the books).
+    Falls back to the whole pool, with `fell_back=True` and
+    `reason="too_few_matches"`, whenever fewer than two comps match — one
+    match is a single listing, not a market.
+
+    This is the ONLY fallback this function decides. A second, independent
+    one — scoping to the matched quality leaves the LADDER tier too thin
+    (BUI-939) — can't be decided here: it depends on the target grade and on
+    whether the scoped pool would even reach the ladder tier at all (a scoped
+    pool that prices DIRECTLY must never fall back), neither of which this
+    function has in scope. `graded_fmv` decides that one itself, once it
+    knows the tier.
     """
     if not page_quality or page_quality == "unknown":
-        return pool, False
+        return pool, False, None
     matched = [c for c in pool if c.get("page_quality") == page_quality]
     if len(matched) >= 2:
-        return matched, False
-    return pool, True
+        return matched, False, None
+    return pool, True, "too_few_matches"
 
 
 def graded_punt(reason: str, *, certifier: str, label: str,
@@ -1719,11 +1733,29 @@ def graded_fmv(comps: list[dict], target_grade: float, *,
         directly when one is present, so calling it with the rung in place
         would hand back the lone sale (merely bounded from above) rather than
         an interpolation.
+
+        **Page-quality scoping must never starve the ladder (BUI-939).** The
+        page-quality preference exists to make the EXACT tier prefer a
+        same-quality match; it was never meant to be a second, stricter
+        pool for the LADDER tier to run short on. So the tier split above is
+        decided on the page-quality-scoped pool FIRST — a scoped pool that
+        prices directly always does, same-quality comps preferred exactly as
+        before — and only once that path lands on the ladder tier does a
+        second check run: count the scoped pool's anchor-eligible rungs
+        (effective n >= `GRADED_LADDER_MIN_BUCKET_N`, excluding the target
+        rung) the same way `_graded_ladder` itself counts them. Fewer than
+        `GRADED_LADDER_MIN_RUNGS` and the ladder widens back to the WHOLE
+        pool (`page_quality_fallback=True`,
+        `page_quality_fallback_reason="ladder_starved"`, distinguishable from
+        the pre-existing `"too_few_matches"` fallback) before pricing. A
+        scoped pool that already has enough rungs is left alone — this can
+        only add comps back in, never take any away, and never touches the
+        exact-tier decision that already ran.
       * REFUSALS — `no_certifier_pool` (nothing survived the identity + age
-        filters), `ladder_too_thin` (< 3 anchor-eligible rungs left),
-        `outside_ladder` (no rung on one side — the proxy's never-extrapolate
-        rule), `ladder_non_monotone` (the two rungs the interpolation would
-        actually use invert).
+        filters), `ladder_too_thin` (< 3 anchor-eligible rungs left, even
+        after the page-quality widen above), `outside_ladder` (no rung on one
+        side — the proxy's never-extrapolate rule), `ladder_non_monotone`
+        (the two rungs the interpolation would actually use invert).
 
     The `ladder_non_monotone` check is scoped to the NEIGHBOURS, not the whole
     ladder, and that scope is measured rather than assumed. `cgc_proxy_fmv`
@@ -1737,13 +1769,14 @@ def graded_fmv(comps: list[dict], target_grade: float, *,
     the rungs a straight line is drawn between are the ones whose order
     decides whether that line means anything.
     """
-    pool, undated_dropped, stale_dropped = graded_pool(comps)
-    pool, pq_fallback = _graded_page_quality_filter(pool, page_quality)
+    full_pool, undated_dropped, stale_dropped = graded_pool(comps)
+    pool, pq_fallback, pq_reason = _graded_page_quality_filter(full_pool, page_quality)
     identity: dict = {
         "certifier": certifier,
         "label": label,
         "page_quality": page_quality,
         "page_quality_fallback": pq_fallback,
+        "page_quality_fallback_reason": pq_reason,
         "pool_n": len(pool),
         "pool_undated_dropped": undated_dropped,
         "pool_stale_dropped": stale_dropped,
@@ -1760,6 +1793,26 @@ def graded_fmv(comps: list[dict], target_grade: float, *,
 
     if identity["exact_effective_n"] >= GRADED_EXACT_MIN_EFFECTIVE_N:
         return _graded_direct(exact_comps, ladder, eff_n, target_grade, identity)
+
+    # BUI-939: the scoped pool is heading to the ladder tier. If scoping was
+    # actually applied (there's a narrower pool to widen FROM) and it leaves
+    # too few anchor-eligible rungs to interpolate from, widen to the whole
+    # pool before pricing — counted exactly as `_graded_ladder` counts them,
+    # so this can never disagree with the refusal it's trying to prevent.
+    if len(pool) < len(full_pool):
+        eligible = [g for g in ladder
+                   if g != target_grade and eff_n.get(g, 0.0) >= GRADED_LADDER_MIN_BUCKET_N]
+        if len(eligible) < GRADED_LADDER_MIN_RUNGS:
+            pool = full_pool
+            identity["page_quality_fallback"] = True
+            identity["page_quality_fallback_reason"] = "ladder_starved"
+            identity["pool_n"] = len(pool)
+            ladder = bucket_weighted_medians(pool)
+            eff_n = bucket_effective_n(pool)
+            identity["exact_effective_n"] = eff_n.get(target_grade, 0.0)
+            identity["exact_sales"] = sorted(
+                float(c["price"]) for c in pool if float(c["grade"]) == target_grade)
+
     return _graded_ladder(pool, ladder, eff_n, target_grade, identity)
 
 
