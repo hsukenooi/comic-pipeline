@@ -46,6 +46,74 @@ FMV_PROVENANCES = ("machine", "hand")
 FMV_PROVENANCE_HAND = "hand"
 _fmv_provenances_sql = ", ".join(f"'{p}'" for p in FMV_PROVENANCES)
 
+# BUI-924: the PRICE IDENTITY vocabularies. `fmv` was unique on
+# `(comic_id, grade)`, so a CGC 9.6 slab and a raw 9.6 copy of one book
+# collided on a single row and the second write silently overwrote the first's
+# price. They are two different markets; the key widens to
+# `(comic_id, grade, certifier, label)`.
+#
+# RAW IS AN EXPLICIT SENTINEL, never NULL, for two independent reasons:
+# SQLite treats NULLs as DISTINCT in a unique index (the same trap
+# `idx_comics_tiyv`'s `COALESCE(variant,'')` already works around), so a NULL
+# certifier would let unlimited duplicate raw rows accumulate at one grade;
+# and the BUI-777 lesson is that an absent query parameter cannot express
+# NULL, so a NULL sentinel would be unaddressable from the API anyway. Hence
+# `certifier NOT NULL DEFAULT 'none'` and `label NOT NULL DEFAULT 'universal'`
+# — the defaults are what keeps every pre-migration row inside the raw
+# filters instead of silently emptying them.
+#
+# Same closed-vocabulary + single-source treatment as COMPS_POOLS above:
+# `models.py` imports these tuples so the pydantic validators and the CHECK
+# constraints here cannot drift apart.
+FMV_CERTIFIERS = ("none", "cgc", "cbcs", "other")
+FMV_CERTIFIER_NONE = "none"
+FMV_LABELS = (
+    "universal", "signature_series", "qualified", "restored", "conserved",
+    "other",
+)
+FMV_LABEL_UNIVERSAL = "universal"
+COMP_PAGE_QUALITIES = ("white", "ow_w", "ow", "c_ow", "cream", "unknown")
+COMP_PAGE_QUALITY_UNKNOWN = "unknown"
+
+# BUI-924: HOW the number on an `fmv` row was arrived at — the fourth instance
+# of this module's promote-a-notes-token-to-a-column move (`flag_reason`
+# BUI-132, `ungraded_anchor` BUI-712, `provenance` BUI-769).
+#
+# It cannot ride on `confidence`: the stored-label collapse trap means LOW
+# stores as 'low', which `recomputed_cap` reads back as the 0.70 bid factor,
+# so the 0.60 an interpolated/ladder price needs has nowhere to live there.
+# And it cannot stay a notes token: BUI-769 is the standing evidence that a
+# prefix in a freetext field fails OPEN on a reword, in the expensive
+# direction (a haircut silently not applied).
+FMV_PRICING_BASES = ("direct", "interpolated", "ladder", "proxy")
+FMV_PRICING_BASIS_DIRECT = "direct"
+
+_fmv_certifiers_sql = ", ".join(f"'{c}'" for c in FMV_CERTIFIERS)
+_fmv_labels_sql = ", ".join(f"'{lbl}'" for lbl in FMV_LABELS)
+_comp_page_qualities_sql = ", ".join(f"'{q}'" for q in COMP_PAGE_QUALITIES)
+_fmv_pricing_bases_sql = ", ".join(f"'{b}'" for b in FMV_PRICING_BASES)
+
+# The two notes tokens `pricing_basis` is derived from when a writer omits it.
+# Verbatim twins of `fmv_runner._interpolated_from_notes` /
+# `_CGC_PROXY_NOTE_TOKEN` (apps/fmv is not a workspace member, so there is no
+# import edge to share them across — the same deliberate duplication
+# HAND_PRICE_NOTES_MARKERS above carries).
+#
+# Both the one-shot backfill AND every omitting upsert go through
+# `derive_pricing_basis` below, deliberately: the server-first deploy window
+# means a raw row written by an OLDER `comic-fmv` during it would otherwise
+# land with no basis and lose its haircut on the next cache read. A rule
+# applied only in a migration protects only the rows that already existed.
+_INTERPOLATED_NOTE_TOKEN = "interpolated="
+_CGC_PROXY_NOTE_TOKEN = "CGC proxy"
+
+# BUI-924: certifier parsed out of an existing `pool='slab'` comps title.
+# Word-bounded so "CGCS", "cgc-ready" (already excluded from the slab pool by
+# `pool`) or a product id containing the letters cannot match. A slab comp
+# whose title names neither grader is `other`, never `none` — `none` means
+# "this is a raw copy", which a slab row is by definition not.
+_COMPS_SLAB_CERTIFIER_RE = re.compile(r"\b(cgc|cbcs)\b", re.IGNORECASE)
+
 # The BUI-533/759 notes-prefix matcher, kept as a FALLBACK for one release
 # (BUI-769) so a row whose `provenance` is NULL because it predates the column
 # is still protected. A deliberate verbatim twin of
@@ -118,8 +186,21 @@ def create_tables(conn: sqlite3.Connection) -> None:
             -- FMV_PROVENANCES at the top of this module for why a prefix in a
             -- freetext field is the wrong place to keep a money-relevant claim.
             provenance         TEXT CHECK(provenance IN ({_fmv_provenances_sql}) OR provenance IS NULL),
+            -- BUI-924: the price IDENTITY beyond (comic, grade). A CGC 9.6
+            -- slab and a raw 9.6 copy of one book are two different markets
+            -- and must be two rows; before this they were one, and whichever
+            -- was written second silently replaced the other's price. NOT
+            -- NULL with a raw sentinel default — see FMV_CERTIFIERS at the
+            -- top of this module for why NULL is the wrong "raw".
+            certifier          TEXT NOT NULL DEFAULT 'none' CHECK(certifier IN ({_fmv_certifiers_sql})),
+            label              TEXT NOT NULL DEFAULT 'universal' CHECK(label IN ({_fmv_labels_sql})),
+            -- BUI-924: how this row's number was arrived at. Nullable (a row
+            -- written before the column existed never claimed one), and the
+            -- one-shot backfill plus every omitting upsert derive it from the
+            -- notes tokens — see FMV_PRICING_BASES.
+            pricing_basis      TEXT CHECK(pricing_basis IN ({_fmv_pricing_bases_sql}) OR pricing_basis IS NULL),
             updated_at         TEXT,
-            UNIQUE(comic_id, grade)
+            UNIQUE(comic_id, grade, certifier, label)
         )
     """)
     conn.execute("""
@@ -130,7 +211,11 @@ def create_tables(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (bid_id, fmv_id)
         )
     """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_fmv_comic ON fmv(comic_id)")
+    # BUI-924: `fmv`'s per-book index is created AFTER the migrations (see the
+    # index block below the `_migrate_*` calls), because its definition now
+    # names `certifier`, which does not exist on a legacy DB until the rebuild
+    # has run. Creating the superseded `idx_fmv_comic` here too would mean
+    # building and then dropping an index on every single startup.
     conn.execute("CREATE INDEX IF NOT EXISTS idx_bid_fmvs_bid ON bid_fmvs(bid_id)")
     # BUI-113: remember which seller-scan wish-list matches have already been
     # surfaced, so repeat scans default to showing only new ones. Standalone —
@@ -243,6 +328,15 @@ def create_tables(conn: sqlite3.Connection) -> None:
             from_cache     INTEGER,
             observed_at    TEXT,
             provenance     TEXT NOT NULL CHECK(provenance IN ({_comps_provenances_sql})),
+            -- BUI-924: the slab comp's own identity. `idx_comps_identity` is
+            -- deliberately UNCHANGED — `pool` already separates raw from slab,
+            -- and a provider's product_id is unique within a pool — so these
+            -- three are descriptive, not part of the key. Same explicit-
+            -- sentinel rule as `fmv`: a raw comp is 'none'/'universal', and a
+            -- comp whose page quality was never read is 'unknown', never NULL.
+            certifier      TEXT NOT NULL DEFAULT 'none' CHECK(certifier IN ({_fmv_certifiers_sql})),
+            label          TEXT NOT NULL DEFAULT 'universal' CHECK(label IN ({_fmv_labels_sql})),
+            page_quality   TEXT NOT NULL DEFAULT 'unknown' CHECK(page_quality IN ({_comp_page_qualities_sql})),
             first_seen_at  TEXT NOT NULL,
             last_seen_at   TEXT NOT NULL,
             seen_count     INTEGER NOT NULL DEFAULT 1,
@@ -273,6 +367,28 @@ def create_tables(conn: sqlite3.Connection) -> None:
     # are ordered, not merely adjacent.
     _migrate_add_fmv_provenance_column(conn)
     _migrate_backfill_fmv_provenance(conn)
+    # BUI-924: the fmv REBUILD runs LAST of the fmv migrations, and that
+    # ordering is load-bearing in both directions. It must come after every
+    # additive column above, because it saves the row set by reading
+    # `PRAGMA table_info(fmv)` — a column added after it would be saved but
+    # have nowhere to land in the new literal, and a column added before it
+    # but not yet ALTERed in would simply be absent from the save. It must
+    # also come after `_migrate_backfill_fmv_provenance`, which reads and
+    # writes `fmv` rows: doing that work before the rebuild means the rebuild
+    # carries the backfilled values, rather than the backfill having to be
+    # re-run against a table that changed underneath it.
+    _migrate_fmv_certifier_rebuild(conn)
+    # Belt-and-braces for version skew: the rebuild's literal already carries
+    # `pricing_basis`, so on any DB the rebuild touched this is a no-op. It
+    # exists for the DB that somehow has `certifier` (rebuild done) but not
+    # `pricing_basis` — an ALTER is additive and cannot hurt.
+    _migrate_add_fmv_pricing_basis_column(conn)
+    _migrate_backfill_fmv_pricing_basis(conn)
+    # BUI-924: comps' columns are purely additive (its unique index is
+    # unchanged), so they need none of the rebuild machinery — the same
+    # PRAGMA-guarded ALTER pattern as `flag_reason`/`provenance` above.
+    _migrate_add_comps_certifier_columns(conn)
+    _migrate_backfill_comps_certifier(conn)
     _migrate_lowercase_title_indexes(conn)
     # Partial unique indexes go AFTER migrations so the legacy duplicate-row
     # cleanup (fmv-split collapses (title, issue, year, grade) duplicates into
@@ -293,6 +409,20 @@ def create_tables(conn: sqlite3.Connection) -> None:
     # Drop the pre-variant indexes (they'd wrongly reject a second variant row).
     conn.execute("DROP INDEX IF EXISTS idx_comics_tiy")
     conn.execute("DROP INDEX IF EXISTS idx_comics_ti_nullyear")
+    # BUI-924: same drop-and-create-under-a-new-name move for `fmv`'s
+    # per-book index, and for the same reason the two lines above exist — its
+    # definition widened to (comic_id, certifier, label) so a per-book lookup
+    # can narrow to one market, and `CREATE INDEX IF NOT EXISTS` under the old
+    # name would be a silent no-op on an old-shaped index. Lives HERE, after
+    # the migrations, because `certifier` does not exist until the rebuild has
+    # run. The two legacy rebuilds (`_migrate_fmv_split`,
+    # `_migrate_year_nullable`) still create the old `idx_fmv_comic` on their
+    # own old-shaped tables; the DROP on the next line retires it once, here.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fmv_comic_cert "
+        "ON fmv(comic_id, certifier, label)"
+    )
+    conn.execute("DROP INDEX IF EXISTS idx_fmv_comic")
     # BUI-659: fmv_history — an append-only ledger of every fmv snapshot,
     # keyed by comic_id (not comic_id+grade), so a book's price at grade 9.4
     # today doesn't erase what it was worth last month. `fmv` itself stays a
@@ -337,7 +467,14 @@ def create_tables(conn: sqlite3.Connection) -> None:
             flag_reason TEXT,
             notes       TEXT,
             recorded_at TEXT,
-            source      TEXT NOT NULL CHECK(source IN ({_fmv_history_sources_sql}))
+            source      TEXT NOT NULL CHECK(source IN ({_fmv_history_sources_sql})),
+            -- BUI-924: the same price identity `fmv` now carries. Without it
+            -- a book's raw and slab histories at one grade interleave into a
+            -- single unreadable series. Copied from the `fmv` row by
+            -- `append_fmv_history`, never passed in separately, so the
+            -- snapshot cannot claim an identity the row does not have.
+            certifier   TEXT NOT NULL DEFAULT 'none' CHECK(certifier IN ({_fmv_certifiers_sql})),
+            label       TEXT NOT NULL DEFAULT 'universal' CHECK(label IN ({_fmv_labels_sql}))
         )
     """)
     conn.execute(
@@ -347,6 +484,10 @@ def create_tables(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_fmv_history_recorded "
         "ON fmv_history(recorded_at)"
     )
+    # BUI-924: additive certifier/label on fmv_history. Must run here — after
+    # the CREATE TABLE above and before the seeding migration below, which
+    # reads the columns it adds on an already-seeded DB's next restart.
+    _migrate_add_fmv_history_certifier_columns(conn)
     # Seed fmv_history from whatever `fmv` rows already exist. Also runs LAST
     # for the same reason the table creation just above does — `fmv` is in
     # its final, stable shape here on both a fresh DB (the legacy migrations
@@ -529,6 +670,333 @@ def _migrate_backfill_fmv_provenance(conn: sqlite3.Connection) -> None:
         "from their notes prefix", claimed
     )
     _set_migration_marker(conn, "backfill_fmv_provenance")
+
+
+# ---------------------------------------------------------------------------
+# BUI-924: the price-identity migration (plan unit U2)
+# ---------------------------------------------------------------------------
+
+
+def derive_pricing_basis(notes: str | None) -> str:
+    """Derive `fmv.pricing_basis` from the notes tokens (BUI-924).
+
+    ONE function, used by both the one-shot backfill and every upsert that
+    omits the field. That is the whole point: a rule applied only in a
+    migration protects only the rows that already existed, and the
+    server-first deploy window guarantees an older `comic-fmv` will keep
+    posting priced rows with no basis for a while. Sharing the function is
+    also what stops a "SQL LIKE approximation of a Python predicate" from
+    appearing — the trap
+    docs/solutions/best-practices/a-shipped-guard-is-not-a-running-guard.md
+    names, and the reason `_migrate_backfill_fmv_provenance` matches in Python
+    too.
+
+    `interpolated` is checked before `CGC proxy` because a proxy price that is
+    ALSO interpolated is, first and foremost, interpolated between rungs — and
+    the plan fixes that order. Everything unmatched is `direct`: a row whose
+    notes claim no derivation was priced straight off its own pool.
+    """
+    if notes:
+        if _INTERPOLATED_NOTE_TOKEN in notes:
+            return "interpolated"
+        if _CGC_PROXY_NOTE_TOKEN in notes:
+            return "proxy"
+    return FMV_PRICING_BASIS_DIRECT
+
+
+def _migrate_fmv_certifier_rebuild(conn: sqlite3.Connection) -> None:
+    """Widen `fmv`'s unique key to (comic_id, grade, certifier, label) (BUI-924).
+
+    A REBUILD, not an index swap: the constraint is inline in the
+    `CREATE TABLE fmv` literal, so there is no index to drop. Same
+    Python-memory pattern as `_migrate_year_nullable`, and the same three
+    things have to survive it:
+
+    1. `bid_fmvs` rows — plain FK children of `fmv`, wiped by the DROP.
+    2. `bids.fmv_id` — declared `REFERENCES fmv(id) ON DELETE SET NULL` on the
+       host side, so `DROP TABLE fmv` NULLS every bid's primary price link.
+       There is no FK the other way, so a lost link is invisible to
+       `PRAGMA foreign_key_check` (BUI-626) — it has to be saved and restored
+       explicitly or it is simply gone.
+    3. Every `fmv.id` — the value both of the above point AT. A rebuild that
+       renumbered would keep every count and break every link.
+
+    The saved column list is built from `PRAGMA table_info(fmv)`, never a
+    literal, so `flag_reason`, `ungraded_anchor`, `ungraded_anchor_n` and
+    `provenance` ride along without being named here, and a column added by a
+    future additive migration cannot be silently dropped by this one. (It
+    would instead fail loudly on the restore INSERT, which is the correct
+    direction: the fix is to add it to the literal in `create_tables`, not to
+    lose the data.)
+
+    Gate: `PRAGMA table_info(fmv)` already lists `certifier` → done. A crash
+    marker is checked BEFORE the gate, because a crash in the post-DROP window
+    leaves the schema looking migrated and the gate would return early over a
+    half-restored `fmv`.
+
+    IMPORTANT: raw conn.execute() only — no conn.commit(). Runs inside the
+    host's per-plugin SAVEPOINT (same constraint as every _migrate_* above).
+    """
+    _assert_no_migration_marker(conn, "fmv_certifier_rebuild")
+
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(fmv)")]
+    if not cols:
+        # No fmv table yet — create_tables just made it from scratch with the
+        # new shape. Nothing to migrate.
+        return
+    if "certifier" in cols:
+        return
+
+    logger.info("fmv-certifier rebuild: starting")
+
+    # Only carry rows that survive a JOIN against the live parent, exactly as
+    # _migrate_year_nullable does: a sqlite3 CLI session that never opted into
+    # `PRAGMA foreign_keys=ON` can leave orphans behind that would fail FK
+    # enforcement on re-insert.
+    # The column names go into SQL unquoted (they have to — they are
+    # identifiers, not bindable values), so assert they are plain identifiers
+    # first. They can only have come from this module's own DDL, so this can
+    # never fire in practice; it is here so that "is this string-built SQL
+    # safe?" is answerable by reading the four lines above it rather than by
+    # auditing every migration that ever touched the table.
+    bad = [c for c in cols if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", c)]
+    if bad:
+        raise RuntimeError(f"fmv has non-identifier column name(s): {bad}")
+
+    col_sql = ", ".join(f"f.{c}" for c in cols)
+    saved_fmv = conn.execute(
+        f"SELECT {col_sql} FROM fmv f JOIN comics c ON c.id = f.comic_id"
+    ).fetchall()
+    saved_bid_fmvs = conn.execute(
+        """
+        SELECT bf.bid_id, bf.fmv_id, bf.is_primary
+        FROM bid_fmvs bf
+        JOIN fmv f ON f.id = bf.fmv_id
+        JOIN bids b ON b.id = bf.bid_id
+        """
+    ).fetchall()
+    saved_bid_fmv_id = conn.execute(
+        "SELECT b.id, b.fmv_id FROM bids b "
+        "JOIN fmv f ON f.id = b.fmv_id WHERE b.fmv_id IS NOT NULL"
+    ).fetchall()
+
+    # Marker before the first DROP: from here on the schema alone can no
+    # longer tell a finished migration from a crashed one.
+    _set_migration_marker(conn, "fmv_certifier_rebuild")
+
+    conn.execute("DROP TABLE bid_fmvs")
+    conn.execute("DROP TABLE fmv")
+    conn.execute(f"""
+        CREATE TABLE fmv (
+            id                 INTEGER PRIMARY KEY,
+            comic_id           INTEGER NOT NULL REFERENCES comics(id) ON DELETE CASCADE,
+            grade              REAL NOT NULL,
+            low                REAL,
+            high               REAL,
+            comps              INTEGER,
+            confidence         TEXT CHECK(confidence IN ('high', 'medium', 'low') OR confidence IS NULL),
+            notes              TEXT,
+            flag_reason        TEXT,
+            ungraded_anchor    REAL,
+            ungraded_anchor_n  INTEGER,
+            provenance         TEXT CHECK(provenance IN ({_fmv_provenances_sql}) OR provenance IS NULL),
+            certifier          TEXT NOT NULL DEFAULT 'none' CHECK(certifier IN ({_fmv_certifiers_sql})),
+            label              TEXT NOT NULL DEFAULT 'universal' CHECK(label IN ({_fmv_labels_sql})),
+            pricing_basis      TEXT CHECK(pricing_basis IN ({_fmv_pricing_bases_sql}) OR pricing_basis IS NULL),
+            updated_at         TEXT,
+            UNIQUE(comic_id, grade, certifier, label)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE bid_fmvs (
+            bid_id      INTEGER NOT NULL REFERENCES bids(id) ON DELETE CASCADE,
+            fmv_id      INTEGER NOT NULL REFERENCES fmv(id) ON DELETE CASCADE,
+            is_primary  INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (bid_id, fmv_id)
+        )
+    """)
+
+    insert_cols = ", ".join(cols)
+    placeholders = ", ".join("?" for _ in cols)
+    for f in saved_fmv:
+        conn.execute(
+            f"INSERT INTO fmv ({insert_cols}) VALUES ({placeholders})",
+            tuple(f[c] for c in cols),
+        )
+    for bf in saved_bid_fmvs:
+        conn.execute(
+            "INSERT OR IGNORE INTO bid_fmvs (bid_id, fmv_id, is_primary) VALUES (?, ?, ?)",
+            (bf["bid_id"], bf["fmv_id"], bf["is_primary"]),
+        )
+    # Restore the bids.fmv_id values the SET NULL cascade wiped on DROP.
+    for b in saved_bid_fmv_id:
+        conn.execute("UPDATE bids SET fmv_id = ? WHERE id = ?", (b["fmv_id"], b["id"]))
+
+    # The DROP took both tables' indexes with them, and `create_tables`'
+    # own index block for them already ran (it sits above the migration
+    # calls), so they are recreated here or not at all.
+    #
+    # `idx_fmv_comic` is replaced by a NEW name, per the
+    # `_migrate_lowercase_title_indexes` rule: its DEFINITION changes
+    # (`fmv(comic_id)` → `fmv(comic_id, certifier, label)`, so a per-book
+    # lookup can narrow to one market), and `CREATE INDEX IF NOT EXISTS`
+    # under the old name would be a silent no-op on a DB that still has the
+    # old shape. `idx_bid_fmvs_bid` keeps its name because its definition is
+    # unchanged — there is nothing for the old name to shadow.
+    conn.execute("DROP INDEX IF EXISTS idx_fmv_comic")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fmv_comic_cert "
+        "ON fmv(comic_id, certifier, label)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_bid_fmvs_bid ON bid_fmvs(bid_id)")
+
+    _clear_migration_marker(conn, "fmv_certifier_rebuild")
+
+    logger.info(
+        "fmv-certifier rebuild complete: %d fmv, %d bid_fmvs, %d bids.fmv_id restored",
+        len(saved_fmv), len(saved_bid_fmvs), len(saved_bid_fmv_id),
+    )
+
+
+def _migrate_add_fmv_pricing_basis_column(conn: sqlite3.Connection) -> None:
+    """Add the nullable `pricing_basis` column to fmv if absent (BUI-924).
+
+    Additive and idempotent, same PRAGMA guard as every other additive
+    migration here. The rebuild above already creates the column, so this is
+    a no-op on any DB it touched; it exists for the version-skew case where
+    `certifier` is present but `pricing_basis` somehow is not.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(fmv)")}
+    if cols and "pricing_basis" not in cols:
+        conn.execute(
+            "ALTER TABLE fmv ADD COLUMN pricing_basis TEXT "
+            f"CHECK(pricing_basis IN ({_fmv_pricing_bases_sql}) "
+            "OR pricing_basis IS NULL)"
+        )
+
+
+def _migrate_backfill_fmv_pricing_basis(conn: sqlite3.Connection) -> None:
+    """One-time backfill of `fmv.pricing_basis` from the notes tokens (BUI-924).
+
+    Marker-gated rather than `WHERE pricing_basis IS NULL` alone, for the same
+    reason `_migrate_backfill_fmv_provenance` is: this is a ONE-TIME
+    translation of the old convention, so an operator who corrects a row by
+    hand afterwards does not have the correction silently re-derived away on
+    the next server restart.
+
+    Matched in Python via the shared `derive_pricing_basis`, never a SQL LIKE
+    approximation of it, so the backfill and the live upsert path cannot
+    disagree about what a token means.
+
+    IMPORTANT: raw conn.execute() only — no conn.commit(). Runs inside the
+    host's per-plugin SAVEPOINT.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM migration_state WHERE migration='backfill_fmv_pricing_basis'"
+    ).fetchone()
+    if row is not None:
+        return
+
+    counts: dict[str, int] = {}
+    for r in conn.execute(
+        "SELECT id, notes FROM fmv WHERE pricing_basis IS NULL"
+    ).fetchall():
+        basis = derive_pricing_basis(r["notes"])
+        conn.execute(
+            "UPDATE fmv SET pricing_basis=? WHERE id=?", (basis, r["id"])
+        )
+        counts[basis] = counts.get(basis, 0) + 1
+    if counts:
+        logger.info("_migrate_backfill_fmv_pricing_basis: %s", counts)
+    _set_migration_marker(conn, "backfill_fmv_pricing_basis")
+
+
+def _migrate_add_comps_certifier_columns(conn: sqlite3.Connection) -> None:
+    """Add certifier/label/page_quality to comps if absent (BUI-924).
+
+    Purely additive — `idx_comps_identity` is unchanged, since `pool` already
+    separates raw from slab — so this needs none of the rebuild machinery
+    `fmv` required. Each column is checked independently (SQLite errors on a
+    duplicate ADD COLUMN), and each carries the NOT NULL default that makes
+    every pre-existing row an explicit raw/unknown rather than a NULL.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(comps)")}
+    if not cols:
+        return
+    if "certifier" not in cols:
+        conn.execute(
+            "ALTER TABLE comps ADD COLUMN certifier TEXT NOT NULL DEFAULT 'none' "
+            f"CHECK(certifier IN ({_fmv_certifiers_sql}))"
+        )
+    if "label" not in cols:
+        conn.execute(
+            "ALTER TABLE comps ADD COLUMN label TEXT NOT NULL DEFAULT 'universal' "
+            f"CHECK(label IN ({_fmv_labels_sql}))"
+        )
+    if "page_quality" not in cols:
+        conn.execute(
+            "ALTER TABLE comps ADD COLUMN page_quality TEXT NOT NULL "
+            "DEFAULT 'unknown' "
+            f"CHECK(page_quality IN ({_comp_page_qualities_sql}))"
+        )
+
+
+def _migrate_backfill_comps_certifier(conn: sqlite3.Connection) -> None:
+    """One-time backfill of `comps.certifier` on existing slab rows (BUI-924).
+
+    Every pre-existing comp lands on the 'none' (raw) default from the ALTER,
+    which is correct for `pool='raw'` and wrong for `pool='slab'` — a slab
+    comp is certified by definition. The grader is recoverable from the
+    listing title, which is the only place it was ever recorded.
+
+    Unparseable slab rows become `other`, NOT `none`: "we could not read which
+    grader" and "this is a raw copy" are different facts, and collapsing them
+    would silently feed slab prices into a raw pool later.
+
+    Marker-gated (one-time) and matched in Python against the shared regex,
+    for the same two reasons `_migrate_backfill_fmv_pricing_basis` above is.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM migration_state WHERE migration='backfill_comps_certifier'"
+    ).fetchone()
+    if row is not None:
+        return
+
+    counts: dict[str, int] = {}
+    for r in conn.execute(
+        "SELECT id, title FROM comps WHERE pool='slab' AND certifier='none'"
+    ).fetchall():
+        match = _COMPS_SLAB_CERTIFIER_RE.search(r["title"] or "")
+        certifier = match.group(1).lower() if match else "other"
+        conn.execute(
+            "UPDATE comps SET certifier=? WHERE id=?", (certifier, r["id"])
+        )
+        counts[certifier] = counts.get(certifier, 0) + 1
+    if counts:
+        logger.info("_migrate_backfill_comps_certifier: %s", counts)
+    _set_migration_marker(conn, "backfill_comps_certifier")
+
+
+def _migrate_add_fmv_history_certifier_columns(conn: sqlite3.Connection) -> None:
+    """Add certifier/label to fmv_history if absent (BUI-924).
+
+    Additive, same guard as the comps columns above. Existing history rows all
+    predate slab support, so the raw sentinel defaults are the true answer for
+    every one of them — no backfill is needed or wanted.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(fmv_history)")}
+    if not cols:
+        return
+    if "certifier" not in cols:
+        conn.execute(
+            "ALTER TABLE fmv_history ADD COLUMN certifier TEXT NOT NULL "
+            f"DEFAULT 'none' CHECK(certifier IN ({_fmv_certifiers_sql}))"
+        )
+    if "label" not in cols:
+        conn.execute(
+            "ALTER TABLE fmv_history ADD COLUMN label TEXT NOT NULL "
+            f"DEFAULT 'universal' CHECK(label IN ({_fmv_labels_sql}))"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1693,24 +2161,34 @@ def _merge_yearless_into_yeared(
 ) -> None:
     """Reparent all fmv children from a yearless orphan onto a yeared row.
 
-    For each fmv grade on yearless_id:
-    - No conflict (yeared has no fmv at that grade): reassign comic_id in-place.
-    - Conflict (yeared already has fmv at that grade): COALESCE non-null fields
-      into the yeared fmv, reparent bid_fmvs and bids.fmv_id, then delete the
-      duplicate yearless fmv row.
+    For each fmv IDENTITY on yearless_id — (grade, certifier, label), not
+    grade alone (BUI-924):
+    - No conflict (yeared has no fmv at that identity): reassign comic_id
+      in-place.
+    - Conflict (yeared already has fmv at that identity): COALESCE non-null
+      fields into the yeared fmv, reparent bid_fmvs and bids.fmv_id, then
+      delete the duplicate yearless fmv row.
+
+    Keying the lookup on grade alone would treat a yearless CGC 9.6 slab row
+    as a duplicate of the yeared raw 9.6 row, COALESCE two different markets'
+    prices into one, and DELETE the slab — and the yeared row's own UNIQUE
+    constraint no longer stops it, because the two rows are legitimately
+    distinct under the widened key.
 
     Does NOT delete the yearless comics row — caller's responsibility.
     """
     yearless_fmvs = conn.execute(
-        "SELECT id, grade, low, high, comps, confidence, notes, updated_at "
+        "SELECT id, grade, low, high, comps, confidence, notes, updated_at, "
+        "certifier, label, pricing_basis "
         "FROM fmv WHERE comic_id=?",
         (yearless_id,),
     ).fetchall()
 
     for yfmv in yearless_fmvs:
         yeared_fmv = conn.execute(
-            "SELECT id FROM fmv WHERE comic_id=? AND grade=?",
-            (yeared_id, yfmv["grade"]),
+            "SELECT id FROM fmv WHERE comic_id=? AND grade=? AND certifier=? "
+            "AND label=?",
+            (yeared_id, yfmv["grade"], yfmv["certifier"], yfmv["label"]),
         ).fetchone()
 
         if yeared_fmv is None:
@@ -1721,18 +2199,23 @@ def _merge_yearless_into_yeared(
             conn.execute(
                 """
                 UPDATE fmv SET
-                    low        = COALESCE(low,        ?),
-                    high       = COALESCE(high,       ?),
-                    comps      = COALESCE(comps,      ?),
-                    confidence = COALESCE(confidence, ?),
-                    notes      = COALESCE(notes,      ?),
-                    updated_at = COALESCE(updated_at, ?)
+                    low           = COALESCE(low,        ?),
+                    high          = COALESCE(high,       ?),
+                    comps         = COALESCE(comps,      ?),
+                    confidence    = COALESCE(confidence, ?),
+                    notes         = COALESCE(notes,      ?),
+                    updated_at    = COALESCE(updated_at, ?),
+                    -- BUI-924: travels with `low`/`notes` deliberately. The
+                    -- merge can COALESCE a price UP from the yearless row;
+                    -- leaving its basis behind would strip that price's
+                    -- haircut and silently raise the cap it computes.
+                    pricing_basis = COALESCE(pricing_basis, ?)
                 WHERE id=?
                 """,
                 (
                     yfmv["low"], yfmv["high"], yfmv["comps"],
                     yfmv["confidence"], yfmv["notes"], yfmv["updated_at"],
-                    yeared_fmv["id"],
+                    yfmv["pricing_basis"], yeared_fmv["id"],
                 ),
             )
             # Reparent bid_fmvs; preserve the higher is_primary if both exist.
@@ -1808,8 +2291,11 @@ def upsert_fmv(
     ungraded_anchor: float | None = None,
     ungraded_anchor_n: int | None = None,
     provenance: str | None = None,
+    certifier: str | None = None,
+    label: str | None = None,
+    pricing_basis: str | None = None,
 ) -> int:
-    """Upsert a per-grade FMV row. Returns the fmv id.
+    """Upsert a per-identity FMV row. Returns the fmv id.
 
     `flag_reason` (BUI-132) carries the BUI-86 needs_manual state as a structured
     column (one_sided / too_wide / too_sparse, or NULL for not-flagged). The
@@ -1880,11 +2366,51 @@ def upsert_fmv(
       forever. Nothing is weakened by allowing this: `comic-fmv`'s reader ORs
       the column with the notes-prefix fallback, so a row whose notes still
       carry the marker stays protected either way.
+
+    `certifier`/`label` (BUI-924) are the rest of the row's IDENTITY, not
+    metadata about it: together with `comic_id` and `grade` they are the
+    conflict key. Omitted, they fall back to the raw sentinels
+    ('none'/'universal') — which is what makes a write from a client that
+    predates this column land on the RAW row and leave any slab row beside it
+    untouched, in both directions. They are never NULL (see FMV_CERTIFIERS),
+    and the `ON CONFLICT` clause plus the trailing id lookup both name the
+    full four-part key. That lookup matters as much as the conflict clause: a
+    `WHERE comic_id=? AND grade=?` lookup returns EITHER row once two coexist,
+    and the id it returns is what the API echoes and what `bids.fmv_id` ends
+    up pointing at.
+
+    `pricing_basis` (BUI-924) records HOW the number was arrived at. When the
+    caller omits it, it is DERIVED from the notes tokens on every upsert (see
+    `derive_pricing_basis`), not only by the one-shot backfill — during the
+    server-first deploy window an older `comic-fmv` keeps posting priced rows
+    with no basis, and each must still carry its haircut. Its ON CONFLICT
+    treatment deliberately mirrors `notes`, the field it is derived from, so
+    the two can never disagree: a flagged row takes the incoming value (its
+    price is nulled anyway), a bare n=0 stub cannot overwrite a priced row's
+    basis (the BUI-599 guard), and otherwise the incoming value wins.
     """
     if grade is None:
         raise ValueError("grade is required for upsert_fmv")
     flag_reason = flag_reason or None
     provenance = provenance or None
+    certifier = certifier or FMV_CERTIFIER_NONE
+    label = label or FMV_LABEL_UNIVERSAL
+    # Validated in Python as well as by the CHECK constraints, so a bad value
+    # is a named error at the call site rather than a bare IntegrityError from
+    # four frames down — the same house style as the `grade is required` guard
+    # above and `upsert_comps`' missing-field guard.
+    if certifier not in FMV_CERTIFIERS:
+        raise ValueError(
+            f"unknown certifier {certifier!r} (expected one of {FMV_CERTIFIERS})"
+        )
+    if label not in FMV_LABELS:
+        raise ValueError(f"unknown label {label!r} (expected one of {FMV_LABELS})")
+    if pricing_basis is not None and pricing_basis not in FMV_PRICING_BASES:
+        raise ValueError(
+            f"unknown pricing_basis {pricing_basis!r} "
+            f"(expected one of {FMV_PRICING_BASES})"
+        )
+    pricing_basis = pricing_basis or derive_pricing_basis(notes)
     has_value = any(
         v is not None for v in (low, high, comps, confidence, notes, flag_reason)
     )
@@ -1893,9 +2419,10 @@ def upsert_fmv(
         """
         INSERT INTO fmv (comic_id, grade, low, high, comps, confidence, notes,
                           flag_reason, ungraded_anchor, ungraded_anchor_n,
-                          provenance, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(comic_id, grade) DO UPDATE SET
+                          provenance, certifier, label, pricing_basis,
+                          updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(comic_id, grade, certifier, label) DO UPDATE SET
             -- A flagged incoming row clears the stale auto-priced number; an
             -- unflagged incoming row (a fresh price OR a bare n=0 stub)
             -- COALESCE-preserves it. The n=0 stub guard lives in the COALESCE:
@@ -1952,16 +2479,26 @@ def upsert_fmv(
                                WHEN excluded.low IS NULL AND excluded.flag_reason IS NULL
                                     AND low IS NOT NULL THEN provenance
                                ELSE excluded.provenance END,
+            -- BUI-924: `pricing_basis` is derived from `notes`, so it takes
+            -- exactly the `notes` treatment three lines up — a flagged row
+            -- overwrites, a bare n=0 stub cannot degrade a priced row, and
+            -- otherwise the incoming (possibly derived) value wins. Nothing
+            -- here can conflict on certifier/label: they ARE the key.
+            pricing_basis = CASE WHEN excluded.flag_reason IS NOT NULL THEN excluded.pricing_basis
+                               WHEN excluded.low IS NULL AND low IS NOT NULL THEN pricing_basis
+                               ELSE COALESCE(excluded.pricing_basis, pricing_basis) END,
             updated_at  = CASE WHEN excluded.low IS NOT NULL OR excluded.flag_reason IS NOT NULL
                                THEN excluded.updated_at
                                ELSE updated_at END
         """,
         (comic_id, grade, low, high, comps, confidence, notes, flag_reason,
-         ungraded_anchor, ungraded_anchor_n, provenance, now),
+         ungraded_anchor, ungraded_anchor_n, provenance, certifier, label,
+         pricing_basis, now),
     )
     conn.commit()
     row = conn.execute(
-        "SELECT id FROM fmv WHERE comic_id=? AND grade=?", (comic_id, grade)
+        "SELECT id FROM fmv WHERE comic_id=? AND grade=? AND certifier=? AND label=?",
+        (comic_id, grade, certifier, label),
     ).fetchone()
     return row["id"]
 
@@ -1995,10 +2532,15 @@ def append_fmv_history(
     id, so a missing row here means something upstream is already broken and
     should not be swallowed silently by this function itself; the caller's
     own try/except is where "never block the write" is enforced.
+
+    BUI-924: `certifier`/`label` are read off the `fmv` row here for the same
+    reason every other field is, and are deliberately NOT parameters. A raw
+    and a slab reading at one grade are two series; a snapshot that could
+    claim an identity its own row does not have would interleave them.
     """
     row = conn.execute(
         "SELECT comic_id, grade, low, high, comps, confidence, flag_reason, "
-        "notes, updated_at FROM fmv WHERE id=?",
+        "notes, updated_at, certifier, label FROM fmv WHERE id=?",
         (fmv_id,),
     ).fetchone()
     if row is None:
@@ -2007,13 +2549,13 @@ def append_fmv_history(
         """
         INSERT INTO fmv_history (
             comic_id, grade, low, high, comps, confidence, flag_reason, notes,
-            recorded_at, source
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            recorded_at, source, certifier, label
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             row["comic_id"], row["grade"], row["low"], row["high"],
             row["comps"], row["confidence"], row["flag_reason"], row["notes"],
-            row["updated_at"], source,
+            row["updated_at"], source, row["certifier"], row["label"],
         ),
     )
     conn.commit()
@@ -2041,19 +2583,20 @@ def _migrate_seed_fmv_history(conn: sqlite3.Connection) -> None:
 
     fmv_rows = conn.execute(
         "SELECT comic_id, grade, low, high, comps, confidence, flag_reason, "
-        "notes, updated_at FROM fmv"
+        "notes, updated_at, certifier, label FROM fmv"
     ).fetchall()
     for r in fmv_rows:
         conn.execute(
             """
             INSERT INTO fmv_history (
                 comic_id, grade, low, high, comps, confidence, flag_reason,
-                notes, recorded_at, source
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'backfill')
+                notes, recorded_at, source, certifier, label
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'backfill', ?, ?)
             """,
             (
                 r["comic_id"], r["grade"], r["low"], r["high"], r["comps"],
                 r["confidence"], r["flag_reason"], r["notes"], r["updated_at"],
+                r["certifier"], r["label"],
             ),
         )
     if fmv_rows:
@@ -2091,6 +2634,14 @@ def upsert_comps(
     and `provenance` (all required — the route's pydantic model enforces the
     closed vocabularies before this ever runs); every other key is optional
     and defaults to NULL when absent.
+
+    BUI-924 adds three more optional keys — `certifier`, `label`, and
+    `page_quality` — which default to the explicit sentinels
+    'none'/'universal'/'unknown' rather than NULL, so a raw comp and a comp
+    whose page quality was never read are both statable facts instead of
+    absences. They are descriptive here, NOT part of the identity:
+    `idx_comps_identity` is unchanged because `pool` already separates raw
+    from slab and a provider's `product_id` is unique within a pool.
 
     Returns `{"inserted": n, "updated": n, "conflicts": n}` — a running
     total across the batch, so the caller (the ingest endpoint) can report
@@ -2156,9 +2707,9 @@ def upsert_comps(
             INSERT INTO comps (
                 comic_id, pool, provider, product_id, title, price, sold_date,
                 grade, buying_format, link, query, tier, from_cache,
-                observed_at, provenance, first_seen_at, last_seen_at,
-                seen_count, conflict_count
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0)
+                observed_at, provenance, certifier, label, page_quality,
+                first_seen_at, last_seen_at, seen_count, conflict_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0)
             ON CONFLICT(provider, product_id, COALESCE(comic_id, -1), pool)
             DO UPDATE SET
                 last_seen_at   = excluded.last_seen_at,
@@ -2170,7 +2721,15 @@ def upsert_comps(
                 comp.get("title"), price, sold_date, comp.get("grade"),
                 comp.get("buying_format"), comp.get("link"), comp.get("query"),
                 comp.get("tier"), comp.get("from_cache"), comp.get("observed_at"),
-                comp["provenance"], now, now,
+                comp["provenance"],
+                # BUI-924: `or <sentinel>` rather than `.get(k, <sentinel>)` —
+                # an explicit `None` on the wire must land on the sentinel
+                # too, not violate the NOT NULL. Same reason `upsert_fmv`
+                # coalesces its own certifier/label.
+                comp.get("certifier") or FMV_CERTIFIER_NONE,
+                comp.get("label") or FMV_LABEL_UNIVERSAL,
+                comp.get("page_quality") or COMP_PAGE_QUALITY_UNKNOWN,
+                now, now,
                 1 if conflict else 0,
             ),
         )
@@ -2277,6 +2836,7 @@ def list_comics(
     locg_variant_id: int | None = None,
     variant: str | None = None,
     max_age_days: float | None = None,
+    certifier: str | None = None,
 ) -> list[sqlite3.Row]:
     """Return comics enriched with FMV data. One row per (comic, fmv) pair.
 
@@ -2305,7 +2865,30 @@ def list_comics(
     max_age_days: if set, only return rows where the joined fmv.updated_at
         is within the last N days. Stale rows are excluded so callers can't
         accidentally reuse outdated FMVs.
+    certifier: BUI-924 — scope to one price market. Unlike every other filter
+        here, an ABSENT parameter is not "no filter": it means `'none'`, the
+        raw market. That is the fail-closed direction and it is the whole
+        point. Every caller that exists today (`comic-fmv`'s cache lookup, the
+        dashboard, ad hoc queries) was written when `fmv` held raw prices
+        only, and handing one of them a CGC slab's band because it did not
+        know to ask would set a raw bid cap off a slab market — several times
+        the right number. A caller that wants a slab row has to name it.
+
+        The filter lives in the JOIN's ON clause, not the WHERE, so it
+        narrows which fmv row joins rather than turning the LEFT JOIN into an
+        inner one: a comic with no fmv rows at all still comes back (with
+        NULL fmv fields), exactly as before, and so does one whose only rows
+        are slabs — unpriced from a raw caller's point of view, which is the
+        truth.
     """
+    if certifier is not None and certifier not in FMV_CERTIFIERS:
+        # Loud rather than silently empty: an unrecognized value (a 'CGC'
+        # that should have been 'cgc') would otherwise read as "this book has
+        # no price on file", which is indistinguishable from the truth and
+        # sends the caller off to fetch one.
+        raise ValueError(
+            f"unknown certifier {certifier!r} (expected one of {FMV_CERTIFIERS})"
+        )
     clauses: list[str] = []
     params: list[Any] = []
     if title is not None:
@@ -2358,6 +2941,15 @@ def list_comics(
                f.low AS fmv_low, f.high AS fmv_high, f.comps AS fmv_comps,
                f.confidence AS fmv_confidence, f.notes AS fmv_notes,
                f.flag_reason AS fmv_flag_reason,
+               -- BUI-924: the rest of the price identity, and the basis the
+               -- number was arrived at on. Served on EVERY row, unprefixed,
+               -- for the same two reasons `variant` above is: a caller can
+               -- only key its lookup on what the WRITE keys on, and the
+               -- KEY'S MERE PRESENCE is the deploy-order probe — a graded
+               -- client checks whether `certifier` comes back at all before
+               -- it writes anything, because an old server would silently
+               -- drop the field and upsert a slab price onto the raw row.
+               f.certifier, f.label, f.pricing_basis,
                -- BUI-769: `comic-fmv`'s hand-priced guard reads this to decide
                -- whether a default run may overwrite the row. It must be
                -- served on EVERY row this endpoint returns, not just the ones
@@ -2366,11 +2958,11 @@ def list_comics(
                f.provenance AS fmv_provenance,
                f.updated_at AS fmv_updated_at
         FROM comics c
-        LEFT JOIN fmv f ON f.comic_id = c.id
+        LEFT JOIN fmv f ON f.comic_id = c.id AND f.certifier = ?
         {where}
         ORDER BY c.id, f.grade
         """,
-        params,
+        [certifier or FMV_CERTIFIER_NONE, *params],
     ).fetchall()
 
 
