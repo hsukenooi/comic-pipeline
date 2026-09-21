@@ -284,6 +284,34 @@ Use the midpoint of the range by default. Adjust toward the tighter end (10% / 1
 - State the CGC source price, the grade, and the discount applied
 - Cap confidence at MEDIUM-LOW regardless of how many CGC comps you found — the discount estimate itself introduces irreducible uncertainty
 
+### 7b. Graded (slab) pricing mode (BUI-930)
+
+A **certified** target — `certifier` set to `cgc` or `cbcs` — is priced from that certifier's own slab sales, never from the raw market. This section is a separate branch from §1–§7a, not an extension of them: a certified target never runs `build_pool`'s grade-window widening, the §7 interpolation, the §7a CGC-proxy rescue, the cross check, or the ungraded anchor — each of those reads the raw market, and running one on a slab target would price it off the wrong pool (the §7a rescue in particular would price a slab at ~0.5× itself). **§7a's raw-discount factors (10–25% below CGC-equivalent) never apply to a slab target** — a slab target *is* the CGC-equivalent price, not a raw price to be discounted from it.
+
+**Deploy-order gate.** Before any certified target is looked up, one run-level `GET /api/comics` probe checks that returned rows carry a `certifier` key. A comics server that predates the certifier-aware schema (BUI-924/925) silently drops the key and would upsert a slab price onto the same `(comic_id, grade)` row a raw copy uses — so on such a server every certified row is refused before any read or write (`skipped_schema_mismatch`), and raw books in the same batch are unaffected.
+
+**Only Universal (blue label) CGC/CBCS is priced.** A non-Universal label (Signature Series, Qualified, Restored, Conserved) or a certifier other than CGC/CBCS punts to `needs_manual` before any fetch — each trades in its own market at the same numeric grade, so pooling it with Universal comps would be an identity error, not a condition difference.
+
+**Comp pool identity and weighting.** The pool is live slab comps from the fetch plus stored `pool='slab'` ledger comps, both filtered to the *same* `(comic_id, certifier, label)`, deduped on `product_id`. Age is `sold_date`, else `first_seen_at`; a comp with neither is excluded. Weight **1.0** up to 90 days old, **0.5** from 91–365 days, excluded beyond 365 days. Weights apply everywhere the pool is counted — the exact-tier gate reads **effective n** (the weight sum, not the raw comp count), and rung medians/counts are weighted too. This is the opposite of the raw path, which keeps the ledger archive-only and never reads it for a price (CONCEPTS.md "Comps Ledger").
+
+**Page-quality preference.** When at least two comps share the target's `page_quality`, the pool narrows to just those; otherwise every quality is pooled and the row notes the fallback. Page quality moves vintage slab prices enough to prefer a same-quality match, but not enough to refuse pricing when one doesn't exist.
+
+**Pre-tier refusal.** If nothing survives the identity + age filters, the row refuses `no_certifier_pool` before the exact/ladder split is even evaluated — there is no pool to bucket into either tier.
+
+**Exact tier.** At effective n ≥ 2 sales exactly at the target grade, the target prices directly: weighted Q25/median/Q75 of that bucket, the §8 confidence rubric applied to that bucket's **effective n** and CV (§8's thresholds are unchanged — only the n being tested is now a weighted sum), and — below `OUTLIER_ROBUST_BUCKET_N` (3) — the same envelope clamp §7a's proxy tier uses, bounding the whole band from above by what the bracketing rungs imply. The bucket is **strictly** exact (unlike the raw path's ±window): a 9.6 slab and a 9.8 slab are two different products at two different prices, and pooling them the way the raw path pools nearby grades would be exactly the error the raw window exists to usefully make for raw copies.
+
+**Ladder tier — single-sale rungs allowed to anchor.** Below effective n 2 at the exact grade, the target rung is **dropped** from the ladder and the neighbouring rungs interpolate across the gap — calling the interpolation helper with the rung still in place would return the lone sale merely bounded from above, not an interpolation, so dropping it first is the whole mechanism. A rung with only one sale (routine on a vintage slab, which may see one eBay sale at a given grade in the observed window) is still eligible to anchor the interpolation; the raw path's two-sale rung minimum does not apply here. A ladder price is always confidence **LOW** and bid factor **0.60**, still subject to the same envelope clamp. Ladder refusals, evaluated on the two rungs the interpolation would actually use (not the whole ladder — a whole-ladder monotonicity rule was measured to refuse ladders a neighbour-scoped rule prices correctly, per the plan's KTD):
+
+- `ladder_too_thin` — fewer than three anchor-eligible rungs remain after dropping the target.
+- `outside_ladder` — no eligible rung on one side of the target (never extrapolated past the observed ladder).
+- `ladder_non_monotone` — the target's two bracketing rungs invert.
+
+**Printing guard (BUI-929).** A live slab comp priced below half its rung's leave-one-out median triggers one Browse API description fetch for that listing. The comp is dropped (`printing_dropped`) if the text carries an ordinal printing token (`2nd`, `second printing`, `3rd`, …) or `facsimile`; it is kept and counted separately (`printing_unverified`) when no text comes back. Bare `reprint` never triggers a drop on its own (BUI-645: reprint-titled first prints exist) — only a price outlier plus a confirmed later-printing token drops a comp.
+
+**The BIN rule (R34).** A certified target with `listing_type: "BIN"` is still fetched, priced, and written — the band and comps are real — but `max_bid` is withheld (`null`) on both a fresh price and a cache hit, because a BIN listing has no auction to snipe. This is the same withheld-cap shape as a ledger-advisory row, applied for a different reason.
+
+**Pricing basis.** A certified row's `fmv.pricing_basis` is `"direct"` (exact tier) or `"ladder"` (ladder tier) — distinct from the raw path's `"interpolated"` (§7) and `"proxy"` (§7a) values on the same column. A cache hit reads `pricing_basis` to reproduce the same confidence and bid factor the fresh row got, the same mechanism the raw path uses for an interpolated row's 0.60 haircut.
+
 ### 8. Confidence rubric
 
 | n (trimmed pool) | CV | Confidence |

@@ -11,6 +11,8 @@ Grade raw (ungraded) comics from eBay seller photos. A first grader runs on ever
 
 One or more eBay listing URLs or item IDs. No seller-stated grade needed — this skill derives it from photos.
 
+**Skip a certified (CGC/CBCS) listing outright (BUI-923)** — `grade_source: "certified"` from `/comic:identify` means the grade is sealed by the grading company, not a seller's word to verify. Photo-grading a slab has nothing to add: there's no condition risk to assess and no seller-deviation signal (BUI-78) to accumulate against a company grade. If a mixed batch of URLs includes both raw and certified listings, grade only the raw ones and pass the certified ones straight through with their certified grade untouched.
+
 ## Step 1: Download Listing Photos
 
 Use the eBay Browse API via `~/Projects/comic-pipeline/apps/ebay/src/ebay_fetch.py` — the `get_item_by_legacy_id` endpoint returns `image` and `additionalImages` with direct `i.ebayimg.com` URLs that are downloadable without bot detection. Do not scrape eBay HTML pages (returns 400/CAPTCHA).

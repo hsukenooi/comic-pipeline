@@ -168,6 +168,7 @@ Verdicts (ladder — first failure wins):
 | `fmv_stub` | Comic + fmv at grade exist but `fmv.low`/`fmv.high` are NULL and the row is NOT flagged — `/comic:fmv` never computed FMV |
 | `partial` | fmv populated but `bids.fmv_id` is null or mismatches the matched fmv |
 | `no_fmv_at_grade` | Comic linked, but no `fmv` row at the bid's grade |
+| `no_fmv_at_certifier` | An `fmv` row IS linked at the bid's grade, but only at a **different** certifier/label than the bid carries (BUI-925) — e.g. a raw row exists at 9.6 but the bid is a CGC 9.6 slab. `guidance` names both the requested and the found certifier/label. Not `fully_linked` — proximity to the right grade isn't the right key |
 | `no_comic` | No comic linked to the bid (and no match via `locg_id` if given) |
 | `no_bid` | The `bids` row itself is missing — snipe never landed |
 
