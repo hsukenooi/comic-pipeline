@@ -4973,14 +4973,22 @@ class TestParseSlabFields:
     # that spike's results), the same real "CGC 9.8 Qualified" fragment
     # test_grade_tokens.py's own BUI-923 corpus already pins for resolve_label.
 
-    def test_signature_series_via_ss_and_autograph(self):
+    def test_autograph_without_witnessed_token_is_qualified(self):
         # Real spike/corpus title (also pinned in TestHardExclude's
         # test_signed_copies_are_excluded — same title, opposite mode).
+        # BUI-941: an autograph with no witnessed-signing token reads as the
+        # green Qualified label, not the yellow Signature Series one.
         title = "X-MEN #13 CGC 6.0 OW-W 1965 KIRBY, Goldberg autograph/signature 2nd JUGGERNAUT"
         fields = sc.parse_slab_fields(title)
         assert fields["certifier"] == "cgc"
-        assert fields["label"] == "signature_series"
+        assert fields["label"] == "qualified"
         assert fields["page_quality"] == "ow_w"
+
+    def test_signature_series_via_explicit_witnessed_token(self):
+        # Real spike title — the yellow label is claimed outright.
+        title = "Invincible #1 (Image Comics Malibu Comics January 2003) CGC 9.2 Signature Series"
+        fields = sc.parse_slab_fields(title)
+        assert fields["label"] == "signature_series"
 
     def test_qualified_label(self):
         title = "Ultimate Fallout #4 CGC 9.6 Qualified Marvel Comics 2011"
@@ -5110,7 +5118,7 @@ class TestGradedFetchMode:
         assert slab["label"] == "universal"
         assert slab["page_quality"] == "unknown"
 
-    def test_signature_series_comp_labeled_in_graded_mode_excluded_in_raw_mode(
+    def test_signed_comp_labeled_in_graded_mode_excluded_in_raw_mode(
         self, tmp_path, monkeypatch,
     ):
         # Real corpus title (also pinned excluded in TestHardExclude).
@@ -5122,7 +5130,8 @@ class TestGradedFetchMode:
             "key",
         )
         assert len(out["slab_comps"]) == 1
-        assert out["slab_comps"][0]["label"] == "signature_series"
+        # BUI-941: labeled, not dropped — and non-Universal either way.
+        assert out["slab_comps"][0]["label"] == "qualified"
 
         # Same title, no certifier field: raw-mode inclusive tier's
         # hard_exclude still drops it outright, byte-for-byte unchanged.
@@ -5137,6 +5146,49 @@ class TestGradedFetchMode:
             "key",
         )
         assert out2["slab_comps"] == []
+
+    def test_universal_target_pool_rejects_the_autographed_comp(
+        self, tmp_path, monkeypatch,
+    ):
+        """BUI-941 done-when, at the pool-building seam.
+
+        fmv-math-spec.md §7b pools live slab comps filtered to the *same*
+        `(comic_id, certifier, label)` as the target, so the one thing that
+        keeps an autographed slab out of a Universal target's pool is the
+        label `parse_slab_fields` stamps on it here. Before BUI-941 the
+        plural in "W/ AUTOGRAPHS" matched no pattern, `resolve_label`
+        returned None, and `or "universal"` put the comp straight into the
+        Universal 7.5 rung beside genuine blue-label sales.
+
+        Both titles are verbatim from the offline corpus
+        (~/.cache/ebay-sold-comps), and they are the real Ultimate Fallout #4
+        slab pool the BUI-929 spike fetched.
+        """
+        autographed = ("J-523 2011 MARVEL COMICS ULTIMATE FALLOUT #4 "
+                       "CGC 7.5 W/ AUTOGRAPHS ")
+        universal = "Ultimate Fallout #4 CGC 7.5 Marvel Comics 2011 1st Miles Morales"
+        results = [[
+            self._comp("s_auto", autographed, 222.22),
+            self._comp("s_univ", universal, 300.0),
+        ]]
+        self._wire(tmp_path, monkeypatch, results)
+        out = sc.fetch_book_comps(
+            {"title": "Ultimate Fallout", "issue": "4", "year": 2011,
+             "grade": 7.5, "certifier": "cgc", "label": "universal"},
+            "key",
+        )
+
+        # Both survive the graded-mode exclusions — labeled, never dropped.
+        assert len(out["slab_comps"]) == 2
+        by_id = {c["product_id"]: c for c in out["slab_comps"]}
+        assert by_id["s_auto"]["label"] == "qualified"
+        assert by_id["s_univ"]["label"] == "universal"
+
+        # §7b's identity filter, applied as the pricing path applies it.
+        pool = [c for c in out["slab_comps"]
+                if (c["certifier"], c["label"]) == ("cgc", "universal")]
+        assert [c["product_id"] for c in pool] == ["s_univ"]
+        assert all("AUTOGRAPH" not in c["title"].upper() for c in pool)
 
     def test_provider_failure_returns_standard_error_shape(self, tmp_path, monkeypatch):
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)

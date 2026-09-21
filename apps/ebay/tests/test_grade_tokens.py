@@ -92,9 +92,12 @@ class TestResolveLabel:
     @pytest.mark.parametrize("text,expected", [
         ("CGC 9.8 SS", "signature_series"),
         ("CGC 9.8 Signature Series", "signature_series"),
-        ("CGC 9.8 Signed Todd McFarlane", "signature_series"),
-        ("CGC 9.8 Autograph", "signature_series"),
-        ("CGC 9.8 Signature", "signature_series"),
+        # BUI-941: a bare signature word no longer claims CGC witnessed the
+        # signing — an unwitnessed/unevidenced signature is the green
+        # Qualified label's case, not the yellow Signature Series one.
+        ("CGC 9.8 Signed Todd McFarlane", "qualified"),
+        ("CGC 9.8 Autograph", "qualified"),
+        ("CGC 9.8 Signature", "qualified"),
         ("CGC 9.8 Qualified", "qualified"),
         ("CGC 9.8 (Q)", "qualified"),
         ("CGC 9.8 Restored", "restored"),
@@ -106,7 +109,7 @@ class TestResolveLabel:
 
     def test_not_signed_does_not_match(self):
         """BUI-668's `(?<!not\\s)` guard, reused here — 'NOT signed' must not
-        read as Signature Series."""
+        read as a signature at all."""
         assert gt.resolve_label("CGC 9.8 not signed") is None
 
     def test_no_label(self):
@@ -115,6 +118,98 @@ class TestResolveLabel:
     def test_blank(self):
         assert gt.resolve_label("") is None
         assert gt.resolve_label(None) is None
+
+
+class TestResolveLabelAutographs:
+    """BUI-941: an autograph token of any spelling must resolve to a
+    NON-Universal label, or `parse_slab_fields`'s `or "universal"` default
+    lets an autographed slab into the Universal comp pool at its grade.
+
+    The two titles named in the ticket are the first two cases; the rest are
+    the boundary decisions, each grounded in the offline corpus at
+    ~/.cache/ebay-sold-comps (see the measurement in grade_tokens.py's label
+    block comment).
+    """
+
+    # The ticket's example 1 — verbatim from the corpus. `\bautograph(?:ed)?\b`
+    # had no plural branch, so this resolved to None and the comp entered the
+    # Universal 7.5 rung of Ultimate Fallout #4.
+    UNLABELLED_AUTOGRAPHS = (
+        "J-523 2011 MARVEL COMICS ULTIMATE FALLOUT #4 CGC 7.5 W/ AUTOGRAPHS "
+    )
+    # The ticket's example 2 — "AA SS" with a description (not in the title)
+    # saying the autograph was JSA-authenticated after the fact.
+    AA_SS_STAN_LEE = "Amazing Spider-Man #50 CGC AA SS 4.5 Signed by Stan Lee"
+
+    def test_ticket_example_plural_autographs_is_not_universal(self):
+        assert gt.resolve_label(self.UNLABELLED_AUTOGRAPHS) == "qualified"
+
+    def test_ticket_example_aa_beats_ss(self):
+        """`AA` (Authentic Autograph) outranks `SS` in the same title: the
+        signature was authenticated after the fact, not witnessed."""
+        assert gt.resolve_label(self.AA_SS_STAN_LEE) == "qualified"
+
+    @pytest.mark.parametrize("text", [
+        "ULTIMATE FALLOUT #4 CGC 7.5 W/ AUTOGRAPHS",
+        "ASM #300 CGC 9.8 w/ autograph",
+        "ASM #300 CGC 9.8 Autographed",
+        "ASM #300 CGC 9.8 Autograph",
+        "X-MEN #13 CGC 6.0 OW-W 1965 KIRBY, Goldberg autograph/signature",
+    ])
+    def test_every_autograph_spelling_resolves_non_universal(self, text):
+        label = gt.resolve_label(text)
+        assert label is not None and label != "universal"
+        assert label in gt.LABEL_VALUES
+
+    @pytest.mark.parametrize("text,expected", [
+        # An explicit witnessed token keeps the yellow label.
+        ("ASM #50 SS 1967 Stan Lee Signed CGC 8.5", "signature_series"),
+        ("Invincible #1 CGC 9.2 Signature Series", "signature_series"),
+        # CGC's own colour names for the two signature labels.
+        ("Batman #227 (1970) CGC 5.0 Signed By Neal Adams Yellow Label",
+         "signature_series"),
+        ("ASM #300 CGC 9.8 Signed, Green Label", "qualified"),
+        # After-market authentication beats the witnessed token.
+        ("ASM #50 CGC SS 4.5 Signed by Stan Lee, JSA authenticated", "qualified"),
+        ("ASM #50 CGC SS 4.5 Signed by Stan Lee, PSA cert", "qualified"),
+    ])
+    def test_witnessed_vs_after_market_precedence(self, text, expected):
+        assert gt.resolve_label(text) == expected
+
+    @pytest.mark.parametrize("text", [
+        # `\baa\b` matched inside this hyphen-glued run — the corpus's only
+        # bare-AA hit, and a trading card, not a slab.
+        "2026 Topps Chrome Marvel Andy Kubert Auto #AA-AK Ultimate X-Men /99",
+        # `\bss\b` matched these two sellers' stock numbers.
+        "Batman #439 Vol. 1 1989 DC Comics 7.0+ Comic Book SS-254",
+        "Uncanny X-Men #300 Vol. 1 1993 Marvel Comics 1st App 7.0+ Comic Book SS-12",
+        # JSA is the Justice Society of America before it is James Spence
+        # Authentication: a bare series mention must not label the slab.
+        "JSA #1 CGC 9.8 DC Comics 1999",
+        "Justice Society of America JSA #1 CGC 9.8 White Pages",
+        # `\bsigned\b` cannot reach inside a longer word.
+        "ASM #300 CGC 9.8 cover designed by Todd McFarlane",
+        "ASM #300 CGC 9.8 unsigned copy",
+        # The bounded `\bautograph(?:s|ed)?\b` rejects a seller's shop name;
+        # a bare `\bautograph` prefix would not. Real corpus title.
+        "Omar Vizquel 1998 Pacific Invincible #27 Indians MLB READ FREE SHIP AutographDen",
+        # Naming the artist is not claiming a signature.
+        "X-Men #1 CGC 9.6 Jim Lee cover 1991 Marvel Comics",
+    ])
+    def test_boundary_false_positives_stay_unlabelled(self, text):
+        assert gt.resolve_label(text) is None
+
+    def test_signed_justice_society_slab_is_still_non_universal(self):
+        """The JSA collision, bounded rather than dissolved.
+
+        A SIGNED Justice Society book satisfies the JSA/PSA co-occurrence
+        gate off its own series name, so it reads `qualified` where the
+        title's `SS` alone would have said `signature_series`. The residual
+        is confined to *which* non-Universal label it gets — it can never
+        route a signed slab back into a Universal pool, which is the only
+        property §7b depends on.
+        """
+        assert gt.resolve_label("JSA #1 CGC 9.8 SS Signed by Geoff Johns") == "qualified"
 
 
 # ─── Page-quality tokens ─────────────────────────────────────────────────────
