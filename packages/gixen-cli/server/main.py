@@ -1880,6 +1880,14 @@ async def lifespan(app: FastAPI):
     # PER-25 regression tests assert on.
     pm = load_plugins()
     app.state.plugin_manager = pm
+    # BUI-933: deliberately unguarded. A plugin's register_db_tables failure
+    # (e.g. a half-applied overlay migration) raises PluginDBTablesError here
+    # after logging every failure — it is not caught, so it propagates out of
+    # this async generator's __aenter__ and FastAPI/Uvicorn aborts startup
+    # instead of serving with a broken plugin-owned schema. See
+    # _invoke_db_tables_isolated's docstring for why the loop still runs to
+    # completion (every good sibling plugin's DDL still lands) before the
+    # raise.
     _invoke_db_tables_isolated(pm, _db, logger=logger)
     _invoke_register_routes(pm, app, logger=logger)
     app.state.dashboard_tabs = _collect_dashboard_tabs(pm, logger=logger)

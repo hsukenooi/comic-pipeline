@@ -72,6 +72,28 @@ _logger = logging.getLogger("gixen.plugins")
 _GROUP = "gixen.plugins"
 
 
+class PluginDBTablesError(Exception):
+    """Raised by ``_invoke_db_tables_isolated`` when one or more plugins'
+    ``register_db_tables`` hook raised (BUI-933).
+
+    This is startup-critical and deliberately propagates out of
+    ``_invoke_db_tables_isolated`` and the ``lifespan`` that calls it, so
+    FastAPI/Uvicorn aborts application startup instead of serving with a
+    plugin-owned schema that never finished migrating (e.g. a half-applied
+    overlay migration leaving ``/api/comics/*`` reading columns that don't
+    exist). Before BUI-933 this failure was logged and swallowed, so the
+    comics server came up "healthy" with a silently broken plugin API — see
+    the ticket for the incident this closes.
+
+    The per-plugin SQLite savepoint isolation is unaffected: a failing
+    plugin's own DDL is rolled back, and every *other* plugin's DDL that
+    already committed via its own savepoint's ``RELEASE`` is retained. This
+    exception only changes what happens after the loop finishes — the host
+    no longer treats "some plugin's schema failed to migrate" as a
+    recoverable, ignorable event.
+    """
+
+
 hookspec = pluggy.HookspecMarker("gixen")
 hookimpl = pluggy.HookimplMarker("gixen")
 
@@ -86,9 +108,12 @@ class GixenPluginSpec:
     ``trylast=True`` to override.
 
     Error handling: per-plugin isolation is applied at hook-invocation time
-    by the host's lifespan. A plugin whose hook raises will not prevent
-    other plugins from registering (for ``register_db_tables`` — see
-    ``load_plugins`` and the lifespan in ``server/main.py``).
+    by the host's lifespan. A plugin whose ``register_db_tables`` hook raises
+    does not corrupt or roll back any *other* plugin's already-committed DDL
+    (each runs in its own SQLite savepoint) — but since BUI-933 it DOES abort
+    server startup: the host would rather crash loudly at boot than come up
+    "healthy" with a plugin's schema half-migrated and its endpoints broken.
+    See ``_invoke_db_tables_isolated`` and the lifespan in ``server/main.py``.
     """
 
     @hookspec
@@ -109,7 +134,13 @@ class GixenPluginSpec:
             avoid collisions with the core ``bids`` table or other plugins.
 
         DDL executed in this hook is wrapped in a SQLite savepoint by the
-        host; a failure rolls back this plugin's DDL only.
+        host; a failure rolls back this plugin's DDL only. That failure is
+        then re-raised as ``gixen.plugins.PluginDBTablesError`` after every
+        plugin has had a chance to run (BUI-933) — it is NOT swallowed. A
+        raising ``register_db_tables`` aborts server startup entirely, so a
+        broken migration fails fast and loud (a launchd crash-loop, or a
+        `uvicorn` process that never comes up) instead of leaving the server
+        running with this plugin's tables/columns missing or stale.
 
         ``app.state.db`` is guaranteed to be set to the same connection by the
         host before this hook fires. Plugins can read it via the FastAPI
@@ -344,12 +375,31 @@ def _invoke_db_tables_isolated(
     for core. A plugin that violates the hookspec by calling
     ``conn.executescript(...)`` implicitly COMMITs the transaction and
     destroys the savepoint — the inner ``ROLLBACK TO`` would then raise
-    ``OperationalError``. We guard that secondary failure so the lifespan
-    keeps going. (PER-25 ADV-001 / REL-01 / COR-01.)
+    ``OperationalError``. We guard that secondary failure so the loop below
+    keeps going and every plugin still gets a chance to migrate. (PER-25
+    ADV-001 / REL-01 / COR-01.)
+
+    BUI-933: the loop still isolates *sibling* plugins from each other — a
+    good plugin's DDL, once ``RELEASE``d, is never undone by a later
+    plugin's failure — but the function as a whole no longer treats a
+    failure as ignorable. After every plugin has run, if any failed, this
+    raises ``PluginDBTablesError`` naming them, so the caller (the FastAPI
+    ``lifespan`` in ``server/main.py``) aborts startup instead of the
+    comics server coming up "healthy" with a broken/half-migrated
+    plugin-owned schema (e.g. a failed overlay migration leaving
+    ``/api/comics/*`` reading columns that don't exist). This is why the
+    loop runs to completion rather than raising on the first failure: an
+    operator restarting a crash-looping server should see every plugin
+    that's broken, not just the alphabetically-first one, and every good
+    sibling's DDL should still land even though the process is about to
+    abort — so a later fix to just the bad plugin doesn't also need to
+    re-apply migrations that had actually already succeeded.
 
     Returns the list of plugin names whose DDL succeeded, for caller logging.
+    Raises ``PluginDBTablesError`` if any plugin's DDL failed.
     """
     succeeded: list[str] = []
+    failed: list[str] = []
     for plugin_name, _plugin in pm.list_name_plugin():
         sp_name = "sp_" + re.sub(r"[^a-z0-9_]", "_", plugin_name.lower())
         try:
@@ -375,6 +425,16 @@ def _invoke_db_tables_isolated(
             logger.exception(
                 "register_db_tables failed for plugin %s", plugin_name
             )
+            failed.append(plugin_name)
+    if failed:
+        raise PluginDBTablesError(
+            "register_db_tables failed for plugin(s): "
+            + ", ".join(failed)
+            + " — refusing to start the comics server with a broken or "
+            "half-migrated plugin schema (BUI-933). See the exception(s) "
+            "logged above (logger 'server.main') for the underlying cause "
+            "from each plugin."
+        )
     return succeeded
 
 
