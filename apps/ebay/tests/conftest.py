@@ -40,7 +40,7 @@ def _no_sold_comps_secondary(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _no_printing_guard_credentials(monkeypatch):
+def _no_printing_guard_credentials(monkeypatch, tmp_path):
     """BUI-929: pin the printing guard's Browse API credentials to 'absent'
     for every test, same reasoning as `_no_sold_comps_secondary` above — a
     dev machine's real environment/.env can hold real EBAY_CLIENT_ID/
@@ -55,6 +55,10 @@ def _no_printing_guard_credentials(monkeypatch):
     """
     monkeypatch.delenv("EBAY_CLIENT_ID", raising=False)
     monkeypatch.delenv("EBAY_CLIENT_SECRET", raising=False)
+    # The guard also falls back to ebay-fetch's config file (production has
+    # no env credentials); point it at a path that does not exist.
+    import ebay_fetch
+    monkeypatch.setattr(ebay_fetch, "CONFIG_FILE", tmp_path / "no-ebay-config.json")
 
 
 @pytest.fixture(autouse=True)
