@@ -226,6 +226,18 @@ Pricing a book off graded-slab (CGC/CBCS) prices instead of raw sold comps, disc
 
 The discount factor differs by price source — an eBay CGC *sold* basis is not an auction-house *realized* basis — so a factor calibrated to one source must not be applied to the other.
 
+### Certified Grade
+A grade assigned by a grading company (CGC or CBCS) and sealed in a slab, as distinct from a seller-stated or photo-assessed grade on a raw book. It carries no grade risk, so it skips photo grading and enters pricing at high grade confidence. A certified target is priced only from certified comps of the same certifier and [[Label]], never from the raw pool, and never at the same identity as a raw row at the same numeric grade — a slab 9.6 and a raw 9.6 are different books to the pricing path. Its identity also carries a cert number and a page quality (white, off-white to white, off-white), the latter moving vintage slab prices enough to prefer same-page-quality comps.
+
+### Label
+The grading company's certification category on a slab: **Universal** (blue), the plain certified grade; **Signature Series** (yellow), a witnessed autograph; **Qualified** (green), a book with a named defect excluded from the grade; **Restored** (purple). Each trades in its own market at the same numeric grade, so a label mismatch between a target and a comp is an identity mismatch, not a condition difference. Only Universal is priced; the other three are identified and punt to [[needs_manual]] with the label as the reason.
+
+### Page Quality
+The grading company's assessment of a slabbed book's interior paper, printed on the label: white, off-white to white, off-white, cream to off-white, cream. It is part of a [[Certified Grade]]'s identity for pricing because two slabs at the same numeric grade trade differently by it on vintage books. Comps at the target's page quality are preferred; when too few exist the wider pool is used and the row says so. Unknown on either side means "not parsed", not "white".
+
+### Pricing Basis
+How an `fmv` band was produced, stored on the row so a cache hit reproduces the same confidence and bid factor: **direct** (priced from sales at the exact grade), **interpolated** (raw [[Grade-Curve Interpolation]]), **ladder** (a slab target read off neighboring certified rungs), **proxy** ([[CGC Proxy]]). It exists because the stored confidence label collapses tiers and a notes token fails open on a reword, so neither can carry the 0.60-factor signal a ladder or interpolated row needs on the [[Money Path]].
+
 ### Oracle Bound
 The measured ceiling on what a proposed comp classifier or exclusion rule could ever be worth: assume a **perfect** detector for the class, apply it to the stored comps corpus, and measure how much the published prices would actually move — before designing any real detector. Read as a **magnitude** (dollars of correction), never a count of affected pools, and measured in **both directions**, because removing a comp can raise a price as easily as lower it. Since removals are non-monotonic, the bound sizes the prize rather than limiting what a specific rule will do.
 
