@@ -4579,6 +4579,177 @@ def _write_json(path: str, data) -> None:
         Path(path).write_text(json.dumps(data, indent=2))
 
 
+# ─── Provenance cell (BUI-949) ─────────────────────────────────────────────────
+#
+# A short "what the price rests on" cell, shared verbatim by `_brief_row` (the
+# `provenance` JSON key) and `_print_table` (the table column) so the two
+# surfaces can never disagree — same pattern as `_graded_punt_evidence_tokens`
+# above. Built ONLY from the structured fmv dict + `pricing_basis`, never by
+# parsing `fmv_notes` (BUI-769: a note reword must not silently blank a
+# downstream reader). Tokens are chosen for exactly two reads — the Buy It Now
+# stop, where the user decides by hand, and the auction approval gate, where
+# the user overrides the bid — not for completeness.
+#
+# `lone_sale`, `two_rung`, and `ask-ceiling` are reserved future tokens (not
+# implemented by this ticket): a later cell just appends another element to
+# `tokens` in `_certified_provenance` below, never a rewrite of the join.
+
+def _ladder_rung_count(fmv: dict) -> int | None:
+    """Anchor-eligible rung count behind a priced `ladder` row, or None when
+    unrecoverable.
+
+    Mirrors `fmv_math._graded_ladder`'s own `eligible` filter exactly
+    (`effective_n >= GRADED_LADDER_MIN_BUCKET_N`) so this count agrees with
+    the same refusal threshold (`ladder_too_thin` fires below
+    `GRADED_LADDER_MIN_RUNGS`) — never the whole same-label pool depth
+    `fmv['n']` carries, which `_graded_ladder`'s own return dict documents as
+    NOT rung depth. Only available on a FRESH row: a cache hit's
+    `graded_ladder` is shape-parity-only (`_fmv_from_db_row` sets it to
+    None — BUI-930 never persists the per-rung breakdown), so this returns
+    None there and `_certified_provenance` renders the bare tier with no
+    count rather than a fabricated one.
+    """
+    ladder = fmv.get("graded_ladder") or {}
+    eff = ladder.get("effective_n")
+    if not eff:
+        return None
+    return sum(1 for v in eff.values() if v >= fmv_math.GRADED_LADDER_MIN_BUCKET_N)
+
+
+def _certified_provenance(fmv: dict) -> str:
+    """The provenance cell for a priced (non-refused) certified/slab row."""
+    basis = fmv.get("pricing_basis")
+    tokens: list[str] = []
+    if basis == "direct":
+        # BUI-949: the exact bucket's raw comp count (`fmv['n']`), not
+        # `exact_effective_n` — the latter is 0.0 on a cache hit
+        # (`_fmv_from_db_row` shape-parity default), which would render a
+        # priced row as "exact n0". `n` is set on both the fresh and cached
+        # paths, so the cell degrades gracefully instead of lying.
+        tokens.append(f"exact n{fmv.get('n') or 0}")
+    elif basis == "ladder":
+        rungs = _ladder_rung_count(fmv)
+        tokens.append(f"ladder {rungs} rungs" if rungs is not None else "ladder")
+    else:
+        # Closed vocabulary (BUI-930): a priced graded row's basis is always
+        # 'direct' or 'ladder'. Fall back to naming whatever's there rather
+        # than crashing if that vocabulary ever widens.
+        tokens.append(basis or "?")
+    if fmv.get("page_quality_fallback"):
+        tokens.append("pq widened")
+    if fmv.get("ledger_dropped"):
+        tokens.append(f"ledger-drop {fmv['ledger_dropped']}")
+    return " ".join(tokens)
+
+
+def _raw_basis(fmv: dict) -> str:
+    """The raw-path pricing tier ('direct' | 'interpolated' | 'proxy'),
+    read from the fmv dict — never inferred from `fmv_notes`.
+
+    A cache hit carries `pricing_basis` exactly as the server derived it
+    (BUI-930: raw rows omit the column on write, and the server derives it
+    from the persisted notes tokens on read). A fresh row carries no such key
+    at all — `compute_fmv`/`cgc_proxy_fmv` are graded-mode-only for that
+    field — so fall back to the same `cgc_proxy`/`interpolated` booleans
+    `_print_table` already branches on, in the same precedence order.
+    """
+    basis = fmv.get("pricing_basis")
+    if basis in ("direct", "interpolated", "proxy"):
+        return basis
+    if fmv.get("cgc_proxy"):
+        return "proxy"
+    if fmv.get("interpolated"):
+        return "interpolated"
+    return "direct"
+
+
+def _haircut_source(fmv: dict) -> str | None:
+    """Which confidence input a below-0.80 RAW bid factor traces to, or None
+    at 0.80 (no haircut).
+
+    Reads the two ranked inputs `fmv_math.bid_factor` already combined —
+    `confidence` (the fmv-pool label; forced LOW/MEDIUM-LOW by the
+    interpolated/proxy tiers themselves, BUI-318/348) and `grade_confidence`
+    (the /comic:grade photo label) — both echoed on every fmv dict, fresh or
+    cached, rather than recomputing a factor or a price. `bid_factor`'s own
+    logic is `combined = min(rank(confidence), rank(grade))`; the lower rank
+    is the binding constraint, which is exactly what's compared below.
+
+    `grade_confidence` absent is a special case, not a neutral tie:
+    `bid_factor` early-returns BASE_BID_FACTOR whenever it's None regardless
+    of `confidence` (BUI-51 — the haircut is opt-in on a real photo grade), so
+    a below-0.80 factor with no grade_confidence can only be the
+    interpolated/proxy tier's own cap — a statement about the fmv-pool side,
+    named `fmv` here for the same reason.
+    """
+    factor = fmv.get("bid_factor")
+    if factor is None or factor >= fmv_math.BASE_BID_FACTOR:
+        return None
+    grade_conf = fmv.get("grade_confidence")
+    if not grade_conf:
+        return "fmv"
+    fmv_rank = fmv_math._rank(fmv.get("confidence"))
+    gc = grade_conf.strip().lower() if isinstance(grade_conf, str) else ""
+    grade_rank = fmv_math._CONF_RANK[fmv_math._GRADE_CONF_NORMALIZE.get(gc, "LOW")]
+    if fmv_rank < grade_rank:
+        return "fmv"
+    if grade_rank < fmv_rank:
+        return "grade"
+    return "both"
+
+
+def _raw_provenance(fmv: dict) -> str:
+    """The provenance cell for a priced raw (non-certified) row."""
+    basis = _raw_basis(fmv)
+    tokens = [f"{basis} n{fmv.get('n') or 0}"]
+    haircut = _haircut_source(fmv)
+    if haircut:
+        tokens.append(f"haircut {haircut}")
+    return " ".join(tokens)
+
+
+def _provenance(r: dict) -> str:
+    """The one provenance cell, dispatched by row shape — the EXACT precedence
+    `_print_table` already uses for its FMV column (flag_reason, then
+    ledger-advisory, then graded, then plain raw, then fetch-err, then n/a),
+    so the two columns can never tell a different story about the same row.
+    The order matters, not just the branches: `_is_fetch_error(r)` returns
+    True for a `ledger-advisory` row BY DESIGN (`run()`'s BUI-663 hook keeps
+    it inside the fetch-err warning/count on purpose — see its own comment),
+    so checking it before the real-`fmv`-data branches below would relabel a
+    priced advisory band as a bare fetch failure, silently dropping the one
+    piece of information (a ledger band DOES exist) the row exists to carry.
+
+    Takes the full stitched row, not just its `fmv` dict: the skip states
+    BUI-143/BUI-549/BUI-639/BUI-930 track (a failed hand-price lookup, a
+    failed comp fetch, a permanently-rejected write, a certifier-schema
+    deploy gap) all leave `fmv` empty exactly like a genuine no-comps book,
+    and this project already fixed the trap of rendering all four alike as a
+    bland 'n/a' once (BUI-143/549) — reusing those same distinct tokens here
+    is what keeps this cell from reopening it.
+    """
+    source = r.get("source")
+    if source == "skipped_lookup_error":
+        return "skip:unverified"
+    if source == SOURCE_SCHEMA_MISMATCH:
+        return "skip:schema"
+    if source == "skipped_rejected":
+        return "skip:422"
+    fmv = r.get("fmv") or {}
+    if fmv.get("flag_reason"):
+        reason = fmv["flag_reason"]
+        return f"refused {reason}" if fmv.get("graded") else reason
+    if fmv.get("ledger_advisory"):
+        return "ledger-advisory"
+    if fmv.get("graded") and fmv.get("fmv_low") is not None:
+        return _certified_provenance(fmv)
+    if fmv.get("fmv_low") is not None:
+        return _raw_provenance(fmv)
+    if _is_fetch_error(r):
+        return "fetch-err"
+    return "n/a"
+
+
 def _brief_row(r: dict) -> dict:
     """BUI-362: project one result row down to the linkage + pricing fields an
     orchestrator (/comic:buy Step 3→5) actually threads forward. The full
@@ -4627,6 +4798,12 @@ def _brief_row(r: dict) -> dict:
         see BUI-549. `skipped_rejected` needs the same distinction for the
         same reason: it too has every pricing field null despite having
         actually been priced in-memory.
+      - provenance (BUI-949) → `_provenance(r)`: the short "what the price
+        rests on" cell, additive alongside every field above (never replaces
+        `fmv_notes`, which stays the full audit trail). Takes the whole row,
+        not just `fmv`, so it can name the skip states (BUI-143/549/639/930)
+        that otherwise leave `fmv` empty exactly like a genuine no-comps book
+        — the same distinction `source` above exists to carry.
     """
     fmv = r.get("fmv") or {}
     db_row = r.get("db_row") or {}
@@ -4661,6 +4838,9 @@ def _brief_row(r: dict) -> dict:
         "label": fmv.get("label"),
         "pricing_basis": fmv.get("pricing_basis"),
         "source": r.get("source"),
+        # BUI-949: additive — every key above is unchanged, so an existing
+        # `--brief` consumer that ignores unknown keys sees no drift.
+        "provenance": _provenance(r),
     }
 
 
@@ -4705,8 +4885,8 @@ def _cell(value) -> str:
 def _print_table(rows: list[dict]) -> None:
     click.echo(f"{'#':>3}  {'Comic':<30} {'Grade':>5}  "
                f"{'FMV':<14} {'Med':>5}  {'n':>3}  {'CV':>5}  "
-               f"{'Conf':<12} {'Max bid':>7}  Source")
-    click.echo("-" * 110)
+               f"{'Conf':<12} {'Provenance':<24} {'Max bid':>7}  Source")
+    click.echo("-" * 130)
     for i, r in enumerate(rows, 1):
         inp = r["input"]
         label = f"{inp.get('title','?')} #{inp.get('issue','?')}"
@@ -4821,11 +5001,17 @@ def _print_table(rows: list[dict]) -> None:
             fmv_str = "n/a"
             med_str = "n/a"
             mb_str = "n/a"
+        # BUI-949: same dispatch `_brief_row` uses for its `provenance` key —
+        # reads the raw row/`fmv` dict directly, never the `fmv_str`/`mb_str`
+        # display strings just built above, so this cell can't drift from
+        # what `--brief` consumers see for the identical row.
+        prov_str = _provenance(r)
         click.echo(
             f"{i:>3}  {label[:30]:<30} {str(grade):>5}  "
             f"{fmv_str:<14} {med_str:>5}  {_cell(fmv.get('n')):>3}  "
             f"{_cell(fmv.get('cv_pct')):>5}  "
-            f"{_cell(fmv.get('confidence')):<12} {mb_str:>7}  {r['source']}"
+            f"{_cell(fmv.get('confidence')):<12} {prov_str:<24} "
+            f"{mb_str:>7}  {r['source']}"
         )
 
     # BUI-143: a whole batch run during a SerpApi outage/quota-exhaustion would
