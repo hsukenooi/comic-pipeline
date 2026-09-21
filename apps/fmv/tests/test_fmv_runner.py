@@ -2050,6 +2050,156 @@ class TestRunSkipsPermanentWriteRejection:
         assert rows[1]["max_bid"] is not None
 
 
+class TestCertifiedRowPuntsToNeedsManual:
+    """BUI-928 (plan U11, R35): a certified (CGC/CBCS) row must never be
+    priced from the raw market before the graded FMV mode ships. `run` short-
+    circuits it to needs_manual (`flag_reason: "graded_mode_unavailable"`)
+    BEFORE `_split_by_db_cache`, the comp fetch, or the upsert ever see it —
+    unlike every other skip class in this file, this one never reaches the
+    server at all."""
+
+    def _batch(self):
+        return [
+            {"item_id": "1", "title": "Slab", "issue": "1", "year": 1990,
+             "grade": 9.0, "certifier": "cgc"},
+            {"item_id": "2", "title": "Raw", "issue": "1", "year": 1990,
+             "grade": 9.0},
+        ]
+
+    def _fake_results(self):
+        comps = [_make_comp(p, 9.0) for p in [50, 55, 60, 65, 70]]
+        return [
+            {"input": {"_req_id": 1, "title": "Raw", "issue": "1",
+                       "year": 1990, "grade": 9.0, "item_id": "2"},
+             "comps": comps, "queries_used": [{"tier": "base", "cached": False}]},
+        ]
+
+    def _run(self, tmp_path, server_url, **kwargs):
+        batch_path = tmp_path / "batch.json"
+        batch_path.write_text(json.dumps(self._batch()))
+        out_path = tmp_path / "out.json"
+        fetch_mock = MagicMock(return_value=self._fake_results())
+        upsert_mock = MagicMock(return_value={"comic_id": 99, "fmv_id": 5})
+        with patch("fmv_runner._fetch_comps", fetch_mock), \
+             patch("fmv_runner._upsert_fmv", upsert_mock):
+            fmv_runner.run(batch_path=str(batch_path), out_path=str(out_path),
+                           max_age_days=7, force=False, quiet=True,
+                           server_url=server_url, **kwargs)
+        out = json.loads(out_path.read_text())
+        return out, fetch_mock, upsert_mock
+
+    def test_certified_row_is_needs_manual_with_zero_fetch_and_upsert_calls(
+            self, tmp_path, server_url):
+        out, fetch_mock, upsert_mock = self._run(tmp_path, server_url)
+        assert len(out) == 2
+
+        # The certified row: needs_manual, flag_reason set, no price.
+        assert out[0]["source"] == "needs_manual_certified"
+        assert out[0]["fmv"]["flag_reason"] == "graded_mode_unavailable"
+        assert out[0]["fmv"]["max_bid"] is None
+        assert "comic_id" not in out[0]
+        assert out[0]["db_row"] is None
+
+        # The raw row still prices normally, exactly as today.
+        assert out[1]["source"] == "fresh"
+        assert out[1]["fmv"]["n"] == 5
+        assert out[1]["comic_id"] == 99
+        assert out[1]["fmv_id"] == 5
+
+        # ZERO fetch calls and ZERO upsert calls for the certified book: the
+        # only _fetch_comps call was sent exactly the one raw book, and the
+        # only _upsert_fmv call was for the raw book's title.
+        assert fetch_mock.call_count == 1
+        sent_books = fetch_mock.call_args.args[0]
+        assert len(sent_books) == 1
+        assert sent_books[0]["title"] == "Raw"
+        assert all(b.get("title") != "Slab" for b in sent_books)
+
+        assert upsert_mock.call_count == 1
+        upsert_inp = upsert_mock.call_args.args[1]
+        assert upsert_inp["title"] == "Raw"
+
+    def test_certified_row_brief_line_has_null_max_bid_comic_id_fmv_id(
+            self, tmp_path, server_url, capsys):
+        batch_path = tmp_path / "batch.json"
+        batch_path.write_text(json.dumps(self._batch()))
+        fetch_mock = MagicMock(return_value=self._fake_results())
+        upsert_mock = MagicMock(return_value={"comic_id": 99, "fmv_id": 5})
+        with patch("fmv_runner._fetch_comps", fetch_mock), \
+             patch("fmv_runner._upsert_fmv", upsert_mock):
+            fmv_runner.run(batch_path=str(batch_path), out_path=None,
+                           max_age_days=7, force=False, quiet=True, brief=True,
+                           server_url=server_url)
+        cap = capsys.readouterr()
+        lines = [ln for ln in cap.out.splitlines() if ln.strip()]
+        assert len(lines) == 2
+        rows = [json.loads(ln) for ln in lines]
+
+        certified_row = rows[0]
+        assert certified_row["source"] == "needs_manual_certified"
+        assert certified_row["flag_reason"] == "graded_mode_unavailable"
+        assert certified_row["max_bid"] is None
+        assert certified_row["comic_id"] is None
+        assert certified_row["fmv_id"] is None
+
+        raw_row = rows[1]
+        assert raw_row["source"] == "fresh"
+        assert raw_row["max_bid"] is not None
+        assert raw_row["comic_id"] == 99
+        assert raw_row["fmv_id"] == 5
+
+    def test_all_certifier_vocabulary_values_other_than_none_punt(
+            self, tmp_path, server_url):
+        for certifier in ("cgc", "CGC", "cbcs", "other"):
+            batch = [{"item_id": "1", "title": "Slab", "issue": "1",
+                      "year": 1990, "grade": 9.0, "certifier": certifier}]
+            batch_path = tmp_path / f"batch-{certifier}.json"
+            batch_path.write_text(json.dumps(batch))
+            out_path = tmp_path / f"out-{certifier}.json"
+            fetch_mock = MagicMock(return_value=[])
+            upsert_mock = MagicMock()
+            with patch("fmv_runner._fetch_comps", fetch_mock), \
+                 patch("fmv_runner._upsert_fmv", upsert_mock):
+                fmv_runner.run(batch_path=str(batch_path), out_path=str(out_path),
+                               max_age_days=7, force=False, quiet=True,
+                               server_url=server_url)
+            out = json.loads(out_path.read_text())
+            assert out[0]["source"] == "needs_manual_certified"
+            assert out[0]["fmv"]["flag_reason"] == "graded_mode_unavailable"
+            fetch_mock.assert_not_called()
+            upsert_mock.assert_not_called()
+
+    def test_certifier_none_or_absent_stays_on_the_raw_path(
+            self, tmp_path, server_url):
+        # certifier explicitly "none", empty string, and the key absent
+        # entirely must all behave exactly like today (unaffected raw path).
+        for certifier_value in ("none", "None", "", None):
+            book = {"item_id": "1", "title": "Raw", "issue": "1",
+                    "year": 1990, "grade": 9.0}
+            if certifier_value is not None:
+                book["certifier"] = certifier_value
+            batch_path = tmp_path / f"batch-{certifier_value}.json"
+            batch_path.write_text(json.dumps([book]))
+            out_path = tmp_path / f"out-{certifier_value}.json"
+            fetch_mock = MagicMock(return_value=[
+                {"input": {"_req_id": 0, "title": "Raw", "issue": "1",
+                           "year": 1990, "grade": 9.0, "item_id": "1"},
+                 "comps": [_make_comp(p, 9.0) for p in [50, 55, 60, 65, 70]],
+                 "queries_used": [{"tier": "base", "cached": False}]},
+            ])
+            upsert_mock = MagicMock(return_value={"comic_id": 99, "fmv_id": 5})
+            with patch("fmv_runner._fetch_comps", fetch_mock), \
+                 patch("fmv_runner._upsert_fmv", upsert_mock):
+                fmv_runner.run(batch_path=str(batch_path), out_path=str(out_path),
+                               max_age_days=7, force=False, quiet=True,
+                               server_url=server_url)
+            out = json.loads(out_path.read_text())
+            assert out[0]["source"] == "fresh"
+            assert out[0]["comic_id"] == 99
+            fetch_mock.assert_called_once()
+            upsert_mock.assert_called_once()
+
+
 class TestHandPricedAndFetchErrComposition:
     """BUI-533 x BUI-536 composition: --force on a hand-priced row whose
     fetch THEN errors out. The force-overwrite echo fires (it's a statement of
@@ -3146,6 +3296,45 @@ class TestStitch:
         assert out[1]["source"] == "skipped_lookup_error"
         assert out[2]["source"] == "skipped_rejected"
         assert out[2]["fmv"] is None
+
+    def test_certified_needs_manual_gets_its_own_source_and_flag_reason(self):
+        """BUI-928: unlike the other three skips, a certified punt DOES carry
+        a `flag_reason` (so it renders like any other needs-manual row) while
+        still projecting null max_bid/comic_id/fmv_id — nothing was ever
+        upserted for it."""
+        book = _make_book("a", "Slab", "1", 1990, 9.0)
+        book["certifier"] = "cgc"
+        out = fmv_runner._stitch([book], {}, {}, {}, {}, {},
+                                 {0: book})
+        assert out[0]["source"] == "needs_manual_certified"
+        assert out[0]["fmv"]["flag_reason"] == "graded_mode_unavailable"
+        assert out[0]["fmv"]["max_bid"] is None
+        assert out[0]["db_row"] is None
+        brief = fmv_runner._brief_row(out[0])
+        assert brief["flag_reason"] == "graded_mode_unavailable"
+        assert brief["max_bid"] is None
+        assert brief["comic_id"] is None
+        assert brief["fmv_id"] is None
+
+    def test_certified_needs_manual_defaults_to_empty_when_omitted(self):
+        """Back-compat: existing callers that don't pass certified_needs_manual
+        still work."""
+        books = [_make_book("a", "A", "1", 1990, 9.0)]
+        out = fmv_runner._stitch(books, {}, {}, {}, {}, {})
+        assert out[0]["source"] == "error"
+
+    def test_certified_needs_manual_takes_precedence_when_index_collides(self):
+        """A book's original index can only land in one bucket by construction
+        (run() filters certified rows out before any other bucket can claim
+        that index) — this proves _stitch's own ordering doesn't silently
+        prefer a different bucket if that invariant were ever violated."""
+        book = _make_book("a", "Slab", "1", 1990, 9.0)
+        cached_row = {"fmv_low": 5, "fmv_high": 10, "fmv_comps": 5,
+                      "fmv_confidence": "low",
+                      "title": "Slab", "issue": "1", "year": 1990, "grade": 9.0}
+        out = fmv_runner._stitch([book], {0: cached_row}, {}, {}, {}, {},
+                                 {0: book})
+        assert out[0]["source"] == "needs_manual_certified"
 
 
 # ─── Flagged-state presentation (BUI-86) ─────────────────────────────────────
