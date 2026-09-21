@@ -114,6 +114,11 @@ class RowResult:
     status: str
     max_bid: float | None = None
     grade: float | None = None
+    # BUI-926 (U4): carried alongside `grade` so `verify_items` can send the
+    # full price identity per row, same reasoning as `grade` above (a
+    # gradeless/uncertified row can't be matched to an fmv row either).
+    certifier: str | None = None
+    label: str | None = None
     created: bool | None = None
     link_attempted: bool = False
     link_ok: bool | None = None
@@ -150,6 +155,8 @@ class RowResult:
             "status": self.status,
             "max_bid": self.max_bid,
             "grade": self.grade,
+            "certifier": self.certifier,
+            "label": self.label,
             "created": self.created,
             "link_attempted": self.link_attempted,
             "link_ok": self.link_ok,
@@ -357,12 +364,36 @@ def build_bid_payload(
     comic_id: int | None = None,
     locg_id: int | None = None,
     grade: float | None = None,
+    certifier: str | None = None,
+    cert_number: str | None = None,
+    label: str | None = None,
     source: str | None = None,
     policy_bypass: bool = False,
 ) -> dict[str, Any]:
     """The POST /api/bids payload shape, shared by cli.py's single-item
     `add` command and `add_one_row` below so the two request paths cannot
     silently drift on a future field addition to one and not the other.
+
+    BUI-926 (U4): `certifier`/`cert_number` populate `AddBidRequest.certifier`/
+    `.cert_number` (server/main.py) and are also folded into each
+    `comic_identities` entry alongside `label`, so the server's certifier-
+    aware FMV resolution (a later wave) sees the full price identity at add
+    time. `certifier=None` means "not supplied" (omitted from the payload,
+    same "only send what was given" convention as `source`/`seller` above) —
+    it is NEVER coerced to the literal string "none" here, because that
+    would turn every plain re-add into an explicit (and wrong) "this bid is
+    raw" assertion that could clobber an already-recorded certifier server-
+    side (AddBidRequest.certifier=None vs ="none" are deliberately different
+    requests — see that field's own docstring).
+
+    A certified row (`certifier` supplied and not the literal "none") NEVER
+    sends `seller_grade`/`photo_grade`, even if a caller passed them — those
+    columns are seller/photo-assessed *raw* grade observations (BUI-78) and
+    have no meaning once a book carries a certified grade instead. This is a
+    hard guard, not just an absence: build-batch/build-batch-rows callers
+    should never populate both, but a slab is real money, so the payload
+    shape itself refuses to let a stray raw-grade value leak onto a
+    certified request.
 
     BUI-621 (U7): `source` populates the optional provenance tag U6 added to
     `AddBidRequest` (`"cli"` from `add`, `"batch"` from `add_one_row`) — omit
@@ -397,6 +428,11 @@ def build_bid_payload(
     create) instead of this client silently sending a `0` that un-groups an
     already-grouped snipe. `group=0` is still sent explicitly: 0 is a
     positive "ungrouped" claim (BUI-383), never "unspecified"."""
+    # BUI-926 (U4): "certified" means a supplied certifier other than the
+    # literal raw sentinel "none" — that's what gates the seller_grade/
+    # photo_grade suppression below.
+    is_certified = certifier is not None and certifier != "none"
+
     payload: dict[str, Any] = {
         "item_id": item_id,
         "max_bid": float(max_bid),
@@ -406,10 +442,22 @@ def build_bid_payload(
         payload["snipe_group"] = group
     if seller is not None:
         payload["seller"] = seller
-    if seller_grade is not None:
-        payload["seller_grade"] = seller_grade
-    if photo_grade is not None:
-        payload["photo_grade"] = photo_grade
+    if grade is not None:
+        # BUI-926 (U4): AddBidRequest.grade — stored directly on the bid row
+        # (db.py's insert_bid/update_bid_grades), independent of whether it
+        # also drives a comic_identities entry below (a grade with no
+        # comic_id/locg_id still lands on the row; it just has nothing to
+        # link against yet).
+        payload["grade"] = grade
+    if not is_certified:
+        if seller_grade is not None:
+            payload["seller_grade"] = seller_grade
+        if photo_grade is not None:
+            payload["photo_grade"] = photo_grade
+    if certifier is not None:
+        payload["certifier"] = certifier
+    if cert_number is not None:
+        payload["cert_number"] = cert_number
     if source is not None:
         payload["source"] = source
     if policy_bypass:
@@ -422,6 +470,10 @@ def build_bid_payload(
             identity["comic_id"] = comic_id
         else:
             identity["locg_id"] = locg_id
+        if certifier is not None:
+            identity["certifier"] = certifier
+        if label is not None:
+            identity["label"] = label
         identities.append(identity)
     payload["comic_identities"] = identities
     return payload
@@ -489,6 +541,24 @@ def add_one_row(row: dict, *, server_request: ServerRequestFn) -> RowResult:
         seller = row.get("seller")
         seller_grade = _optional_float(row, "seller_grade")
         photo_grade = _optional_float(row, "photo_grade")
+        # BUI-926 (U4): certifier/cert_number/label — validate certifier
+        # client-side against the same fixed vocabulary server/main.py's
+        # AddBidRequest enforces, so a bad row fails loudly here (FAILED,
+        # with a clear message) instead of reaching the network for a 422.
+        certifier = row.get("certifier")
+        if certifier is not None:
+            if not isinstance(certifier, str) or certifier.strip().lower() not in (
+                "none", "cgc", "cbcs", "other",
+            ):
+                raise _RowValidationError(
+                    f"invalid certifier: {certifier!r} (must be one of "
+                    "none/cgc/cbcs/other)"
+                )
+            certifier = certifier.strip().lower()
+        cert_number = row.get("cert_number")
+        if cert_number is not None and not isinstance(cert_number, str):
+            cert_number = str(cert_number)
+        label = row.get("label")
         _check_end_date_not_past(row)  # BUI-567: before the network, not after
         # BUI-623 (U9): per-row audited bypass — a ROWS_FILE row may set
         # "policy_bypass": true so this specific row commits past a blocking
@@ -506,6 +576,8 @@ def add_one_row(row: dict, *, server_request: ServerRequestFn) -> RowResult:
         # add-batch docstring: "--comic-id/--catalog-id ambiguity doesn't
         # apply here: this row schema only has comic_id") — no locg_id kwarg.
         comic_id=comic_id, grade=grade,
+        # BUI-926 (U4): certified identity, when the row carries it.
+        certifier=certifier, cert_number=cert_number, label=label,
         # BUI-621 (U7): every add-batch row is provenance-tagged "batch",
         # distinct from cli.py's `add` command tagging "cli".
         source="batch",
@@ -525,7 +597,8 @@ def add_one_row(row: dict, *, server_request: ServerRequestFn) -> RowResult:
             # table/JSON summary render it the same way.
             return RowResult(
                 item_id=item_id, status=STATUS_BLOCKED, max_bid=float(bid),
-                grade=grade, error=resp.get("message") or err, title=title,
+                grade=grade, certifier=certifier, label=label,
+                error=resp.get("message") or err, title=title,
                 advisories=resp.get("advisories") or [],
             )
         if isinstance(resp, dict) and resp.get("indeterminate"):
@@ -537,17 +610,18 @@ def add_one_row(row: dict, *, server_request: ServerRequestFn) -> RowResult:
             # server did not stop working. Never STATUS_FAILED.
             return RowResult(
                 item_id=item_id, status=STATUS_INDETERMINATE, max_bid=float(bid),
-                grade=grade, error=err, title=title,
+                grade=grade, certifier=certifier, label=label, error=err, title=title,
             )
         return RowResult(
             item_id=item_id, status=STATUS_FAILED, max_bid=float(bid),
-            grade=grade, error=err, title=title,
+            grade=grade, certifier=certifier, label=label, error=err, title=title,
         )
 
     created = created_from_response(resp)
     status = STATUS_ADDED if created else STATUS_UPDATED
     result = RowResult(
         item_id=item_id, status=status, max_bid=float(bid), grade=grade,
+        certifier=certifier, label=label,
         created=created, title=title,
         advisories=advisories_from_response(resp),
     )
@@ -791,12 +865,25 @@ def verify_items(outcome: BatchOutcome) -> list[dict]:
     """Build /api/comics/verify's `items` payload for every landed row that
     carries a grade — a row with no grade can't be matched to an fmv row
     (verify.md's own schema requires it), so gradeless rows are skipped
-    rather than sent in as a guaranteed no_fmv_at_grade."""
-    return [
-        {"item_id": r.item_id, "grade": r.grade}
-        for r in outcome.rows
-        if r.status in _TERMINAL_OK_STATUSES and r.grade is not None
-    ]
+    rather than sent in as a guaranteed no_fmv_at_grade.
+
+    BUI-926 (U4): `certifier`/`label`, when the row carried them, ride along
+    per item so a future certifier-aware verify (BUI-925) can match on the
+    full price identity instead of grade alone. The overlay's current
+    VerifyItem model silently ignores unknown keys (pydantic's default
+    "ignore" extra-fields behavior), so sending them today is inert on an
+    unmigrated server, not a compatibility risk."""
+    items = []
+    for r in outcome.rows:
+        if r.status not in _TERMINAL_OK_STATUSES or r.grade is None:
+            continue
+        item: dict[str, Any] = {"item_id": r.item_id, "grade": r.grade}
+        if r.certifier is not None:
+            item["certifier"] = r.certifier
+        if r.label is not None:
+            item["label"] = r.label
+        items.append(item)
+    return items
 
 
 def apply_verify_results(outcome: BatchOutcome, verify_response: dict) -> None:
@@ -1126,6 +1213,24 @@ def build_batch_rows(
             grade = _coerce_grade_value(row.get("grade"), "grade")
             seller_grade = _coerce_grade_value(row.get("seller_grade"), "seller_grade")
             photo_grade = _coerce_grade_value(row.get("photo_grade"), "photo_grade")
+            # BUI-926 (U4): certifier/cert_number/label — validated with the
+            # same vocabulary `add_one_row` enforces, so a bad working-list
+            # row fails loudly at build time rather than producing a
+            # rows.json that fails every row later.
+            certifier = row.get("certifier")
+            if certifier is not None:
+                if not isinstance(certifier, str) or certifier.strip().lower() not in (
+                    "none", "cgc", "cbcs", "other",
+                ):
+                    raise _RowValidationError(
+                        f"invalid certifier: {certifier!r} (must be one of "
+                        "none/cgc/cbcs/other)"
+                    )
+                certifier = certifier.strip().lower()
+            cert_number = row.get("cert_number")
+            if cert_number is not None and not isinstance(cert_number, str):
+                cert_number = str(cert_number)
+            label = row.get("label")
         except _RowValidationError as e:
             raise AddBatchError(f"item_id {item_id!r}: {e}") from None
 
@@ -1175,6 +1280,17 @@ def build_batch_rows(
             out_row["seller_grade"] = seller_grade
         if photo_grade is not None:
             out_row["photo_grade"] = photo_grade
+
+        # BUI-926 (U4): certified identity — copied onto the row when the
+        # working-list entry carried it, independent of the comic_id/grade
+        # linking gate above (a certifier/cert_number describes the physical
+        # book, not whether it resolved to a comic_id).
+        if certifier is not None:
+            out_row["certifier"] = certifier
+        if cert_number is not None:
+            out_row["cert_number"] = cert_number
+        if label is not None:
+            out_row["label"] = label
 
         result.rows.append(out_row)
 

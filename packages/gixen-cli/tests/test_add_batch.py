@@ -221,6 +221,71 @@ def test_build_bid_payload_includes_policy_bypass_when_true():
     assert payload["policy_bypass"] is True
 
 
+# ---------------------------------------------------------------------------
+# build_bid_payload — certified identity (BUI-926 / U4)
+# ---------------------------------------------------------------------------
+
+
+def test_build_bid_payload_certified_row_includes_grade_certifier_cert_number():
+    payload = build_bid_payload(
+        "1", 100, 6, 0, comic_id=187, grade=9.6,
+        certifier="cgc", cert_number="4172733006", label="universal",
+    )
+    assert payload["grade"] == 9.6
+    assert payload["certifier"] == "cgc"
+    assert payload["cert_number"] == "4172733006"
+    assert payload["comic_identities"] == [
+        {"comic_id": 187, "grade": 9.6, "certifier": "cgc", "label": "universal"}
+    ]
+
+
+def test_build_bid_payload_certified_row_omits_seller_and_photo_grade():
+    """BUI-926: certified rows NEVER send seller_grade/photo_grade, even if a
+    caller passed them — those are raw-grade observations (BUI-78) with no
+    meaning once a book carries a certified grade instead."""
+    payload = build_bid_payload(
+        "1", 100, 6, 0, comic_id=187, grade=9.6,
+        certifier="cgc", cert_number="4172733006",
+        seller_grade=9.0, photo_grade=8.5,
+    )
+    assert "seller_grade" not in payload
+    assert "photo_grade" not in payload
+
+
+def test_build_bid_payload_raw_row_still_sends_seller_and_photo_grade():
+    """The suppression above is certifier-gated, not blanket: an ordinary raw
+    row (no certifier, or certifier='none') keeps sending seller_grade/
+    photo_grade exactly as before BUI-926."""
+    payload = build_bid_payload(
+        "1", 100, 6, 0, seller_grade=9.0, photo_grade=8.5,
+    )
+    assert payload["seller_grade"] == 9.0
+    assert payload["photo_grade"] == 8.5
+
+    payload_none = build_bid_payload(
+        "1", 100, 6, 0, certifier="none", seller_grade=9.0, photo_grade=8.5,
+    )
+    assert payload_none["seller_grade"] == 9.0
+    assert payload_none["photo_grade"] == 8.5
+    assert payload_none["certifier"] == "none"
+
+
+def test_build_bid_payload_omits_certified_fields_by_default():
+    payload = build_bid_payload("1", 100, 6, 0)
+    assert "certifier" not in payload
+    assert "cert_number" not in payload
+    assert "grade" not in payload
+
+
+def test_build_bid_payload_grade_without_identity_still_sent_top_level():
+    """A grade with no comic_id/locg_id still lands on the row (server/
+    db.py's insert_bid stores it independent of any FMV link) even though
+    no comic_identities entry is built for it."""
+    payload = build_bid_payload("1", 100, 6, 0, grade=9.2)
+    assert payload["grade"] == 9.2
+    assert payload["comic_identities"] == []
+
+
 def test_created_from_response_defaults_true_when_key_missing():
     assert created_from_response({}) is True
 
@@ -460,6 +525,53 @@ def test_add_one_row_no_comic_id_sends_empty_identity_list():
     server = _FakeServer({("post", "/api/bids"): (True, {"item_id": "1", "created": True}, None)})
     add_one_row(_row("1"), server_request=server)
     assert server.calls[0][2]["comic_identities"] == []
+
+
+def test_add_one_row_certified_row_reaches_the_add_payload():
+    """BUI-926 (U4): a working-list row carrying certifier/cert_number/label
+    reaches POST /api/bids and is folded into the comic_identities entry."""
+    server = _FakeServer({
+        ("post", "/api/bids"): (True, {"item_id": "1", "created": True}, None),
+        ("post", "/api/bids/1/link-fmv"): (True, {}, None),
+    })
+    add_one_row(
+        _row("1", comic_id=187, grade=7.0, certifier="cgc",
+             cert_number="4172733006", label="universal"),
+        server_request=server,
+    )
+    add_calls = [c for c in server.calls if c[1] == "/api/bids"]
+    payload = add_calls[0][2]
+    assert payload["grade"] == 7.0
+    assert payload["certifier"] == "cgc"
+    assert payload["cert_number"] == "4172733006"
+    assert payload["comic_identities"] == [
+        {"comic_id": 187, "grade": 7.0, "certifier": "cgc", "label": "universal"}
+    ]
+
+
+def test_add_one_row_raw_row_sends_no_certified_fields():
+    server = _FakeServer({("post", "/api/bids"): (True, {"item_id": "1", "created": True}, None)})
+    add_one_row(_row("1"), server_request=server)
+    payload = server.calls[0][2]
+    assert "certifier" not in payload
+    assert "cert_number" not in payload
+
+
+def test_add_one_row_rejects_unknown_certifier_without_network():
+    result = add_one_row(_row("1", certifier="psa"), server_request=_FakeServer({}))
+    assert result.status == STATUS_FAILED
+    assert "certifier" in result.error
+
+
+def test_add_one_row_result_carries_certifier_and_label():
+    """So verify_items (BUI-926) can build the full price identity per row."""
+    server = _FakeServer({("post", "/api/bids"): (True, {"item_id": "1", "created": True}, None)})
+    result = add_one_row(
+        _row("1", grade=7.0, certifier="cgc", label="universal"),
+        server_request=server,
+    )
+    assert result.certifier == "cgc"
+    assert result.label == "universal"
 
 
 def test_add_one_row_links_fmv_when_grade_and_comic_id_present():
@@ -906,6 +1018,21 @@ def test_verify_items_only_includes_landed_rows_with_a_grade():
     ]
 
 
+def test_verify_items_carries_certifier_and_label_per_row():
+    """BUI-926 (U4): a certified row's certifier/label ride along in the
+    --verify payload; a raw row (neither set) keeps the pre-existing
+    {item_id, grade}-only shape."""
+    outcome = BatchOutcome(rows=[
+        RowResult(item_id="1", status=STATUS_ADDED, grade=9.6, certifier="cgc", label="universal"),
+        RowResult(item_id="2", status=STATUS_ADDED, grade=8.0),
+    ])
+    items = verify_items(outcome)
+    assert items == [
+        {"item_id": "1", "grade": 9.6, "certifier": "cgc", "label": "universal"},
+        {"item_id": "2", "grade": 8.0},
+    ]
+
+
 def test_apply_verify_results_splices_verdict_onto_matching_row():
     outcome = BatchOutcome(rows=[
         RowResult(item_id="1", status=STATUS_ADDED, grade=9.2),
@@ -1088,6 +1215,49 @@ def test_build_batch_rows_never_drops_comic_id_when_present():
     working_list = [_wl_row("1", grade=9.4)]
     result = build_batch_rows(brief, working_list)
     assert result.rows[0]["comic_id"] == 999
+
+
+# ---------------------------------------------------------------------------
+# build_batch_rows — certified identity (BUI-926 / U4)
+# ---------------------------------------------------------------------------
+
+
+def test_build_batch_rows_certified_row_copies_certifier_cert_number():
+    brief = [_brief("1", comic_id=42, max_bid=800)]
+    working_list = [_wl_row(
+        "1", grade=7.0, certifier="cgc", cert_number="4172733006",
+    )]
+    result = build_batch_rows(brief, working_list)
+    row = result.rows[0]
+    assert row["certifier"] == "cgc"
+    assert row["cert_number"] == "4172733006"
+    assert row["grade"] == 7.0
+
+
+def test_build_batch_rows_raw_row_emits_no_certified_fields():
+    brief = [_brief("1", comic_id=42, max_bid=800)]
+    working_list = [_wl_row("1", grade=9.2)]
+    result = build_batch_rows(brief, working_list)
+    row = result.rows[0]
+    assert "certifier" not in row
+    assert "cert_number" not in row
+    assert "label" not in row
+
+
+def test_build_batch_rows_copies_label_when_present():
+    brief = [_brief("1", comic_id=42, max_bid=800)]
+    working_list = [_wl_row(
+        "1", grade=9.8, certifier="cgc", label="signature_series",
+    )]
+    result = build_batch_rows(brief, working_list)
+    assert result.rows[0]["label"] == "signature_series"
+
+
+def test_build_batch_rows_invalid_certifier_errors():
+    brief = [_brief("1", comic_id=42, max_bid=800)]
+    working_list = [_wl_row("1", grade=9.2, certifier="psa")]
+    with pytest.raises(AddBatchError, match="certifier"):
+        build_batch_rows(brief, working_list)
 
 
 def test_build_batch_rows_letter_grade_is_coerced_to_cgc_float():

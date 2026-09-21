@@ -118,6 +118,53 @@ def test_add_source_cli_reaches_the_add_payload():
     assert captured["json"]["source"] == "cli"
 
 
+def test_add_certifier_and_cert_number_reach_the_add_payload():
+    """BUI-926 (U4): `gixen add --certifier --cert-number` land in the POST
+    /api/bids payload (cli.py wires them through build_bid_payload, already
+    unit-tested in test_add_batch.py — this just proves the CLI option
+    actually reaches that call)."""
+    runner = CliRunner()
+    captured = {}
+
+    def fake_request(method, path, **kwargs):
+        if path == "/api/bids":
+            captured["json"] = kwargs.get("json")
+            return {"item_id": "444", "created": True}
+        return {}
+
+    with patch("cli._server_url", return_value="http://srv"), \
+         patch("cli._server_request", side_effect=fake_request), \
+         patch("cli._record_add"):
+        result = runner.invoke(
+            cli, ["add", "444", "500.00", "--grade", "9.6",
+                  "--certifier", "cgc", "--cert-number", "4172733006"],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert captured["json"]["certifier"] == "cgc"
+    assert captured["json"]["cert_number"] == "4172733006"
+    assert captured["json"]["grade"] == 9.6
+
+
+def test_add_direct_gixen_mode_warns_on_certifier_without_server_url():
+    """No COMICS_SERVER_URL -> direct-Gixen mode, which has nowhere to store
+    the certified-identity columns (they live on the server's bids table)."""
+    runner = CliRunner()
+    mock_client = MagicMock()
+    mock_client.list_snipes.return_value = []
+    mock_client.add_snipe.return_value = None
+    with patch("cli._server_url", return_value=None), \
+         patch("cli._make_client", return_value=mock_client), \
+         patch("cli._record_add"), \
+         patch("cli._get_ebay_bid_count", return_value=None):
+        result = runner.invoke(
+            cli, ["add", "444", "20.00", "--certifier", "cgc"],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "--certifier/--cert-number require COMICS_SERVER_URL" in result.output
+
+
 def test_add_advisories_render_even_when_link_fmv_also_ran():
     """The advisory line prints after whichever success message the
     link-fmv branch chose — it must not be skipped just because a link

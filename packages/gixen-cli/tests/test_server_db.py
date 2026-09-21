@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from server.db import (
     init_db, insert_bid, get_bid_by_item_id, get_bid_by_id, get_pending_bid_by_item_id,
-    update_bid, update_bid_status, delete_bid, get_all_bids,
+    update_bid, update_bid_grades, update_bid_status, delete_bid, get_all_bids,
     get_pending_bids, mark_bids_purged, set_local_snipe_result,
     mirror_gixen_max_bid, list_bid_decisions,
 )
@@ -947,6 +947,185 @@ def test_cache_gixen_data_fills_null_seller(db):
     db.commit()
     row = get_bid_by_item_id(db, "700000005")
     assert row["seller"] == "scraped_seller"
+
+
+# ---------------------------------------------------------------------------
+# grade / certifier / cert_number columns (BUI-926 / U4)
+# ---------------------------------------------------------------------------
+
+
+def test_bids_certified_columns_present_on_fresh_db(tmp_path):
+    conn = init_db(tmp_path / "fresh_certified.db")
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(bids)")}
+    assert "grade" in cols
+    assert "certifier" in cols
+    assert "cert_number" in cols
+    conn.close()
+
+
+def test_bids_certified_migration_is_idempotent(tmp_path):
+    db_path = tmp_path / "idem_certified.db"
+    conn = init_db(db_path)
+    conn.close()
+    conn2 = init_db(db_path)
+    cols = {row[1] for row in conn2.execute("PRAGMA table_info(bids)")}
+    assert "grade" in cols
+    assert "certifier" in cols
+    assert "cert_number" in cols
+    conn2.close()
+
+
+def test_certified_columns_survive_bids_rebuild(tmp_path):
+    """BUI-926: grade/certifier/cert_number must be in _BIDS_TABLE_SQL so the
+    FK-removal rebuild (forced by a legacy `comics` FK) preserves them and
+    their data, mirroring test_grade_columns_survive_bids_rebuild (BUI-78)."""
+    legacy_db_path = tmp_path / "legacy_certified.db"
+    raw = sqlite3.connect(str(legacy_db_path))
+    raw.execute("PRAGMA journal_mode=WAL")
+    raw.executescript("""
+        CREATE TABLE comics (
+            id INTEGER PRIMARY KEY, title TEXT NOT NULL, issue TEXT NOT NULL,
+            year INTEGER NOT NULL, grade REAL
+        );
+        CREATE TABLE bids (
+            id INTEGER PRIMARY KEY,
+            item_id TEXT NOT NULL,
+            comic_id INTEGER REFERENCES comics(id),
+            max_bid REAL NOT NULL,
+            bid_offset INTEGER DEFAULT 6,
+            snipe_group INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'PENDING',
+            winning_bid REAL,
+            seller TEXT,
+            auction_end_at TEXT,
+            local_snipe_at TEXT,
+            local_snipe_result TEXT,
+            notes TEXT,
+            added_at TEXT DEFAULT (datetime('now')),
+            resolved_at TEXT,
+            ebay_title TEXT,
+            status_mirror TEXT,
+            cached_current_bid TEXT,
+            cached_at TEXT,
+            fmv_id INTEGER,
+            seller_grade REAL,
+            photo_grade REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_bids_item_id ON bids(item_id);
+    """)
+    raw.execute(
+        "INSERT INTO bids (item_id, max_bid, comic_id, seller_grade, photo_grade) "
+        "VALUES ('legacy_cert001', 50.0, NULL, 9.0, 7.0)"
+    )
+    raw.commit()
+    raw.close()
+
+    conn = init_db(legacy_db_path)
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(bids)")}
+        assert "grade" in cols
+        assert "certifier" in cols
+        assert "cert_number" in cols
+        row = conn.execute(
+            "SELECT grade, certifier, cert_number FROM bids WHERE item_id='legacy_cert001'"
+        ).fetchone()
+        assert row["grade"] is None
+        assert row["certifier"] == "none"
+        assert row["cert_number"] is None
+    finally:
+        conn.close()
+
+
+def test_certifier_none_after_legacy_rebuild(tmp_path):
+    """A pre-migration bid (from a DB that predates BUI-926 entirely, forcing
+    the pre-existing status-rename table rebuild — see _seed_old_db) reads
+    certifier='none' after init_db, both via the plain ALTER and via the
+    rebuild's column-copy (BUI-926 test scenario: 'a pre-migration bid reads
+    certifier none after the migration, on a fresh DB and after a rebuild')."""
+    db_path = tmp_path / "legacy_certifier_rebuild.db"
+    _seed_old_db(db_path)
+    conn = init_db(db_path)
+    try:
+        for item_id in ("purged001", "pending001", "won001"):
+            row = conn.execute(
+                "SELECT certifier, grade, cert_number FROM bids WHERE item_id=?",
+                (item_id,),
+            ).fetchone()
+            assert row["certifier"] == "none"
+            assert row["grade"] is None
+            assert row["cert_number"] is None
+    finally:
+        conn.close()
+
+
+def test_insert_bid_persists_certified_fields(db):
+    """BUI-926: insert_bid stores grade/certifier/cert_number when supplied."""
+    insert_bid(db, "710000001", 500.0, 6, 0, "slabseller",
+               grade=9.6, certifier="cgc", cert_number="4172733006")
+    row = get_bid_by_item_id(db, "710000001")
+    assert row["grade"] == 9.6
+    assert row["certifier"] == "cgc"
+    assert row["cert_number"] == "4172733006"
+
+
+def test_insert_bid_certified_fields_default(db):
+    """Backward-compat: the existing positional/keyword call (no certified
+    fields) stores grade/cert_number NULL and certifier the column's own
+    NOT NULL DEFAULT 'none' — insert_bid must never hard-code 'none' as a
+    Python-level default (that would collide with the column default in two
+    places); omitting certifier entirely still yields 'none' on read-back."""
+    insert_bid(db, "710000002", 50.0, 6, 0, "someseller")
+    row = get_bid_by_item_id(db, "710000002")
+    assert row["grade"] is None
+    assert row["certifier"] == "none"
+    assert row["cert_number"] is None
+
+
+def test_update_bid_grades_fills_grade_and_cert_number_only_nulls(db):
+    """BUI-926: grade/cert_number follow the same fill-NULL-only rule as
+    seller_grade/photo_grade (BUI-78 C2) — a re-add never clobbers an
+    already-recorded certified grade or cert number."""
+    insert_bid(db, "710000003", 500.0, 6, 0, "buyer")
+    update_bid_grades(db, "710000003", grade=9.6, cert_number="4172733006")
+    row = get_bid_by_item_id(db, "710000003")
+    assert row["grade"] == 9.6
+    assert row["cert_number"] == "4172733006"
+    # A second call with different values must NOT overwrite what's set.
+    update_bid_grades(db, "710000003", grade=1.0, cert_number="0000000000")
+    row = get_bid_by_item_id(db, "710000003")
+    assert row["grade"] == 9.6
+    assert row["cert_number"] == "4172733006"
+
+
+def test_update_bid_grades_certifier_is_authoritative(db):
+    """certifier follows `seller`'s rule (supplied wins, else keep existing),
+    not the fill-NULL-only rule grade/cert_number follow — it is a stated
+    identity, not an observation, and the column's NOT NULL DEFAULT 'none'
+    means there is always a well-defined 'existing' to fall back to."""
+    insert_bid(db, "710000004", 500.0, 6, 0, "buyer")
+    row = get_bid_by_item_id(db, "710000004")
+    assert row["certifier"] == "none"
+    update_bid_grades(db, "710000004", certifier="cgc")
+    row = get_bid_by_item_id(db, "710000004")
+    assert row["certifier"] == "cgc"
+    # A later call omitting certifier (None) must NOT clear it back to 'none'
+    # — this is the re-add-must-not-clear invariant.
+    update_bid_grades(db, "710000004", grade=9.0)
+    row = get_bid_by_item_id(db, "710000004")
+    assert row["certifier"] == "cgc"
+    assert row["grade"] == 9.0
+
+
+def test_update_bid_grades_no_op_when_all_certified_fields_none(db):
+    """No-op guard (mirrors the pre-existing seller/seller_grade/photo_grade
+    check) must also treat grade/certifier/cert_number as no-op inputs."""
+    insert_bid(db, "710000005", 50.0, 6, 0, "buyer", certifier="cgc", grade=9.0)
+    # A call with every argument None (including the new three) must not
+    # touch the row at all.
+    update_bid_grades(db, "710000005")
+    row = get_bid_by_item_id(db, "710000005")
+    assert row["certifier"] == "cgc"
+    assert row["grade"] == 9.0
 
 
 # ---------------------------------------------------------------------------

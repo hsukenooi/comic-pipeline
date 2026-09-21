@@ -475,10 +475,17 @@ def _get_ebay_bid_count(item_id: str) -> int | None:
          "existing post-bid link-fmv call for old-server compatibility). "
          "Takes precedence over --catalog-id if both are given.",
 )
-@click.option("--grade", type=float, default=None, help="Numeric condition grade for post-bid FMV linking")
+@click.option("--grade", type=float, default=None, help="Numeric condition grade for post-bid FMV linking (BUI-926: also stored on the bid row)")
 @click.option("--seller", default=None, help="eBay seller username (BUI-78 seller-reliability)")
 @click.option("--seller-grade", type=float, default=None, help="Seller's stated grade (CGC float, BUI-78)")
 @click.option("--photo-grade", type=float, default=None, help="Photo-assessed consensus grade (CGC float, BUI-78)")
+@click.option(
+    "--certifier",
+    default=None,
+    type=click.Choice(["none", "cgc", "cbcs", "other"], case_sensitive=False),
+    help="Certified grading company for a slab (BUI-926); omit for a raw comic.",
+)
+@click.option("--cert-number", default=None, help="Certification/cert number for a slab (BUI-926)")
 @click.option(
     "--ack-policy",
     is_flag=True,
@@ -500,6 +507,8 @@ def add(
     seller: str | None,
     seller_grade: float | None,
     photo_grade: float | None,
+    certifier: str | None,
+    cert_number: str | None,
     ack_policy: bool,
 ):
     """Add a snipe for an eBay item."""
@@ -527,6 +536,10 @@ def add(
             # BUI-619 (U5): comic_id/catalog_id are already mutually exclusive
             # by this point (the both-given branch above nulls out catalog_id).
             comic_id=comic_id, locg_id=catalog_id, grade=grade,
+            # BUI-926 (U4): --certifier/--cert-number, when supplied, also
+            # suppress seller_grade/photo_grade from the payload — see
+            # build_bid_payload's own docstring.
+            certifier=certifier, cert_number=cert_number,
             # BUI-621 (U7): tag this row's provenance "cli" — add-batch's
             # add_one_row tags its own rows "batch".
             source="cli",
@@ -584,6 +597,15 @@ def add(
     if seller is not None or seller_grade is not None or photo_grade is not None:
         click.echo(
             "⚠️  --seller/--seller-grade/--photo-grade require COMICS_SERVER_URL "
+            "(server mode); ignored in direct-Gixen mode.",
+            err=True,
+        )
+    if certifier is not None or cert_number is not None:
+        # BUI-926 (U4): the certified-identity columns live on the server's
+        # bids table (server/db.py) — there is nowhere to store them without
+        # it, same as seller/seller-grade/photo-grade above.
+        click.echo(
+            "⚠️  --certifier/--cert-number require COMICS_SERVER_URL "
             "(server mode); ignored in direct-Gixen mode.",
             err=True,
         )

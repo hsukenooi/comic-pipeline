@@ -145,6 +145,80 @@ def test_readd_fills_null_grades(api):
     assert row["photo_grade"] == 6.0
 
 
+def test_add_bid_persists_certified_fields(api):
+    """BUI-926 (U4): grade/certifier/cert_number sent on POST land in the DB."""
+    r = api.post("/api/bids", json={
+        "item_id": "412000010", "max_bid": 500.0,
+        "grade": 9.6, "certifier": "cgc", "cert_number": "4172733006",
+    })
+    assert r.status_code == 200
+    row = _dbconn().execute(
+        "SELECT grade, certifier, cert_number FROM bids WHERE item_id='412000010'"
+    ).fetchone()
+    assert row["grade"] == 9.6
+    assert row["certifier"] == "cgc"
+    assert row["cert_number"] == "4172733006"
+
+
+def test_add_bid_without_certified_fields_stores_none_certifier(api):
+    """Backward-compat: a minimal add stores certifier='none' (the column's
+    NOT NULL DEFAULT), grade/cert_number NULL, no error."""
+    r = api.post("/api/bids", json={"item_id": "412000011", "max_bid": 50.0})
+    assert r.status_code == 200
+    row = _dbconn().execute(
+        "SELECT grade, certifier, cert_number FROM bids WHERE item_id='412000011'"
+    ).fetchone()
+    assert row["grade"] is None
+    assert row["certifier"] == "none"
+    assert row["cert_number"] is None
+
+
+def test_readd_does_not_clear_certified_fields(api):
+    """BUI-926: a re-add (upsert) that omits grade/certifier/cert_number must
+    NOT clear values a prior add already set — the field's own None means
+    'not supplied by this request', not 'clear the certifier back to none'
+    (see AddBidRequest.certifier's docstring)."""
+    api.post("/api/bids", json={
+        "item_id": "412000012", "max_bid": 50.0,
+        "grade": 9.6, "certifier": "cgc", "cert_number": "4172733006",
+    })
+    r = api.post("/api/bids", json={"item_id": "412000012", "max_bid": 60.0})
+    assert r.status_code == 200
+    assert r.json()["created"] is False  # update-in-place path
+    row = _dbconn().execute(
+        "SELECT grade, certifier, cert_number FROM bids "
+        "WHERE item_id='412000012' AND status='PENDING'"
+    ).fetchone()
+    assert row["grade"] == 9.6
+    assert row["certifier"] == "cgc"
+    assert row["cert_number"] == "4172733006"
+
+
+def test_add_bid_rejects_unknown_certifier(api):
+    """Write path enforces the fixed certifier vocabulary (BUI-926 R31)."""
+    r = api.post("/api/bids", json={
+        "item_id": "412000013", "max_bid": 50.0, "certifier": "psa",
+    })
+    assert r.status_code == 422
+
+
+def test_add_bid_explicit_none_certifier_is_stored(api):
+    """A client that explicitly (re)states a bid as raw sends certifier:
+    'none' — distinct from omitting the field — and that value is written
+    like any other supplied value (supplied wins, mirrors `seller`)."""
+    api.post("/api/bids", json={
+        "item_id": "412000014", "max_bid": 50.0, "certifier": "cgc",
+    })
+    r = api.post("/api/bids", json={
+        "item_id": "412000014", "max_bid": 60.0, "certifier": "none",
+    })
+    assert r.status_code == 200
+    row = _dbconn().execute(
+        "SELECT certifier FROM bids WHERE item_id='412000014' AND status='PENDING'"
+    ).fetchone()
+    assert row["certifier"] == "none"
+
+
 def test_add_bid_rejects_overlong_seller(api):
     """Write path mirrors the read endpoint's 1-128 char seller validation."""
     r = api.post("/api/bids", json={
