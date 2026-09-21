@@ -35,7 +35,10 @@ from dataclasses import dataclass, field
 # change. See comic_identity_year.py's module docstring for the cluster
 # boundaries and why _classify_edition_kind's back-reference into this module
 # is a deferred (call-time) import rather than a top-level one.
-from grade_tokens import strip_certification_tokens  # BUI-932
+from grade_tokens import (  # BUI-932/BUI-934
+    resolve_certifier_token,
+    strip_certification_tokens,
+)
 
 from comic_identity_year import (  # noqa: F401 — re-exported for callers
     _all_title_years,
@@ -72,8 +75,9 @@ def _normalize(text):
 # issue branch then matched that orphaned "7" as wish issue #7, producing
 # false positives at score 1.00 (seller comichunterlv: 61 of 62 false). Strip
 # the whole decimal-grade token *before* normalizing so neither half survives.
-# This catches the raw forms too ("F/VF 7.0", "VF/NM 9.0") which the literal
-# "cgc"-skip guard in main() does NOT — they carry no "cgc" string.
+# This catches the raw forms too ("F/VF 7.0", "VF/NM 9.0") which the
+# certifier-token skip guard in main() (BUI-934: grade_tokens.resolve_
+# certifier_token) does NOT — they carry no certifier name at all.
 _GRADE_RE = re.compile(r"\b\d{1,2}\.\d\b")
 
 # BUI-135 (code-review follow-up): a grade written WITHOUT a decimal still
@@ -701,9 +705,12 @@ def hard_reject(title, series, issue, include_graded=False):
     should call this before match_listing to shrink the candidate pool cheaply.
 
     Rules applied in order:
-      1. CGC slab — "cgc" in title.  This scan is raw/ungraded only by
-         default; mirrors the existing ``if "cgc" in ...`` skip in main() so
-         callers using hard_reject get that guard for free. BUI-932:
+      1. Certified slab — any certifier token (CGC/CBCS/PGX, via
+         grade_tokens.resolve_certifier_token) in title.  This scan is
+         raw/ungraded only by default; mirrors the existing certifier-token
+         skip in main() so callers using hard_reject get that guard for
+         free. BUI-934: word-boundary matched, so it doesn't false-hit on a
+         certifier token embedded in an unrelated word. BUI-932:
          ``include_graded=True`` skips this rule so a certified listing can
          reach the rest of the chain instead of being dropped outright.
       2. Edition mismatch — title contains Annual / Giant-Size / Giant Size /
@@ -720,8 +727,8 @@ def hard_reject(title, series, issue, include_graded=False):
          must contain it as a bounded token (#N or bare N), using the same
          word-boundary regex as match_listing so the two are consistent.
     """
-    # Rule 1: CGC slab
-    if not include_graded and "cgc" in title.lower():
+    # Rule 1: certified slab (BUI-934: any known certifier token, not just CGC)
+    if not include_graded and resolve_certifier_token(title) is not None:
         return True
 
     # Rule 2: edition mismatch
@@ -1731,7 +1738,10 @@ def identify_comic(title: "str | None", include_graded: bool = False) -> ComicId
     *include_graded* (BUI-932, default False) suppresses the "CGC slab"
     reject reason below so a caller that has opted into surfacing slabs
     (seller-scan / wishlist-sellers with --include-graded) doesn't carry a
-    stale reject note for a listing it deliberately chose to keep.
+    stale reject note for a listing it deliberately chose to keep. BUI-934:
+    the reject signal itself fires for any certifier token grade_tokens
+    knows (CGC/CBCS/PGX) — the "CGC slab" reason text is kept as-is (other
+    tests assert on it) even though it now also covers CBCS/PGX titles.
     """
     raw_title = title or ""
     identity = ComicIdentity(title=raw_title)
@@ -1744,7 +1754,8 @@ def identify_comic(title: "str | None", include_graded: bool = False) -> ComicId
     identity._title_norm = _normalize(stripped)
 
     # --- deterministic reject signals (independent of series/issue) -------
-    if not include_graded and "cgc" in raw_title.lower():
+    # BUI-934: any known certifier token (CGC/CBCS/PGX), not just literal "cgc".
+    if not include_graded and resolve_certifier_token(raw_title) is not None:
         identity.reject_reasons.append("CGC slab")
     if _digital_reject(raw_title):
         identity.reject_reasons.append("digital-only listing")

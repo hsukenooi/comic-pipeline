@@ -1994,6 +1994,24 @@ class TestMatchResultsForWishIncludeGraded:
         matches = ws.match_results_for_wish(results, wish)
         assert matches == []
 
+    # ── BUI-934: every certifier token grade_tokens knows, not just "cgc" ────
+    # wishlist_sellers has no reject literal of its own — it goes through
+    # comic_identity.should_reject/hard_reject via seller_scan's re-export —
+    # so this proves the fix reaches this module's real call path too.
+
+    def test_flag_off_cbcs_listing_dropped(self):
+        wish = self._wish_item()
+        results = [self._result("Ultimate Fallout #4 CBCS 9.8")]
+        matches = ws.match_results_for_wish(results, wish)
+        assert matches == []
+
+    def test_flag_on_cbcs_listing_kept_with_certification_fields(self):
+        wish = self._wish_item()
+        results = [self._result("Ultimate Fallout #4 CBCS 9.8 OW/W")]
+        matches = ws.match_results_for_wish(results, wish, include_graded=True)
+        assert len(matches) == 1
+        assert matches[0]["certifier"] == "cbcs"
+
     def test_flag_on_cgc_listing_kept_with_certification_fields(self):
         wish = self._wish_item()
         results = [self._result("Ultimate Fallout #4 CGC 9.8 OW/W")]
