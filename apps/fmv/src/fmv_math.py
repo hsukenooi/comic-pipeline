@@ -1593,11 +1593,12 @@ def _exact_sales_detail(exact_comps: Iterable[dict]) -> list[dict]:
     kept comp already has a parseable date — `_graded_comp_date` is never
     None here.
     """
-    return sorted(
-        ({"price": float(c["price"]), "sold_date": _graded_comp_date(c).isoformat()}
-         for c in exact_comps),
-        key=lambda d: d["price"],
-    )
+    detail = []
+    for c in exact_comps:
+        sold = _graded_comp_date(c)
+        detail.append({"price": float(c["price"]),
+                       "sold_date": sold.isoformat() if sold is not None else None})
+    return sorted(detail, key=lambda d: d["price"])
 
 
 def _nearest_rungs(
