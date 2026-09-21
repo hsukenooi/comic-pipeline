@@ -142,6 +142,8 @@ presentation (see "Present the results" below); use the `win_backed` /
   "issue": "129",
   "year": 1973,
   "grade": 8.0,
+  "certifier": "none",
+  "label": "universal",
   "fmv_high": 100.0,
   "loss_count": 4,
   "above_fmv_loss_count": 3,
@@ -154,6 +156,13 @@ presentation (see "Present the results" below); use the `win_backed` /
 }
 ```
 
+- `certifier` / `label` (BUI-935) — the row's price identity beyond grade
+  (BUI-924/925): `certifier` is `"none"` and `label` is `"universal"` for a
+  raw book, or a grader (`"cgc"`, `"cbcs"`, …) and a label variant for a slab.
+  Read-only context, carried straight from the linked `fmv` row — once slab
+  rows exist, two rows can share one `grade` with nothing else in the payload
+  to tell them apart, so always render both alongside `grade` rather than
+  grade alone.
 - `contested_win_margin` — `median(winning_bid / fmv_high)` over **wins**, or
   `null` when `win_count` is 0. **The headline field (BUI-532)** whenever
   it is non-null and `> 1`: uncensored, exact evidence `fmv_high` is too low
@@ -214,6 +223,11 @@ Render each tier as its own table, most urgent first within the tier:
 | Uncanny X-Men #142 (1980)          | 9.2   | $250.00  | Unconfirmed — overshoot 1.20x (censored upper bound) | 3 | 0             |
 ```
 
+- **Grade** — once a row's `certifier` is not `"none"` (a slab), append it and
+  `label` (when not `"universal"`) to the grade, e.g. `9.6 CGC` or
+  `9.8 CGC (Signature Series)` — a bare grade no longer names the row
+  uniquely once slab rows exist (BUI-935), so never render `grade` alone once
+  any row in the response carries a non-raw `certifier`.
 - **Signal** carries either `Confirmed <margin>x (win)` or `Unconfirmed —
   overshoot <ratio>x (censored upper bound)` — never blend the two numbers
   into one column, and never let an Unconfirmed row outrank a Confirmed one.

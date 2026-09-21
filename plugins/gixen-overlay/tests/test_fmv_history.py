@@ -432,6 +432,37 @@ def test_get_fmv_history_by_title_issue_year(api):
     assert len(r.json()) == 1
 
 
+def test_get_fmv_history_carries_certifier_and_label(api):
+    """BUI-935: `get_fmv_history` reads `SELECT * FROM fmv_history`, and
+    `fmv_history` has carried `certifier`/`label` columns since BUI-924
+    (copied from the `fmv` row by `append_fmv_history`) — pin that a raw
+    snapshot reports the raw sentinel ('none'/'universal') and a slab
+    snapshot reports its actual certifier/label, rather than assuming
+    `SELECT *` still covers every column after a future column-list
+    refactor."""
+    raw_data = _create_comic(api, title="Fantastic Four", issue="1",
+                              year=1961, grade=9.6, fmv_low=80.0, fmv_high=100.0)
+    slab_data = _create_comic(api, title="Fantastic Four", issue="1",
+                               year=1961, grade=9.6, fmv_low=800.0,
+                               fmv_high=1000.0, certifier="cgc",
+                               label="signature_series")
+    assert raw_data["comic_id"] == slab_data["comic_id"]  # same book identity
+    assert raw_data["fmv_id"] != slab_data["fmv_id"]  # two distinct markets
+
+    r = api.get("/api/comics/fmv-history", params={
+        "comic_id": raw_data["comic_id"],
+    })
+    assert r.status_code == 200
+    rows = r.json()
+    assert len(rows) == 2
+    raw_row = next(row for row in rows if row["high"] == 100.0)
+    slab_row = next(row for row in rows if row["high"] == 1000.0)
+    assert raw_row["certifier"] == "none"
+    assert raw_row["label"] == "universal"
+    assert slab_row["certifier"] == "cgc"
+    assert slab_row["label"] == "signature_series"
+
+
 def test_get_fmv_history_unresolvable_comic_id_400s(api):
     r = api.get("/api/comics/fmv-history", params={"comic_id": 999999})
     assert r.status_code == 400
