@@ -427,6 +427,10 @@ def create_tables(conn: sqlite3.Connection) -> None:
     _migrate_sweep_allcaps_orphans(conn)
     # variant column must exist before the unique-index migration references it.
     _migrate_add_variant_column(conn)
+    # BUI-950: purely additive, touches `comics` only, and has no ordering
+    # dependency on anything else here (unlike `variant`, no later migration
+    # reads or rebuilds around it).
+    _migrate_add_comics_slab_watch_column(conn)
     # flag_reason column must be added AFTER the fmv-split / year-nullable rebuilds
     # above (those recreate `fmv` from the pre-BUI-132 schema), so it survives them.
     _migrate_add_fmv_flag_reason_column(conn)
@@ -613,6 +617,32 @@ def _migrate_add_variant_column(conn: sqlite3.Connection) -> None:
     cols = {row[1] for row in conn.execute("PRAGMA table_info(comics)")}
     if "variant" not in cols:
         conn.execute("ALTER TABLE comics ADD COLUMN variant TEXT")
+
+
+def _migrate_add_comics_slab_watch_column(conn: sqlite3.Connection) -> None:
+    """Add the nullable `slab_watch` column to comics if absent (BUI-950).
+
+    Additive and idempotent, mirroring `_migrate_add_variant_column` just
+    above (both touch `comics`). Three states, not two: `1` is a hand
+    INCLUDE (always in the slab watch set regardless of raw FMV), `0` is a
+    hand EXCLUDE (always out, regardless of raw FMV), and `NULL` — the state
+    of every existing row, since nothing could write this column before now
+    — means "let `SLAB_WATCH_MIN_FMV` decide" (see
+    `list_comics_for_slab_watch` and `GET /api/comics/slab-watch`). No
+    backfill: a hand override is only ever set by an explicit
+    `POST /api/comics/{id}/slab-watch` call.
+
+    The CHECK constraint is safe to add via ALTER TABLE ADD COLUMN because
+    every pre-existing row lands on NULL, which the constraint always
+    admits — unlike the `fmv`/`comps` certifier columns elsewhere in this
+    file, this one has no default and needs none.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(comics)")}
+    if "slab_watch" not in cols:
+        conn.execute(
+            "ALTER TABLE comics ADD COLUMN slab_watch INTEGER "
+            "CHECK(slab_watch IN (0, 1) OR slab_watch IS NULL)"
+        )
 
 
 def _migrate_add_fmv_flag_reason_column(conn: sqlite3.Connection) -> None:
@@ -3069,6 +3099,86 @@ def list_comics(
         """,
         [certifier or FMV_CERTIFIER_NONE, *params],
     ).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# Slab watch set (BUI-950)
+# ---------------------------------------------------------------------------
+
+# Default for SLAB_WATCH_MIN_FMV, read per request (see routes.py's
+# `_read_slab_watch_min_fmv`) — the same non-disabling-default posture as
+# `POLICY_FMV_MULTIPLE`/`POLICY_FMV_STALE_DAYS` in policy.py: leaving the env
+# var unset does not turn threshold-based inclusion off, it falls back to
+# this value. Chosen 2026-09-21 over a $50 line (~212 books) — see BUI-950.
+SLAB_WATCH_DEFAULT_MIN_FMV = 100.0
+
+
+def list_comics_for_slab_watch(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Return every comic with its RAW high-water mark and hand override.
+
+    One row per comic: `id`, `title`, `issue`, `year`, `variant`,
+    `slab_watch` (1/0/NULL — see `_migrate_add_comics_slab_watch_column`),
+    and `raw_high` — the MAX of `fmv.high` across every RAW
+    (`certifier='none'`) row for that comic, at ANY grade. "Any grade" is
+    deliberate: the watch-set question is "has this book EVER priced above
+    the line raw", not "is its current/highest grade's price above it" — a
+    book primarily priced at a lower grade can still have a high-grade `fmv`
+    row from an earlier run that establishes it belongs on the slab watch
+    list.
+
+    Unlike `list_comics`, this is NOT scoped to the wish-list — it returns
+    every comic in the DB. `GET /api/comics/slab-watch` does the wish-list
+    intersection in Python (the wish list is a JSON store, not a SQL table),
+    so this query hands it the FULL raw-high/override map to join against
+    rather than being re-queried per wish item.
+
+    A comic with no raw `fmv` row at all (LEFT JOIN, no match) gets
+    `raw_high=NULL` — it can still enter the watch set by hand override
+    (`slab_watch=1`), never by threshold.
+    """
+    return conn.execute(
+        """
+        SELECT c.id, c.title, c.issue, c.year, c.variant, c.slab_watch,
+               MAX(f.high) AS raw_high
+        FROM comics c
+        LEFT JOIN fmv f ON f.comic_id = c.id AND f.certifier = ?
+        GROUP BY c.id
+        """,
+        (FMV_CERTIFIER_NONE,),
+    ).fetchall()
+
+
+def set_comic_slab_watch(
+    conn: sqlite3.Connection, comic_id: int, slab_watch: int | None
+) -> dict[str, Any] | None:
+    """Write path for `POST /api/comics/{comic_id}/slab-watch` (BUI-950).
+
+    Returns None when `comic_id` names no known book — the route 404s on
+    that, mirroring `stamp_comps_excluded`'s contract. `slab_watch` must be
+    `1` (hand include), `0` (hand exclude), or `None` (clear the override,
+    fall back to `SLAB_WATCH_MIN_FMV`) — FastAPI/pydantic reject any other
+    value at the request-model boundary before this is ever called
+    (`SlabWatchRequest` in models.py), so the only defense-in-depth needed
+    here is the column's own CHECK constraint.
+
+    Self-commits on the shared app singleton connection, same pattern as
+    `stamp_comps_excluded` (a single-row, low-contention update) — not the
+    `write_transaction`/`_write_locked()` machinery used by writes that touch
+    multiple tables or gixen-cli lifecycle state.
+    """
+    row = conn.execute(
+        "SELECT id FROM comics WHERE id = ?", (comic_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    conn.execute(
+        "UPDATE comics SET slab_watch = ? WHERE id = ?", (slab_watch, comic_id)
+    )
+    conn.commit()
+    logger.info(
+        "set_comic_slab_watch: comic_id=%s slab_watch=%r", comic_id, slab_watch
+    )
+    return {"comic_id": comic_id, "slab_watch": slab_watch}
 
 
 # ---------------------------------------------------------------------------

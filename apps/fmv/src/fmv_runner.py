@@ -4954,3 +4954,63 @@ def run_inversion_sweep(*, server_url: str | None) -> None:
                "`comic-fmv --force` on that book or hand-price the bad row. "
                "Note the two grades may have been priced weeks apart, so check "
                "the notes' dates before reading an inversion as a bad pool.")
+
+
+# ─── BUI-950 — the slab watch set (read-only, prints and exits) ──────────────
+
+
+def run_list_slab_watch(*, server_url: str | None) -> None:
+    """Driver for `comic-fmv --list-slab-watch`. Prints and returns.
+
+    Mirrors `run_inversion_sweep`/`run_sentinel_probe`'s report-mode shape
+    (fixed server dependency, exit 1 on a config/read failure, never a
+    misleadingly-clean empty result from a call that never landed) — this is
+    the third such mode, appended rather than folded into any of the
+    existing pricing functions above, so the collection job in BUI-950's
+    next wave and a human running `comic-fmv --list-slab-watch` by hand see
+    exactly the same set `GET /api/comics/slab-watch` serves (the hand
+    override toggle lives at `POST /api/comics/{id}/slab-watch`, and the
+    `SLAB_WATCH_MIN_FMV` threshold is documented on that endpoint — this
+    function only reads and prints, it changes nothing).
+
+    Reporting only: no comps are fetched, nothing is written. Exits 1 on a
+    missing `--server-url`/`COMICS_SERVER_URL` or a failed/malformed server
+    read — never a clean "0 books" printed from a read that never landed.
+    """
+    if not server_url:
+        click.echo("Error: COMICS_SERVER_URL must be set. --list-slab-watch "
+                   "reads the slab watch set from the comics server.",
+                   err=True)
+        sys.exit(1)
+
+    result = _get_json_or_warn(
+        f"{server_url}/api/comics/slab-watch", params={},
+        warn="slab watch set: /api/comics/slab-watch read failed",
+        default=_LOOKUP_FAILED,
+    )
+    if result is _LOOKUP_FAILED or not isinstance(result, dict):
+        click.echo("Error: failed to read the slab watch set from the comics "
+                   "server; no list rendered.", err=True)
+        sys.exit(1)
+
+    items = result.get("items") or []
+    threshold = result.get("threshold")
+    click.echo(
+        f"Slab watch set: {result.get('count', len(items))} book(s) "
+        f"(threshold ${threshold:g})" if isinstance(threshold, (int, float))
+        else f"Slab watch set: {result.get('count', len(items))} book(s)"
+    )
+    if not items:
+        return
+
+    for it in items:
+        label = f"{it.get('title')} #{it.get('issue')}"
+        if it.get("year"):
+            label += f" ({it['year']})"
+        raw_high = it.get("raw_high")
+        raw_high_str = f"${raw_high:g}" if isinstance(raw_high, (int, float)) else "—"
+        click.echo(
+            f"{it.get('comic_id'):>6}  {label[:40]:<40} "
+            f"{it.get('reason', '?'):<9} {it.get('certifier', '?'):<4} "
+            f"raw_high={raw_high_str}"
+        )

@@ -101,10 +101,17 @@ def _print_version(ctx: click.Context, param: click.Parameter, value: bool) -> N
                    "cache-fresh) — run weekly, not per-invocation. Ignores "
                    "--batch. Exits 0 (healthy), 1 (a check failed), or 2 "
                    "(the probe itself could not complete).")
+@click.option("--list-slab-watch", is_flag=True,
+              help="BUI-950: print the slab watch set — wish-list books "
+                   "whose highest raw FMV clears SLAB_WATCH_MIN_FMV, plus "
+                   "any hand override — from GET /api/comics/slab-watch, "
+                   "then exit. Read-only: no comps are fetched, nothing is "
+                   "written. Ignores --batch.")
 def cli(batch_path: str | None, out_path: str | None,
         max_age_days: float, force: bool, grade_window: float | None,
         quiet: bool, brief: bool, server_url: str | None,
-        inversion_sweep: bool, sentinel_probe: bool) -> None:
+        inversion_sweep: bool, sentinel_probe: bool,
+        list_slab_watch: bool) -> None:
     """Compute fair market value for a batch of comics.
 
     Pipeline per book:
@@ -157,6 +164,12 @@ def cli(batch_path: str | None, out_path: str | None,
     # heartbeat ping it attempts on success is best-effort/optional).
     if sentinel_probe:
         sys.exit(sentinel_probe_module.run_sentinel_probe(server_url=server_url))
+    # BUI-950: same "handled before run()'s --batch gate" reason as
+    # --inversion-sweep/--sentinel-probe above — a read-only report mode
+    # with no batch input of its own.
+    if list_slab_watch:
+        fmv_runner.run_list_slab_watch(server_url=server_url)
+        return
     fmv_runner.run(
         batch_path=batch_path,
         out_path=out_path,
