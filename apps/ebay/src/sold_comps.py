@@ -2124,20 +2124,14 @@ def _printing_guard_token() -> "tuple[str | None, str | None]":
        must degrade to "no text" (exactly the outcome a comp's OWN
        description fetch already tolerates — see `_printing_guard`), not
        take down the entire sold-comps run.
-    2. `load_config()` ALSO falls back to reading
-       `~/.config/ebay-fetch/config.json` when the env vars are absent —
-       and that file holds REAL credentials on a dev machine that has ever
-       run `ebay-fetch` interactively (confirmed present on this repo's own
-       dev machine while building this guard). Reusing that fallback here
-       would mean an autouse test fixture that only deletes the env vars
-       (the established pattern — see conftest.py's
-       `_no_printing_guard_credentials`, mirroring `_no_sold_comps_secondary`
-       for the OTHER credential pair this codebase already tests against)
-       fails to isolate the guard from that file, and a pytest run on that
-       machine would make a REAL OAuth token request the instant a test's
-       slab pool happened to contain a price outlier. Env-var-only keeps
-       this credential source exactly as isolable as sold-comps.com's key
-       already is.
+    2. The config-file fallback is read HERE, directly, because production
+       has no env credentials (the Mac Mini's `comic-fmv` -> `ebay-sold-comps`
+       chain relies on `~/.config/ebay-fetch/config.json`). The test
+       fixture `_no_printing_guard_credentials` in conftest.py deletes the
+       env vars AND repoints `ebay_fetch.CONFIG_FILE` at a nonexistent
+       path, so a dev machine holding real credentials in that file never
+       makes a real OAuth request from a test whose slab pool happens to
+       contain a price outlier.
 
     `ebay_fetch.get_token()` itself calls `sys.exit(1)` on bad credentials
     or an exhausted retry budget; `SystemExit` is a `BaseException`, not an
@@ -2149,9 +2143,27 @@ def _printing_guard_token() -> "tuple[str | None, str | None]":
     """
     client_id = os.environ.get("EBAY_CLIENT_ID")
     client_secret = os.environ.get("EBAY_CLIENT_SECRET")
+    environment = os.environ.get("EBAY_ENVIRONMENT", "production")
+    if not client_id or not client_secret:
+        # Production runs (`comic-fmv` shelling out to this script on the
+        # Mac Mini) carry NO env credentials — they live in the same
+        # `~/.config/ebay-fetch/config.json` that `ebay-fetch` itself reads.
+        # Read it directly (never via `load_config()`, which sys.exit(1)s),
+        # through the module attribute so the test fixture can point it at
+        # a nonexistent file. Without this fallback the guard is inert in
+        # production: every outlier "unverified", none ever dropped.
+        try:
+            config_file = ebay_fetch.CONFIG_FILE
+            if config_file.exists():
+                with open(config_file) as f:
+                    cfg = json.load(f)
+                client_id = cfg.get("client_id")
+                client_secret = cfg.get("client_secret")
+                environment = cfg.get("environment", environment)
+        except Exception:  # noqa: BLE001 — unreadable config == no credentials
+            return None, None
     if not client_id or not client_secret:
         return None, None
-    environment = os.environ.get("EBAY_ENVIRONMENT", "production")
     base_url = (ebay_fetch.PRODUCTION_BASE if environment == "production"
                 else ebay_fetch.SANDBOX_BASE)
     try:

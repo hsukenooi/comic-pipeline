@@ -5330,3 +5330,38 @@ class TestPrintingGuardTokenAndDescriptionHelpers:
         text = sc._default_fetch_description({"product_id": "999"})
         assert text == "Second Printing"
         assert calls == [("999", "tok", "https://api.ebay.com")]
+
+
+class TestPrintingGuardCredentialFallback:
+    """BUI-929 follow-up: production has no EBAY_CLIENT_ID/SECRET env vars —
+    the credentials live in ebay-fetch's config file — so the guard must fall
+    back to that file or it never verifies a single outlier."""
+
+    def test_no_env_and_no_config_file_yields_no_token(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(sc.ebay_fetch, "get_token", lambda *a: calls.append(a) or "tok")
+        assert sc._printing_guard_token() == (None, None)
+        assert calls == []
+
+    def test_config_file_supplies_credentials_when_env_absent(self, monkeypatch, tmp_path):
+        cfg = tmp_path / "config.json"
+        cfg.write_text(json.dumps({"client_id": "id-from-file", "client_secret": "secret-from-file",
+                                   "environment": "production"}))
+        monkeypatch.setattr(sc.ebay_fetch, "CONFIG_FILE", cfg)
+        seen = []
+        monkeypatch.setattr(sc.ebay_fetch, "get_token",
+                            lambda cid, sec, base: seen.append((cid, sec, base)) or "tok")
+        token, base = sc._printing_guard_token()
+        assert token == "tok" and base == sc.ebay_fetch.PRODUCTION_BASE
+        assert seen == [("id-from-file", "secret-from-file", sc.ebay_fetch.PRODUCTION_BASE)]
+
+    def test_env_wins_over_config_file(self, monkeypatch, tmp_path):
+        cfg = tmp_path / "config.json"
+        cfg.write_text(json.dumps({"client_id": "file", "client_secret": "file"}))
+        monkeypatch.setattr(sc.ebay_fetch, "CONFIG_FILE", cfg)
+        monkeypatch.setenv("EBAY_CLIENT_ID", "env-id")
+        monkeypatch.setenv("EBAY_CLIENT_SECRET", "env-secret")
+        seen = []
+        monkeypatch.setattr(sc.ebay_fetch, "get_token", lambda cid, sec, base: seen.append(cid) or "tok")
+        assert sc._printing_guard_token()[0] == "tok"
+        assert seen == ["env-id"]
