@@ -64,7 +64,7 @@ def _intent(
 def _insert_comic_fmv(
     conn, *, title="Test Comic", issue="1", year=2000, grade=9.0,
     low=80.0, high=100.0, comps=5, confidence=None, updated_at=None,
-    comic_id=None,
+    comic_id=None, certifier="none", label="universal",
 ):
     """Insert an fmv row at `grade`, creating the comic unless `comic_id` is
     given — pass an existing `comic_id` to add a SECOND grade to the same
@@ -82,21 +82,33 @@ def _insert_comic_fmv(
     if updated_at is None:
         updated_at = datetime.now(timezone.utc).isoformat()
     conn.execute(
-        "INSERT INTO fmv (comic_id, grade, low, high, comps, confidence, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (comic_id, grade, low, high, comps, confidence, updated_at),
+        "INSERT INTO fmv (comic_id, grade, low, high, comps, confidence, "
+        "updated_at, certifier, label) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (comic_id, grade, low, high, comps, confidence, updated_at,
+         certifier, label),
     )
     conn.commit()
+    # BUI-925: keyed on the FULL identity, like everything else now. A
+    # `(comic_id, grade)` lookup here would hand a test the wrong row's id as
+    # soon as it seeds a slab beside a raw one — the helper would then be
+    # reproducing the bug the tests below exist to catch.
     fmv_id = conn.execute(
-        "SELECT id FROM fmv WHERE comic_id=? AND grade=?", (comic_id, grade),
+        "SELECT id FROM fmv WHERE comic_id=? AND grade=? AND certifier=? "
+        "AND label=?",
+        (comic_id, grade, certifier, label),
     ).fetchone()["id"]
     return comic_id, fmv_id
 
 
-def _insert_bid(conn, item_id, max_bid, *, snipe_group=0, status="PENDING"):
+def _insert_bid(
+    conn, item_id, max_bid, *, snipe_group=0, status="PENDING",
+    certifier="none",
+):
     conn.execute(
-        "INSERT INTO bids (item_id, max_bid, snipe_group, status) VALUES (?, ?, ?, ?)",
-        (item_id, max_bid, snipe_group, status),
+        "INSERT INTO bids (item_id, max_bid, snipe_group, status, certifier) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (item_id, max_bid, snipe_group, status, certifier),
     )
     conn.commit()
     return conn.execute(
@@ -688,3 +700,175 @@ def test_ae4_unresolvable_identity_commits_and_ledger_records_unpriced(api):
     unpriced_check = next(c for c in checks if c["code"] == "unpriced_entry")
     assert unpriced_check["outcome"] == "advise"
     assert any("comic_id=999999" in s for s in unpriced_check["data"]["attempted"])
+
+
+# ---------------------------------------------------------------------------
+# BUI-925 — the checks resolve on the FULL price identity
+# ---------------------------------------------------------------------------
+
+
+def _raw_and_slab(conn, *, grade=9.2, raw_high=100.0, slab_high=1000.0):
+    """One comic with a raw band and a CGC band at the SAME grade.
+
+    This is the shape that makes every grade-only lookup ambiguous, and it is
+    the shape the whole ticket is about: a 9.2 raw copy and a 9.2 CGC slab of
+    one book are the same collectible and the same `comics` row, but wildly
+    different prices.
+    """
+    comic_id, raw_fmv = _insert_comic_fmv(
+        conn, title="AE6 Comic", issue="1", year=1964, grade=grade,
+        low=raw_high / 2, high=raw_high,
+    )
+    _comic_id, slab_fmv = _insert_comic_fmv(
+        conn, comic_id=comic_id, grade=grade,
+        low=slab_high / 2, high=slab_high, certifier="cgc",
+    )
+    return comic_id, raw_fmv, slab_fmv
+
+
+def test_over_fmv_sums_the_slab_row_for_a_certified_identity_ae6(conn, monkeypatch):
+    """AE6: a `(comic, 9.2, cgc)` identity is measured against the CGC band.
+
+    Pre-BUI-925 the resolver keyed on `(comic_id, grade)` with `LIMIT 1`, so
+    this bid was measured against whichever 9.2 row SQLite reached first —
+    a $1200 cap read as 12x FMV off the raw row, or as fine off the slab row,
+    with nothing in the payload distinguishing the two cases.
+    """
+    monkeypatch.delenv("POLICY_FMV_MULTIPLE", raising=False)
+    comic_id, _raw, _slab = _raw_and_slab(conn)
+    _insert_bid(conn, "900300001", 1200.0, certifier="cgc")
+    intent = _intent(
+        item_id="900300001", max_bid=1200.0,
+        comic_identities=[
+            {"comic_id": comic_id, "grade": 9.2, "certifier": "cgc"}
+        ],
+    )
+    r = _by_code(policy.check_bid_write(conn, intent), "over_fmv")
+    assert r is not None
+    assert r["data"]["summed_high"] == 1000.0
+    assert r["data"]["ratio"] == pytest.approx(1.2)
+
+
+def test_over_fmv_sums_the_raw_row_when_the_identity_names_no_certifier(conn, monkeypatch):
+    """The same books, the other direction: absent certifier means RAW.
+
+    The twin of the test above — together they prove the resolver is reading
+    the certifier rather than happening to pick the right row.
+    """
+    monkeypatch.delenv("POLICY_FMV_MULTIPLE", raising=False)
+    comic_id, _raw, _slab = _raw_and_slab(conn)
+    _insert_bid(conn, "900300002", 150.0)
+    intent = _intent(
+        item_id="900300002", max_bid=150.0,
+        comic_identities=[{"comic_id": comic_id, "grade": 9.2}],
+    )
+    r = _by_code(policy.check_bid_write(conn, intent), "over_fmv")
+    assert r is not None and r["outcome"] == "advise"
+    assert r["data"]["summed_high"] == 100.0
+    assert r["data"]["ratio"] == pytest.approx(1.5)
+
+
+def test_recomputed_cap_uses_the_slab_row_for_a_certified_identity(conn):
+    """The other money check reads the same resolver, so it moves with it."""
+    comic_id, _raw, _slab = _raw_and_slab(conn)
+    _insert_bid(conn, "900300003", 900.0, certifier="cgc")
+    intent = _intent(
+        item_id="900300003", max_bid=900.0,
+        comic_identities=[
+            {"comic_id": comic_id, "grade": 9.2, "certifier": "cgc"}
+        ],
+    )
+    r = _by_code(policy.check_bid_write(conn, intent), "recomputed_cap")
+    assert r is not None
+    # The cap is a confidence factor x the linked high; whatever the factor,
+    # it has to be derived from the SLAB high, not the $100 raw one.
+    assert [link["high"] for link in r["data"]["per_link"]] == [1000.0]
+    assert r["data"]["recomputed_cap"] > 100.0
+
+
+def test_unrecognized_certifier_on_an_identity_does_not_silently_resolve_raw(conn):
+    """A typo'd certifier must not be downgraded to "raw" behind the operator.
+
+    `psa` is outside the vocabulary, so `LinkFmvRequest` rejects the entry and
+    it lands in `attempted` — the write is advised `unpriced_entry`. Resolving
+    it as raw instead would measure a slab bid against a raw band, which is
+    the expensive direction and, worse, invisible.
+    """
+    comic_id, _raw, _slab = _raw_and_slab(conn)
+    _insert_bid(conn, "900300004", 1200.0)
+    intent = _intent(
+        item_id="900300004", max_bid=1200.0,
+        comic_identities=[
+            {"comic_id": comic_id, "grade": 9.2, "certifier": "psa"}
+        ],
+    )
+    results = policy.check_bid_write(conn, intent)
+    unpriced = _by_code(results, "unpriced_entry")
+    assert unpriced is not None and unpriced["outcome"] == "advise"
+    assert any("failed validation" in a for a in unpriced["data"]["attempted"])
+    assert _by_code(results, "over_fmv") is None
+
+
+def test_patch_arm_scopes_existing_links_to_the_bids_own_certifier(conn, monkeypatch):
+    """An edit on a CGC bid is not measured against a raw link (BUI-925/926).
+
+    The PATCH arm carries no identity of its own, so it takes the bid row's
+    `certifier`. A junction pointing at the raw row (written by the title
+    auto-link, or by a client that predates the column) resolves to nothing
+    here — `unpriced_entry` says so honestly, which is strictly better than
+    an `over_fmv` verdict computed off the wrong market.
+    """
+    monkeypatch.delenv("POLICY_FMV_MULTIPLE", raising=False)
+    _comic_id, raw_fmv, _slab = _raw_and_slab(conn)
+    bid = _insert_bid(conn, "900300005", 1200.0, certifier="cgc")
+    _link(conn, bid["id"], raw_fmv)
+    intent = _intent(
+        item_id="900300005", max_bid=1200.0, trigger="edit", prior_row=bid,
+    )
+    results = policy.check_bid_write(conn, intent)
+    assert _by_code(results, "over_fmv") is None
+    unpriced = _by_code(results, "unpriced_entry")
+    assert unpriced is not None and unpriced["outcome"] == "advise"
+
+
+def test_patch_arm_still_resolves_a_legacy_raw_bids_links(conn, monkeypatch):
+    """The compatibility half: every pre-BUI-926 bid is `certifier='none'`,
+    so the PATCH arm behaves exactly as it did before."""
+    monkeypatch.delenv("POLICY_FMV_MULTIPLE", raising=False)
+    _comic_id, raw_fmv, _slab = _raw_and_slab(conn)
+    bid = _insert_bid(conn, "900300006", 150.0)
+    _link(conn, bid["id"], raw_fmv)
+    intent = _intent(
+        item_id="900300006", max_bid=150.0, trigger="edit", prior_row=bid,
+    )
+    r = _by_code(policy.check_bid_write(conn, intent), "over_fmv")
+    assert r is not None and r["outcome"] == "advise"
+    assert r["data"]["summed_high"] == 100.0
+
+
+def test_duplicate_comic_stays_comic_keyed_and_names_both_certifiers(conn):
+    """A raw copy and a slab of one book are still two snipes on one book.
+
+    `duplicate_comic` deliberately does NOT split on certifier — that would
+    stop it firing for exactly the case an operator most wants to see. What
+    changes is the MESSAGE: it names both certifiers, so "why is this a
+    duplicate, they're different books to me" is answerable from the advisory
+    alone.
+    """
+    comic_id, raw_fmv, _slab = _raw_and_slab(conn)
+    existing = _insert_bid(conn, "900300007", 90.0, snipe_group=3)
+    _link(conn, existing["id"], raw_fmv)
+    intent = _intent(
+        item_id="900300008", max_bid=1200.0, snipe_group=0,
+        comic_identities=[
+            {"comic_id": comic_id, "grade": 9.2, "certifier": "cgc"}
+        ],
+    )
+    r = _by_code(policy.check_bid_write(conn, intent), "duplicate_comic")
+    assert r is not None and r["outcome"] == "advise"
+    assert "900300007" in r["message"]
+    assert "certifier none" in r["message"]
+    assert "certifier cgc" in r["message"]
+    dup = r["data"]["duplicates"][0]
+    assert dup["existing_certifier"] == "none"
+    assert dup["new_certifier"] == "cgc"

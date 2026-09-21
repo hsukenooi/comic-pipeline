@@ -18,7 +18,11 @@ from fastapi.responses import FileResponse
 
 from gixen_overlay.db import (
     DEFAULT_REJECTIONS_WINDOW_HOURS,
+    FMV_CERTIFIER_NONE,
+    FMV_CERTIFIERS,
+    FMV_LABEL_UNIVERSAL,
     JOB_CONTRACTS,
+    certifier_from_title,
     heartbeat_report,
     record_heartbeat,
     multi_issue_lot_reason,
@@ -204,6 +208,7 @@ async def api_list_comics(
     locg_variant_id: int | None = None,
     variant: str | None = None,
     max_age_days: float | None = None,
+    certifier: str | None = None,
 ):
     """List comics enriched with FMV data.
 
@@ -220,7 +225,24 @@ async def api_list_comics(
     an absent query param cannot express "the base edition" (variant IS NULL),
     only "no filter". Both halves are purely additive: a caller that omits the
     param and ignores the extra field sees exactly the previous behavior.
+
+    `certifier` (BUI-925) scopes the join to ONE price market. Unlike every
+    other filter here, an ABSENT parameter is not "no filter" — it means
+    `'none'`, the raw market (see `list_comics`). Every row also returns
+    `certifier`, `label`, and `pricing_basis`, and the mere PRESENCE of the
+    `certifier` key is load-bearing: it is the graded mode's deploy-order
+    probe (plan KTD "Deploy-order guard"), because an old server silently
+    drops the query parameter and would hand a slab target the raw row.
     """
+    if certifier is not None and certifier not in FMV_CERTIFIERS:
+        # 422 rather than the ValueError `list_comics` would raise (a 500):
+        # an unrecognized value is a caller bug, and it must not be
+        # answerable with an empty list, which reads as "this book has no
+        # price on file" and sends the caller off to fetch one.
+        raise HTTPException(
+            status_code=422,
+            detail=f"certifier must be one of: {', '.join(FMV_CERTIFIERS)}",
+        )
     db = request.app.state.db
     rows = list_comics(
         db,
@@ -232,6 +254,7 @@ async def api_list_comics(
         locg_variant_id=locg_variant_id,
         variant=variant,
         max_age_days=max_age_days,
+        certifier=certifier,
     )
     return [dict(r) for r in rows]
 
@@ -247,6 +270,7 @@ async def api_comics_outcomes(
     locg_variant_id: int | None = None,
     window: float = DEFAULT_OUTCOME_GRADE_WINDOW,
     days: float = DEFAULT_OUTCOME_RECENCY_DAYS,
+    certifier: str | None = None,
 ):
     """BUI-286: the user's own resolved auctions for a (comic, grade) window.
 
@@ -263,7 +287,16 @@ async def api_comics_outcomes(
 
     Always both WON and LOST (R2/KTD-3) — see `get_first_party_outcomes` for
     why there is no parameter to narrow this to wins alone.
+
+    `certifier` (BUI-925) scopes the outcomes to one market; absent means the
+    raw one. These rows are merged directly into the caller's comp pool, so a
+    slab win must never surface for a raw book.
     """
+    if certifier is not None and certifier not in FMV_CERTIFIERS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"certifier must be one of: {', '.join(FMV_CERTIFIERS)}",
+        )
     db = request.app.state.db
     rows = get_first_party_outcomes(
         db,
@@ -275,6 +308,7 @@ async def api_comics_outcomes(
         locg_variant_id=locg_variant_id,
         window=window,
         days=days,
+        certifier=certifier or FMV_CERTIFIER_NONE,
     )
     return [dict(r) for r in rows]
 
@@ -427,6 +461,13 @@ async def api_upsert_comic(req: UpsertComicRequest, request: Request):
             ungraded_anchor=req.fmv_ungraded_anchor,
             ungraded_anchor_n=req.fmv_ungraded_anchor_n,
             provenance=req.fmv_provenance,  # BUI-769
+            # BUI-925: the rest of the row IDENTITY. Omitted by an older
+            # client, these arrive here already normalized to the raw
+            # sentinels by the model's validators, so such a write lands on
+            # the raw row and leaves any slab row beside it untouched.
+            certifier=req.certifier,
+            label=req.label,
+            pricing_basis=req.pricing_basis,
         )
         # BUI-659: append an immutable snapshot of the row upsert_fmv just
         # wrote to fmv_history. Runs AFTER upsert_fmv's own commit — the fmv
@@ -446,7 +487,20 @@ async def api_upsert_comic(req: UpsertComicRequest, request: Request):
                 fmv_id, comic_id, req.grade,
             )
     row = db.execute("SELECT * FROM comics WHERE id=?", (comic_id,)).fetchone()
-    return {**dict(row), "comic_id": comic_id, "fmv_id": fmv_id}
+    # BUI-925: echo the identity the row was written at. `upsert_fmv` conflicts
+    # and re-reads on the full `(comic_id, grade, certifier, label)` key, so
+    # the values it stored ARE these normalized ones — no re-SELECT can
+    # disagree. The echo is the graded client's SECOND assertion that it is
+    # talking to a certifier-aware server, never its gate: an old server drops
+    # the unknown key and 200s, so the gate has to be the read-side probe
+    # (`GET /api/comics` returning a `certifier` key) BEFORE any write.
+    return {
+        **dict(row),
+        "comic_id": comic_id,
+        "fmv_id": fmv_id,
+        "certifier": req.certifier,
+        "label": req.label,
+    }
 
 
 @router.post("/api/comics/comps")
@@ -609,6 +663,12 @@ async def api_link_fmv(item_id: str, req: LinkFmvRequest, request: Request):
 
     Tries three resolution strategies in order, narrowed by grade:
 
+    Every strategy narrows by the FULL price identity — grade *and*
+    `(certifier, label)` (BUI-925). A request that names no certifier asks
+    about the raw row and can only ever get the raw row; a request naming
+    `cbcs` 404s when only the CGC row exists at that grade, rather than
+    linking the bid to a different market's price.
+
     1. `comic_id` — direct lookup against `fmv(comic_id, grade)`. Use this
        when the caller already knows the internal DB id (e.g. `fmv_runner`
        threading the id back from `POST /api/comics`).
@@ -666,9 +726,15 @@ async def api_link_fmv(item_id: str, req: LinkFmvRequest, request: Request):
                 locg_variant_id=comic["locg_variant_id"],
             )
             if promoted_comic_id != comic["id"]:
+                # BUI-925: re-resolve on the FULL key. `upsert_comic`'s merge
+                # leaves exactly one fmv row per identity on the survivor, but
+                # "one row at that grade" stopped being true once a slab row
+                # can sit beside a raw one — an unqualified lookup here would
+                # return either, and `fmv_id` is what the bid gets linked to.
                 merged_fmv = db.execute(
-                    "SELECT id FROM fmv WHERE comic_id=? AND grade=?",
-                    (promoted_comic_id, req.grade),
+                    "SELECT id FROM fmv "
+                    "WHERE comic_id=? AND grade=? AND certifier=? AND label=?",
+                    (promoted_comic_id, req.grade, req.certifier, req.label),
                 ).fetchone()
                 if merged_fmv is not None:
                     fmv_id = merged_fmv["id"]
@@ -683,29 +749,43 @@ def _resolve_fmv_for_link(db, req: LinkFmvRequest) -> tuple[Any | None, list[str
     Strategies are tried in order and short-circuit on first hit. The
     attempted list is reported back in the 404 detail so callers can tell
     which inputs were too sparse.
+
+    BUI-925: EVERY strategy carries `(certifier, label)` alongside the grade.
+    Before that, all four queries keyed on `(comic_id|locg_id|title+issue,
+    grade)` and `LIMIT 1` — which, the moment a slab row exists beside a raw
+    one at the same grade, returns whichever SQLite reaches first. This is the
+    resolver `on_bid_write_committed` and both policy arms also call, so the
+    ambiguity would have reached the bid cap, not just the link. The certifier
+    is named in each `attempted` string too, so a 404 says which market it
+    looked in. (The volume ambiguity in the title strategies — two comics rows
+    that differ only by year — is pre-existing and out of scope.)
     """
     attempted: list[str] = []
+    certifier, label = req.certifier, req.label
+    identity = f"certifier={certifier}+label={label}"
 
     if req.comic_id is not None:
-        attempted.append(f"comic_id={req.comic_id}+grade={req.grade}")
+        attempted.append(f"comic_id={req.comic_id}+grade={req.grade}+{identity}")
         row = db.execute(
-            "SELECT id AS fmv_id FROM fmv WHERE comic_id=? AND grade=? LIMIT 1",
-            (req.comic_id, req.grade),
+            "SELECT id AS fmv_id FROM fmv "
+            "WHERE comic_id=? AND grade=? AND certifier=? AND label=? LIMIT 1",
+            (req.comic_id, req.grade, certifier, label),
         ).fetchone()
         if row is not None:
             return row, attempted
 
     if req.locg_id is not None:
-        attempted.append(f"locg_id={req.locg_id}+grade={req.grade}")
+        attempted.append(f"locg_id={req.locg_id}+grade={req.grade}+{identity}")
         row = db.execute(
             """
             SELECT f.id AS fmv_id
             FROM fmv f
             JOIN comics c ON c.id = f.comic_id
             WHERE c.locg_id = ? AND f.grade = ?
+              AND f.certifier = ? AND f.label = ?
             LIMIT 1
             """,
-            (req.locg_id, req.grade),
+            (req.locg_id, req.grade, certifier, label),
         ).fetchone()
         if row is not None:
             return row, attempted
@@ -713,7 +793,8 @@ def _resolve_fmv_for_link(db, req: LinkFmvRequest) -> tuple[Any | None, list[str
     if req.series and req.issue:
         if req.year is not None:
             attempted.append(
-                f"series={req.series!r}+issue={req.issue!r}+year={req.year}+grade={req.grade}"
+                f"series={req.series!r}+issue={req.issue!r}+year={req.year}"
+                f"+grade={req.grade}+{identity}"
             )
             row = db.execute(
                 """
@@ -722,14 +803,15 @@ def _resolve_fmv_for_link(db, req: LinkFmvRequest) -> tuple[Any | None, list[str
                 JOIN comics c ON c.id = f.comic_id
                 WHERE LOWER(c.title) = LOWER(?) AND c.issue = ?
                   AND c.year = ? AND f.grade = ?
+                  AND f.certifier = ? AND f.label = ?
                 LIMIT 1
                 """,
-                (req.series, req.issue, req.year, req.grade),
+                (req.series, req.issue, req.year, req.grade, certifier, label),
             ).fetchone()
             if row is not None:
                 return row, attempted
         attempted.append(
-            f"series={req.series!r}+issue={req.issue!r}+grade={req.grade}"
+            f"series={req.series!r}+issue={req.issue!r}+grade={req.grade}+{identity}"
         )
         row = db.execute(
             """
@@ -738,9 +820,10 @@ def _resolve_fmv_for_link(db, req: LinkFmvRequest) -> tuple[Any | None, list[str
             JOIN comics c ON c.id = f.comic_id
             WHERE LOWER(c.title) = LOWER(?) AND c.issue = ?
               AND f.grade = ?
+              AND f.certifier = ? AND f.label = ?
             LIMIT 1
             """,
-            (req.series, req.issue, req.grade),
+            (req.series, req.issue, req.grade, certifier, label),
         ).fetchone()
         if row is not None:
             return row, attempted
@@ -896,6 +979,8 @@ async def api_verify(req: VerifyRequest, request: Request):
       - `no_bid`         — no bids row for item_id
       - `no_comic`       — no comic linked via bid_fmvs (or via locg_id if given)
       - `no_fmv_at_grade`— comic exists but no fmv row at the requested grade
+      - `no_fmv_at_certifier` — a linked fmv row IS at the requested grade, but
+        only at a DIFFERENT certifier/label (BUI-925)
       - `needs_manual`   — fmv flagged (BUI-86/BUI-132): intentionally unpriceable, hand-price it
       - `fmv_stub`       — fmv row exists but low/high are NULL (`/comic:fmv` never ran)
       - `partial`        — fmv populated but bid_fmvs junction or bids.fmv_id is missing
@@ -913,7 +998,10 @@ async def api_verify(req: VerifyRequest, request: Request):
     results = []
 
     for item in req.items:
-        result = _verify_one(db, item.item_id, item.grade, item.locg_id)
+        result = _verify_one(
+            db, item.item_id, item.grade, item.locg_id,
+            certifier=item.certifier, label=item.label,
+        )
         results.append(result)
 
     summary = {
@@ -950,17 +1038,91 @@ _VERDICT_GUIDANCE: dict[str, str] = {
     "fully_linked": "",
 }
 
+# BUI-925: the needs_manual reasons the GRADED pricing path emits, each with
+# the one thing to do about it. Kept separate from `_VERDICT_GUIDANCE` for the
+# same reason `needs_manual` itself is templated: the advice depends on the
+# reason, not the verdict. A reason with no entry here falls back to the raw
+# path's interpolation/CGC-proxy advice below, which is the honest default —
+# it is what every pre-BUI-925 reason (`one_sided`, `too_wide`, `too_sparse`,
+# `variant_dropped`) means.
+_NEEDS_MANUAL_REASON_ADVICE: dict[str, str] = {
+    "label_signature_series": (
+        "a Signature Series slab prices off its own market, not the Universal "
+        "one — hand-price it from SS comps at this grade"
+    ),
+    "label_qualified": (
+        "a Qualified (green label) slab is not comparable to Universal comps "
+        "— hand-price it"
+    ),
+    "label_restored": (
+        "a Restored (purple label) slab is not comparable to Universal comps "
+        "— hand-price it"
+    ),
+    "label_conserved": (
+        "a Conserved slab is not comparable to Universal comps — hand-price it"
+    ),
+    "certifier_other": (
+        "only CGC and CBCS are priced automatically; this book names a third "
+        "grader — hand-price it"
+    ),
+    "no_certifier_pool": (
+        "no sold slab comps exist at this certifier — hand-price it, or price "
+        "the raw copy and apply your own slab premium"
+    ),
+    "ladder_too_thin": (
+        "fewer than three usable grade rungs, so there is nothing to "
+        "interpolate between — hand-price it"
+    ),
+    "ladder_non_monotone": (
+        "the neighbouring grade rungs are not monotone around this grade, so "
+        "an interpolation would be meaningless — hand-price it"
+    ),
+    "outside_ladder": (
+        "this grade sits outside the observed rungs; extrapolating past them "
+        "is never done — hand-price it"
+    ),
+    "graded_mode_unavailable": (
+        "certified books are not auto-priced yet (the graded FMV mode has not "
+        "shipped) — hand-price it from slab comps at this certifier and grade"
+    ),
+}
 
-def _guidance_for(verdict: str, flag_reason: str | None = None) -> str:
+
+def _guidance_for(
+    verdict: str,
+    flag_reason: str | None = None,
+    *,
+    wanted: str | None = None,
+    found: str | None = None,
+) -> str:
     """Return the one-line guidance string for a verdict.
 
     `needs_manual` is templated (it embeds the row's `flag_reason`), so it's
-    built here rather than stored in `_VERDICT_GUIDANCE`. Every other verdict
-    `_verify_one` can emit — including `fully_linked`, which maps to `""` —
-    has a static entry in that dict; there is no verdict this function can
-    silently return `None` for.
+    built here rather than stored in `_VERDICT_GUIDANCE`. `no_fmv_at_certifier`
+    (BUI-925) is templated for the same reason — its whole job is to NAME the
+    two identities, since "there is a price at this grade, but for a different
+    market" is only actionable once you can see which market you have and
+    which one you asked for. Every other verdict `_verify_one` can emit —
+    including `fully_linked`, which maps to `""` — has a static entry in
+    `_VERDICT_GUIDANCE`; there is no verdict this function can silently
+    return `None` for.
     """
+    if verdict == "no_fmv_at_certifier":
+        return (
+            f"This bid is linked to a priced FMV row at the right grade, but "
+            f"for `{found}` — you asked about `{wanted}`. A slab and a raw "
+            f"copy are different markets, so that price is not this book's. "
+            f"Run `/comic:fmv` at `{wanted}`, or re-link the bid if the "
+            f"certifier on the listing is wrong."
+        )
     if verdict == "needs_manual":
+        specific = _NEEDS_MANUAL_REASON_ADVICE.get(flag_reason or "")
+        if specific is not None:
+            return (
+                f"This book is flagged `needs_manual` (reason: `{flag_reason}`) "
+                f"— {specific}. Do NOT re-run `/comic:fmv`; it will just "
+                f"re-flag it."
+            )
         return (
             f"This book is flagged `needs_manual` (reason: `{flag_reason}`) — "
             "its comp pool can't be auto-priced. Hand-price it via grade-curve "
@@ -970,18 +1132,68 @@ def _guidance_for(verdict: str, flag_reason: str | None = None) -> str:
     return _VERDICT_GUIDANCE[verdict]
 
 
-def _verify_one(db, item_id: str, grade: float | None, locg_id: int | None) -> dict:
+def _no_fmv_at_certifier(base: dict, bid, wrong, certifier: str, label: str) -> dict:
+    """BUI-925: the `no_fmv_at_certifier` result for one verify item.
+
+    `wrong` is a junction row that would have been THE match but for its
+    certifier/label. It is reported (its comic_id/fmv_id are echoed) rather
+    than hidden, because the operator's next move — re-price at this
+    certifier, or re-link the bid — depends on seeing which row is actually
+    on the bid.
+    """
+    return {
+        **base,
+        "verdict": "no_fmv_at_certifier",
+        "missing": [
+            (
+                f"fmv row at grade {base['grade']}"
+                if base["grade"] is not None else "fmv row at any grade"
+            )
+            + f" for certifier {certifier!r} label {label!r}"
+        ],
+        "found_certifier": wrong["certifier"],
+        "found_label": wrong["label"],
+        "comic_id": wrong["comic_id"],
+        "fmv_id": wrong["fmv_id"],
+        "bid_fmv_id": bid["fmv_id"],
+        "guidance": _guidance_for(
+            "no_fmv_at_certifier",
+            wanted=f"{certifier}/{label}",
+            found=f"{wrong['certifier']}/{wrong['label']}",
+        ),
+    }
+
+
+def _verify_one(
+    db,
+    item_id: str,
+    grade: float | None,
+    locg_id: int | None,
+    certifier: str = FMV_CERTIFIER_NONE,
+    label: str = FMV_LABEL_UNIVERSAL,
+) -> dict:
     """Walk bid → bid_fmvs → fmv → comics for one working-list item.
 
     The grade-matched fmv is the canonical pivot: we look for a row whose
     grade exactly matches the requested grade (when given). `bids.fmv_id` is
     a denormalized pointer that should agree with the primary `bid_fmvs` row
     — we check both because past incidents (PER-90) showed they can drift.
+
+    BUI-925: the pivot is the FULL identity — grade AND `(certifier, label)`.
+    A junction row at the right grade but a different certifier or label is
+    NOT a match; it yields the distinct `no_fmv_at_certifier` verdict. Without
+    that, a raw row wrongly linked to a CGC bid verified `fully_linked` — the
+    verdict that tells the buy flow "this cap is backed by a real price for
+    this book", while the number came from a different market. Defaults are
+    the raw sentinels, so an old client's payload (no certifier) verifies
+    exactly as before: every pre-BUI-924 fmv row is `none`/`universal`.
     """
     base: dict[str, Any] = {
         "item_id": item_id,
         "grade": grade,
         "locg_id": locg_id,
+        "certifier": certifier,
+        "label": label,
         "missing": [],
     }
 
@@ -1004,6 +1216,7 @@ def _verify_one(db, item_id: str, grade: float | None, locg_id: int | None) -> d
     fmv_query = (
         "SELECT bf.fmv_id, bf.is_primary, "
         "       f.grade, f.low, f.high, f.flag_reason, "
+        "       f.certifier, f.label, "
         "       c.id AS comic_id, c.title, c.issue, c.year, c.locg_id "
         "FROM bid_fmvs bf "
         "JOIN fmv f ON f.id = bf.fmv_id "
@@ -1012,13 +1225,40 @@ def _verify_one(db, item_id: str, grade: float | None, locg_id: int | None) -> d
     )
     fmv_rows = db.execute(fmv_query, (bid["id"],)).fetchall()
 
+    # BUI-925: the identity half of "is this the right row". Applied to the
+    # locg_id and grade strategies alike — a canonical locg_id match on a raw
+    # row is still the wrong price for a CGC bid.
+    def _identity_matches(r) -> bool:
+        return r["certifier"] == certifier and r["label"] == label
+
     # Match strategy: prefer locg_id (canonical), fall back to grade.
     match = None
     if locg_id is not None:
         match = next((r for r in fmv_rows if r["locg_id"] == locg_id
-                      and (grade is None or r["grade"] == grade)), None)
+                      and (grade is None or r["grade"] == grade)
+                      and _identity_matches(r)), None)
     if match is None and grade is not None:
-        match = next((r for r in fmv_rows if r["grade"] == grade), None)
+        match = next((r for r in fmv_rows
+                      if r["grade"] == grade and _identity_matches(r)), None)
+    if match is None and grade is not None:
+        # BUI-925: a linked row IS at the requested grade, but for another
+        # certifier/label. Reported BEFORE the last-resort primary fallback
+        # below, which would otherwise hand that row to the fully_linked /
+        # fmv_stub ladder and call a slab price this raw bid's price (or the
+        # reverse). This branch is the one that has to fire, not no_comic and
+        # not no_fmv_at_grade: the book and the grade are both right, and only
+        # the market is wrong, which is a different fix.
+        wrong = next((r for r in fmv_rows if r["grade"] == grade), None)
+        if wrong is not None:
+            return _no_fmv_at_certifier(base, bid, wrong, certifier, label)
+    if match is None and grade is None and fmv_rows:
+        # Same failure with no grade to pivot on: the caller named a certifier,
+        # and NOTHING linked to this bid is at it. Without this the last-resort
+        # fallback below would hand back the primary row — a raw price — and
+        # the ladder would verdict it `fully_linked` for a CGC item.
+        if not any(_identity_matches(r) for r in fmv_rows):
+            wrong = next((r for r in fmv_rows if r["is_primary"]), fmv_rows[0])
+            return _no_fmv_at_certifier(base, bid, wrong, certifier, label)
     if match is None and fmv_rows:
         # Last resort: take the primary, so we can still report partial states.
         match = next((r for r in fmv_rows if r["is_primary"]), fmv_rows[0])
@@ -1194,6 +1434,18 @@ def _build_comics_row(row):
         "current_bid_numeric": current_bid_numeric,
         # Comic enrichment.
         "cond_grade": item["primary_grade"],
+        # BUI-925: the rest of the primary book's price identity, beside the
+        # grade it qualifies. A `9.2` on the dashboard means two different
+        # prices depending on these, so shipping the grade without them is
+        # shipping an ambiguous number. This is the linked FMV ROW's identity
+        # (`primary_certifier`), not `bids.certifier` (BUI-926) — the two can
+        # disagree, and that disagreement is precisely what verify reports as
+        # `no_fmv_at_certifier`, so the row shows the identity the displayed
+        # band actually came from. Built here, in the ONE row builder both
+        # /api/comics/snipes and /api/comics/history call, so the BUI-50
+        # parity rule holds structurally rather than by review.
+        "certifier": item["primary_certifier"],
+        "label": item["primary_label"],
         "cond_extra_count": max(0, lot_count - 1),
         "fmv_low": fmv_low,
         "fmv_high": fmv_high,
@@ -1230,7 +1482,13 @@ _COMICS_AGGREGATES = """
     -- non-primary issues don't drive the displayed anchor).
     MAX(CASE WHEN bf.is_primary = 1 THEN f.flag_reason END) AS primary_flag_reason,
     MAX(CASE WHEN bf.is_primary = 1 THEN f.ungraded_anchor END) AS primary_ungraded_anchor,
-    MAX(CASE WHEN bf.is_primary = 1 THEN f.ungraded_anchor_n END) AS primary_ungraded_anchor_n
+    MAX(CASE WHEN bf.is_primary = 1 THEN f.ungraded_anchor_n END) AS primary_ungraded_anchor_n,
+    -- BUI-925: the primary book's certifier and label. Same one-scalar-per-
+    -- group shape as primary_grade above, and in this SHARED fragment
+    -- precisely so the snipes and history endpoints cannot drift apart on it
+    -- (docs/solutions/ui-bugs/purged-snipes-shown-as-won-2026-06-01.md).
+    MAX(CASE WHEN bf.is_primary = 1 THEN f.certifier END) AS primary_certifier,
+    MAX(CASE WHEN bf.is_primary = 1 THEN f.label END) AS primary_label
 """
 
 
@@ -1313,9 +1571,21 @@ async def api_comics_history(request: Request):
 async def api_seller_reliability(request: Request, seller: str):
     """Average grade deviation for one seller (BUI-78).
 
-    `avg_deviation = AVG(seller_grade - photo_grade)` over the seller's bids that
-    have BOTH grades and are not tombstoned (status NOT IN PURGED/REMOVED — the
-    BUI-50 parity rule). Positive = the seller over-states condition. The key is
+    `avg_deviation = AVG(seller_grade - photo_grade)` over the seller's RAW
+    bids that have BOTH grades and are not tombstoned (status NOT IN
+    PURGED/REMOVED — the BUI-50 parity rule). Positive = the seller
+    over-states condition.
+
+    BUI-925: `certifier = 'none'` scopes this to raw bids. The whole metric is
+    "how far does this seller's own condition claim sit from what the photos
+    show" — a certified book carries a third party's grade instead, so it has
+    no seller claim to deviate and would only add noise (BUI-926 already stops
+    a certified add from writing `seller_grade`/`photo_grade` at all, making
+    this belt-and-suspenders for rows written any other way). Legacy bids keep
+    counting: the column is `NOT NULL DEFAULT 'none'`, so every pre-migration
+    row is inside this filter, not silently dropped out of it.
+
+    The key is
     the lowercased eBay username (matching what the buy flow writes at INSERT);
     auction outcome is irrelevant to grading accuracy, so all live/terminal
     statuses count. No min-sample cutoff — the caller (/comic:buy) decides.
@@ -1336,6 +1606,7 @@ async def api_seller_reliability(request: Request, seller: str):
         WHERE LOWER(seller) = ?
           AND seller_grade IS NOT NULL
           AND photo_grade IS NOT NULL
+          AND certifier = '{FMV_CERTIFIER_NONE}'
           AND status NOT IN ({TOMBSTONE_STATUSES_SQL})
         """,
         (key,),
@@ -1360,10 +1631,30 @@ def _link_issue_to_bid(
     locg_id,
     locg_variant_id,
     is_primary: bool,
+    certifier: str = FMV_CERTIFIER_NONE,
+    label: str = FMV_LABEL_UNIVERSAL,
 ) -> bool:
     """Upsert one comic/issue and link it to `bid_id` via fmv_id.
 
     Returns True iff a bids -> bid_fmvs junction row was written for this issue.
+
+    BUI-925: `certifier`/`label` are the rest of the `fmv` identity and are
+    applied to EVERY lookup here, including the no-grade `any_valued`
+    fallback. This is the title-derived auto-link that fires on every bid
+    write, so it is the widest path by which a bid can acquire a price it was
+    never priced against: with `certifier` unqualified, a raw-titled bid on a
+    book whose raw row is an unpriced stub and whose CGC row is priced would
+    have linked to the CGC band and set its cap off the slab market. The
+    caller derives the certifier from the eBay title (`certifier_from_title`),
+    which yields `'none'` for the overwhelming majority of listings — and
+    `'none'` can only ever match a raw row.
+
+    `label` has no title parser yet (U1 puts label tokens in `ebay-fetch`,
+    which this path does not run), so it stays `'universal'`. That is the
+    fail-closed choice, not an oversight: a Signature Series slab whose title
+    this path reads will simply not match the SS row, and the worst case is an
+    unpriced stub at `(cgc, universal)` — never an SS price on a Universal
+    bid, or the reverse.
     """
     comic_id = upsert_comic(
         db,
@@ -1382,9 +1673,10 @@ def _link_issue_to_bid(
         # so this is correct for free and mirrors the no-grade branch.
         existing_valued = db.execute(
             "SELECT f.id FROM fmv f "
-            "WHERE f.comic_id=? AND f.grade=? AND f.low IS NOT NULL "
+            "WHERE f.comic_id=? AND f.grade=? AND f.certifier=? AND f.label=? "
+            "AND f.low IS NOT NULL "
             "LIMIT 1",
-            (comic_id, grade),
+            (comic_id, grade, certifier, label),
         ).fetchone()
         if existing_valued:
             fmv_id = existing_valued["id"]
@@ -1394,14 +1686,21 @@ def _link_issue_to_bid(
                 comic_id=comic_id,
                 grade=grade,
                 notes=f"auto-linked from eBay title (confidence={confidence})",
+                certifier=certifier,
+                label=label,
             )
         link_fmv_to_bid(db, bid_id, fmv_id, is_primary=is_primary)
         return True
     else:
-        # No parseable grade — link to any existing valued FMV for this comic.
+        # No parseable grade — link to any existing valued FMV for this comic
+        # AT THIS CERTIFIER (BUI-925). "Any grade" was always loose; "any
+        # market" is not survivable, because this branch is exactly the one
+        # that runs when the title gave us the least information.
         any_valued = db.execute(
-            "SELECT f.id FROM fmv f WHERE f.comic_id=? AND f.low IS NOT NULL LIMIT 1",
-            (comic_id,),
+            "SELECT f.id FROM fmv f "
+            "WHERE f.comic_id=? AND f.certifier=? AND f.label=? "
+            "AND f.low IS NOT NULL LIMIT 1",
+            (comic_id, certifier, label),
         ).fetchone()
         if any_valued:
             link_fmv_to_bid(db, bid_id, any_valued["id"], is_primary=is_primary)
@@ -1462,6 +1761,12 @@ async def api_extract_comics(request: Request):
             if primary_resolution is not None:
                 year = primary_resolution.year
 
+        # BUI-925: the listing's own claim about which market this book
+        # trades in. `bids.ebay_title` is all this path has (it never sees the
+        # eBay item specifics `ebay-fetch --identify` reads), so an unmatched
+        # title is 'none' and the link stays on the raw row.
+        title_certifier = certifier_from_title(title)
+
         try:
             wrote_junction = False
             for idx, issue in enumerate(issues):
@@ -1476,6 +1781,7 @@ async def api_extract_comics(request: Request):
                     locg_id=primary_resolution.locg_id if (primary_resolution and idx == 0) else None,
                     locg_variant_id=primary_resolution.locg_variant_id if (primary_resolution and idx == 0) else None,
                     is_primary=(idx == 0),
+                    certifier=title_certifier,
                 ):
                     wrote_junction = True
             if wrote_junction:
