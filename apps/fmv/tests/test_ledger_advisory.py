@@ -308,6 +308,24 @@ class TestPoolDepthFloor:
         assert out["source"] == "ledger-advisory"
         assert out["fmv"]["n"] >= fmv_runner.LEDGER_ADVISORY_MIN_POOL
 
+    def test_a_cross_provider_duplicate_row_collapses_to_one_comp(
+            self, server_url):
+        """BUI-936: two ledger rows for the SAME sale — same price/grade/
+        sold-date (and therefore title, which `_ledger_row` derives from
+        grade alone) but a different `product_id`, as if sold-comps.com and
+        SerpApi had each posted their own observation of it — must count as
+        ONE comp, not two. Three rows on the wire, only two genuine sales:
+        under the floor, same as `test_a_two_comp_ledger_pool_stays_a_plain_
+        fetch_err` above."""
+        pool = [
+            _ledger_row(1, price=45.0, grade=8.0, sold_date="2026-06-15"),
+            _ledger_row(2, price=45.0, grade=8.0, sold_date="2026-06-15"),
+            _ledger_row(3, price=50.0, grade=8.0, sold_date="2026-06-29"),
+        ]
+        out, _ = _price_with_ledger(pool, server_url=server_url)
+        assert out["source"] == "error"
+        assert out["fmv"] is None
+
     def test_a_pool_shape_flag_stays_a_plain_fetch_err(self, server_url):
         """A ledger pool that `compute_fmv` flags needs-manual emits no band:
         the ticket's 'what happens when the ledger is also thin' answered
