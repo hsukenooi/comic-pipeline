@@ -4,9 +4,11 @@ import json
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
 import requests
 
 import ebay_fetch
@@ -19,6 +21,21 @@ def _ok_response(content=b"fake-image-bytes"):
     resp.raise_for_status.return_value = None
     resp.content = content
     return resp
+
+
+def _iso_in(hours):
+    """An `itemEndDate` *hours* from now, in the Browse API's ISO-8601 shape."""
+    end = datetime.now(timezone.utc) + timedelta(hours=hours)
+    return end.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def _printed_tier(line):
+    """The tier token from a grade-photos line, without BUI-917's reason.
+
+    This is exactly what grade.md Step 2 is told to read: the token after
+    `tier: `, ignoring any trailing `(...)`.
+    """
+    return line.rsplit("— tier: ", 1)[1].split(" (")[0].strip()
 
 
 # ============================================================
@@ -353,12 +370,20 @@ class TestStaleFileCleanup:
 
 class TestMainStdoutContract:
     def _fake_item(self):
+        # BUI-917: a realistic live-auction shape — buyingOptions, an
+        # itemEndDate, and an age signal. The pre-BUI-917 fixture carried none
+        # of them, which now reads as "end time unknown" (ambiguous → rigor).
+        # A modern book half an hour from close at $5.00 is the genuine cheap
+        # case: its price has essentially finished moving.
         return {
             "title": "Fantastic Four #52",
             "image": {"imageUrl": "https://example.com/main.jpg"},
             "additionalImages": [],
+            "buyingOptions": ["AUCTION"],
             "currentBidPrice": {"value": "5.00"},
             "bidCount": 1,
+            "itemEndDate": _iso_in(0.5),
+            "localizedAspects": [{"name": "Publication Year", "value": "2019"}],
         }
 
     def test_happy_path_line_format(self, tmp_path, capsys):
@@ -367,10 +392,16 @@ class TestMainStdoutContract:
                 with patch("grade_photos.fetch_item_with_status", return_value=(self._fake_item(), 200)):
                     with patch("grade_photos._download_image"):
                         grade_photos.main(["123", "--workdir", str(tmp_path)])
-        out = capsys.readouterr().out
-        assert out.strip() == (
-            "comic-1: Fantastic Four #52 — 1 images — current bid $5.00 (1 bids) — tier: cheap"
+        out = capsys.readouterr().out.strip()
+        # Everything up to the tier is the historical contract, byte for byte.
+        # BUI-917 appends the estimate that produced the tier; the exact
+        # minutes-left text is clock-dependent, so match its shape, not its
+        # digits.
+        assert out.startswith(
+            "comic-1: Fantastic Four #52 — 1 images — current bid $5.00 (1 bids) — "
+            "tier: cheap (estimated: close ≤ $7.50 ($5.00 ×1.5, "
         )
+        assert out.endswith("m left, modern 2019))")
 
     def test_fetch_failed_line_format(self, tmp_path, capsys):
         """BUI-147: a fetch failure must print FETCH FAILED, never a
@@ -416,12 +447,19 @@ class TestMainStdoutContract:
 
 class TestValueTier:
     def _item_with_price(self, value):
+        # BUI-917: held at "a modern book half an hour from close" so these
+        # tests keep testing what they were written for — the threshold
+        # comparison itself — rather than the estimated-close fallback, which
+        # has its own class below.
         return {
             "title": "Fantastic Four #52",
             "image": {"imageUrl": "https://example.com/main.jpg"},
             "additionalImages": [],
+            "buyingOptions": ["AUCTION"],
             "currentBidPrice": {"value": str(value)},
             "bidCount": 1,
+            "itemEndDate": _iso_in(0.5),
+            "localizedAspects": [{"name": "Publication Year", "value": "2019"}],
         }
 
     def _run(self, tmp_path, item, capsys):
@@ -434,7 +472,7 @@ class TestValueTier:
 
     def test_price_below_threshold_is_cheap(self, tmp_path, capsys):
         out = self._run(tmp_path, self._item_with_price("5.00"), capsys)
-        assert out.endswith("— tier: cheap")
+        assert _printed_tier(out) == "cheap"
 
     def test_price_at_threshold_is_not_cheap(self, tmp_path, capsys):
         """The gate is inclusive at the boundary: current_price >= VALUE_THRESHOLD
@@ -447,10 +485,13 @@ class TestValueTier:
         out = self._run(tmp_path, self._item_with_price("42.50"), capsys)
         assert out.endswith("— tier: not-cheap")
 
-    def test_unknown_price_is_cheap(self, tmp_path, capsys):
-        """No price field at all (current_price is None) counts as cheap,
-        same as a below-threshold price (BUI-165's "absent = below threshold"
-        rule, now expressed as the printed tier instead of doc prose)."""
+    def test_unknown_price_is_not_cheap(self, tmp_path, capsys):
+        """BUI-917 flips BUI-165's "absent price = below threshold = cheap".
+
+        No price field at all is the emptiest signal there is — it says nothing
+        about what the book is worth — and the safe error on the rigor split is
+        over-rigor, so it now prints not-cheap with the reason `price unknown`.
+        """
         item = {
             "title": "Fantastic Four #52",
             "image": {"imageUrl": "https://example.com/main.jpg"},
@@ -458,7 +499,330 @@ class TestValueTier:
         }
         out = self._run(tmp_path, item, capsys)
         assert "current bid n/a" in out
-        assert out.endswith("— tier: cheap")
+        assert out.endswith("— tier: not-cheap (price unknown)")
+
+
+# ============================================================
+# BUI-917: on a live auction the tier is an ESTIMATED CLOSE, not
+# the current bid — a young low bid is not evidence of low worth
+# ============================================================
+
+
+def _tier(price, *, is_auction=True, hours_left=96.5, bid_count=0,
+          age="modern", age_label="2019"):
+    """decide_tier() with the BUI-917 signals defaulted to a young auction."""
+    return grade_photos.decide_tier(
+        price, is_auction=is_auction, hours_left=hours_left,
+        bid_count=bid_count, age=age, age_label=age_label,
+    )
+
+
+class TestEstimatedCloseTier:
+    """The reported incident and the case that must stay cheap.
+
+    The incident (BUI-917): Fantastic Four #29, a 1964 Silver Age Marvel, at
+    $4.25 with 2 bids and 4 days left printed `cheap` — so a book that closes
+    well above the $25 threshold got one thin grader instead of a panel, purely
+    because it was graded early in its auction.
+    """
+
+    FF29 = dict(hours_left=96.5, bid_count=2, age="vintage", age_label="1964")
+
+    def test_ff29_is_not_cheap_and_says_why(self):
+        tier, why = _tier(4.25, **self.FF29)
+        assert tier == "not-cheap"
+        assert why == "estimated: vintage 1964, 4d left"
+
+    def test_ff29_was_cheap_under_the_old_current_price_rule(self):
+        """Pins the regression: the old gate was `price < VALUE_THRESHOLD`, and
+        $4.25 satisfies it. The fix is not a threshold change — the threshold is
+        untouched — it is what gets compared against it."""
+        assert 4.25 < grade_photos.VALUE_THRESHOLD
+        assert _tier(4.25, **self.FF29)[0] == "not-cheap"
+
+    @pytest.mark.parametrize("hours_left", [1.5, 6.0, 24.0, 96.5, 240.0])
+    def test_vintage_is_not_cheap_however_early_it_is_graded(self, hours_left):
+        """The Done-when: the rigor a book gets must not depend on WHEN in its
+        auction it happens to be graded."""
+        tier, why = _tier(4.25, hours_left=hours_left, bid_count=2,
+                          age="vintage", age_label="1964")
+        assert tier == "not-cheap"
+        assert "vintage 1964" in why
+
+    def test_modern_book_closing_within_the_hour_with_no_bids_stays_cheap(self):
+        """The genuine cheap case — a modern book, low price, ending in under an
+        hour, nobody bidding. Its price HAS essentially finished moving, so the
+        cheap tier survives; a gate that escalated this would just be rigor with
+        extra steps."""
+        tier, why = _tier(4.99, hours_left=0.67, bid_count=0,
+                          age="modern", age_label="2021")
+        assert tier == "cheap"
+        assert why == (
+            "estimated: close ≤ $6.24 ($4.99 ×1.25, 40m left, modern 2021)"
+        )
+
+    def test_vintage_inside_the_final_hour_falls_back_to_the_projection(self):
+        """BUI-917's own framing: "the same book graded an hour before close
+        would tier correctly". Inside that window the bid IS the evidence, so
+        the age veto lifts rather than pinning every vintage book to rigor
+        forever."""
+        tier, why = _tier(4.25, hours_left=0.5, bid_count=2,
+                          age="vintage", age_label="1964")
+        assert tier == "cheap"
+        assert "close ≤ $6.38" in why
+
+    def test_unknown_age_on_a_young_auction_is_not_cheap(self):
+        """Ambiguous resolves to over-rigor: one extra grader is the cheap
+        error, a thin grade on a valuable book is the expensive one."""
+        tier, why = _tier(4.25, age="unknown", age_label=None)
+        assert tier == "not-cheap"
+        assert why == "estimated: age unknown, 4d left"
+
+    def test_unknown_age_inside_the_final_hour_still_names_the_gap(self):
+        """The veto lifts near the close, so this row can be cheap — the reason
+        has to say the age was unreadable, or a wrong `cheap` leaves no trace."""
+        tier, why = _tier(5.00, hours_left=0.5, bid_count=0,
+                          age="unknown", age_label=None)
+        assert tier == "cheap"
+        assert why.endswith("30m left, age unknown)")
+
+    def test_unknown_end_time_is_not_cheap(self):
+        assert _tier(4.25, hours_left=None) == (
+            "not-cheap", "estimated: end time unknown",
+        )
+
+    def test_modern_young_auction_projected_over_the_threshold_is_not_cheap(self):
+        """$18 with three days to run clears $25 on any honest headroom."""
+        tier, why = _tier(18.00, hours_left=72.0, bid_count=0)
+        assert tier == "not-cheap"
+        assert "close ≤ $54.00" in why
+
+    def test_modern_young_auction_projected_under_the_threshold_is_cheap(self):
+        tier, why = _tier(4.00, hours_left=96.5, bid_count=0)
+        assert tier == "cheap"
+        assert "close ≤ $12.00" in why
+
+    def test_existing_bids_widen_the_headroom(self):
+        """Same book, same time left: an auction with bidders has demonstrated
+        competing demand, so its price is given more room to run."""
+        assert _tier(6.00, bid_count=0)[0] == "cheap"
+        assert _tier(6.00, bid_count=1)[0] == "not-cheap"
+
+    def test_absent_bid_count_counts_as_no_bids(self):
+        assert _tier(6.00, bid_count=None)[0] == "cheap"
+
+    # ── the paths BUI-917 must leave alone ──────────────────────────────
+
+    def test_bin_below_threshold_is_cheap_with_no_estimate(self):
+        """A fixed-price listing's price IS its close price, so there is nothing
+        to estimate — even for a vintage book, and even with days on the clock.
+        The line stays byte-identical to its pre-BUI-917 form (why is None)."""
+        assert _tier(10.00, is_auction=False, age="vintage", age_label="1964") == (
+            "cheap", None,
+        )
+
+    def test_bin_at_or_above_threshold_is_not_cheap_with_no_estimate(self):
+        assert _tier(40.00, is_auction=False) == ("not-cheap", None)
+
+    @pytest.mark.parametrize("price", [25.00, 42.50])
+    def test_price_already_over_the_line_needs_no_estimate(self, price):
+        """The existing above-threshold path is untouched: no estimate runs, no
+        reason is printed, whichever way the price is still moving."""
+        assert _tier(price, age="vintage", age_label="1964") == ("not-cheap", None)
+
+    def test_price_unknown_is_not_cheap(self):
+        assert _tier(None) == ("not-cheap", "price unknown")
+
+
+class TestAgeSignal:
+    """The age signal reads the listing only — no FMV exists yet at grade time
+    (in /comic:buy the grade step runs BEFORE fmv)."""
+
+    def test_title_year_alone_reads_vintage(self):
+        assert grade_photos._age_signal("Fantastic Four #29 (1964) Marvel", {}) == (
+            "vintage", "1964",
+        )
+
+    def test_publication_year_aspect_alone_reads_vintage(self):
+        assert grade_photos._age_signal(
+            "Fantastic Four #29", {"Publication Year": "1964"},
+        ) == ("vintage", "1964")
+
+    def test_a_slab_year_in_the_title_cannot_launder_the_cover_year(self):
+        """The EARLIEST plausible year decides, so a certification year sitting
+        beside the cover year can't make a Silver Age book look modern."""
+        assert grade_photos._age_signal(
+            "Fantastic Four #29 (1964) CGC 6.0 (2024 grading)", {},
+        ) == ("vintage", "1964")
+
+    def test_pre_modern_era_aspect_overrides_an_all_modern_year_set(self):
+        """A lone title year can be a printing or certification date; the
+        seller's own Era tag is about the book."""
+        assert grade_photos._age_signal(
+            "Fantastic Four #29 slabbed 2024",
+            {"Era": "Silver Age (1956-69)"},
+        ) == ("vintage", "silver age")
+
+    def test_modern_needs_every_year_seen_to_be_modern_age(self):
+        assert grade_photos._age_signal(
+            "Amazing Spider-Man (2021) #1", {"Publication Year": "2021"},
+        ) == ("modern", "2021")
+
+    def test_modern_era_aspect_with_no_year_reads_modern(self):
+        assert grade_photos._age_signal(
+            "Amazing Spider-Man #1", {"Era": "Modern Age (1992-Now)"},
+        ) == ("modern", "Modern Age")
+
+    def test_no_year_and_no_era_is_unknown(self):
+        assert grade_photos._age_signal("Fantastic Four #29 VF", {}) == ("unknown", None)
+
+    def test_1992_is_the_boundary(self):
+        assert grade_photos._age_signal("Book (1991) #1", {})[0] == "vintage"
+        assert grade_photos._age_signal("Book (1992) #1", {})[0] == "modern"
+
+    @pytest.mark.parametrize("raw", [None, {}, "nonsense", [None, 3, {"value": "x"}]])
+    def test_malformed_aspects_degrade_to_unknown_rather_than_raising(self, raw):
+        """A malformed aspects block must cost this item its age signal (i.e.
+        get it rigor), never abort the batch."""
+        assert grade_photos._age_signal("No year here", grade_photos._flatten_aspects(raw)) == (
+            "unknown", None,
+        )
+
+
+class TestHoursRemaining:
+    def test_future_end_date(self):
+        hours = grade_photos._hours_remaining(_iso_in(4))
+        assert 3.9 < hours < 4.1
+
+    def test_past_end_date_clamps_to_zero(self):
+        assert grade_photos._hours_remaining(_iso_in(-5)) == 0.0
+
+    @pytest.mark.parametrize("raw", [None, "", "not-a-date", 12345])
+    def test_missing_or_unparseable_is_none(self, raw):
+        """None means "we can't tell how much room this price has", which
+        decide_tier() treats as ambiguous → not-cheap."""
+        assert grade_photos._hours_remaining(raw) is None
+
+    def test_naive_timestamp_is_read_as_utc(self):
+        naive = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%S")
+        hours = grade_photos._hours_remaining(naive)
+        assert 2.9 < hours < 3.1
+
+
+class TestEstimatedCloseTierEndToEnd:
+    """The same two cases through main(), proving the signals survive the
+    Browse-API shape (buyingOptions / itemEndDate / localizedAspects)."""
+
+    def _run(self, tmp_path, item, capsys):
+        with patch("grade_photos.load_config", return_value=("id", "secret", ebay_fetch.PRODUCTION_BASE)):
+            with patch("grade_photos.get_token", return_value="fake-token"):
+                with patch("grade_photos.fetch_item_with_status", return_value=(item, 200)):
+                    with patch("grade_photos._download_image"):
+                        grade_photos.main(["123", "--workdir", str(tmp_path)])
+        return capsys.readouterr().out.strip()
+
+    def test_ff29_listing_prints_not_cheap_with_the_reason(self, tmp_path, capsys):
+        item = {
+            "title": "Fantastic Four #29 (1964) Marvel Comics Silver Age",
+            "image": {"imageUrl": "https://example.com/main.jpg"},
+            "additionalImages": [{"imageUrl": "https://example.com/1.jpg"}],
+            "buyingOptions": ["AUCTION"],
+            "currentBidPrice": {"value": "4.25"},
+            "bidCount": 2,
+            "itemEndDate": _iso_in(96.5),
+            "localizedAspects": [
+                {"name": "Publication Year", "value": "1964"},
+                {"name": "Era", "value": "Silver Age (1956-69)"},
+            ],
+        }
+        out = self._run(tmp_path, item, capsys)
+        assert "current bid $4.25 (2 bids)" in out
+        assert _printed_tier(out) == "not-cheap"
+        assert out.endswith("— tier: not-cheap (estimated: vintage 1964, 4d left)")
+
+    def test_modern_listing_closing_soon_prints_cheap(self, tmp_path, capsys):
+        item = {
+            "title": "Amazing Spider-Man (2021) #1 NM",
+            "image": {"imageUrl": "https://example.com/main.jpg"},
+            "additionalImages": [],
+            "buyingOptions": ["AUCTION"],
+            "currentBidPrice": {"value": "4.99"},
+            "bidCount": 0,
+            "itemEndDate": _iso_in(0.6),
+            "localizedAspects": [{"name": "Publication Year", "value": "2021"}],
+        }
+        out = self._run(tmp_path, item, capsys)
+        assert _printed_tier(out) == "cheap"
+        assert "estimated: close ≤ $6.24 ($4.99 ×1.25," in out
+
+    def test_bin_listing_line_carries_no_estimate(self, tmp_path, capsys):
+        """A vintage BIN under the threshold: the price is final, so the line is
+        exactly what it was before BUI-917."""
+        item = {
+            "title": "Fantastic Four #29 (1964) Marvel Comics",
+            "image": {"imageUrl": "https://example.com/main.jpg"},
+            "additionalImages": [],
+            "buyingOptions": ["FIXED_PRICE"],
+            "price": {"value": "9.99"},
+            "itemEndDate": _iso_in(240),
+            "localizedAspects": [{"name": "Publication Year", "value": "1964"}],
+        }
+        out = self._run(tmp_path, item, capsys)
+        assert out.endswith("current bid $9.99 (None bids) — tier: cheap")
+
+    def test_auction_without_buying_options_is_still_treated_as_an_auction(self, tmp_path, capsys):
+        """A response missing buyingOptions must not be mistaken for a BIN whose
+        price is final."""
+        item = {
+            "title": "Fantastic Four #29 (1964) Marvel Comics",
+            "image": {"imageUrl": "https://example.com/main.jpg"},
+            "additionalImages": [],
+            "currentBidPrice": {"value": "4.25"},
+            "bidCount": 2,
+            "itemEndDate": _iso_in(96.5),
+            "localizedAspects": [],
+        }
+        out = self._run(tmp_path, item, capsys)
+        assert _printed_tier(out) == "not-cheap"
+        assert "estimated: vintage 1964" in out
+
+    @pytest.mark.parametrize("buying_options", [None, [], ["SOMETHING_NEW"], "FIXED_PRICE"])
+    def test_unrecognised_buying_options_default_to_auction_not_to_a_final_price(
+        self, tmp_path, capsys, buying_options,
+    ):
+        """A malformed/partial response must not let a young vintage auction be
+        declared final-priced (and therefore cheap) on no evidence. Note the
+        string "FIXED_PRICE" — not a list — is malformed, and must NOT be read
+        as a BIN by substring luck."""
+        item = {
+            "title": "Fantastic Four #29 (1964) Marvel Comics",
+            "image": {"imageUrl": "https://example.com/main.jpg"},
+            "additionalImages": [],
+            "price": {"value": "4.25"},
+            "itemEndDate": _iso_in(96.5),
+            "localizedAspects": [],
+        }
+        if buying_options is not None:
+            item["buyingOptions"] = buying_options
+        out = self._run(tmp_path, item, capsys)
+        assert _printed_tier(out) == "not-cheap"
+
+    def test_an_auction_that_also_offers_buy_it_now_is_still_an_auction(self, tmp_path, capsys):
+        """buyingOptions carries BOTH options on an auction with a BIN price —
+        the price can still move, so the estimate must run."""
+        item = {
+            "title": "Fantastic Four #29 (1964) Marvel Comics",
+            "image": {"imageUrl": "https://example.com/main.jpg"},
+            "additionalImages": [],
+            "buyingOptions": ["FIXED_PRICE", "AUCTION"],
+            "currentBidPrice": {"value": "4.25"},
+            "bidCount": 2,
+            "itemEndDate": _iso_in(96.5),
+            "localizedAspects": [{"name": "Publication Year", "value": "1964"}],
+        }
+        out = self._run(tmp_path, item, capsys)
+        assert _printed_tier(out) == "not-cheap"
+        assert "estimated: vintage 1964" in out
 
 
 # ============================================================

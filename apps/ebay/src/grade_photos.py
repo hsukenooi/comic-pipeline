@@ -80,9 +80,21 @@ item:
     comic-1: <title> — <N> images — current bid $12.34 (3 bids) — tier: cheap
 
 BUI-511: the trailing `tier: cheap|not-cheap` is this script's value-gate
-verdict (see VALUE_THRESHOLD below) — cheap when current_price is below the
-threshold or unknown, not-cheap when at/above it. grade.md's Step 2 reads
-this field directly rather than re-deriving the split from current_price.
+verdict (see VALUE_THRESHOLD below); grade.md's Step 2 reads this field
+directly rather than re-deriving the split from current_price.
+
+BUI-917: the tier is no longer a bare `current_price vs VALUE_THRESHOLD`
+comparison. On a live auction that price is where bidding has *reached*, not
+where it closes, so a low one graded early said `cheap` about a book worth far
+more. When the price is not yet final the tier comes from an estimated close
+instead (see decide_tier() below), and the line carries the reason:
+
+    comic-1: <title> — 6 images — current bid $4.25 (2 bids) — tier: not-cheap (estimated: vintage 1964, 4d left)
+
+A row the price alone decides — at/above the threshold, or a fixed-price (BIN)
+listing below it — prints the bare `tier: cheap|not-cheap` with no
+parenthetical, exactly as it did before. So a reader (or a parser) takes the
+token after `tier: ` and ignores any trailing `(...)`.
 
 BUI-440: when --workdir is not given, each run gets its own fresh directory
 under /tmp/comic-grading (via tempfile.mkdtemp) instead of writing straight
@@ -99,13 +111,22 @@ this script) so grade.md's Step 2 can address each comic's images at
 
 import argparse
 import importlib.metadata
+import math
 import shutil
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
 
+# BUI-917: the two year helpers the value gate's age signal needs. Both are
+# pure (comic_identity_year imports nothing but `re`), so this keeps the
+# module's import-time-safety contract — no config read, no network. The
+# leading underscores are the repo's existing convention for these two:
+# comic_identity.py imports `_title_paren_years`/`_all_title_years` from here
+# the same way (see that module's "Import direction" docstring).
+from comic_identity_year import _all_title_years, _coerce_publication_year
 from ebay_fetch import fetch_item_with_status, get_token, load_config
 
 
@@ -146,10 +167,252 @@ _DEFAULT_WORKDIR_ROOT = Path("/tmp/comic-grading")
 # grade.md's Step 2 used to re-derive the cheap/not-cheap split from prose
 # comparing `current_price` against a `VALUE_THRESHOLD` restated in the doc;
 # now main() prints the tier directly (see the per-comic line below) and
-# grade.md just reads it. cheap = current_price below this, OR unknown
-# (current_price is None); not-cheap = current_price at/above this. Keep this
-# in sync with grade.md's escalation value trigger if it ever changes.
+# grade.md just reads it. Keep this in sync with grade.md's escalation value
+# trigger if it ever changes. BUI-917: what the tier COMPARES against this
+# threshold is no longer always `current_price` — see decide_tier() below.
 VALUE_THRESHOLD = 25.0
+
+# ─── BUI-917: the estimated-close value gate ────────────────────────────────
+# The bug: a live auction's `current_price` is where bidding has reached, not
+# where it closes. A 1964 Fantastic Four #29 at $4.25 with 2 bids and 4 days
+# left printed `cheap`, so a Silver Age Marvel that closes well above $25 got
+# one thin grader instead of a panel — the rigor a book received depended on
+# WHEN in its auction it happened to be graded rather than on what it is worth.
+#
+# The asymmetry that sets every constant here: over-rigor costs one extra
+# grader agent; under-rigor puts a single thin grade on a book worth real money
+# and then feeds that grade to the bid cap. So every ambiguous signal resolves
+# to `not-cheap`, and nothing below is tuned to protect the batching saving.
+# No FMV is available to lean on — in /comic:buy the grade step runs BEFORE
+# fmv, so the gate has only what the Browse API response already carries:
+# listing type, end time, bid count, and the book's age.
+
+# Inside this window an auction has essentially finished discovering its price,
+# which is BUI-917's own framing ("the same book graded an hour before close
+# would tier correctly"). Outside it, a low current bid is not evidence of low
+# worth, and the age veto in decide_tier() applies.
+_PRICE_NEARLY_FINAL_HOURS = 1.0
+
+# eBay's `Era` item-specific splits at "Modern Age (1992-Now)", and
+# comic_identity.era_mismatch already cuts at 1992 (BUI-231) — reuse that
+# boundary rather than inventing a second one. A pre-1992 book's worth lives in
+# its scarcity, which a four-day-old bid says nothing about.
+_MODERN_AGE_START_YEAR = 1992
+
+# The `Era` values eBay offers below Modern Age. Matched case-insensitively as
+# substrings so "Silver Age (1956-69)" hits.
+_PRE_MODERN_ERA_MARKERS = (
+    "golden age",
+    "atom age",
+    "silver age",
+    "bronze age",
+    "copper age",
+)
+
+# How far a live auction's current price is still allowed to travel before it
+# closes, by time remaining and by whether anyone has bid yet. These are
+# deliberately generous UPPER BOUNDS on headroom, not calibrated predictions:
+# the gate's job is to refuse to call a book cheap while its price can still
+# cross VALUE_THRESHOLD. An auction that already has bids has demonstrated
+# competing demand and gets the wider column; a no-bid price is just the
+# seller's opening ask, which only has to survive to the close. These are the
+# knob to turn (and the only one) if the tier over-escalates in practice.
+_CLOSE_HEADROOM = (
+    # (hours remaining <=, multiplier with no bids, multiplier with >=1 bid)
+    (1.0, 1.25, 1.5),
+    (6.0, 1.5, 2.5),
+    (24.0, 2.0, 3.5),
+    (math.inf, 3.0, 6.0),
+)
+
+
+def _flatten_aspects(raw):
+    """Browse API ``localizedAspects`` (a list of {name, value}) → a flat dict.
+
+    Mirrors the same one-liner in ebay_fetch.parse_item(); duplicated because
+    it is inline there, not a function. Tolerates None, a non-list, and
+    non-dict entries: a malformed aspects block must degrade to "age unknown"
+    (which the gate treats as not-cheap), never raise and take out the item.
+    """
+    aspects = {}
+    if not isinstance(raw, list):
+        return aspects
+    for entry in raw:
+        if isinstance(entry, dict) and entry.get("name"):
+            aspects[entry["name"]] = entry.get("value")
+    return aspects
+
+
+def _age_signal(title, aspects):
+    """Classify the book's age from the listing alone.
+
+    Returns ``(age, label)`` where age is "vintage" (pre-Modern Age),
+    "modern", or "unknown", and label is a short human string for the printed
+    reason (a year, or the era name) — None when age is "unknown".
+
+    Three signals, all already in the item response and all optional:
+      - item-specifics ``Publication Year`` (parsed through
+        comic_identity_year's shared 1930-2035 plausibility window, so a SKU
+        or a garbage number can't pose as a year),
+      - every plausible year in the title (``_all_title_years``),
+      - the ``Era`` item-specific ("Silver Age (1956-69)", "Modern Age
+        (1992-Now)").
+
+    Resolved conservatively, in the over-rigor direction:
+      - The EARLIEST year any signal offers decides, so a title carrying both
+        the cover year and a slab/grading year ("... 1964 ... CGC 2024") reads
+        1964, and a "modern" verdict needs EVERY year seen to be >= 1992.
+      - A pre-Modern ``Era`` overrides an all-modern year set: the seller's era
+        tag describes the book, whereas a lone title year can be a printing or
+        certification date.
+      - No year and no usable ``Era`` is "unknown" — ambiguous, which the gate
+        resolves as not-cheap on an auction whose price is not yet final.
+    """
+    years = []
+    pub_year = _coerce_publication_year(aspects)
+    if pub_year is not None:
+        years.append(pub_year)
+    years.extend(_all_title_years(title or ""))
+
+    era = str(aspects.get("Era") or "").lower()
+    era_label = era.split("(")[0].strip() or "pre-Modern Age"
+    pre_modern_era = any(marker in era for marker in _PRE_MODERN_ERA_MARKERS)
+
+    if years:
+        earliest = min(years)
+        if earliest < _MODERN_AGE_START_YEAR:
+            return "vintage", str(earliest)
+        if pre_modern_era:
+            return "vintage", era_label
+        return "modern", str(earliest)
+    if pre_modern_era:
+        return "vintage", era_label
+    if "modern age" in era:
+        return "modern", "Modern Age"
+    return "unknown", None
+
+
+def _hours_remaining(end_iso, now=None):
+    """Hours from *now* until an ISO-8601 ``itemEndDate``, or None if unusable.
+
+    None means "we cannot tell how much room this price still has", which the
+    gate treats as ambiguous. An end date already past clamps to 0.0 — the
+    price is final. A naive timestamp is read as UTC (eBay always sends the
+    zone, so this is belt-and-braces against a fixture or a proxy dropping it).
+    """
+    if not end_iso:
+        return None
+    try:
+        end = datetime.fromisoformat(str(end_iso).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    now = now or datetime.now(timezone.utc)
+    return max((end - now).total_seconds() / 3600.0, 0.0)
+
+
+def _format_remaining(hours):
+    """Time remaining as a short human string for the printed reason."""
+    if hours >= 48:
+        return f"{int(hours // 24)}d left"
+    if hours >= 1:
+        return f"{hours:.0f}h left"
+    return f"{int(round(hours * 60))}m left"
+
+
+def _close_headroom(hours_left, bid_count):
+    """The headroom multiplier from _CLOSE_HEADROOM for this auction's state."""
+    contested = bool(bid_count)  # None (absent) and 0 both mean "no bids yet"
+    for max_hours, no_bids, with_bids in _CLOSE_HEADROOM:
+        if hours_left <= max_hours:
+            return with_bids if contested else no_bids
+    return _CLOSE_HEADROOM[-1][2]  # unreachable (last bound is inf); safe default
+
+
+def decide_tier(price, *, is_auction, hours_left, bid_count, age, age_label):
+    """The value gate: return ``(tier, why)`` for one listing.
+
+    ``tier`` is "cheap" or "not-cheap" — grade.md Step 2's rigor split.
+    ``why`` is a short parenthetical to print beside it when the ESTIMATE
+    decided, and None when the price alone did (which keeps those lines
+    byte-identical to their pre-BUI-917 form).
+
+    The rule, in order, deterministic and price-final-first:
+
+      1. No price at all → not-cheap. (BUI-917 flips BUI-165's "absent price
+         counts as below the threshold": an absent price is the emptiest
+         signal there is, and the safe error is over-rigor.)
+      2. price >= VALUE_THRESHOLD → not-cheap. Unchanged: a price already over
+         the line needs no estimate, whichever direction it is still moving.
+      3. Not a live auction (fixed-price/BIN) → cheap. Unchanged: a BIN price
+         IS the close price, so there is nothing to estimate.
+      4. A live auction below the threshold — the BUI-917 case. Its price is
+         not yet final, so:
+           a. End time unknown → not-cheap. We can't tell how much room the
+              price has left; ambiguous resolves to rigor.
+           b. More than _PRICE_NEARLY_FINAL_HOURS left, and the book is
+              vintage or its age is unknown → not-cheap. This is the FF #29
+              class: for a pre-Modern book no multiple of a young auction's
+              bid is a trustworthy estimate of the close, and a book whose age
+              we cannot read gets the same benefit of the doubt.
+           c. Otherwise compare an estimated close — price x the
+              _CLOSE_HEADROOM multiplier for the time left and the bid count —
+              against VALUE_THRESHOLD. At/above it, not-cheap; below it,
+              cheap. Inside the nearly-final window that multiplier is small,
+              so a modern book minutes from close at a low price with no bids
+              stays cheap, which is the whole point of keeping a cheap tier.
+
+    Note what is NOT used: `bid_count` only ever says whether the auction is
+    contested (>=1 bid), never how fast it is moving — the Browse API gives no
+    bid timestamps, so 2 bids could be two openers or a war, and reading
+    velocity into the count would be invention.
+
+    Two residuals this deliberately accepts, both able to print `cheap` on a
+    book that closes high. Named here so a later reader doesn't have to
+    rediscover them:
+
+      - **The final-hour snipe.** Inside _PRICE_NEARLY_FINAL_HOURS the age veto
+        lifts, so a vintage book still sitting at $4.25 with 20 minutes left
+        reads cheap — and a competing sniper can take it to $200 in the last
+        seconds. This is BUI-917's own stated position ("the same book graded an
+        hour before close would tier correctly"); narrowing the window (or
+        dropping the lift entirely) is the one-line change if a real run shows
+        it costing a grade.
+      - **A modern key.** A first appearance at $4 with days to run projects
+        under the threshold and reads cheap, because nothing in the listing says
+        the book is hot and no FMV exists yet at grade time. Two existing guards
+        cover it from outside: grade.md Step 2 counts a known key as not-cheap
+        regardless of the printed tier, and a certified (slabbed) listing is
+        skipped by /comic:grade altogether (BUI-923) — which also keeps the
+        "slab year, no cover year" listings that would misread as modern away
+        from this gate.
+    """
+    if price is None:
+        return "not-cheap", "price unknown"
+    if price >= VALUE_THRESHOLD:
+        return "not-cheap", None
+    if not is_auction:
+        return "cheap", None
+    if hours_left is None:
+        return "not-cheap", "estimated: end time unknown"
+    remaining = _format_remaining(hours_left)
+    if hours_left > _PRICE_NEARLY_FINAL_HOURS:
+        if age == "vintage":
+            return "not-cheap", f"estimated: vintage {age_label}, {remaining}"
+        if age == "unknown":
+            return "not-cheap", f"estimated: age unknown, {remaining}"
+    headroom = _close_headroom(hours_left, bid_count)
+    projected = price * headroom
+    # The age is named even though the projection doesn't use it: a wrong
+    # `cheap` hides behind a wrong age read, so put it on the line where a
+    # human reviewing the run can see it.
+    age_note = f", {age} {age_label}" if age_label else f", age {age}"
+    why = (
+        f"estimated: close ≤ ${projected:.2f} "
+        f"(${price:.2f} ×{headroom:g}, {remaining}{age_note})"
+    )
+    return ("not-cheap" if projected >= VALUE_THRESHOLD else "cheap"), why
 
 
 class TokenExpiredError(RuntimeError):
@@ -263,11 +526,35 @@ def download_listing(token, item_id, outdir, base_url):
         current_price = float(price_node.get("value")) if price_node.get("value") is not None else None
     except (TypeError, ValueError):
         current_price = None
+    # BUI-917: the estimated-close signals for the value gate. All three come
+    # from the same response — still no extra request.
+    buying_options = data.get("buyingOptions")
+    if not isinstance(buying_options, list):
+        buying_options = []
+    # "AUCTION" is checked first because an auction that also offers Buy It Now
+    # carries BOTH options, and it is still an auction whose price can move.
+    if "AUCTION" in buying_options:
+        is_auction = True
+    elif "FIXED_PRICE" in buying_options:
+        is_auction = False
+    else:
+        # buyingOptions missing or unrecognised — a malformed/partial response.
+        # Default to "auction", because that is the branch that cannot be wrong
+        # in the expensive direction: it routes the row through the estimate
+        # (and with no usable end date, straight to not-cheap), whereas
+        # defaulting to "fixed price" would declare a price final on no
+        # evidence and could hand a young vintage auction a single thin grader.
+        is_auction = True
+    age, age_label = _age_signal(data.get("title", ""), _flatten_aspects(data.get("localizedAspects")))
     return {
         "title": data.get("title", item_id),
         "image_count": len(imgs),
         "current_price": current_price,            # USD float: live bid or BIN price; None only if absent
         "bid_count": data.get("bidCount"),         # int for auctions, None otherwise
+        "is_auction": is_auction,                  # True when the price can still move
+        "end_date_iso": data.get("itemEndDate"),   # raw ISO 8601; None when absent
+        "age": age,                                # "vintage" | "modern" | "unknown"
+        "age_label": age_label,                    # short label for the printed reason
     }
 
 
@@ -414,13 +701,23 @@ def main(argv=None):
         consecutive_post_refresh_401s = 0
         price = result["current_price"]
         price_str = f"${price:.2f}" if price is not None else "n/a"
-        # BUI-511: cheap = below VALUE_THRESHOLD or unknown price; not-cheap =
-        # at/above it. Printed so grade.md's Step 2 value gate reads the tier
-        # directly instead of re-deriving the split from current_price itself.
-        tier = "cheap" if price is None or price < VALUE_THRESHOLD else "not-cheap"
+        # BUI-511: the tier is printed here so grade.md's Step 2 value gate
+        # reads it directly instead of re-deriving the split from
+        # current_price. BUI-917: it is now decide_tier()'s verdict — an
+        # estimated close, not the raw current price — and carries the reason
+        # when the estimate (rather than a final price) decided it.
+        tier, why = decide_tier(
+            price,
+            is_auction=result["is_auction"],
+            hours_left=_hours_remaining(result["end_date_iso"]),
+            bid_count=result["bid_count"],
+            age=result["age"],
+            age_label=result["age_label"],
+        )
         print(
             f"{label}: {result['title']} — {result['image_count']} images — "
-            f"current bid {price_str} ({result['bid_count']} bids) — tier: {tier}"
+            f"current bid {price_str} ({result['bid_count']} bids) — "
+            f"tier: {tier}{f' ({why})' if why else ''}"
         )
     return 0
 
