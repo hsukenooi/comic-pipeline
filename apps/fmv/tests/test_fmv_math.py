@@ -1892,6 +1892,7 @@ class TestGradedPageQuality:
     def test_one_matching_comp_falls_back_and_says_so(self):
         out = _graded(self._pool(1), 9.4, page_quality="white")
         assert out["page_quality_fallback"] is True
+        assert out["page_quality_fallback_reason"] == "too_few_matches"
         assert out["pool_n"] == 5
 
     def test_unknown_target_quality_is_not_a_filter(self):
@@ -1901,7 +1902,161 @@ class TestGradedPageQuality:
         for value in (None, "unknown"):
             out = _graded(self._pool(2), 9.4, page_quality=value)
             assert out["page_quality_fallback"] is False
+            assert out["page_quality_fallback_reason"] is None
             assert out["pool_n"] == 6
+
+
+class TestGradedPageQualityLadderFallback:
+    """BUI-939: page-quality scoping must not starve the ladder tier.
+
+    The exact tier's "prefer same-quality comps" rule (`TestGradedPageQuality`
+    above) is a DIFFERENT rule from this one. That rule decides which pool
+    the EXACT bucket is read from; this one decides which pool the LADDER's
+    neighbour rungs are read from, and only once the exact tier has already
+    said no on the scoped pool.
+    """
+
+    def test_real_invincible_1_94_white_case_widens_and_prices(self):
+        """The BUI-939 case: Invincible #1 CGC 9.4 white pages, 9 live comps
+        of which 3 are white (matching >= 2, so the OLD `too_few_matches`
+        fallback never fires — this is the starvation-only bug). Scoped to
+        white the ladder sees only the 9.2 and 9.8 rungs (2, one short of
+        `GRADED_LADDER_MIN_RUNGS`) and used to refuse `ladder_too_thin`
+        outright, even though the unscoped pool has a 9.6 rung too."""
+        white = [_slab_comp(610, 9.2, age=5, page_quality="white",
+                            product_id="w1"),
+                 _slab_comp(3609, 9.4, age=6, page_quality="white",
+                            product_id="w2"),
+                 _slab_comp(5000, 9.8, age=7, page_quality="white",
+                            product_id="w3")]
+        other = [_slab_comp(700, 9.2, age=8, page_quality="cream",
+                            product_id="c1"),
+                 _slab_comp(750, 9.2, age=9, page_quality="cream",
+                            product_id="c2"),
+                 _slab_comp(3400, 9.4, age=10, page_quality="cream",
+                           product_id="c3"),
+                 _slab_comp(4200, 9.6, age=11, page_quality="cream",
+                            product_id="c4"),
+                 _slab_comp(4300, 9.6, age=12, page_quality="cream",
+                            product_id="c5"),
+                 _slab_comp(4800, 9.8, age=13, page_quality="cream",
+                            product_id="c6")]
+        pool = white + other
+        assert len(pool) == 9  # matches the real 9-live-comp pool
+
+        # Proof the bug is real: scoped to white alone, only 2 rungs remain
+        # (9.2, 9.8) besides the target — one short of GRADED_LADDER_MIN_RUNGS.
+        scoped, fell_back, _ = fm._graded_page_quality_filter(white + other,
+                                                               "white")
+        assert fell_back is False  # 3 matches >= 2, old rule doesn't fire
+        rungs = {c["grade"] for c in scoped} - {9.4}
+        assert rungs == {9.2, 9.8}
+
+        out = _graded(pool, 9.4, page_quality="white")
+        assert out["flag_reason"] is None
+        assert out["pricing_basis"] == "ladder"
+        assert out["page_quality_fallback"] is True
+        assert out["page_quality_fallback_reason"] == "ladder_starved"
+        assert out["pool_n"] == 9
+        # The bracket comes from the WIDENED (9.2/9.6) pair, not the
+        # scoped-only (9.2/9.8) pair — proof the full pool, not just the two
+        # white-only rungs, fed the ladder.
+        assert out["graded_ladder"]["grade_below"] == 9.2
+        assert out["graded_ladder"]["grade_above"] == 9.6
+
+    def test_scoped_pool_pricing_direct_is_never_widened(self):
+        """Direct pricing still prefers same-quality comps even when the
+        UNSCOPED pool's ladder rungs (irrelevant here) would be starved: the
+        exact tier is decided, and satisfied, before the starvation check
+        ever runs."""
+        white = [_slab_comp(3000, 9.4, age=1, page_quality="white",
+                            product_id="w1"),
+                 _slab_comp(3200, 9.4, age=2, page_quality="white",
+                            product_id="w2")]
+        # Only one other rung exists at all, so the unscoped pool's ladder
+        # (were it ever consulted) would itself be starved.
+        other = [_slab_comp(900, 9.2, age=3, page_quality="cream",
+                            product_id="c1")]
+        out = _graded(white + other, 9.4, page_quality="white")
+        assert out["pricing_basis"] == "direct"
+        assert out["page_quality_fallback"] is False
+        assert out["page_quality_fallback_reason"] is None
+        assert out["pool_n"] == 2
+        assert out["fmv_low"] >= 3000
+
+    def test_scoped_pool_at_exactly_min_rungs_is_not_widened(self):
+        """Exactly `GRADED_LADDER_MIN_RUNGS` (3) anchor-eligible rungs in the
+        scoped pool is enough — the fallback triggers on FEWER than that,
+        not on the boundary itself."""
+        white = [_slab_comp(500, 9.0, age=1, page_quality="white",
+                            product_id="w1"),
+                 _slab_comp(900, 9.2, age=2, page_quality="white",
+                            product_id="w2"),
+                 _slab_comp(4200, 9.6, age=3, page_quality="white",
+                            product_id="w3"),
+                 _slab_comp(5000, 9.8, age=4, page_quality="white",
+                            product_id="w4")]
+        # A decoy rung of a different quality the widen must NOT need to
+        # reach for — if it leaked in, the bracket would come from 9.6/9.9-ish
+        # neighbours built from a mixed pool instead of the pure-white one.
+        other = [_slab_comp(50000, 9.4, age=5, page_quality="cream",
+                            product_id="c1")]
+        out = _graded(white + other, 9.4, page_quality="white")
+        assert out["flag_reason"] is None
+        assert out["pricing_basis"] == "ladder"
+        assert out["page_quality_fallback"] is False
+        assert out["page_quality_fallback_reason"] is None
+        assert out["pool_n"] == 4
+        assert out["graded_ladder"]["grade_below"] == 9.2
+        assert out["graded_ladder"]["grade_above"] == 9.6
+
+    def test_still_refuses_when_the_full_pool_is_also_starved(self):
+        """Widening can't invent rungs that don't exist: if the WHOLE pool
+        (not just the scoped one) has fewer than `GRADED_LADDER_MIN_RUNGS`
+        anchor-eligible rungs, the book still refuses `ladder_too_thin` —
+        just after trying the wider pool first, not instead of it."""
+        white = [_slab_comp(610, 9.2, age=1, page_quality="white",
+                            product_id="w1"),
+                 _slab_comp(5000, 9.8, age=2, page_quality="white",
+                            product_id="w2")]
+        # Adds no new rung (same 9.2 grade as an existing white comp), so the
+        # unscoped pool still only has 2 rungs besides the target.
+        other = [_slab_comp(700, 9.2, age=3, page_quality="cream",
+                            product_id="c1")]
+        out = _graded(white + other, 9.4, page_quality="white")
+        assert out["flag_reason"] == "ladder_too_thin"
+        assert out["page_quality_fallback"] is True
+        assert out["page_quality_fallback_reason"] == "ladder_starved"
+        assert out["pool_n"] == 3  # widened to the full 3-comp pool
+
+    def test_target_rung_is_the_only_matching_rung(self):
+        """All the same-quality comps happen to sit AT the target grade —
+        zero eligible rungs remain in the scoped pool once it's dropped, not
+        merely too few. Still widens and still prices, off the wider pool's
+        rungs alone."""
+        # All three white comps are stale (weight 0.5 each -> effective n
+        # 1.5, below the exact tier's floor) and all at the target grade, so
+        # scoping to white leaves NOTHING to anchor a ladder with.
+        white = [_slab_comp(3000 + i, 9.4, age=200, page_quality="white",
+                            product_id=f"w{i}") for i in range(3)]
+        other = [_slab_comp(900, 9.2, age=1, page_quality="cream",
+                            product_id="c1"),
+                 _slab_comp(4200, 9.6, age=2, page_quality="cream",
+                            product_id="c2"),
+                 _slab_comp(4800, 9.8, age=3, page_quality="cream",
+                            product_id="c3")]
+        scoped, fell_back, _ = fm._graded_page_quality_filter(
+            white + other, "white")
+        assert fell_back is False
+        assert {c["grade"] for c in scoped} == {9.4}  # zero other rungs
+
+        out = _graded(white + other, 9.4, page_quality="white")
+        assert out["flag_reason"] is None
+        assert out["pricing_basis"] == "ladder"
+        assert out["page_quality_fallback"] is True
+        assert out["page_quality_fallback_reason"] == "ladder_starved"
+        assert out["graded_ladder"]["grade_below"] == 9.2
+        assert out["graded_ladder"]["grade_above"] == 9.6
 
 
 class TestGradedRefusalShape:

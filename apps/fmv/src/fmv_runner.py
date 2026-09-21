@@ -3456,10 +3456,17 @@ def _graded_note_parts(fmv: dict) -> list[str]:
         parts.append(f"basis={basis}")
     pq = fmv.get("page_quality")
     if pq:
-        parts.append(
-            f"page_quality={pq}"
-            + (" (no 2+ same-quality comps; pooled all qualities)"
-               if fmv.get("page_quality_fallback") else ""))
+        # BUI-939: two distinct fallback reasons share the one boolean —
+        # name which one fired so an auditor can tell "there weren't enough
+        # same-quality comps" apart from "there were, but scoping to them
+        # would have starved the ladder."
+        pq_note = ""
+        if fmv.get("page_quality_fallback"):
+            pq_note = (" (same-quality pool too thin for the ladder; "
+                       "widened to all qualities)"
+                       if fmv.get("page_quality_fallback_reason") == "ladder_starved"
+                       else " (no 2+ same-quality comps; pooled all qualities)")
+        parts.append(f"page_quality={pq}{pq_note}")
     pool_n = fmv.get("pool_n")
     if pool_n is not None:
         parts.append(
@@ -4009,6 +4016,7 @@ def _fmv_from_db_row(row: dict, grade_confidence: str | None = None) -> dict:
         "graded_ladder": None,
         "page_quality": None,
         "page_quality_fallback": False,
+        "page_quality_fallback_reason": None,
         "exact_effective_n": 0.0,
         "exact_sales": [],
         "pool_n": None,
