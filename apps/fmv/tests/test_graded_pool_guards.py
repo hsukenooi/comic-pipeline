@@ -156,18 +156,24 @@ class TestInvincible1Replay:
         after = _price(_guarded(data), target, page_quality=None)
         assert after["flag_reason"] == "ladder_too_thin"
 
-    def test_page_quality_scoping_still_refuses_both_ways(self):
-        # BUI-939, NOT this ticket: the target reads page_quality "white", and
-        # `_graded_page_quality_filter` cuts the server pool to the 2 comps
-        # whose own titles happen to say "white". That refusal is unchanged by
-        # the guards, and pinning it here keeps the two tickets' effects apart.
+    def test_page_quality_scoping_widens_and_the_guards_then_price(self):
+        # BUI-939 and this ticket, kept apart: the target reads page_quality
+        # "white", and `_graded_page_quality_filter` cuts the server pool to
+        # the 2 comps whose own titles say "white". Post-BUI-939 that scoped
+        # pool is starved for the ladder and widens back to the whole pool
+        # (`ladder_starved`), so the outcome is whatever the WHOLE pool says:
+        # unguarded it still inverts (BUI-939 alone does not price this book),
+        # guarded it prices — the same $3,650 as with no page quality at all.
         data = _pool(self.SERVER)
         target = data["target"]
         assert target["page_quality"] == "white"
-        for comps in (data["comps"], _guarded(data)):
-            out = _price(comps, target, page_quality=target["page_quality"])
-            assert out["flag_reason"] == "ladder_too_thin"
-
+        before = _price(data["comps"], target, page_quality="white")
+        assert before["page_quality_fallback_reason"] == "ladder_starved"
+        assert before["flag_reason"] == "ladder_non_monotone"
+        after = _price(_guarded(data), target, page_quality="white")
+        assert after["page_quality_fallback_reason"] == "ladder_starved"
+        assert after["flag_reason"] is None
+        assert after["fmv_high"] == 3650
 
 class TestGuardsAreGradedOnly:
     """The raw path must be able to see everything it saw before."""
