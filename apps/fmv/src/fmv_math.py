@@ -1789,28 +1789,37 @@ def graded_fmv(comps: list[dict], target_grade: float, *,
         would hand back the lone sale (merely bounded from above) rather than
         an interpolation.
 
-        **Page-quality scoping must never starve the ladder (BUI-939).** The
-        page-quality preference exists to make the EXACT tier prefer a
-        same-quality match; it was never meant to be a second, stricter
-        pool for the LADDER tier to run short on. So the tier split above is
-        decided on the page-quality-scoped pool FIRST — a scoped pool that
-        prices directly always does, same-quality comps preferred exactly as
-        before — and only once that path lands on the ladder tier does a
-        second check run: count the scoped pool's anchor-eligible rungs
-        (effective n >= `GRADED_LADDER_MIN_BUCKET_N`, excluding the target
-        rung) the same way `_graded_ladder` itself counts them. Fewer than
-        `GRADED_LADDER_MIN_RUNGS` and the ladder widens back to the WHOLE
-        pool (`page_quality_fallback=True`,
+        **Page quality scopes the EXACT bucket and nothing else (BUI-937).**
+        The preference exists so the EXACT tier prefers a same-quality match;
+        it was never meant to be a second, stricter pool for anything else to
+        read. So exactly one thing reads the page-quality-scoped pool — the
+        exact bucket: its effective n decides the tier above, and its sales
+        are the band when it prices. Everything else reads the WHOLE
+        same-label pool: the ladder tier's rungs, and the exact tier's own
+        envelope clamp.
+
+        Two things follow. BUI-939's conditional widen becomes structural —
+        a pool the ladder never reads cannot starve it, so there is no rung
+        count to check and no way for scoping alone to turn a priceable book
+        into `ladder_too_thin`. And the gap BUI-930 named but could not reach
+        closes: a scoped pool whose only rung IS the exact bucket used to
+        leave a thin band with no envelope to bound it, and now the whole
+        pool's neighbours bound it. That envelope is an all-quality bound on
+        a same-quality band, so it can clamp a genuine page-quality premium
+        away — the intended direction, since `min()` only ever lowers a cap
+        and the alternative was a two-sale bucket setting a four-figure cap
+        unbounded.
+
+        A ladder-tier row whose scoped pool WAS narrower reports the widen in
+        the two fields BUI-939 introduced for it (`page_quality_fallback=True`,
         `page_quality_fallback_reason="ladder_starved"`, distinguishable from
-        the pre-existing `"too_few_matches"` fallback) before pricing. A
-        scoped pool that already has enough rungs is left alone — this can
-        only add comps back in, never take any away, and never touches the
-        exact-tier decision that already ran.
+        the pre-existing `"too_few_matches"` fallback) — now on every such
+        row, not only the ones a rung count would have rescued.
       * REFUSALS — `no_certifier_pool` (nothing survived the identity + age
-        filters), `ladder_too_thin` (< 3 anchor-eligible rungs left, even
-        after the page-quality widen above), `outside_ladder` (no rung on one
-        side — the proxy's never-extrapolate rule), `ladder_non_monotone`
-        (the two rungs the interpolation would actually use invert).
+        filters), `ladder_too_thin` (< 3 anchor-eligible rungs in the whole
+        same-label pool), `outside_ladder` (no rung on one side — the proxy's
+        never-extrapolate rule), `ladder_non_monotone` (the two rungs the
+        interpolation would actually use invert).
 
     The `ladder_non_monotone` check is scoped to the NEIGHBOURS, not the whole
     ladder, and that scope is measured rather than assumed. `cgc_proxy_fmv`
@@ -1839,44 +1848,52 @@ def graded_fmv(comps: list[dict], target_grade: float, *,
     if not pool:
         return _graded_result(flag_reason="no_certifier_pool", **identity)
 
-    ladder = bucket_weighted_medians(pool)
-    eff_n = bucket_effective_n(pool)
     target_grade = float(target_grade)
+    # The EXACT bucket is the one thing the page-quality preference scopes
+    # (BUI-937): the scoped pool decides the tier, and — when it prices — it
+    # is the band.
+    scoped_eff_n = bucket_effective_n(pool)
     exact_comps = [c for c in pool if float(c["grade"]) == target_grade]
-    identity["exact_effective_n"] = eff_n.get(target_grade, 0.0)
+    identity["exact_effective_n"] = scoped_eff_n.get(target_grade, 0.0)
     identity["exact_sales"] = sorted(float(c["price"]) for c in exact_comps)
     identity["exact_sales_detail"] = _exact_sales_detail(exact_comps)
+
+    # Every RUNG comes from the whole same-label pool, whatever its page
+    # quality — the ladder tier's neighbours and the exact tier's envelope
+    # clamp alike. Built from `full_pool` unconditionally, which is what makes
+    # BUI-939's widen structural rather than a rung count that has to be
+    # remembered.
+    ladder = bucket_weighted_medians(full_pool)
+    eff_n = bucket_effective_n(full_pool)
 
     if identity["exact_effective_n"] >= GRADED_EXACT_MIN_EFFECTIVE_N:
         return _graded_direct(exact_comps, ladder, eff_n, target_grade, identity)
 
-    # BUI-939: the scoped pool is heading to the ladder tier. If scoping was
-    # actually applied (there's a narrower pool to widen FROM) and it leaves
-    # too few anchor-eligible rungs to interpolate from, widen to the whole
-    # pool before pricing — counted exactly as `_graded_ladder` counts them,
-    # so this can never disagree with the refusal it's trying to prevent.
     if len(pool) < len(full_pool):
-        eligible = [g for g in ladder
-                   if g != target_grade and eff_n.get(g, 0.0) >= GRADED_LADDER_MIN_BUCKET_N]
-        if len(eligible) < GRADED_LADDER_MIN_RUNGS:
-            pool = full_pool
-            identity["page_quality_fallback"] = True
-            identity["page_quality_fallback_reason"] = "ladder_starved"
-            identity["pool_n"] = len(pool)
-            ladder = bucket_weighted_medians(pool)
-            eff_n = bucket_effective_n(pool)
-            identity["exact_effective_n"] = eff_n.get(target_grade, 0.0)
-            widened_exact = [c for c in pool if float(c["grade"]) == target_grade]
-            identity["exact_sales"] = sorted(float(c["price"]) for c in widened_exact)
-            identity["exact_sales_detail"] = _exact_sales_detail(widened_exact)
+        # Scoping was applied and the book is priced off the ladder, which
+        # reads every quality — so the row says so, in the two fields BUI-939
+        # introduced for exactly this disclosure.
+        identity["page_quality_fallback"] = True
+        identity["page_quality_fallback_reason"] = "ladder_starved"
+        identity["pool_n"] = len(full_pool)
+        identity["exact_effective_n"] = eff_n.get(target_grade, 0.0)
+        widened_exact = [c for c in full_pool if float(c["grade"]) == target_grade]
+        identity["exact_sales"] = sorted(float(c["price"]) for c in widened_exact)
+        identity["exact_sales_detail"] = _exact_sales_detail(widened_exact)
 
-    return _graded_ladder(pool, ladder, eff_n, target_grade, identity)
+    return _graded_ladder(full_pool, ladder, eff_n, target_grade, identity)
 
 
 def _graded_direct(exact_comps: list[dict], ladder: dict[float, float],
                    eff_n: dict[float, float], target_grade: float,
                    identity: dict) -> dict:
-    """The EXACT tier: price the band off the target-grade bucket alone."""
+    """The EXACT tier: price the band off the target-grade bucket alone.
+
+    `exact_comps` is the page-quality-SCOPED bucket (it is the band, and its
+    effective n already decided this tier), while `ladder`/`eff_n` are the
+    WHOLE same-label pool's rungs (BUI-937) — the envelope that bounds the
+    band must exist even when scoping left the scoped pool one rung wide.
+    """
     prices = [float(c["price"]) for c in exact_comps]
     weights = [float(c["weight"]) for c in exact_comps]
     effective_n = sum(weights)
@@ -1895,8 +1912,18 @@ def _graded_direct(exact_comps: list[dict], ladder: dict[float, float],
     # and leaving the high would leave the bid cap exactly where the guard
     # says it must not be. `min()` everywhere means this can only LOWER a
     # number, never raise one.
+    #
+    # BUI-937: the TARGET rung is overridden with this bucket's own median and
+    # effective n, every other rung left as the whole pool's. What is being
+    # bounded is the scoped bucket — so the helper's thin-bucket trigger has to
+    # read the SCOPED n, or a fat all-quality rung at the target grade would
+    # wave a two-sale same-quality band through unbounded — while what bounds
+    # it is the whole market's neighbours. With no scoping applied the override
+    # is a no-op: `ladder[target_grade]` already IS `med`.
+    clamp_ladder = {**ladder, target_grade: med}
+    clamp_counts = {**eff_n, target_grade: effective_n}
     capped, envelope_clamped = _cgc_ladder_price_and_clamp(
-        ladder, target_grade, counts=eff_n,
+        clamp_ladder, target_grade, counts=clamp_counts,
         min_bucket_n=GRADED_LADDER_MIN_BUCKET_N,
     )
     if envelope_clamped and capped is not None:
@@ -1907,9 +1934,13 @@ def _graded_direct(exact_comps: list[dict], ladder: dict[float, float],
         # The gap the clamp above cannot cover, and the ONE place a thin exact
         # bucket can still set a four-figure cap unbounded. `capped` comes
         # back unclamped whenever no eligible rung BRACKETS the target — the
-        # target sits at an end of the ladder, or the page-quality preference
-        # scoped the pool down to the exact bucket alone — so there is no
-        # envelope to bound it with. A 2-sale bucket is never IQR-trimmable
+        # target sits at an end of the whole pool's ladder, or the envelope
+        # came back at or above the bucket's own median — so there is no
+        # (binding) envelope to bound it with. Since BUI-937 the scoped-pool
+        # case is no longer one of those: the neighbours are read from every
+        # same-label comp, so scoping alone can no longer leave a thin band
+        # unbounded, and this guard is left holding only the ends of the
+        # ladder. A 2-sale bucket is never IQR-trimmable
         # and its median-of-2 is just a midpoint, so one mistagged or premium
         # listing sets `fmv_high` and, at 0.80x, the bid. This is BUI-179's
         # guard, applied where BUI-349's cannot reach: refuse rather than
@@ -1943,8 +1974,12 @@ def _graded_direct(exact_comps: list[dict], ladder: dict[float, float],
         pricing_basis="direct",
         envelope_clamped=envelope_clamped,
         graded_ladder={
-            "ladder": dict(sorted(ladder.items())),
-            "effective_n": dict(sorted(eff_n.items())),
+            # The ladder the clamp actually read, target rung and all, so an
+            # auditor comparing `fmv_high` against the rungs is looking at the
+            # same numbers the guard was (BUI-937: whole-pool neighbours, this
+            # bucket's own target rung).
+            "ladder": dict(sorted(clamp_ladder.items())),
+            "effective_n": dict(sorted(clamp_counts.items())),
             "target_grade": target_grade,
             "envelope_price": capped if envelope_clamped else None,
         },
