@@ -687,6 +687,15 @@ class MetronClient:
             return None
 
         hits: list[dict[str, Any]] = []
+        # BUI-913: `@_retry_once_on_rate_limit` resets `self.degraded` to
+        # `False` on EVERY decorated call, including each inner
+        # `issue_in_series` below — so by itself `self.degraded` reflects
+        # only the LAST candidate checked, not the whole scan. `degraded_any`
+        # aggregates across every inner call so the final decision (and the
+        # value republished onto `self.degraded` below, for BUI-788's
+        # `throttled` classification in `cmd_resolve_year_lookup`) is correct
+        # regardless of loop order or how many candidates get checked.
+        degraded_any = False
         for candidate in exact_matches:
             if self.degraded:
                 # BUI-344-style guard (mirrors resolve_creator_run): the
@@ -695,19 +704,29 @@ class MetronClient:
                 # connection error) — stop spending capped retries against a
                 # down Metron for every remaining candidate rather than
                 # limping through the rest of the list.
+                #
+                # BUI-913: `degraded_any` below no longer DEPENDS on this
+                # break for correctness (it OR's every call, so a mid-scan
+                # trip is never lost even if a later candidate happens to
+                # succeed) — but the break still matters for not spending
+                # further capped retries/requests against an already-down
+                # Metron. Do not remove it without accounting for that cost;
+                # see `test_resolve_issue_by_membership_break_still_stops_the_scan_once_degraded_913`
+                # in tests/test_metron.py, which fails on call count if it's
+                # removed.
                 break
             detail = self.issue_in_series(candidate, issue_number)
+            degraded_any = degraded_any or self.degraded
             if detail is not None:
                 hits.append(detail)
 
+        self.degraded = degraded_any
         if self.degraded:
-            # The scan is INCOMPLETE: the last-checked candidate's
-            # issue_in_series call failed (each decorated call resets the
-            # flag on entry, so a True here can only come from that final
-            # failure — earlier failures break the loop before the next
-            # call's reset). An unchecked candidate could have made this a
-            # cross-volume tie, and a wrong year is worse than no year —
-            # never certify uniqueness off a partial scan.
+            # The scan is INCOMPLETE: some exact-name candidate's
+            # issue_in_series call failed before every candidate was checked
+            # (see `degraded_any` above). An unchecked candidate could have
+            # made this a cross-volume tie, and a wrong year is worse than no
+            # year — never certify uniqueness off a partial scan.
             return None
         if len(hits) != 1:
             return None

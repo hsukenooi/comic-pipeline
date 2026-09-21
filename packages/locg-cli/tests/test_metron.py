@@ -2016,6 +2016,42 @@ def test_resolve_issue_by_membership_partial_scan_after_hit_fails_soft():
     assert client.degraded is True
 
 
+def test_resolve_issue_by_membership_break_still_stops_the_scan_once_degraded_913():
+    """BUI-913 regression: the `if self.degraded: break` guard must still stop
+    the loop from checking further candidates once one has degraded, even
+    though `degraded_any` aggregation no longer depends on it for a correct
+    final result.
+
+    vol1's `issue_in_series` call degrades (a connection error, caught
+    in-body — no retry consumed) and returns no hit; vol2, if it were ever
+    queried, WOULD resolve cleanly. With the break in place, vol2 is never
+    checked: exactly one `issues_list` call is spent, and the method
+    correctly refuses to certify uniqueness off the incomplete scan.
+
+    This assertion is deliberately about the CALL COUNT, not just the return
+    value: `degraded_any`'s aggregation means the return value (`None`) and
+    `client.degraded` (`True`) would come out the same even if the break
+    were removed (vol2 succeeding does not clear a trip that already
+    happened). The call count is what actually depends on the break —
+    remove it and vol2 gets queried too, which this test then catches.
+    """
+    from mokkari.exceptions import ApiError
+
+    vol1 = _mock_series(id=1, display_name="X-Men (1963)")
+    vol2 = _mock_series(id=2, display_name="X-Men (1991)")
+    client, session = _make_client_with_session(series_list=[vol1, vol2])
+    session.issues_list.side_effect = [
+        ApiError("Connection error: timed out"),
+        [_mock_issue(id=606, cover_date="1992-04-01")],  # only reached if the break is removed
+    ]
+
+    result = client.resolve_issue_by_membership("X-Men", "6")
+
+    assert result is None
+    assert client.degraded is True
+    assert session.issues_list.call_count == 1
+
+
 # ---------------------------------------------------------------------------
 # Credential error — raised, not swallowed
 # ---------------------------------------------------------------------------
