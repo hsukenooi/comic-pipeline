@@ -3441,6 +3441,38 @@ def _confidence_to_db_label(label: str) -> str:
     return "low"  # MEDIUM-LOW and LOW
 
 
+def _graded_punt_evidence_tokens(fmv: dict) -> list[str]:
+    """`key=value` evidence tokens for a REFUSED graded row (BUI-940).
+
+    Shared by `_graded_note_parts` (joined into `fmv_notes` with the rest of
+    the ` | `-separated tokens) and `_print_table` (joined into the FMV
+    cell), so the two surfaces can never disagree about what evidence a
+    punted row carries. `flag_reason` is only ever set on a refusal — a
+    priced row (`_graded_direct`/the priced branch of `_graded_ladder`)
+    never passes it — so this only fires there; it never duplicates the
+    `exact_grade_sales=`/`slab_ladder=` tokens a priced ladder row already
+    gets. Either piece of evidence may be absent: `graded_punt`'s pre-fetch
+    refusals (`label_*`, `certifier_other`) never fetched comps, so there is
+    no exact sale and no rung to report — this returns `[]` for those.
+    """
+    if not fmv.get("flag_reason"):
+        return []
+    tokens: list[str] = []
+    exact_detail = fmv.get("exact_sales_detail") or []
+    if exact_detail:
+        tokens.append(
+            "exact=" + ",".join(
+                f"${s['price']:g}@{s['sold_date']}" for s in exact_detail))
+    nearest = fmv.get("nearest_rungs") or {}
+    for side in ("below", "above"):
+        rung = nearest.get(side)
+        if rung:
+            tokens.append(
+                f"{side}={rung['grade']:g}:${rung['median']:g} "
+                f"n{rung['n']:g}")
+    return tokens
+
+
 def _graded_note_parts(fmv: dict) -> list[str]:
     """The `fmv_notes` tokens unique to a graded (slab) row (BUI-930).
 
@@ -3506,6 +3538,11 @@ def _graded_note_parts(fmv: dict) -> list[str]:
             "envelope_clamped=exact-grade band bounded from above by the "
             f"neighbouring rungs (BUI-349/355) at ${ladder.get('envelope_price', 0):g}; "
             "do not raise it to match the raw sales")
+    # BUI-940: a REFUSED graded row still carries whatever the pricing math
+    # looked at before punting — the evidence a human needs to hand-price it
+    # without reopening the results file. See `_graded_punt_evidence_tokens`
+    # (shared with `_print_table`'s FMV cell, so the two can't disagree).
+    parts.extend(_graded_punt_evidence_tokens(fmv))
     if fmv.get("bin_listing"):
         # R34: rendered and written, but with no cap. Named so a blank max_bid
         # can never read as "we could not price this".
@@ -4019,6 +4056,11 @@ def _fmv_from_db_row(row: dict, grade_confidence: str | None = None) -> dict:
         "page_quality_fallback_reason": None,
         "exact_effective_n": 0.0,
         "exact_sales": [],
+        # BUI-940: shape parity only, same as `exact_sales`/`graded_ladder`
+        # above — a cached row is never a punt (see the `flag_reason: None`
+        # comment above), so there is no evidence to recover from a column.
+        "exact_sales_detail": [],
+        "nearest_rungs": None,
         "pool_n": None,
         "envelope_clamped": False,
     }
@@ -4178,6 +4220,15 @@ def _print_table(rows: list[dict]) -> None:
         if fmv.get("flag_reason"):
             # BUI-86: needs manual pricing — distinct from a genuine no-comps row.
             fmv_str = f"manual:{fmv['flag_reason']}"
+            # BUI-940: a refused GRADED row (punt) still carries the
+            # exact-grade sale(s) and nearest rungs the math looked at
+            # before punting — show them here instead of leaving the cell
+            # blank beyond the reason. A raw (non-graded) needs_manual row,
+            # or a graded pre-fetch punt with nothing fetched, has no
+            # evidence to add and this is a no-op for it.
+            evidence = _graded_punt_evidence_tokens(fmv)
+            if evidence:
+                fmv_str += " " + " ".join(evidence)
             med_str = "—"
             mb_str = "manual"
         elif fmv.get("ledger_advisory"):

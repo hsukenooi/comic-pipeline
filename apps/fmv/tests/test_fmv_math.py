@@ -1875,6 +1875,74 @@ class TestGradedLadderTier:
         assert out["flag_reason"] == "ladder_too_thin"
 
 
+class TestGradedPuntEvidence:
+    """BUI-940: a refused (or ladder-priced) row still names the exact-grade
+    sale(s) and the nearest anchor-eligible rung on each side, so a human
+    reading a punt doesn't have to reopen the results file. Additive only —
+    `exact_sales` stays a bare price list, `flag_reason`/`max_bid`/
+    `fmv_low`/`fmv_high` are untouched by any of this."""
+
+    def test_exact_sales_detail_carries_price_and_sold_date(self):
+        rungs = [_slab_comp(900, 4.0, age=10), _slab_comp(1400, 5.5, age=12),
+                 _slab_comp(1500, 6.0, age=14), _slab_comp(500, 2.5, age=16)]
+        lone = _slab_comp(700, 4.5, age=1)
+        out = _graded(rungs + [lone], 4.5)
+        assert out["exact_sales"] == [700.0]  # unchanged
+        assert out["exact_sales_detail"] == [
+            {"price": 700.0, "sold_date": (_GREF - timedelta(days=1)).isoformat()}]
+
+    def test_nearest_rungs_reports_both_sides_on_non_monotone_refusal(self):
+        """The BUI-940 ticket's own fixture shape: Batman #227-style — the
+        two bracketing rungs a human needs are exactly what tripped the
+        refusal, so they must ride along with it, not just the reason."""
+        comps = [_slab_comp(2000, 8.5, age=10), _slab_comp(3000, 9.2, age=12),
+                 _slab_comp(2500, 9.6, age=14), _slab_comp(4000, 9.8, age=16)]
+        out = _graded(comps, 9.4)
+        assert out["flag_reason"] == "ladder_non_monotone"
+        assert out["nearest_rungs"] == {
+            "below": {"grade": 9.2, "median": 3000.0, "n": 1.0},
+            "above": {"grade": 9.6, "median": 2500.0, "n": 1.0},
+        }
+
+    def test_nearest_rungs_is_one_sided_outside_the_ladder(self):
+        """`outside_ladder` is exactly the case `_bracket_interpolate` can't
+        express (it needs both sides) — `nearest_rungs` still reports the
+        side that exists rather than going blank because the other doesn't."""
+        comps = [_slab_comp(900, 4.0, age=10), _slab_comp(1400, 5.5, age=12),
+                 _slab_comp(1500, 6.0, age=14)]
+        out = _graded(comps, 9.8)
+        assert out["flag_reason"] == "outside_ladder"
+        assert out["nearest_rungs"] == {
+            "below": {"grade": 6.0, "median": 1500.0, "n": 1.0},
+            "above": None,
+        }
+
+    def test_nearest_rungs_still_populated_on_ladder_too_thin(self):
+        comps = [_slab_comp(900, 4.0, age=10), _slab_comp(1400, 5.5, age=12),
+                 _slab_comp(700, 4.5, age=1)]
+        out = _graded(comps, 4.5)
+        assert out["flag_reason"] == "ladder_too_thin"
+        assert out["nearest_rungs"] == {
+            "below": {"grade": 4.0, "median": 900.0, "n": 1.0},
+            "above": {"grade": 5.5, "median": 1400.0, "n": 1.0},
+        }
+
+    def test_no_evidence_on_a_pre_fetch_punt(self):
+        """`graded_punt` refuses before any comps are fetched (a Signature
+        Series slab, say) — there is nothing to report, and this must not
+        fabricate any."""
+        out = fm.graded_punt("label_signature_series", certifier="cgc",
+                             label="signature_series")
+        assert out["exact_sales_detail"] == []
+        assert out["nearest_rungs"] is None
+
+    def test_no_evidence_when_the_pool_is_empty(self):
+        out = _graded([], 4.5)  # nothing survives the identity + age filters
+        assert out["flag_reason"] == "no_certifier_pool"
+        assert out["exact_sales_detail"] == []
+        assert out["nearest_rungs"] is None
+
+
 class TestGradedPageQuality:
     def _pool(self, whites):
         pool = [_slab_comp(1000 + i, 9.4, age=i, page_quality="ow_w",

@@ -3397,6 +3397,104 @@ class TestFlaggedPresentation:
         assert "manual_review=too_wide" in notes
         assert "bid_haircut" not in notes
 
+    # ─── BUI-940: graded punt evidence in notes + table ───────────────────────
+
+    def test_build_notes_carries_exact_sale_and_both_rungs_on_a_punt(self):
+        fmv = {"window": None, "cv_pct": "n/a", "confidence": "LOW",
+               "flag_reason": "ladder_non_monotone", "grade_span": None,
+               "bid_factor": 0.60, "grade_confidence": None,
+               "graded": True, "certifier": "cgc", "label": "universal",
+               "pricing_basis": None, "graded_ladder": None,
+               "exact_sales_detail": [{"price": 700.0, "sold_date": "2026-09-17"}],
+               "nearest_rungs": {
+                   "below": {"grade": 4.0, "median": 1400.0, "n": 1.0},
+                   "above": {"grade": 5.5, "median": 899.0, "n": 1.0}}}
+        notes = fmv_runner._build_notes(fmv)
+        assert "exact=$700@2026-09-17" in notes
+        assert "below=4:$1400 n1" in notes
+        assert "above=5.5:$899 n1" in notes
+        assert "manual_review=ladder_non_monotone" in notes
+        # Every token is a `|`-separated `key=value` pair, same shape the
+        # rest of `fmv_notes` already uses — grep-on-`=` consumers survive.
+        assert all("=" in tok for tok in notes.split(" | ")
+                   if tok.startswith(("exact", "below", "above")))
+
+    def test_build_notes_omits_evidence_tokens_on_a_pre_fetch_punt(self):
+        """A `graded_punt` refusal never fetched comps, so there is no exact
+        sale and no rung — the notes must not fabricate either."""
+        fmv = {"window": None, "cv_pct": "n/a", "confidence": "LOW",
+               "flag_reason": "label_signature_series", "grade_span": None,
+               "bid_factor": 0.60, "grade_confidence": None,
+               "graded": True, "certifier": "cgc", "label": "signature_series",
+               "pricing_basis": None, "graded_ladder": None,
+               "exact_sales_detail": [], "nearest_rungs": None}
+        notes = fmv_runner._build_notes(fmv)
+        assert "manual_review=label_signature_series" in notes
+        assert "exact=" not in notes
+        assert "below=" not in notes
+        assert "above=" not in notes
+
+    def test_build_notes_evidence_never_appears_on_a_priced_row(self):
+        """`flag_reason` is only ever set on a refusal, so a priced ladder
+        row's own `exact_grade_sales=`/`slab_ladder=` tokens (already
+        covered elsewhere) must never be duplicated by the punt-evidence
+        block."""
+        fmv = {"window": None, "cv_pct": "n/a", "confidence": "LOW",
+               "flag_reason": None, "grade_span": None, "bid_factor": 0.60,
+               "grade_confidence": None, "graded": True, "certifier": "cgc",
+               "label": "universal", "pricing_basis": "ladder",
+               "n": 4, "exact_sales": [700.0], "exact_effective_n": 1.0,
+               "exact_sales_detail": [{"price": 700.0, "sold_date": "2026-09-17"}],
+               "nearest_rungs": {
+                   "below": {"grade": 4.0, "median": 1400.0, "n": 1.0},
+                   "above": {"grade": 5.5, "median": 899.0, "n": 1.0}},
+               "graded_ladder": {"grade_below": 4.0, "grade_above": 5.5,
+                                 "median_below": 1400.0, "median_above": 899.0,
+                                 "target_grade": 4.5}}
+        notes = fmv_runner._build_notes(fmv)
+        assert notes.count("exact_grade_sales=") == 1
+        assert "below=" not in notes
+        assert "above=" not in notes
+
+    def test_print_table_shows_evidence_in_the_fmv_cell_for_a_graded_punt(self, capsys):
+        row = {
+            "input": {"title": "Batman", "issue": "227", "grade": 4.5},
+            "fmv": {"flag_reason": "ladder_non_monotone", "max_bid": None,
+                    "n": 0, "confidence": None, "graded": True,
+                    "exact_sales_detail": [
+                        {"price": 700.0, "sold_date": "2026-09-17"}],
+                    "nearest_rungs": {
+                        "below": {"grade": 4.0, "median": 1400.0, "n": 1.0},
+                        "above": {"grade": 5.5, "median": 899.0, "n": 1.0}}},
+            "comp_count_total": 14, "queries_used": [], "db_row": None,
+            "source": "fresh", "breaker_tripped": False,
+        }
+        fmv_runner._print_table([row])
+        out = capsys.readouterr().out
+        assert "manual:ladder_non_monotone" in out
+        assert "exact=$700@2026-09-17" in out
+        assert "below=4:$1400 n1" in out
+        assert "above=5.5:$899 n1" in out
+
+    def test_print_table_graded_punt_with_no_evidence_stays_blank(self, capsys):
+        """The pre-fetch punt (`label_signature_series`, from
+        `test_print_table_renders_a_graded_punt_row` above) has neither an
+        exact sale nor a rung — the cell must render exactly as before,
+        with no trailing evidence tokens and no crash."""
+        row = {
+            "input": {"title": "Batman", "issue": "227", "grade": 4.5},
+            "fmv": {"flag_reason": "label_signature_series", "max_bid": None,
+                    "n": 0, "confidence": None, "graded": True},
+            "comp_count_total": 0, "queries_used": [], "db_row": None,
+            "source": "fresh", "breaker_tripped": False,
+        }
+        fmv_runner._print_table([row])
+        out = capsys.readouterr().out
+        assert "manual:label_signature_series" in out
+        assert "exact=" not in out
+        assert "below=" not in out
+        assert "above=" not in out
+
     def test_print_table_distinguishes_three_states(self, capsys):
         rows = [
             {"input": {"title": "Priced", "issue": "1", "grade": 8.0},
