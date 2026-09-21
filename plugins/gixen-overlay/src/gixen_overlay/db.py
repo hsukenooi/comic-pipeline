@@ -20,6 +20,25 @@ COMPS_PROVENANCES = ("live", "backfill-cache", "backfill-capture")
 _comps_pools_sql = ", ".join(f"'{p}'" for p in COMPS_POOLS)
 _comps_provenances_sql = ", ".join(f"'{p}'" for p in COMPS_PROVENANCES)
 
+# BUI-947: why a stored comp is barred from re-entering a slab pool. The first
+# four are `ebay-sold-comps`' own graded-guard codes, spelled exactly as
+# `fetch_book_comps` emits them in `graded_identity_dropped_ids` (BUI-946) —
+# `multibook_lot` (BUI-922's ampersand lot), `cross_title` / `store_variant`
+# (`graded_identity_exclude`, BUI-922/938) and `printing` (BUI-929). `manual`
+# is the operator's own stamp, for a row no automated guard names.
+#
+# Deliberately NOT a DDL CHECK, unlike `pool`/`provenance` above and exactly
+# like `fmv.flag_reason`: BUI-947's premise is that EVERY future guard grows
+# this list (BUI-941's autograph guard is the next one), and a CHECK on the
+# column would make each of those a table REBUILD of the largest table in the
+# schema. The enforcement point is `models.CompsExcludeRequest`, which imports
+# this tuple, plus `stamp_comps_excluded` below, which re-checks it so a
+# direct-Python caller cannot write a code the API would refuse.
+COMPS_EXCLUSION_CODES = (
+    "multibook_lot", "cross_title", "store_variant", "printing", "manual",
+)
+COMPS_EXCLUSION_CODE_MANUAL = "manual"
+
 # BUI-659: the fmv_history closed vocabulary. 'upsert' marks a row appended
 # by the live POST /api/comics path (api_upsert_comic); 'backfill' marks a
 # row seeded once by the one-time migration from pre-existing `fmv` rows.
@@ -365,6 +384,30 @@ def create_tables(conn: sqlite3.Connection) -> None:
             certifier      TEXT NOT NULL DEFAULT 'none' CHECK(certifier IN ({_fmv_certifiers_sql})),
             label          TEXT NOT NULL DEFAULT 'universal' CHECK(label IN ({_fmv_labels_sql})),
             page_quality   TEXT NOT NULL DEFAULT 'unknown' CHECK(page_quality IN ({_comp_page_qualities_sql})),
+            -- BUI-947: the EXCLUSION STAMP. A `pool='slab'` row the graded
+            -- guards would drop is stamped here rather than DELETEd: the row
+            -- is still a true market fact and still wanted for audit, it just
+            -- must never enter a pool again. NULL (the default, and the state
+            -- of every row that has never been stamped) means "in play";
+            -- `get_comps` skips a stamped row unless a caller asks for it.
+            --
+            -- Why a stamp and not a delete: the listing this row describes
+            -- has usually aged past the provider's ~90-day sold window, so
+            -- NO future fetch will ever report it again (that is BUI-947's
+            -- whole premise). Deleting it would destroy the only surviving
+            -- record that the listing existed and was judged; stamping keeps
+            -- it, with the reason and the moment attached.
+            --
+            -- Declared mid-table, not appended: SQLite's `DROP COLUMN` edits
+            -- this literal as TEXT, and a comment block immediately before
+            -- the FINAL column leaves `-- ...` fused to the closing paren, so
+            -- every later DROP on this table fails with "incomplete input".
+            -- Keeping a comment-free column last costs nothing and keeps that
+            -- door open. (Column ORDER already differs between a fresh
+            -- install and a migrated one, since ALTER always appends — see
+            -- `certifier` above — so nothing reads position here.)
+            excluded_code  TEXT,
+            excluded_at    TEXT,
             first_seen_at  TEXT NOT NULL,
             last_seen_at   TEXT NOT NULL,
             seen_count     INTEGER NOT NULL DEFAULT 1,
@@ -417,6 +460,11 @@ def create_tables(conn: sqlite3.Connection) -> None:
     # PRAGMA-guarded ALTER pattern as `flag_reason`/`provenance` above.
     _migrate_add_comps_certifier_columns(conn)
     _migrate_backfill_comps_certifier(conn)
+    # BUI-947: additive for the same reason, and with no backfill of its own —
+    # NULL already means "never stamped", which is the truth for every row
+    # that existed before this column did. Ordered after the certifier pair
+    # only for readability; the two touch disjoint columns.
+    _migrate_add_comps_exclusion_columns(conn)
     _migrate_lowercase_title_indexes(conn)
     # Partial unique indexes go AFTER migrations so the legacy duplicate-row
     # cleanup (fmv-split collapses (title, issue, year, grade) duplicates into
@@ -967,6 +1015,35 @@ def _migrate_add_comps_certifier_columns(conn: sqlite3.Connection) -> None:
             "DEFAULT 'unknown' "
             f"CHECK(page_quality IN ({_comp_page_qualities_sql}))"
         )
+
+
+def _migrate_add_comps_exclusion_columns(conn: sqlite3.Connection) -> None:
+    """Add excluded_code/excluded_at to comps if absent (BUI-947).
+
+    The same PRAGMA-guarded, purely additive ALTER as
+    `_migrate_add_comps_certifier_columns` above, and idempotent for the same
+    reason: SQLite errors on a duplicate ADD COLUMN, so each column is checked
+    independently rather than the pair being checked as a unit (a DB that
+    somehow has one and not the other still converges).
+
+    NULLABLE and with no DEFAULT, which is the opposite choice from the
+    certifier trio's explicit sentinels — and deliberately so. There, NULL and
+    'none' were two different facts that had to be told apart. Here there is
+    exactly one pre-existing state: no row has ever been stamped, because
+    nothing could stamp one. NULL says that, and no backfill is needed or
+    wanted.
+
+    A DB whose `comps` table does not exist yet (`cols` empty) is left alone —
+    `create_tables`' own CREATE literal already carries both columns, so a
+    fresh install never reaches this.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(comps)")}
+    if not cols:
+        return
+    if "excluded_code" not in cols:
+        conn.execute("ALTER TABLE comps ADD COLUMN excluded_code TEXT")
+    if "excluded_at" not in cols:
+        conn.execute("ALTER TABLE comps ADD COLUMN excluded_at TEXT")
 
 
 def _migrate_backfill_comps_certifier(conn: sqlite3.Connection) -> None:
@@ -3622,6 +3699,7 @@ def get_comps(
     days: float | None = None,
     pool: str | None = None,
     provider: str | None = None,
+    include_excluded: bool = False,
     limit: int = DEFAULT_COMPS_READ_LIMIT,
 ) -> list[sqlite3.Row] | None:
     """Read path for `GET /api/comics/comps` (BUI-662). Newest-first by
@@ -3644,6 +3722,19 @@ def get_comps(
     (mirrors `_RESOLVED_RECENCY_CLAUSE`), not a Python-formatted string, since
     `observed_at` may carry a 'Z' suffix that doesn't compare correctly
     byte-for-byte against `datetime.isoformat()`'s output.
+
+    `include_excluded` (BUI-947) defaults to False, and that default is the
+    whole point of the ticket: a BUI-946-stamped row must stop re-entering
+    any pool, and the one place every reader of this ledger passes through is
+    here. The ONE caller in the pricing path (`apps/fmv`'s
+    `_fetch_ledger_comps`, the sanctioned exception documented on the route)
+    therefore gets the filtering for free and cannot forget it — including on
+    the `_graded_ledger_advisory` path, which BUI-946 had to leave unfiltered
+    because it has no live fetch to learn the drops from.
+
+    Set it True only for an AUDIT: "show me what was stamped and why" is a
+    real question and the rows are kept precisely so it can be answered. It
+    is never the right flag for a pool.
     """
     resolved_id = _resolve_comic_id(
         conn, comic_id=comic_id, title=title, issue=issue, year=year
@@ -3653,6 +3744,8 @@ def get_comps(
 
     clauses = ["comic_id = ?"]
     params: list[Any] = [resolved_id]
+    if not include_excluded:
+        clauses.append("excluded_code IS NULL")
     if grade is not None:
         clauses.append("grade = ?")
         params.append(grade)
@@ -3678,6 +3771,108 @@ def get_comps(
         """,
         params,
     ).fetchall()
+
+
+def stamp_comps_excluded(
+    conn: sqlite3.Connection,
+    comic_id: int,
+    product_ids: list[str],
+    code: str,
+) -> dict[str, Any] | None:
+    """Stamp `pool='slab'` comps of one book as excluded (BUI-947).
+
+    Write path for `POST /api/comics/comps/exclude`. Returns None when
+    `comic_id` names no known book — the route 404s on that, the same
+    "resolved vs. not resolved must never be confusable with empty" contract
+    `get_comps` states above.
+
+    THREE narrowings, each of which is a guard rather than a filter:
+
+    * `pool='slab'` — a raw row is NEVER stamped here, whatever the caller
+      sends. Every code in `COMPS_EXCLUSION_CODES` comes from a guard that
+      runs in GRADED mode only (`fetch_book_comps` runs them under
+      `graded_target`), so a code has no meaning for a raw comp; and the raw
+      pool is the one this project has been burned for silently thinning.
+      A product_id that resolves to a raw row is reported in `not_found`,
+      not stamped.
+    * `comic_id` — a product_id is unique per (provider, pool) but NOT across
+      books, and the caller's evidence is always about one book's pool.
+    * `excluded_code IS NULL` — the first stamp wins, so `excluded_at` stays
+      the moment the row was actually first judged (the same
+      first-answer-wins posture `upsert_comps` takes on a price, KTD4). A
+      re-stamp is counted in `already_stamped` and changes nothing, which is
+      what makes a re-run of the sweep a genuine no-op.
+
+    `product_ids` are compared as TEXT (the column's own type) after `str()`,
+    so an int-typed id from a JSON body cannot silently fail to match — the
+    same normalization `_merge_slab_pool`'s `dropped_ids` uses.
+
+    Returns `{comic_id, code, stamped, already_stamped, not_found}` where
+    `not_found` lists every id that matched no un-stamped slab row of this
+    book, for either reason (no such comp, or it is a raw row). The caller
+    gets counts AND the ids, because "I stamped 4 of the 5 I sent" is a
+    different fact from "I stamped 4".
+
+    A stamp SURVIVES re-observation: `upsert_comps`' `ON CONFLICT DO UPDATE`
+    touches only `last_seen_at`/`seen_count`/`conflict_count`, so a later
+    fetch that sees the listing again bumps the bookkeeping and leaves the
+    stamp standing. That is the intended direction — a guard's verdict is
+    about the listing's identity, which re-seeing it does not change — and it
+    means UN-stamping is deliberately not an API: it is a rare, considered
+    correction, made with a direct `UPDATE comps SET excluded_code = NULL`.
+    (A live comp of the same listing still prices normally; only the stored
+    copy is held out, so a wrong stamp costs pool depth, never a price.)
+    """
+    if conn.execute(
+        "SELECT 1 FROM comics WHERE id = ?", (comic_id,)
+    ).fetchone() is None:
+        return None
+    if code not in COMPS_EXCLUSION_CODES:
+        # Defense in depth behind `models.CompsExcludeRequest`: the column
+        # carries no CHECK (see COMPS_EXCLUSION_CODES), so this is the only
+        # thing standing between a direct-Python caller and a code the
+        # readers would never recognize.
+        raise ValueError(
+            f"unknown exclusion code {code!r} "
+            f"(expected one of {COMPS_EXCLUSION_CODES})"
+        )
+
+    now = datetime.now(timezone.utc).isoformat()
+    stamped = 0
+    already = 0
+    not_found: list[str] = []
+    for raw_pid in product_ids:
+        pid = str(raw_pid)
+        row = conn.execute(
+            "SELECT id, excluded_code FROM comps "
+            "WHERE comic_id = ? AND pool = 'slab' AND product_id = ?",
+            (comic_id, pid),
+        ).fetchone()
+        if row is None:
+            not_found.append(pid)
+            continue
+        if row["excluded_code"] is not None:
+            already += 1
+            continue
+        conn.execute(
+            "UPDATE comps SET excluded_code = ?, excluded_at = ? WHERE id = ?",
+            (code, now, row["id"]),
+        )
+        stamped += 1
+    conn.commit()
+    if stamped:
+        logger.info(
+            "stamp_comps_excluded: comic_id=%s code=%s stamped=%d "
+            "already=%d not_found=%d",
+            comic_id, code, stamped, already, len(not_found),
+        )
+    return {
+        "comic_id": comic_id,
+        "code": code,
+        "stamped": stamped,
+        "already_stamped": already,
+        "not_found": not_found,
+    }
 
 
 def get_fmv_history(

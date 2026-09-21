@@ -727,6 +727,29 @@ def run(*, batch_path: str | None, out_path: str | None,
             err=True,
         )
 
+    # BUI-947: the graded merge dropped stored ledger rows this run (BUI-946),
+    # and the stamp that makes those drops durable is a separate, soft-failing
+    # write. Reported only when the two DISAGREE — an all-stamped run prints
+    # nothing (no happy-path noise, same as the block above), but "dropped 4,
+    # stamped 0" is exactly the silent-nothing-stored shape this module keeps
+    # getting burned by, so it is said out loud.
+    ledger_dropped_total = sum(
+        int(r.get("ledger_dropped") or 0) for r in fresh_fmvs.values())
+    excluded_stamped_total = sum(
+        int(r.get("comps_excluded_posted") or 0) for r in fresh_fmvs.values())
+    if ledger_dropped_total and excluded_stamped_total < ledger_dropped_total:
+        click.echo(
+            f"⚠️  {ledger_dropped_total} stored slab comp(s) were dropped "
+            f"from a pool by this run's graded guards, but only "
+            f"{excluded_stamped_total} were STAMPED excluded in the ledger "
+            "(BUI-947, POST /api/comics/comps/exclude). The unstamped ones "
+            "will re-enter the pool on a future run whose live fetch no "
+            "longer sees the listing. Check the comics server is running "
+            "BUI-947's endpoint, then re-run the "
+            "`backfill_comps_ledger.py --sweep-excluded` sweep.",
+            err=True,
+        )
+
     # BUI-678: a currency-rejected comp (BUI-675's gate) is a SUCCESSFUL fetch
     # whose parse discarded every result on non-USD currency — the fetch-err
     # signal (`queries_used` all carrying 'error') can't see it, and it is
@@ -2690,10 +2713,20 @@ def _compute_graded_one(result: dict | None, original_book: dict, *,
         str(d["product_id"]) for d in (result.get("graded_identity_dropped_ids") or [])
         if isinstance(d, dict) and d.get("product_id") not in (None, "")
     }
-    ledger_dropped = sum(
-        1 for c in ledger_slab
+    dropped_rows = [
+        c for c in ledger_slab
         if c.get("product_id") not in (None, "") and str(c["product_id"]) in dropped_ids
-    )
+    ]
+    ledger_dropped = len(dropped_rows)
+    # BUI-947: make the BUI-946 drop DURABLE. The filter above fixes this run;
+    # the stamp stops the same stored row re-entering the next one, which is
+    # the only fix available once the listing has aged out of the provider's
+    # sold window and no fetch can report it again. Fail-soft in every
+    # direction — see `_post_comps_exclusions`; it returns 0 and warns rather
+    # than letting a stamping failure touch the price.
+    comps_excluded_posted = _post_comps_exclusions(
+        server_url, dropped_rows,
+        result.get("graded_identity_dropped_ids") or [])
     pool = _merge_slab_pool(live_slab, ledger_slab, dropped_ids=dropped_ids)
 
     fmv = fmv_math.graded_fmv(pool, target_grade, certifier=certifier,
@@ -2714,6 +2747,14 @@ def _compute_graded_one(result: dict | None, original_book: dict, *,
     row = _graded_upsert_row(server_url, inp, fmv, result=result,
                              live_slab=live_slab, comps_n=len(comps))
     row["breaker_tripped"] = breaker_tripped
+    # BUI-947: how many of those `ledger_dropped` rows the server confirmed it
+    # STAMPED. On the row, not on `fmv`: it is a fact about the ledger write,
+    # not about the price, and `fmv_notes` already carries `ledger_dropped=`
+    # for the pool side. Reported in `run()`'s summary when it diverges from
+    # `ledger_dropped`, so "the merge dropped 4 and the ledger stamped 0" is
+    # visible rather than a silence.
+    row["comps_excluded_posted"] = comps_excluded_posted
+    row["ledger_dropped"] = ledger_dropped
     return row
 
 
@@ -3719,6 +3760,135 @@ def _post_comps(server_url: str, comic_id: int | None,
             err=True,
         )
         return False
+
+
+# BUI-947: set once, for the whole process, the first time
+# `POST /api/comics/comps/exclude` 404s. The endpoint either exists on the
+# server or it does not; re-asking once per book for a 50-book batch would
+# print 50 identical "Error: ... 404" lines about one fact already known
+# after the first. Deliberately NOT set for any other failure — a timeout or
+# a 5xx is transient, and silencing the rest of the run over one blip is how
+# a real outage goes unnoticed.
+_COMPS_EXCLUDE_UNSUPPORTED = False
+
+
+def _post_comps_exclusions(server_url: str, dropped_rows: list[dict],
+                           dropped_ids: list[dict]) -> int:
+    """Stamp the ledger rows this run's graded guards dropped (BUI-947).
+
+    BUI-946 filters a guard-dropped ledger row out of THIS run's pool, in
+    memory. That fixes the run and nothing else: the same row is still on
+    file, still un-stamped, and re-enters the next run's pool — including one
+    where the listing has aged past the provider's ~90-day sold window, so no
+    fetch will ever report it again and BUI-946's filter can never fire for it
+    twice. This makes the drop durable by posting it to the server.
+
+    `dropped_rows` — the LEDGER rows (from `_fetch_ledger_comps`) that BUI-946
+    just excluded. Posting these rather than the raw guard output is what
+    keeps the stamp honest: a guard-dropped live comp with no stored copy has
+    nothing to stamp, and posting its id anyway would only fill `not_found`.
+    `dropped_ids` — the fetch's own `[{product_id, code}]` list, read ONLY to
+    recover which code goes with which id.
+
+    `comic_id` comes from the rows themselves, not from the pricing path's own
+    upsert. It has to: the upsert has not run yet at this point, and the rows
+    were served BY comic_id, so their value is the server's own answer for
+    this book. A set with anything other than exactly one non-null id means
+    the read straddled books (or returned identity-free rows) and nothing is
+    posted — stamping the wrong book's pool is worse than not stamping.
+
+    One call per CODE, because the endpoint stamps one reason at a time.
+
+    FAIL-SOFT, and strictly so: pricing must never fail because stamping
+    failed. A 404 (a server older than this ticket) disables further attempts
+    for the process after one explanatory line; any other error is reported
+    for that book and the run continues. Returns the number of rows the server
+    says it stamped, 0 for every failure and for nothing-to-do.
+    """
+    global _COMPS_EXCLUDE_UNSUPPORTED
+    if not dropped_rows or _COMPS_EXCLUDE_UNSUPPORTED:
+        return 0
+    try:
+        code_by_id = {
+            str(d["product_id"]): d["code"]
+            for d in dropped_ids
+            if isinstance(d, dict) and d.get("product_id") not in (None, "")
+            and d.get("code")
+        }
+        comic_ids = {r.get("comic_id") for r in dropped_rows}
+        comic_ids.discard(None)
+        if len(comic_ids) != 1:
+            click.echo(
+                "Warning: skipping the BUI-947 exclusion stamp — the "
+                f"{len(dropped_rows)} dropped ledger row(s) carry "
+                f"{len(comic_ids)} distinct comic_id(s), so there is no one "
+                "book to stamp. The rows stay in the ledger unstamped.",
+                err=True,
+            )
+            return 0
+        comic_id = comic_ids.pop()
+
+        ids_by_code: dict[str, list[str]] = {}
+        for row in dropped_rows:
+            pid = str(row["product_id"])
+            code = code_by_id.get(pid)
+            if code is None:
+                continue
+            ids_by_code.setdefault(code, []).append(pid)
+
+        stamped = 0
+        for code, pids in sorted(ids_by_code.items()):
+            try:
+                resp = requests.post(
+                    f"{server_url}/api/comics/comps/exclude",
+                    json={"comic_id": comic_id, "product_ids": pids,
+                          "code": code},
+                    timeout=15,
+                )
+            except requests.RequestException as e:
+                click.echo(
+                    f"Warning: comps exclusion stamp failed for comic_id="
+                    f"{comic_id} code={code}: {e!r}. The row(s) stay in the "
+                    "ledger unstamped; pricing is unaffected.",
+                    err=True,
+                )
+                return stamped
+            if resp.status_code == 404:
+                _COMPS_EXCLUDE_UNSUPPORTED = True
+                click.echo(
+                    "Note: this comics server has no "
+                    "POST /api/comics/comps/exclude (BUI-947) — guard-dropped "
+                    "ledger rows will NOT be stamped for the rest of this "
+                    "run. Pricing is unaffected (BUI-946 still filters them "
+                    "in memory); deploy the server to make the drops "
+                    "durable.",
+                    err=True,
+                )
+                return stamped
+            if not resp.ok:
+                click.echo(
+                    f"Warning: comps exclusion stamp failed for comic_id="
+                    f"{comic_id} code={code}: HTTP {resp.status_code}. The "
+                    "row(s) stay in the ledger unstamped; pricing is "
+                    "unaffected.",
+                    err=True,
+                )
+                return stamped
+            try:
+                stamped += int((resp.json() or {}).get("stamped") or 0)
+            except ValueError:
+                # 2xx with an unparseable body: the stamp probably landed,
+                # but this count must never overstate what the server
+                # confirmed, so it is not credited.
+                pass
+        return stamped
+    except Exception as e:  # noqa: BLE001 — must not crash the run; see docstring
+        click.echo(
+            f"Warning: comps exclusion stamp failed unexpectedly: {e!r}. "
+            "Pricing is unaffected.",
+            err=True,
+        )
+        return 0
 
 
 def _confidence_to_db_label(label: str) -> str:
