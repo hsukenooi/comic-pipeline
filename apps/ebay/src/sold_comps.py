@@ -2493,6 +2493,15 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
     # present so a caller reads "0" rather than a missing key; all zero for
     # every raw call, which never runs the guards at all.
     graded_identity_dropped = dict.fromkeys(GRADED_IDENTITY_CODES, 0)
+    # BUI-946: per-comp record of every graded-only guard drop this call
+    # makes — the ampersand-lot guard (`multibook_lot`), the two
+    # `graded_identity_exclude` codes, and the printing guard (`printing`) —
+    # so a downstream caller (fmv_runner's ledger merge) can drop the SAME
+    # listing out of a stored ledger comp by product_id, not just see a
+    # count. Only comps with a product_id can be listed here (every slab/
+    # comp candidate that reaches these checks already passed the
+    # `comp["product_id"]` truthiness gate above); empty for every raw call.
+    graded_identity_dropped_ids: list[dict] = []
     # BUI-678: comps the BUI-675 currency gate rejected (title present, price
     # object present, currency proven non-USD) — summed across every tier's
     # `_run` call below. A response that loses ALL its comps to this gate is a
@@ -2618,6 +2627,16 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
                     continue
                 if comp["product_id"] in seen_ids:
                     continue
+                # BUI-946: check the ampersand-lot guard BEFORE hard_exclude
+                # so a graded-mode multi-book-lot drop gets its own
+                # product_id-tagged code. hard_exclude folds this same check
+                # in internally (BUI-922, see its docstring) and would also
+                # return True here, but a bare bool can't say WHICH reason —
+                # or which comp — to report to the ledger merge below.
+                if graded_target and _multibook_graded_lot(comp["title"]):
+                    graded_identity_dropped_ids.append(
+                        {"product_id": comp["product_id"], "code": "multibook_lot"})
+                    continue
                 if hard_exclude(comp["title"], graded_target=graded_target):
                     continue
                 # BUI-922/938: the two guards that need the TARGET's identity
@@ -2629,6 +2648,8 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
                         target_is_variant=bool(variant))
                     if code:
                         graded_identity_dropped[code] += 1
+                        graded_identity_dropped_ids.append(
+                            {"product_id": comp["product_id"], "code": code})
                         continue
                 seen_ids.add(comp["product_id"])
                 # BUI-657/KTD6: stamp provenance on the comp at the point it
@@ -2863,10 +2884,20 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
         # route_slabs-passing tier produced it (graded_target's base tier,
         # or the pre-existing BUI-524 vintage inclusive tier).
         if slab_comps:
+            # BUI-946: capture which product_ids the guard drops. It mutates
+            # `slab_comps` in place and returns counts only — its return
+            # dict is pinned to exactly {"printing_dropped",
+            # "printing_unverified"} by existing tests, so the drop is read
+            # back here as a before/after set diff rather than adding a key
+            # to that dict.
+            before_slab_ids = {c["product_id"] for c in slab_comps if c.get("product_id")}
             guard_result = _printing_guard(
                 slab_comps, fetch_description=_default_fetch_description)
             printing_dropped = guard_result["printing_dropped"]
             printing_unverified = guard_result["printing_unverified"]
+            after_slab_ids = {c["product_id"] for c in slab_comps if c.get("product_id")}
+            for pid in before_slab_ids - after_slab_ids:
+                graded_identity_dropped_ids.append({"product_id": pid, "code": "printing"})
 
         out_input = {
             "item_id": self_id or None,
@@ -2921,6 +2952,12 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
             # BUI-922/938: {code: count} for the graded-only identity guards
             # (cross_title, store_variant). All zeros on every raw call.
             "graded_identity_dropped": graded_identity_dropped,
+            # BUI-946: [{"product_id", "code"}] for EVERY graded-only guard
+            # drop this call made — multibook_lot, cross_title, store_variant,
+            # printing — so a caller (fmv_runner's ledger merge) can drop the
+            # same listing's stored ledger copy by id. Always empty on a raw
+            # call, which never runs these guards.
+            "graded_identity_dropped_ids": graded_identity_dropped_ids,
         }
     except Exception as e:  # noqa: BLE001 — BUI-537: preserve the partial
         # trail rather than losing it; see the docstring above. `book.get(...)`
@@ -2950,6 +2987,7 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
             "printing_dropped": printing_dropped,
             "printing_unverified": printing_unverified,
             "graded_identity_dropped": graded_identity_dropped,
+            "graded_identity_dropped_ids": graded_identity_dropped_ids,
             "error": str(e),
         }
 

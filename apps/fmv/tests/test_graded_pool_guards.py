@@ -25,6 +25,7 @@ from pathlib import Path
 import pytest
 
 import fmv_math
+import fmv_runner
 
 _REPO = Path(__file__).resolve().parents[3]
 _EBAY_SRC = _REPO / "apps" / "ebay" / "src"
@@ -174,6 +175,68 @@ class TestInvincible1Replay:
         assert after["page_quality_fallback_reason"] == "ladder_starved"
         assert after["flag_reason"] is None
         assert after["fmv_high"] == 3650
+
+def _dropped_ids(data: dict) -> set[str]:
+    """The product_ids the BUI-922/938 guards excluded from `data["comps"]`
+    — everything the live fetch saw that `_guarded` did not keep."""
+    kept_ids = {c["product_id"] for c in _guarded(data)}
+    return {c["product_id"] for c in data["comps"]} - kept_ids
+
+
+class TestLedgerHonoursGuards:
+    """BUI-946 — the Done-when: merge(live-guarded, ledger-unguarded,
+    dropped_ids) prices both books.
+
+    The ticket's defect, reproduced here rather than assumed: BUI-922/938
+    fixed the LIVE fetch (`TestBatman227Replay`/`TestInvincible1Replay`
+    above already pin that a guarded-only pool prices), but
+    `_merge_slab_pool` re-admits the SAME excluded listings the moment they
+    also exist as `pool='slab'` ledger rows from an earlier, pre-guard
+    fetch — which is exactly what these two fixtures' `data["comps"]`
+    represent when passed as the LEDGER side unfiltered. Both books
+    refused in production after PR #523 deployed for precisely this
+    reason.
+    """
+
+    @pytest.mark.parametrize("name", [
+        "graded_pool_bui922_batman227.json",
+        "graded_pool_bui938_invincible1_server.json",
+    ])
+    def test_merge_without_dropped_ids_still_refuses(self, name):
+        # Pins the DEFECT: the live fetch is guarded (only the surviving
+        # comps reach `live`), but the ledger is the unguarded pre-guard
+        # snapshot — an old `_merge_slab_pool(live, ledger)` call with no
+        # `dropped_ids` re-admits the excluded listings from the ledger side
+        # and reproduces the exact production refusal.
+        data = _pool(name)
+        target = data["target"]
+        pool = fmv_runner._merge_slab_pool(_guarded(data), data["comps"])
+        priced = _price(pool, target, page_quality=None)
+        assert priced["flag_reason"] == "ladder_non_monotone"
+        assert priced["fmv_high"] is None
+
+    @pytest.mark.parametrize("name,expected_fmv_high", [
+        ("graded_pool_bui922_batman227.json", 775),
+        ("graded_pool_bui938_invincible1_server.json", 3650),
+    ])
+    def test_merge_with_dropped_ids_prices(self, name, expected_fmv_high):
+        # The FIX: passing dropped_ids (the same product_ids
+        # graded_identity_dropped_ids would report for this fetch) makes the
+        # merge skip those same listings on the ledger side too, so the
+        # result matches the guarded-only pool's already-pinned price.
+        data = _pool(name)
+        target = data["target"]
+        dropped_ids = _dropped_ids(data)
+        pool = fmv_runner._merge_slab_pool(
+            _guarded(data), data["comps"], dropped_ids=dropped_ids)
+        priced = _price(pool, target, page_quality=None)
+        assert priced["flag_reason"] is None
+        assert priced["fmv_high"] == expected_fmv_high
+        # The honoured merge must equal the guarded-only pool exactly — the
+        # ledger contributes nothing this run wasn't already going to keep.
+        guarded_only = _price(_guarded(data), target, page_quality=None)
+        assert priced["pool_n"] == guarded_only["pool_n"]
+
 
 class TestGuardsAreGradedOnly:
     """The raw path must be able to see everything it saw before."""

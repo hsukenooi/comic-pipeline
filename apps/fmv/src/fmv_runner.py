@@ -2417,7 +2417,8 @@ def _slab_pool_comp(comp: dict) -> dict | None:
     return out
 
 
-def _merge_slab_pool(live: list[dict], ledger: list[dict]) -> list[dict]:
+def _merge_slab_pool(live: list[dict], ledger: list[dict], *,
+                     dropped_ids: set[str] | None = None) -> list[dict]:
     """Live slab comps plus ledger slab comps, deduped on `product_id`.
 
     LIVE WINS on a collision, and the direction matters: the live row is
@@ -2427,20 +2428,43 @@ def _merge_slab_pool(live: list[dict], ledger: list[dict]) -> list[dict]:
     `product_id` cannot be deduped and is kept as its own entry — dropping it
     would silently thin a pool that is already one sale per rung, and the only
     cost of keeping it is a double-count of a comp that no source identified.
+
+    `dropped_ids` (BUI-946): product_ids `ebay-sold-comps`' graded-only
+    guards (the ampersand-lot/cross_title/store_variant/printing checks,
+    BUI-922/938/929) excluded from THIS run's live fetch. A ledger row
+    sharing one of those ids is a stored copy of a listing the live fetch
+    just re-examined and rejected — one of BUI-946's motivating incidents was
+    exactly this: the guard drops the listing from `live`, but its ledger
+    copy from an earlier, pre-guard fetch re-enters the pool unless it is
+    skipped here too. Compared as strings (same normalization the dedup key
+    below already uses) so an int-vs-str product_id from either source can't
+    silently fail to match. Only ever applied to `ledger` — a `live` comp
+    sharing a dropped id was never appended to `live` in the first place (the
+    guard drops it before `fetch_book_comps` returns), so this can only ever
+    remove a comp from the ledger side. None/omitted (every caller but
+    `_compute_graded_one`) reproduces the old unfiltered merge exactly — see
+    the module-level note on `_graded_ledger_advisory`/`_ledger_advisory` for
+    why those two stay unfiltered on purpose.
     """
+    dropped = dropped_ids or set()
     out: list[dict] = []
     seen: set[str] = set()
-    for comp in [*live, *ledger]:
-        projected = _slab_pool_comp(comp)
-        if projected is None:
-            continue
-        pid = projected.get("product_id")
-        key = str(pid) if pid not in (None, "") else None
-        if key is not None:
-            if key in seen:
+    for source, comps in (("live", live), ("ledger", ledger)):
+        for comp in comps:
+            if source == "ledger":
+                raw_pid = comp.get("product_id")
+                if raw_pid not in (None, "") and str(raw_pid) in dropped:
+                    continue
+            projected = _slab_pool_comp(comp)
+            if projected is None:
                 continue
-            seen.add(key)
-        out.append(projected)
+            pid = projected.get("product_id")
+            key = str(pid) if pid not in (None, "") else None
+            if key is not None:
+                if key in seen:
+                    continue
+                seen.add(key)
+            out.append(projected)
     return out
 
 
@@ -2567,7 +2591,23 @@ def _compute_graded_one(result: dict | None, original_book: dict, *,
         server_url, title=inp.get("title"), issue=inp.get("issue"),
         year=inp.get("year"), pool="slab", certifier=certifier, label=label,
     ) or []
-    pool = _merge_slab_pool(live_slab, ledger_slab)
+    # BUI-946: product_ids this run's live fetch guards (multibook_lot,
+    # cross_title, store_variant, printing) excluded — see _merge_slab_pool's
+    # docstring. `graded_identity_dropped_ids` is absent on a result from an
+    # older `ebay-sold-comps` binary that predates BUI-946 (result.get(...)
+    # returns None, not KeyError), which this tolerates the same way it
+    # already tolerates a missing `printing_dropped`/`printing_unverified`
+    # above — an old binary's ledger rows just aren't filtered, exactly the
+    # pre-BUI-946 behaviour.
+    dropped_ids = {
+        str(d["product_id"]) for d in (result.get("graded_identity_dropped_ids") or [])
+        if isinstance(d, dict) and d.get("product_id") not in (None, "")
+    }
+    ledger_dropped = sum(
+        1 for c in ledger_slab
+        if c.get("product_id") not in (None, "") and str(c["product_id"]) in dropped_ids
+    )
+    pool = _merge_slab_pool(live_slab, ledger_slab, dropped_ids=dropped_ids)
 
     fmv = fmv_math.graded_fmv(pool, target_grade, certifier=certifier,
                               label=label, page_quality=page_quality)
@@ -2579,6 +2619,11 @@ def _compute_graded_one(result: dict | None, original_book: dict, *,
     # explained rather than merely observed.
     fmv["printing_dropped"] = result.get("printing_dropped") or 0
     fmv["printing_unverified"] = result.get("printing_unverified") or 0
+    # BUI-946: how many of `ledger_slab`'s rows were the stored copy of a
+    # listing THIS run's live guards just re-excluded — see
+    # _merge_slab_pool's dropped_ids param. 0 whenever the ledger holds no
+    # such row (the common case) or the fetch used an older binary.
+    fmv["ledger_dropped"] = ledger_dropped
     row = _graded_upsert_row(server_url, inp, fmv, result=result,
                              live_slab=live_slab, comps_n=len(comps))
     row["breaker_tripped"] = breaker_tripped
@@ -2644,6 +2689,19 @@ def _graded_ledger_advisory(server_url: str, *, inp: dict,
     What differs is the pool (`pool='slab'`, filtered to this certifier and
     label) and the math (`graded_fmv`, so the exact/ladder decision and every
     refusal are identical to a live run's).
+
+    BUI-946: this path runs ONLY after every live-fetch tier has already
+    failed (see the fetch-err branch in `_compute_graded_one` that calls it)
+    — there is no `result` with a `graded_identity_dropped_ids` list,
+    because no guard ever ran this run. So `_merge_slab_pool` below is called
+    with no `dropped_ids` (same as `_ledger_advisory`, the raw path's
+    equivalent, which has no such concept at all): a ledger row a PAST run's
+    guards would have excluded still enters this advisory band unfiltered.
+    That is an accepted gap, not an oversight — an advisory band already
+    carries no `max_bid` and a loud "hand-check this" warning (see the caller
+    in `_compute_graded_one`), and BUI-947 is where the ledger itself gets
+    stamped so a row like this stops re-entering ANY pool, advisory or
+    otherwise, regardless of which path reads it.
     """
     rows = _fetch_ledger_comps(
         server_url, title=inp.get("title"), issue=inp.get("issue"),
@@ -3507,7 +3565,13 @@ def _graded_note_parts(fmv: dict) -> list[str]:
     for key, token in (("pool_undated_dropped", "undated_dropped"),
                        ("pool_stale_dropped", "stale_dropped"),
                        ("printing_dropped", "printing_dropped"),
-                       ("printing_unverified", "printing_unverified")):
+                       ("printing_unverified", "printing_unverified"),
+                       # BUI-946: ledger slab rows skipped because this run's
+                       # live guards just excluded the same listing — see
+                       # _merge_slab_pool's dropped_ids param. Falsy-gated
+                       # like every entry in this tuple, so it renders only
+                       # when n > 0.
+                       ("ledger_dropped", "ledger_dropped")):
         if fmv.get(key):
             parts.append(f"{token}={fmv[key]}")
     ladder = fmv.get("graded_ladder") or {}
@@ -4063,6 +4127,12 @@ def _fmv_from_db_row(row: dict, grade_confidence: str | None = None) -> dict:
         "nearest_rungs": None,
         "pool_n": None,
         "envelope_clamped": False,
+        # BUI-946: shape parity only, same pattern as
+        # `page_quality_fallback_reason`/`nearest_rungs` above (BUI-939/940)
+        # — a cached row was never live-merged THIS run, so there is nothing
+        # it could have dropped from the ledger; 0, not None, matching the
+        # int the fresh path always sets.
+        "ledger_dropped": 0,
     }
 
 
