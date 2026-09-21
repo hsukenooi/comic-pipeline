@@ -129,8 +129,9 @@ def test_every_case_has_a_baseline_entry():
 # 2026-09-21 spike pools, named so.
 
 # Every comp age is measured from this fixed date, so the fixture weighs the
-# same today as in a year. `graded_pool` uses the pool's own newest comp as
-# the reference, never a clock, which is what makes that possible.
+# same today as in a year. Since BUI-948 that holds because `_run_graded`
+# passes this same date as `graded_pool`'s `as_of` — the module reads no clock
+# of its own, so pinning both ends of the subtraction pins the weights.
 _SLAB_REF = date(2026, 9, 1)
 
 _GRADED_FROZEN = (
@@ -262,8 +263,14 @@ GRADED_CASES = [
 
 def _run_graded(case) -> dict:
     _name, comps, grade, pq = case
+    # BUI-948: `as_of` is pinned to `_SLAB_REF`, the same date `_slab` measures
+    # every case's `age_days` back from. That is what makes the baseline a
+    # frozen artifact rather than one that drifts with the calendar — and it
+    # holds each case's answer exactly where it was before as_of existed,
+    # because no case spans more than 90 days between its newest comp and
+    # `_SLAB_REF`.
     out = fmv_math.graded_fmv(comps, grade, certifier="cgc", label="universal",
-                              page_quality=pq)
+                              page_quality=pq, as_of=_SLAB_REF)
     return {k: out[k] for k in _GRADED_FROZEN}
 
 

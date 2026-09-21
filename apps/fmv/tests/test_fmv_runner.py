@@ -5,6 +5,7 @@ so these tests don't hit the network or shell out.
 """
 
 import json
+from datetime import date
 
 from unittest.mock import MagicMock, patch
 import pytest
@@ -71,6 +72,31 @@ def _no_identity_rows_by_default(monkeypatch):
     three fixtures above (BUI-286, BUI-658, BUI-663)."""
     monkeypatch.setattr(fmv_runner, "_db_lookup_by_identity",
                         lambda *a, **k: [])
+
+
+_GRADED_AS_OF = date(2026, 9, 21)
+# Captured before any fixture can patch it, the same way
+# `_REAL_DB_LOOKUP_BY_IDENTITY` below is.
+_REAL_GRADED_AS_OF = fmv_runner._graded_as_of
+
+
+@pytest.fixture(autouse=True)
+def _pin_graded_as_of(monkeypatch):
+    """BUI-948: freeze the graded path's calendar reference.
+
+    Slab comps are now aged against `fmv_runner._graded_as_of()` — real
+    `date.today()` in production — instead of the pool's own newest sale. That
+    made every graded fixture in this file clock-dependent overnight: the
+    `sold_date="2026-09-01"` comps below are full weight today and half weight
+    after 2026-11-30, which would have flipped `TestGradedRunEndToEnd` from a
+    priced ladder to `ladder_too_thin` on a date nobody chose. Pinning the one
+    clock site to the day these fixtures' dates were written for keeps them
+    testing the math instead of the calendar.
+
+    It does not hide the clock itself: `TestGradedAsOf` below calls the real
+    function and asserts it returns today. Same autouse pattern as the four
+    fixtures above."""
+    monkeypatch.setattr(fmv_runner, "_graded_as_of", lambda: _GRADED_AS_OF)
 
 
 _REAL_DB_LOOKUP_BY_IDENTITY = fmv_runner._db_lookup_by_identity
@@ -6375,6 +6401,13 @@ class TestIdentityAwareDedupe:
         assert len(pool) == 2
 
 
+class TestGradedAsOf:
+    """The one thing `_pin_graded_as_of` must not be allowed to hide."""
+
+    def test_the_real_helper_reads_todays_calendar_date(self):
+        assert _REAL_GRADED_AS_OF() == date.today()
+
+
 class TestGradedLedgerAdvisoryEffectiveNFloor:
     """BUI-936: `_graded_ledger_advisory`'s depth floor gates on the SAME
     weighted, identity-aware effective-n notion `graded_fmv`'s exact tier
@@ -6391,11 +6424,11 @@ class TestGradedLedgerAdvisoryEffectiveNFloor:
         return {"title": "Fantastic Four", "issue": "46", "year": 1961}
 
     def test_three_stale_rows_clear_row_count_but_not_effective_n(self):
-        # The newest of the three sits at the pool's own reference (weight
-        # 1.0); the other two are 91-365 days older, at
-        # fmv_math.GRADED_STALE_WEIGHT (0.5) each — effective n = 2.0, under
-        # LEDGER_ADVISORY_MIN_POOL (3), even though the raw row count (3)
-        # would have cleared the pre-BUI-936 floor.
+        # Aged against the pinned as_of (2026-09-21, BUI-948): the newest of
+        # the three is 20 days old and weighs 1.0; the other two are 91-365
+        # days old, at fmv_math.GRADED_STALE_WEIGHT (0.5) each — effective
+        # n = 2.0, under LEDGER_ADVISORY_MIN_POOL (3), even though the raw row
+        # count (3) would have cleared the pre-BUI-936 floor.
         rows = [
             self._row("p1", price=1000, sold_date="2026-09-01"),
             self._row("p2", price=1050, sold_date="2026-02-01"),

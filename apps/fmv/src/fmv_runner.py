@@ -25,7 +25,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import TypeGuard
 
@@ -2598,6 +2598,24 @@ def _graded_error_row(inp: dict, comps_n: int, result: dict, *,
     return row
 
 
+def _graded_as_of() -> date:
+    """Today, as the reference date every slab comp is aged against (BUI-948).
+
+    The ONE clock site on the graded path. `fmv_math` takes `as_of` as a
+    required parameter and never reads a clock itself, so this function is
+    where "the calendar" enters the pipeline — and the single seam a test
+    patches to make the whole graded path deterministic.
+
+    Cache semantics follow from that: `as_of` applies when a row is COMPUTED,
+    so a cached row served inside the reuse window keeps the weights its
+    compute date gave it, and re-ages only when it is recomputed. That is the
+    same tolerance the 30-day staleness advisory already grants every cached
+    FMV row; a stale price is what the advisory is for, and re-pricing every
+    cache hit to re-age its comps would defeat the cache entirely.
+    """
+    return date.today()
+
+
 def _compute_graded_one(result: dict | None, original_book: dict, *,
                         server_url: str,
                         punt_reason: str | None = None) -> dict:
@@ -2730,7 +2748,8 @@ def _compute_graded_one(result: dict | None, original_book: dict, *,
     pool = _merge_slab_pool(live_slab, ledger_slab, dropped_ids=dropped_ids)
 
     fmv = fmv_math.graded_fmv(pool, target_grade, certifier=certifier,
-                              label=label, page_quality=page_quality)
+                              label=label, page_quality=page_quality,
+                              as_of=_graded_as_of())
     fmv["live_slab_count"] = len(live_slab)
     fmv["ledger_slab_count"] = len(ledger_slab)
     # BUI-929's printing guard already DROPPED the confirmed later printings
@@ -2847,12 +2866,16 @@ def _graded_ledger_advisory(server_url: str, *, inp: dict,
     if not rows:
         return None
     pool = _merge_slab_pool([], rows)
-    weighted_pool, _, _ = fmv_math.graded_pool(pool)
+    # One `as_of` for the depth floor and the math that follows it, so the
+    # gate can never be measured against a different day than the price.
+    as_of = _graded_as_of()
+    weighted_pool, _, _ = fmv_math.graded_pool(pool, as_of=as_of)
     effective_n = sum(fmv_math.bucket_effective_n(weighted_pool).values())
     if effective_n < LEDGER_ADVISORY_MIN_POOL:
         return None
     fmv = fmv_math.graded_fmv(pool, target_grade, certifier=certifier,
-                             label=label, page_quality=page_quality)
+                             label=label, page_quality=page_quality,
+                             as_of=as_of)
     if fmv.get("flag_reason") is not None or fmv.get("fmv_high") is None:
         return None
     fmv["max_bid"] = None

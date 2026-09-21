@@ -20,6 +20,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -70,10 +71,25 @@ def _guarded(data: dict) -> list[dict]:
     return kept
 
 
+# The day the 2026-09-21 `/comic:buy` run these fixtures were captured from
+# actually priced them. BUI-948 made the age reference an explicit calendar
+# date, so a replay has to name the replayed day or it would re-age with the
+# wall clock and stop being a replay. Every comp in both fixtures is within 90
+# days of it (the oldest, Batman's 2026-06-23, is exactly 90), so all of them
+# still carry full weight and both replays assert the same numbers they did
+# before as_of existed.
+_RUN_DATE = date(2026, 9, 21)
+
+
 def _price(comps, target, *, page_quality):
     return fmv_math.graded_fmv(list(comps), target["grade"],
                                certifier=target["certifier"],
-                               label=target["label"], page_quality=page_quality)
+                               label=target["label"], page_quality=page_quality,
+                               as_of=_RUN_DATE)
+
+
+def _weighted(comps):
+    return fmv_math.graded_pool(comps, as_of=_RUN_DATE)[0]
 
 
 class TestBatman227Replay:
@@ -103,10 +119,10 @@ class TestBatman227Replay:
         # 6.0 ($900) sales.
         data = _pool(self.NAME)
         ladder_before = fmv_math.bucket_weighted_medians(
-            fmv_math.graded_pool(data["comps"])[0])
+            _weighted(data["comps"]))
         assert ladder_before[4.0] > ladder_before[6.0]
         ladder_after = fmv_math.bucket_weighted_medians(
-            fmv_math.graded_pool(_guarded(data))[0])
+            _weighted(_guarded(data)))
         assert 4.0 not in ladder_after
         assert ladder_after[5.5] < ladder_after[6.0] < ladder_after[6.5]
 
@@ -139,10 +155,10 @@ class TestInvincible1Replay:
         # what `ladder_non_monotone` was reporting.
         data = _pool(self.SERVER)
         before = fmv_math.bucket_weighted_medians(
-            fmv_math.graded_pool(data["comps"])[0])
+            _weighted(data["comps"]))
         assert before[9.6] < before[9.4]
         after = fmv_math.bucket_weighted_medians(
-            fmv_math.graded_pool(_guarded(data))[0])
+            _weighted(_guarded(data)))
         grades = sorted(after)
         assert all(after[a] < after[b] for a, b in zip(grades, grades[1:]))
 
