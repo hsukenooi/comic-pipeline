@@ -33,6 +33,7 @@ import json
 import os
 import random
 import re
+import statistics
 import sys
 import threading
 import time
@@ -45,8 +46,15 @@ from pathlib import Path
 import requests
 
 import comic_identity
+import ebay_fetch
 from ebay_fetch import RetryExhausted, atomic_write_json, retry_request
-from grade_tokens import _LETTER_PATTERNS, _NUMERIC_GRADE_RE
+from grade_tokens import (
+    _LETTER_PATTERNS,
+    _NUMERIC_GRADE_RE,
+    resolve_certifier_token,
+    resolve_label,
+    resolve_page_quality,
+)
 
 
 def _version_string() -> str:
@@ -957,7 +965,8 @@ def build_query(title: str, issue: str, year: int | str | None = None,
                 publisher: str | None = None, variant: str | None = None,
                 grade_label: str | None = None,
                 exclude_graded: bool = True,
-                vintage_year: int | str | None = None) -> str:
+                vintage_year: int | str | None = None,
+                graded_target: str | None = None) -> str:
     """Build the _nkw search string. Returns the raw (unencoded) keyword string.
 
     `vintage_year` (BUI-350): the book's real cover year, used ONLY to gate the
@@ -973,6 +982,17 @@ def build_query(title: str, issue: str, year: int | str | None = None,
     BUI-565: `year`/`vintage_year` accept a numeric string (`"1976"`) as well
     as an int — see `_coerce_year` for why that is the natural input and what
     used to happen to it. An int caller's query is byte-for-byte unchanged.
+
+    `graded_target` (BUI-929): "cgc" or "cbcs" for a certified target's
+    dedicated graded-only query. Distinct from `exclude_graded=False` (the
+    older BUI-348 CGC-proxy/BUI-524 inclusive-tier knob, which just stops
+    EXCLUDING graded copies so the query stays a neutral mix): a certified
+    target instead wants the certifier's OWN sale history, so the four
+    `-cgc -cbcs -graded -slab` exclusion terms are replaced with the
+    certifier name as a POSITIVE term — biasing the provider's 240-result
+    cap toward slab sales across grades instead of a raw-dominated mix. Any
+    other value (including None) leaves `exclude_graded` in charge, so every
+    existing caller is byte-for-byte unaffected.
     """
     # BUI-565: coerce BEFORE anything compares against `_VINTAGE_YEAR_CUTOFF`.
     year = _coerce_year(year)
@@ -1016,7 +1036,9 @@ def build_query(title: str, issue: str, year: int | str | None = None,
     gate_year = year if vintage_year is None else vintage_year
     if gate_year and gate_year < _VINTAGE_YEAR_CUTOFF and _is_rebootable_masthead(title):
         parts.extend(_VINTAGE_EXCLUSION_TERMS)
-    if exclude_graded:
+    if graded_target in ("cgc", "cbcs"):
+        parts.append(graded_target)
+    elif exclude_graded:
         parts.extend(["-cgc", "-cbcs", "-graded", "-slab"])
     return " ".join(parts)
 
@@ -1666,9 +1688,46 @@ LOCAL_EXCLUDE_RE = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
+# BUI-929: the subset of LOCAL_EXCLUDE_RE that keeps excluding in GRADED mode.
+# A certified target's whole point is to price a slab from the certifier's
+# own sale history, and a Signature Series / signed / restored SLAB is a
+# real, priceable comp for its own label — just not comparable to a
+# universal one, so it belongs LABELED (parse_slab_fields), not deleted.
+# Everything else LOCAL_EXCLUDE_RE drops (bad-condition listings, lots,
+# PSA/PGX third-party slabs, the WW-live-sale/space-filler noise terms)
+# still isn't a priceable comp of any label, so it stays excluded here too.
+# Deliberately a SEPARATE literal pattern rather than a derivation from
+# LOCAL_EXCLUDE_RE (e.g. string-diffing its source) — that guarantees the raw
+# path's `LOCAL_EXCLUDE_RE` stays byte-for-byte untouched by this change, per
+# the plan's "the raw path keeps the exclusion unchanged".
+_GRADED_MODE_EXCLUDE_RE = re.compile(
+    r'''
+    coverless | no\s+cover | cover\s+torn | cvr\s+off | detached\s+cover |
+    missing\s+pages? | missing\s+pin | missing\s+wrap |
+    vol[\s.]?[2-9] | \bv[2-9]\b |
+    \bpsa\b | \bpgx\b |
+    ww\s+live\s+sale | space\s+filler | water.?stain
+    ''',
+    re.IGNORECASE | re.VERBOSE,
+)
 
-def hard_exclude(title: str) -> bool:
-    return comic_identity.is_comp_excluded(title) or bool(LOCAL_EXCLUDE_RE.search(title))
+
+def hard_exclude(title: str, *, graded_target: str | None = None) -> bool:
+    """True when `title` must never enter any comp pool.
+
+    `graded_target` (BUI-929): in graded mode, LOCAL_EXCLUDE_RE's signature
+    series / signed / autograph / restored terms are deferred to the label
+    parse instead of dropping the comp outright (see
+    `_GRADED_MODE_EXCLUDE_RE`'s comment) — every other caller (graded_target
+    absent/None, the overwhelming common case, including the raw path and
+    the BUI-348/BUI-524 include_graded-only modes) is byte-for-byte
+    unaffected.
+    """
+    if comic_identity.is_comp_excluded(title):
+        return True
+    if graded_target in ("cgc", "cbcs"):
+        return bool(_GRADED_MODE_EXCLUDE_RE.search(title))
+    return bool(LOCAL_EXCLUDE_RE.search(title))
 
 
 # ─── Grade parsing ────────────────────────────────────────────────────────────
@@ -1910,6 +1969,218 @@ def _is_slab_comp(comp: dict) -> bool:
             and bool(_SLAB_TITLE_RE.search(comp.get("title") or "")))
 
 
+def parse_slab_fields(title: str) -> dict:
+    """Parse certifier, label, and page quality from a genuine slab comp's
+    title (BUI-929), built on grade_tokens' shared resolvers (BUI-923) — the
+    same tables identify's certifier-aware parsing uses (see plan "One token
+    module, shared by identify and sold-comps").
+
+    Callers pass this only a title that `_is_slab_comp` has already
+    confirmed names a certifier — so unlike grade_tokens.resolve_label /
+    resolve_page_quality (which return None so a RAW listing's absent token
+    isn't conflated with "universal"/"unknown"; see their docstrings), this
+    function always returns a concrete value: "universal" and "unknown" are
+    the correct DEFAULT label/page-quality for a slab whose title simply
+    doesn't call one out, not an absence signal. `certifier` falls back to
+    "other" only as a defensive floor — `_is_slab_comp`'s own gate
+    (`_SLAB_TITLE_RE` = cgc|cbcs) means resolve_certifier_token always finds
+    one of those two in practice.
+    """
+    return {
+        "certifier": resolve_certifier_token(title) or "other",
+        "label": resolve_label(title) or "universal",
+        "page_quality": resolve_page_quality(title) or "unknown",
+    }
+
+
+# ─── Printing guard (BUI-929) ──────────────────────────────────────────────
+#
+# A slab comp priced well below its rung's other sales is often a different
+# book wearing the same grade — most commonly a later printing or a
+# facsimile edition sold at a discount to the genuine first print. The spike
+# found this hides in the listing DESCRIPTION, not the title (BUI-921/929
+# origin), so the guard fetches the description of exactly the comps that
+# look like outliers and drops the ones the text confirms.
+#
+# Bare "reprint" is deliberately NOT a drop signal (BUI-645, reused here):
+# some genuine first-print issues are honestly titled/described as
+# containing/being reprints of earlier material ("X-Men #76 ... reprints
+# #28"), and their sale price is a real first-print sale. Only an ORDINAL
+# printing token ("2nd print(ing)", "third printing", ...) or "facsimile" —
+# an unambiguous later-printing/non-genuine-first-print signal — drops a
+# comp. These patterns intentionally do NOT match bare "reprint"/"reprints":
+# neither contains an ordinal token or "facsimile" immediately before/after
+# "print", so the guard's own description parse inherits the same BUI-645
+# safety the title-level hard_exclude lexicon already has.
+_ORDINAL_PRINTING_NUM_RE = re.compile(
+    r'\b([2-9]|[1-9][0-9])(?:st|nd|rd|th)\s*print(?:ing)?\b', re.IGNORECASE)
+_ORDINAL_PRINTING_WORD_RE = re.compile(
+    r'\b(?:second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)'
+    r'\s+print(?:ing)?\b',
+    re.IGNORECASE,
+)
+_FACSIMILE_RE = re.compile(r'\bfacsimile\b', re.IGNORECASE)
+
+# Below this fraction of its rung's (leave-one-out) median, a slab comp is a
+# printing-guard candidate. 0.5 per plan KTD ("Printing guard runs on price
+# outliers only").
+_PRINTING_GUARD_PRICE_RATIO = 0.5
+
+
+def _has_printing_token(text: str) -> bool:
+    """True when `text` (a fetched listing description) names an ordinal
+    later printing or a facsimile edition — see the module comment above for
+    why bare "reprint" never matches."""
+    if not text:
+        return False
+    if _FACSIMILE_RE.search(text):
+        return True
+    if _ORDINAL_PRINTING_WORD_RE.search(text):
+        return True
+    return bool(_ORDINAL_PRINTING_NUM_RE.search(text))
+
+
+def _printing_guard(slab_comps: list, *, fetch_description) -> dict:
+    """Guard `slab_comps` (mutated in place) against a later-printing/
+    facsimile comp masquerading as a first-print sale at a suspiciously low
+    price (BUI-929).
+
+    Groups comps by grade (the "rung") and, for each comp, compares its
+    price against the LEAVE-ONE-OUT median of the *other* comps sharing its
+    grade — deliberately excluding the comp itself from its own threshold.
+    Including it would let the very outlier being judged drag its own
+    yardstick down toward it (worse for a small rung: two comps at $1200 and
+    $550 have an inclusive median of $875, whose 0.5x threshold — $437.50 —
+    the $550 comp clears without ever being examined, even though it reads
+    as an obvious outlier against the $1200 sale alone). A rung with fewer
+    than 2 comps total has no "other" sales to compare a comp against, so
+    every comp in it passes through unguarded (never flagged, never
+    fetched) rather than being judged against nothing. A comp with no
+    parsed grade (should not occur for anything `_is_slab_comp` admitted,
+    but handled defensively) is likewise passed through ungrouped.
+
+    A comp whose price is below `_PRINTING_GUARD_PRICE_RATIO` times that
+    leave-one-out median gets exactly one `fetch_description(comp)` call.
+    The comp is DROPPED only when the returned text carries an ordinal
+    printing or "facsimile" token; it is KEPT — and counted in
+    `printing_unverified`, not `printing_dropped` — when the fetch returns
+    falsy (None/""), the contract `fetch_description` uses for "couldn't
+    get the text" (404, a purged listing, a network failure, or no
+    credentials configured — see `_default_fetch_description`). The guard
+    must never fail a comp it couldn't actually verify INTO a drop.
+
+    Returns `{"printing_dropped": <n>, "printing_unverified": <n>}`.
+    """
+    by_grade: dict = {}
+    ungrouped: list = []
+    for comp in slab_comps:
+        grade = comp.get("grade")
+        if grade is None:
+            ungrouped.append(comp)
+        else:
+            by_grade.setdefault(grade, []).append(comp)
+
+    printing_dropped = 0
+    printing_unverified = 0
+    survivors: list = list(ungrouped)
+
+    for rung in by_grade.values():
+        if len(rung) < 2:
+            # No OTHER sale in this rung to judge a comp against.
+            survivors.extend(rung)
+            continue
+        for comp in rung:
+            others = [c["price"] for c in rung if c is not comp
+                      and c.get("price") is not None]
+            price = comp.get("price")
+            if not others or price is None:
+                survivors.append(comp)
+                continue
+            rung_median = statistics.median(others)
+            if not rung_median or price >= _PRINTING_GUARD_PRICE_RATIO * rung_median:
+                survivors.append(comp)
+                continue
+            text = fetch_description(comp)
+            if text and _has_printing_token(text):
+                printing_dropped += 1
+                continue
+            if not text:
+                printing_unverified += 1
+            survivors.append(comp)
+
+    slab_comps[:] = survivors
+    return {"printing_dropped": printing_dropped, "printing_unverified": printing_unverified}
+
+
+def _printing_guard_token() -> "tuple[str | None, str | None]":
+    """Lazily obtain a Browse API OAuth token for the printing guard's
+    description fetch (BUI-929).
+
+    Deliberately does NOT call `ebay_fetch.load_config()`: two independent
+    reasons, not one.
+
+    1. `load_config()` sys.exit(1)s on failure — correct for a CLI script,
+       wrong here, where a missing credential or a token-request failure
+       must degrade to "no text" (exactly the outcome a comp's OWN
+       description fetch already tolerates — see `_printing_guard`), not
+       take down the entire sold-comps run.
+    2. `load_config()` ALSO falls back to reading
+       `~/.config/ebay-fetch/config.json` when the env vars are absent —
+       and that file holds REAL credentials on a dev machine that has ever
+       run `ebay-fetch` interactively (confirmed present on this repo's own
+       dev machine while building this guard). Reusing that fallback here
+       would mean an autouse test fixture that only deletes the env vars
+       (the established pattern — see conftest.py's
+       `_no_printing_guard_credentials`, mirroring `_no_sold_comps_secondary`
+       for the OTHER credential pair this codebase already tests against)
+       fails to isolate the guard from that file, and a pytest run on that
+       machine would make a REAL OAuth token request the instant a test's
+       slab pool happened to contain a price outlier. Env-var-only keeps
+       this credential source exactly as isolable as sold-comps.com's key
+       already is.
+
+    `ebay_fetch.get_token()` itself calls `sys.exit(1)` on bad credentials
+    or an exhausted retry budget; `SystemExit` is a `BaseException`, not an
+    `Exception`, so it is caught explicitly here alongside the ordinary
+    case.
+
+    Returns `(token, base_url)`, or `(None, None)` when credentials are
+    absent or the token request fails.
+    """
+    client_id = os.environ.get("EBAY_CLIENT_ID")
+    client_secret = os.environ.get("EBAY_CLIENT_SECRET")
+    if not client_id or not client_secret:
+        return None, None
+    environment = os.environ.get("EBAY_ENVIRONMENT", "production")
+    base_url = (ebay_fetch.PRODUCTION_BASE if environment == "production"
+                else ebay_fetch.SANDBOX_BASE)
+    try:
+        token = ebay_fetch.get_token(client_id, client_secret, base_url)
+    except (Exception, SystemExit):  # noqa: BLE001 — see docstring
+        return None, None
+    return token, base_url
+
+
+def _default_fetch_description(comp: dict) -> "str | None":
+    """`_printing_guard`'s default `fetch_description` — one Browse API
+    lookup of `comp`'s own listing, via `ebay_fetch.fetch_item_description`
+    (BUI-929). Returns None (never raises) when no Browse API credentials
+    are configured, the token request fails, or the item fetch itself fails
+    (404/purged/network) — every one of those collapses to the same
+    "couldn't verify" outcome `_printing_guard` already treats as KEEP.
+    """
+    item_id = comp.get("product_id")
+    if not item_id:
+        return None
+    token, base_url = _printing_guard_token()
+    if not token:
+        return None
+    try:
+        return ebay_fetch.fetch_item_description(item_id, token, base_url)
+    except Exception:  # noqa: BLE001 — guard must degrade, never crash the batch
+        return None
+
+
 # ─── Per-book pipeline (three-tier query strategy) ───────────────────────────
 
 def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
@@ -1996,6 +2267,11 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
     # the bottom carries the same keys as the success return.
     masthead_swapped_to: str | None = None
     variant_dropped: str | None = None
+    # BUI-929: bound here (not inside the try) for the same reason as
+    # masthead_swapped_to/variant_dropped above — the exception-fallback
+    # return at the bottom must carry the same keys as the success return.
+    printing_dropped = 0
+    printing_unverified = 0
     # BUI-678: comps the BUI-675 currency gate rejected (title present, price
     # object present, currency proven non-USD) — summed across every tier's
     # `_run` call below. A response that loses ALL its comps to this gate is a
@@ -2026,13 +2302,25 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
         publisher = book.get("publisher")
         variant = book.get("variant")  # BUI-304: now a query keyword, not DB-only
         self_id = str(book.get("item_id", ""))
+        # BUI-929: a certified target (certifier "cgc"/"cbcs") runs a
+        # dedicated graded-only pass — see build_query's `graded_target`
+        # docstring for how this differs from the older include_graded-only
+        # knob below. graded_target implies include_graded (both mean "don't
+        # exclude graded copies"), and additionally collapses the rest of
+        # this function to exactly one query (see the tier gates below) and
+        # routes every `_is_slab_comp` hit into `slab_comps` with parsed
+        # fields (see `_run`'s route_slabs branch). Any other/absent
+        # certifier value leaves this byte-for-byte unaffected.
+        certifier = book.get("certifier")
+        graded_target = certifier if certifier in ("cgc", "cbcs") else None
         # BUI-348: opt-in graded-comp fetch for the CGC-proxy tier. Default
-        # (field absent/falsy) keeps exclude_graded=True — every existing
-        # caller's queries stay byte-for-byte identical. Only a book explicitly
-        # tagged `include_graded: true` (comic-fmv's second, proxy-only pass)
+        # (field absent/falsy, and no graded_target) keeps exclude_graded=True
+        # — every existing caller's queries stay byte-for-byte identical.
+        # Only a book explicitly tagged `include_graded: true` (comic-fmv's
+        # second, proxy-only pass), or one with a certifier in {cgc, cbcs},
         # drops the `-cgc -cbcs -graded -slab` terms so the CGC/CBCS slab
         # ladder surfaces.
-        exclude_graded = not bool(book.get("include_graded"))
+        exclude_graded = not (bool(book.get("include_graded")) or graded_target)
 
         if self_id:
             seen_ids.add(self_id)
@@ -2109,7 +2397,7 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
                     continue
                 if comp["product_id"] in seen_ids:
                     continue
-                if hard_exclude(comp["title"]):
+                if hard_exclude(comp["title"], graded_target=graded_target):
                     continue
                 seen_ids.add(comp["product_id"])
                 # BUI-657/KTD6: stamp provenance on the comp at the point it
@@ -2135,6 +2423,12 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
                 # things this query found" signal) but never joins the raw
                 # `comps` pool.
                 if route_slabs and _is_slab_comp(comp):
+                    # BUI-929: certifier/label/page_quality parsed from the
+                    # title here — every slab comp this function returns
+                    # carries them, regardless of which route_slabs-passing
+                    # tier found it (the BUI-929 graded_target base tier, or
+                    # the pre-existing BUI-524 vintage inclusive tier).
+                    comp.update(parse_slab_fields(comp["title"]))
                     slab_comps.append(comp)
                     added += 1
                     continue
@@ -2165,30 +2459,45 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
             # SerpApi-only without a special case here.
             return {"added": added, "has_next_page": _has_next_page(data)}
 
-        # Tier 1 — base
+        # Tier 1 — base. BUI-929: a certified target passes `graded_target`
+        # (see build_query's docstring) and routes every `_is_slab_comp` hit
+        # into `slab_comps` (route_slabs) on this SAME base-tier call — the
+        # graded mode never runs a dedicated 4th "inclusive" pass the way
+        # the raw/CGC-proxy tiers do, because this query already IS the
+        # inclusive one.
         base_nkw = build_query(title, issue, year=year, publisher=publisher,
-                               variant=variant, exclude_graded=exclude_graded)
-        base_result = _run("base", base_nkw)
+                               variant=variant, exclude_graded=exclude_graded,
+                               graded_target=graded_target)
+        base_result = _run("base", base_nkw, route_slabs=bool(graded_target))
 
-        # BUI-523: gated page-2 fetch of the SAME base query — see the
-        # fetch_book_comps docstring for the full spend-gate rationale. Placed
-        # here (before tiers 2/3) so any comps it adds are already in `comps`
-        # when tiers 2/3 recompute their own thin/grade-tagged counts below.
-        grade_tagged_after_base = sum(1 for c in comps if c["grade"] is not None)
-        if base_result["has_next_page"] and grade_tagged_after_base < GRADE_TAGGED_THRESHOLD:
-            _run("base", base_nkw, page=2)
+        # BUI-929: a certified target runs the base tier ONLY — no page-2,
+        # no broaden, no alt-masthead, no grade-targeted, no variant-drop.
+        # Those tiers all exist to widen a RAW pool; a certified target's
+        # pool is the certifier's own sale history, which the base query
+        # above already queries inclusively (no excludes, certifier as a
+        # positive term), so widening further would only spend extra
+        # provider quota without changing what's being searched for.
+        if not graded_target:
+            # BUI-523: gated page-2 fetch of the SAME base query — see the
+            # fetch_book_comps docstring for the full spend-gate rationale.
+            # Placed here (before tiers 2/3) so any comps it adds are already
+            # in `comps` when tiers 2/3 recompute their own thin/grade-tagged
+            # counts below.
+            grade_tagged_after_base = sum(1 for c in comps if c["grade"] is not None)
+            if base_result["has_next_page"] and grade_tagged_after_base < GRADE_TAGGED_THRESHOLD:
+                _run("base", base_nkw, page=2)
 
-        # Tier 2 — auto-broaden if thin. BUI-350: pass the real `vintage_year`
-        # (even though the query text drops `year`) so a rebootable-masthead
-        # vintage key's broadened query keeps the BUI-347 exclusion terms —
-        # this applies to the CGC-proxy graded pass (`include_graded=True`)
-        # just as much as the ordinary raw pass, since both share this same
-        # tier.
-        if len(comps) < THIN_RESULTS_THRESHOLD and year:
-            broader_nkw = build_query(title, issue, year=None, publisher=publisher,
-                                      variant=variant, exclude_graded=exclude_graded,
-                                      vintage_year=year)
-            _run("broader", broader_nkw)
+            # Tier 2 — auto-broaden if thin. BUI-350: pass the real
+            # `vintage_year` (even though the query text drops `year`) so a
+            # rebootable-masthead vintage key's broadened query keeps the
+            # BUI-347 exclusion terms — this applies to the CGC-proxy graded
+            # pass (`include_graded=True`) just as much as the ordinary raw
+            # pass, since both share this same tier.
+            if len(comps) < THIN_RESULTS_THRESHOLD and year:
+                broader_nkw = build_query(title, issue, year=None, publisher=publisher,
+                                          variant=variant, exclude_graded=exclude_graded,
+                                          vintage_year=year)
+                _run("broader", broader_nkw)
 
         # BUI-565: `year` is int|None by here (coerced at the top of this try),
         # so this gate reads a string-year vintage book correctly too. Hoisted
@@ -2214,7 +2523,9 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
         # modern relaunch (where "X-Men #1" and "Uncanny X-Men #1" are different
         # books), and swapping there would price the wrong comic. Not probing
         # leaves today's behavior exactly as it was.
-        alt_title = _alias_masthead_title(title) if is_vintage else None
+        # BUI-929: never probed for a certified target — see the Tier 1
+        # comment above (graded mode runs the base tier only).
+        alt_title = _alias_masthead_title(title) if (is_vintage and not graded_target) else None
         if alt_title and len(comps) < THIN_RESULTS_THRESHOLD:
             primary_comps, primary_seen = comps, seen_ids
             # Give the probe its own accumulator so its depth is measured on its
@@ -2253,7 +2564,9 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
         if isinstance(target_grade, str):
             target_grade = parse_grade(target_grade)
         grade_tagged = sum(1 for c in comps if c["grade"] is not None)
-        if target_grade is not None and grade_tagged < GRADE_TAGGED_THRESHOLD:
+        # BUI-929: never fires for a certified target (base tier only).
+        if (not graded_target and target_grade is not None
+                and grade_tagged < GRADE_TAGGED_THRESHOLD):
             label = _grade_label_for_query(target_grade)
             if label:
                 grade_nkw = build_query(title, issue, year=year, publisher=publisher,
@@ -2301,7 +2614,8 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
         # few. That judgment is NOT made here: `variant_dropped` reports the
         # substitution to the caller (comic-fmv turns it into a needs-manual
         # `flag_reason`) instead of silently writing a variant-blind number.
-        if variant and not comps:
+        # BUI-929: never fires for a certified target (base tier only).
+        if not graded_target and variant and not comps:
             no_variant_nkw = build_query(title, issue, year=year,
                                          publisher=publisher, variant=None,
                                          exclude_graded=exclude_graded)
@@ -2310,6 +2624,18 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
                 variant_dropped = variant
             # Still empty ⇒ the variant was not the cause; this is a genuine
             # no-comps book and must not be flagged as a variant problem.
+
+        # BUI-929: printing guard runs once, after every tier above has
+        # finished populating `slab_comps` — "grouped by grade" per the plan
+        # means the WHOLE pool this book ends up with, not tier-by-tier.
+        # Fires whenever there's a slab pool to guard, regardless of which
+        # route_slabs-passing tier produced it (graded_target's base tier,
+        # or the pre-existing BUI-524 vintage inclusive tier).
+        if slab_comps:
+            guard_result = _printing_guard(
+                slab_comps, fetch_description=_default_fetch_description)
+            printing_dropped = guard_result["printing_dropped"]
+            printing_unverified = guard_result["printing_unverified"]
 
         out_input = {
             "item_id": self_id or None,
@@ -2354,6 +2680,13 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
             # A caller compares this to `comps`/`comp_count_total` to tell a
             # currency-gate-emptied pool apart from a genuine no-comps book.
             "non_usd_dropped": non_usd_dropped_total,
+            # BUI-929: how many slab_comps the printing guard dropped as a
+            # confirmed later printing/facsimile, and how many below-median
+            # comps it flagged but could NOT verify (kept anyway — see
+            # _printing_guard). Both 0 whenever slab_comps is empty or every
+            # comp in it priced at or above its rung's leave-one-out median.
+            "printing_dropped": printing_dropped,
+            "printing_unverified": printing_unverified,
         }
     except Exception as e:  # noqa: BLE001 — BUI-537: preserve the partial
         # trail rather than losing it; see the docstring above. `book.get(...)`
@@ -2380,6 +2713,8 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
             "masthead_swapped_to": masthead_swapped_to,
             "variant_dropped": variant_dropped,
             "non_usd_dropped": non_usd_dropped_total,
+            "printing_dropped": printing_dropped,
+            "printing_unverified": printing_unverified,
             "error": str(e),
         }
 
