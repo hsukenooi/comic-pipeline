@@ -6,12 +6,15 @@ loaded via the entry-point discovery path.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
 import sqlite3
 import statistics
 import subprocess
+import threading
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -1878,6 +1881,264 @@ def test_backfill_year_dry_run_paging_terminates(api, monkeypatch):
     # Each in-scope row previewed exactly once: no re-scan, none skipped.
     assert sorted(cid for cid in seen if cid in comic_ids) == sorted(comic_ids)
     assert len(seen) == len(comic_ids)
+
+
+# ---------------------------------------------------------------------------
+# BUI-912: the Metron shell-out must not block the event loop.
+#
+# `resolve_year_and_locg` is a subprocess with a 30s budget. Called straight
+# from this async handler it froze the comics server's single event loop for
+# `limit * 30s` — at limit=3 the `comics-api` health gate reported "server is
+# not responding" for ~90s and a 90-row pass was ~45 minutes of stall. The
+# resolution now runs on a worker thread; every DB read/write stays on the loop
+# thread (app.state.db is opened with the default check_same_thread=True).
+# ---------------------------------------------------------------------------
+
+
+def _slow_resolver(delay, calls=None, started=None):
+    """A resolver double that blocks `delay` seconds like the real subprocess."""
+    def fake(series, issue, *, outcome=None, **_kw):
+        if calls is not None:
+            calls.append(series)
+        if started is not None:
+            started.set()
+        time.sleep(delay)
+        if outcome is not None:
+            outcome["reason"] = "unresolvable"
+            outcome["retryable"] = False
+        return None
+    return fake
+
+
+def test_backfill_year_resolution_runs_off_the_loop_thread(api, monkeypatch):
+    """BUI-912: the blocking shell-out runs on a worker thread, while the DB
+    write stays on the loop thread.
+
+    Both idents are captured inside the SAME request: `upsert_comic` runs
+    wherever the handler body runs (the loop thread — `app.state.db` is a
+    sqlite3 connection with check_same_thread=True and would raise
+    ProgrammingError anywhere else), and the resolver records its own. A
+    direct call would make the two identical.
+    """
+    from gixen_overlay import routes
+    from gixen_overlay.locg_lookup import LocgResolution
+
+    comic_id = _linked_yearless_comic(api, "700000051", "Offloaded Book")
+    idents: dict[str, int | None] = {"resolver": None, "write": None}
+
+    def resolver(series, issue, **_kw):
+        idents["resolver"] = threading.get_ident()
+        return LocgResolution(year=1994)
+
+    real_upsert = routes.upsert_comic
+
+    def spy_upsert(*a, **kw):
+        idents["write"] = threading.get_ident()
+        return real_upsert(*a, **kw)
+
+    monkeypatch.setattr(routes, "resolve_year_and_locg", resolver)
+    monkeypatch.setattr(routes, "upsert_comic", spy_upsert)
+
+    body = api.post("/api/comics/backfill-year", params={"dry_run": "false"}).json()
+    entry = next(e for e in body["results"] if e["comic_id"] == comic_id)
+
+    assert entry["resolved"] is True, "the offloaded resolution must still land"
+    assert idents["resolver"] is not None and idents["write"] is not None
+    assert idents["resolver"] != idents["write"], (
+        "resolve_year_and_locg ran on the same thread as the DB write — it is "
+        "still blocking the event loop"
+    )
+
+
+def test_backfill_year_slow_resolution_keeps_health_responsive(api, monkeypatch):
+    """BUI-912's own Done-when, in miniature: `/health` must answer while a
+    pass is resolving.
+
+    The TestClient's blocking portal is shared across threads inside its
+    context manager, so the backfill request and the `/health` request land on
+    the SAME event loop — which is what makes this a real test of yielding
+    rather than two independent loops.
+    """
+    from gixen_overlay import routes
+
+    for i, item_id in enumerate(["700000061", "700000062", "700000063"]):
+        _linked_yearless_comic(api, item_id, f"Slow Book {i}")
+
+    started = threading.Event()
+    # 3 rows x 0.4s: if the handler does not yield, /health cannot answer for
+    # ~1.2s. Measured against a 0.4s ceiling, that is a 3x separation.
+    monkeypatch.setattr(
+        routes, "resolve_year_and_locg", _slow_resolver(0.4, started=started)
+    )
+
+    out: dict[str, object] = {}
+
+    def run_pass():
+        out["body"] = api.post("/api/comics/backfill-year").json()
+
+    worker = threading.Thread(target=run_pass, daemon=True)
+    worker.start()
+    try:
+        assert started.wait(10), "the resolver never ran"
+        t0 = time.monotonic()
+        health = api.get("/health")
+        elapsed = time.monotonic() - t0
+    finally:
+        worker.join(30)
+
+    assert health.status_code == 200
+    assert health.json()["status"] == "ok"
+    assert elapsed < 0.4, (
+        f"/health took {elapsed:.2f}s while backfill-year was resolving — the "
+        "event loop is still blocked by the shell-out"
+    )
+    assert out["body"]["scanned"] == 3, "the pass must still complete normally"
+
+
+def test_backfill_year_refuses_an_overlapping_pass(api, monkeypatch):
+    """BUI-912: offloading the shell-out is what makes two concurrent passes
+    possible (the handler used to contain no await at all). Two passes at the
+    same offset would double-spend Metron's ~20 req/min budget and each
+    compute a next_offset the other invalidates, so the second is refused with
+    409 rather than queued — a caller whose curl timed out must learn the pass
+    is still running, not silently start a duplicate."""
+    from gixen_overlay import routes
+
+    _linked_yearless_comic(api, "700000071", "Busy Book")
+    started = threading.Event()
+    calls: list[str] = []
+    monkeypatch.setattr(
+        routes,
+        "resolve_year_and_locg",
+        _slow_resolver(0.5, calls=calls, started=started),
+    )
+
+    out: dict[str, object] = {}
+
+    def run_pass():
+        out["response"] = api.post("/api/comics/backfill-year")
+
+    worker = threading.Thread(target=run_pass, daemon=True)
+    worker.start()
+    try:
+        assert started.wait(10), "the resolver never ran"
+        overlap = api.post("/api/comics/backfill-year")
+    finally:
+        worker.join(30)
+
+    assert overlap.status_code == 409
+    assert "already running" in overlap.json()["detail"]
+    assert out["response"].status_code == 200, "the in-flight pass must still finish"
+    assert len(calls) == 1, "the refused pass must not have spent a Metron lookup"
+    # The lock is released on the way out, so the next pass is accepted.
+    assert api.post("/api/comics/backfill-year").status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# BUI-914: absent Metron credentials are an operator config error, not an
+# unresolvable population.
+#
+# Per row `credentials` is the right verdict. In aggregate it reads as "Metron
+# genuinely cannot resolve these books", with nothing saying which of the two
+# you are looking at — so the endpoint says it once at the top and stops,
+# instead of spending up to 30s a row to reprint the same verdict.
+# ---------------------------------------------------------------------------
+
+
+def test_backfill_year_reports_missing_metron_credentials(api, monkeypatch):
+    from gixen_overlay import routes
+
+    comic_id = _linked_yearless_comic(api, "700000081", "Credentialless Book")
+    monkeypatch.setattr(
+        routes, "resolve_year_and_locg", _resolver_failing_with("credentials", False)
+    )
+
+    body = api.post("/api/comics/backfill-year").json()
+
+    assert body["metron_credentials_missing"] is True
+    assert "METRON_USERNAME" in body["metron_credentials_message"]
+    # The per-row verdict is unchanged — the new field is additive.
+    entry = next(e for e in body["results"] if e["comic_id"] == comic_id)
+    assert entry["reason"] == "credentials"
+    assert entry["retryable"] is False
+    assert body["unresolved_by_reason"]["credentials"] == 1
+
+
+def test_backfill_year_healthy_pass_reports_credentials_present(api, monkeypatch):
+    """The flag is present and false on a healthy pass, so a caller can gate on
+    it unconditionally instead of probing for the key."""
+    from gixen_overlay import routes
+    from gixen_overlay.locg_lookup import LocgResolution
+
+    _linked_yearless_comic(api, "700000082", "Fine Book")
+    monkeypatch.setattr(
+        routes, "resolve_year_and_locg", lambda series, issue, **_kw: LocgResolution(year=1977)
+    )
+
+    body = api.post("/api/comics/backfill-year").json()
+
+    assert body["metron_credentials_missing"] is False
+    assert body["metron_credentials_message"] is None
+
+
+@pytest.mark.parametrize("dry_run", ["true", "false"])
+def test_backfill_year_credentials_verdict_halts_the_pass(api, monkeypatch, dry_run):
+    """BUI-914: stop at the first `credentials` row. Every later row would
+    spend a subprocess and up to 30s to report the same non-retryable verdict.
+
+    `scanned` must then count the rows actually attempted and `next_offset`
+    advance only by those — both modes, since a pass halted at row 1 leaves
+    rows 2..N unscanned and still at the head of the population (BUI-721: the
+    per-mode arithmetic is unchanged, it just keys off attempted, not the page).
+    """
+    from gixen_overlay import routes
+
+    for i, item_id in enumerate(["700000091", "700000092", "700000093"]):
+        _linked_yearless_comic(api, item_id, f"Credentialless Book {i}")
+
+    calls: list[str] = []
+
+    def resolver(series, issue, *, outcome=None, **_kw):
+        calls.append(series)
+        if outcome is not None:
+            outcome["reason"] = "credentials"
+            outcome["retryable"] = False
+        return None
+
+    monkeypatch.setattr(routes, "resolve_year_and_locg", resolver)
+
+    body = api.post(
+        "/api/comics/backfill-year",
+        params={"limit": 3, "offset": 0, "dry_run": dry_run},
+    ).json()
+
+    assert len(calls) == 1, f"burned {len(calls)} lookups on a server with no credentials"
+    assert body["scanned"] == 1
+    assert body["unresolved"] == 1
+    assert len(body["results"]) == 1
+    assert body["next_offset"] == 1, "must not page past the rows it never scanned"
+    assert body["metron_credentials_missing"] is True
+
+
+def test_backfill_year_credentials_signal_is_logged_once(api, monkeypatch, caplog):
+    """One `logger.error`, not one per row — the signal is the point."""
+    from gixen_overlay import routes
+
+    for i, item_id in enumerate(["700000101", "700000102"]):
+        _linked_yearless_comic(api, item_id, f"Unlogged Book {i}")
+    monkeypatch.setattr(
+        routes, "resolve_year_and_locg", _resolver_failing_with("credentials", False)
+    )
+
+    with caplog.at_level(logging.ERROR, logger="gixen_overlay.routes"):
+        api.post("/api/comics/backfill-year", params={"limit": 2})
+
+    credential_errors = [
+        r for r in caplog.records
+        if r.levelno == logging.ERROR and "credentials" in r.getMessage()
+    ]
+    assert len(credential_errors) == 1, [r.getMessage() for r in credential_errors]
+    assert "METRON_USERNAME" in credential_errors[0].getMessage()
 
 
 # ---------------------------------------------------------------------------

@@ -1811,6 +1811,13 @@ async def api_sweep_orphans(request: Request, dry_run: bool = True):
     return sweep_orphan_yearless_comics(db, dry_run=dry_run)
 
 
+# BUI-912: serializes `POST /api/comics/backfill-year` passes. Module-level
+# (not per-app) because the comics server is one process with one app; created
+# at import time, which is safe on 3.10+ where `asyncio.Lock` no longer binds a
+# loop on construction.
+_BACKFILL_YEAR_LOCK = asyncio.Lock()
+
+
 @router.post("/api/comics/backfill-year")
 async def api_backfill_year(
     request: Request,
@@ -1848,11 +1855,20 @@ async def api_backfill_year(
     writing: each result carries `resolved` (bool) and, when true, the year
     that WOULD be written. Pass `?dry_run=false` to commit. `limit` defaults
     to a deliberately small 25 and bounds how many rows are scanned in one
-    call — each resolution shells out to the `locg` CLI **synchronously**
-    (subprocess, not awaited) with a 30s timeout apiece, so a large limit
-    blocks this single-process server's whole event loop — sync loop, other
-    requests, everything — for up to `limit * 30s`. Call repeatedly with a
-    small limit to page through a larger backlog instead of raising it.
+    call — each resolution shells out to the `locg` CLI (subprocess, 30s
+    timeout apiece), so a page still costs up to `limit * 30s` of WALL CLOCK.
+    **Since BUI-912 that wall clock is no longer an event-loop stall:** the
+    shell-out is awaited through `asyncio.to_thread`, so `/health`, the
+    dashboard and gixen-cli's sync loop keep serving throughout (at `limit=3`
+    the health gate used to report the server unresponsive for ~90s, which read
+    as an outage). Keep the limit small anyway — the CALLER's timeout still has
+    to cover the whole page (`comics-api` defaults `COMICS_CURL_MAX_TIME=30`,
+    shorter than a single row), and Metron allows ~20 req/min, so a wide page
+    spends most of itself rate-limited. Call repeatedly with a small limit to
+    page through a larger backlog instead of raising it. **Two passes at once
+    are refused with 409** (also BUI-912: the offload is what made an overlap
+    possible at all) — page sequentially, and on a caller-side timeout reconcile
+    against the store rather than blind-retrying.
 
     **Paging protocol (BUI-721):** the scan is `WHERE year IS NULL ORDER BY
     id LIMIT ? OFFSET ?` — a row that resolves and writes leaves the `year IS
@@ -1890,7 +1906,8 @@ async def api_backfill_year(
     row's position under another.
 
     Returns `{dry_run, active_only, offset, next_offset, scanned, resolved,
-    unresolved, unresolved_by_reason, retryable_unresolved, results}` —
+    unresolved, unresolved_by_reason, retryable_unresolved,
+    metron_credentials_missing, metron_credentials_message, results}` —
     `results` entries that fail to resolve carry
     `resolved: false` and no `year`, so a caller can tell "nothing to do yet"
     apart from "this call did nothing" (the same fetch-err-vs-genuine-zero
@@ -1913,131 +1930,246 @@ async def api_backfill_year(
     still `NULL` after the call (docs/solutions/conventions/
     an-endpoint-success-report-is-not-a-write.md: BUI-721 was exactly this —
     the response claimed a write that never happened).
+
+    **BUI-914:** one of those reasons is not like the others. With Metron
+    credentials absent every row returns `credentials`, non-retryable — right
+    per row, and misleading in aggregate: an operator config error renders as a
+    population of books Metron genuinely cannot resolve, with nothing saying
+    which of the two you are looking at. So the FIRST `credentials` verdict sets
+    `metron_credentials_missing: true`, fills `metron_credentials_message` with
+    the fix, logs one `logger.error`, and HALTS the pass — the remaining rows
+    would each spend a subprocess and up to 30s to report the same thing.
+    `scanned` then counts the rows actually attempted, not the page, and
+    `next_offset` advances only by those, so nothing is paged past unscanned.
+    The pass is INCOMPLETE: fix the credentials, then restart at `offset=0`.
+    (`metron_credentials_missing` is `false` on every healthy response, and
+    `metron_credentials_message` is `null` there, so a caller can gate on the
+    flag unconditionally.)
     """
     db = request.app.state.db
-    scope_sql = (
-        "SELECT DISTINCT c.id, c.title, c.issue, c.variant, c.locg_id, c.locg_variant_id "
-        "FROM comics c "
-        "JOIN fmv f ON f.comic_id = c.id "
-        "JOIN bid_fmvs bf ON bf.fmv_id = f.id "
-        "WHERE c.year IS NULL ORDER BY c.id LIMIT ? OFFSET ?"
-        if active_only
-        else "SELECT id, title, issue, variant, locg_id, locg_variant_id "
-        "FROM comics WHERE year IS NULL ORDER BY id LIMIT ? OFFSET ?"
-    )
-    rows = db.execute(scope_sql, (limit, offset)).fetchall()
+    # BUI-912: one pass at a time. Until the resolution moved off the request
+    # loop (see `asyncio.to_thread` below) this handler contained no `await` at
+    # all, so two overlapping calls were impossible by construction — the
+    # second could not start until the first returned. The offload opens that
+    # window, and two passes at the same `offset` would scan the same rows,
+    # spend two Metron lookups apiece against a ~20 req/min budget, and each
+    # compute a `next_offset` the other invalidates. Reject the overlap loudly
+    # instead of queueing behind the lock: a caller whose curl aborted on
+    # `COMICS_CURL_MAX_TIME` while the server kept working must learn the pass
+    # is STILL RUNNING, not silently start a duplicate of it.
+    #
+    # `locked()` then `async with` is atomic here, and only here: this is one
+    # event loop thread, and `asyncio.Lock.acquire()` on an uncontended lock
+    # returns without suspending, so no second request can be scheduled between
+    # the two. Do not add an `await` between them.
+    if _BACKFILL_YEAR_LOCK.locked():
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "a backfill-year pass is already running on this server — wait "
+                "for it to finish and page from its next_offset; do not retry "
+                "blind (its writes are committed row by row)"
+            ),
+        )
+    async with _BACKFILL_YEAR_LOCK:
+        scope_sql = (
+            "SELECT DISTINCT c.id, c.title, c.issue, c.variant, c.locg_id, c.locg_variant_id "
+            "FROM comics c "
+            "JOIN fmv f ON f.comic_id = c.id "
+            "JOIN bid_fmvs bf ON bf.fmv_id = f.id "
+            "WHERE c.year IS NULL ORDER BY c.id LIMIT ? OFFSET ?"
+            if active_only
+            else "SELECT id, title, issue, variant, locg_id, locg_variant_id "
+            "FROM comics WHERE year IS NULL ORDER BY id LIMIT ? OFFSET ?"
+        )
+        rows = db.execute(scope_sql, (limit, offset)).fetchall()
 
-    results: list[dict] = []
-    resolved_count = 0
-    unresolved_by_reason: dict[str, int] = {}
+        results: list[dict] = []
+        resolved_count = 0
+        # BUI-914: rows actually ATTEMPTED, which is `len(rows)` unless the
+        # credentials short-circuit below cut the page short. Every count and the
+        # `next_offset` arithmetic keys off this rather than the page size, so a
+        # halted pass never advances the caller past a row it never scanned.
+        scanned_count = 0
+        credentials_missing = False
+        unresolved_by_reason: dict[str, int] = {}
 
-    def _note_unresolved(entry: dict, reason: str, retryable: bool) -> None:
-        """Stamp an unresolved entry with WHY, and count it (BUI-788)."""
-        entry["reason"] = reason
-        entry["retryable"] = retryable
-        unresolved_by_reason[reason] = unresolved_by_reason.get(reason, 0) + 1
+        def _note_unresolved(entry: dict, reason: str, retryable: bool) -> None:
+            """Stamp an unresolved entry with WHY, and count it (BUI-788)."""
+            entry["reason"] = reason
+            entry["retryable"] = retryable
+            unresolved_by_reason[reason] = unresolved_by_reason.get(reason, 0) + 1
 
-    for row in rows:
-        outcome: dict[str, object] = {}
-        resolution = resolve_year_and_locg(row["title"], row["issue"], outcome=outcome)
-        if resolution is None:
-            reason = str(outcome.get("reason") or locg_lookup.REASON_CLI_ERROR)
-            miss_entry: dict[str, Any] = {
+        for row in rows:
+            scanned_count += 1
+            outcome: dict[str, object] = {}
+            # BUI-912: `resolve_year_and_locg` shells out to the `locg` CLI and
+            # blocks for up to `LOCG_TIMEOUT_SECONDS` (30s) per row. Run it on a
+            # worker thread so this single-process server's event loop stays free
+            # — `/health`, the dashboard and gixen-cli's sync loop all share it,
+            # and at `limit=3` the health gate used to read as a ~90s outage.
+            #
+            # ONLY the shell-out moves. Every DB read and write in this handler
+            # stays on the loop thread, for two independent reasons: `app.state.db`
+            # is a `sqlite3.connect()` with the default `check_same_thread=True`
+            # (server/db.py), so touching it off-thread raises ProgrammingError;
+            # and the loop thread is what serializes overlay writes against the
+            # sync loop's own writes on the same connection. So this is a pure
+            # yield point, not a move of the transaction boundary.
+            #
+            # What a yield point costs: a cancellation (server shutdown, or a
+            # client disconnect if the server ever propagates one) unblocks
+            # THIS coroutine but cannot kill the worker thread — the `locg`
+            # child runs on to its own `LOCG_TIMEOUT_SECONDS` kill, so a
+            # shutdown can lag by up to that, and rows already written stay
+            # written with no response to carry their `next_offset` back. That
+            # is the same "halt and reconcile against the store, never
+            # blind-retry" case a caller-side timeout already had, with less
+            # work lost, not a new one.
+            resolution = await asyncio.to_thread(
+                resolve_year_and_locg, row["title"], row["issue"], outcome=outcome
+            )
+            if resolution is None:
+                reason = str(outcome.get("reason") or locg_lookup.REASON_CLI_ERROR)
+                miss_entry: dict[str, Any] = {
+                    "comic_id": row["id"],
+                    "title": row["title"],
+                    "issue": row["issue"],
+                    "resolved": False,
+                }
+                _note_unresolved(
+                    miss_entry,
+                    reason,
+                    bool(outcome.get("retryable", locg_lookup.is_retryable_reason(reason))),
+                )
+                results.append(miss_entry)
+                if reason == locg_lookup.REASON_CREDENTIALS:
+                    # BUI-914: per row this verdict is accurate; in aggregate it
+                    # lies. Without credentials EVERY row comes back `credentials`
+                    # and non-retryable, so an operator config error renders as a
+                    # population of books Metron genuinely cannot resolve. Say it
+                    # once, in the response and in the log, and stop — the
+                    # remaining rows would each cost a subprocess and up to 30s to
+                    # produce the same verdict.
+                    credentials_missing = True
+                    logger.error(
+                        "backfill-year: Metron credentials are missing or rejected — "
+                        "no row can resolve. Set METRON_USERNAME/METRON_PASSWORD for "
+                        "the comics server (~/.comics-server/.env, then launchctl "
+                        "kickstart) and re-run from offset=0. Halted after %d of %d "
+                        "scanned row(s) rather than spending a lookup apiece on the "
+                        "same verdict.",
+                        scanned_count,
+                        len(rows),
+                    )
+                    break
+                continue
+            entry: dict[str, Any] = {
                 "comic_id": row["id"],
                 "title": row["title"],
                 "issue": row["issue"],
-                "resolved": False,
             }
-            _note_unresolved(
-                miss_entry,
-                reason,
-                bool(outcome.get("retryable", locg_lookup.is_retryable_reason(reason))),
-            )
-            results.append(miss_entry)
-            continue
-        entry: dict[str, Any] = {
-            "comic_id": row["id"],
-            "title": row["title"],
-            "issue": row["issue"],
-        }
-        if not dry_run:
-            # locg_id/locg_variant_id: pass the resolution's values as-is (not
-            # `or row[...]`) — upsert_comic COALESCEs a None against the
-            # existing stored value internally, so this already preserves
-            # row["locg_id"] when the resolution didn't find one, without an
-            # `or` that would (incorrectly, if unlikely) treat a real 0 as
-            # missing.
-            skip_reason: dict[str, str] = {}
-            new_comic_id = upsert_comic(
-                db,
-                title=row["title"],
-                issue=row["issue"],
-                year=resolution.year,
-                variant=row["variant"],
-                locg_id=resolution.locg_id,
-                locg_variant_id=resolution.locg_variant_id,
-                skip_reason=skip_reason,
-            )
-            if skip_reason:
-                # BUI-721: upsert_comic's PER-104 guard declined the write —
-                # the row's year is still NULL. Report it as unresolved, not
-                # as the successful write it never was.
-                entry["resolved"] = False
-                entry["skipped"] = skip_reason["code"]
-                entry["year"] = resolution.year
-                # BUI-788: a guard skip is unresolved for a THIRD kind of
-                # reason — Metron answered fine, the write was refused. It is
-                # terminal (the guard refuses the same write every time), so
-                # it must not inflate the retryable count. Carrying its own
-                # code into the same `reason` field is what keeps
-                # `unresolved_by_reason` summing to `unresolved`.
-                _note_unresolved(entry, skip_reason["code"], False)
+            if not dry_run:
+                # locg_id/locg_variant_id: pass the resolution's values as-is (not
+                # `or row[...]`) — upsert_comic COALESCEs a None against the
+                # existing stored value internally, so this already preserves
+                # row["locg_id"] when the resolution didn't find one, without an
+                # `or` that would (incorrectly, if unlikely) treat a real 0 as
+                # missing.
+                skip_reason: dict[str, str] = {}
+                new_comic_id = upsert_comic(
+                    db,
+                    title=row["title"],
+                    issue=row["issue"],
+                    year=resolution.year,
+                    variant=row["variant"],
+                    locg_id=resolution.locg_id,
+                    locg_variant_id=resolution.locg_variant_id,
+                    skip_reason=skip_reason,
+                )
+                if skip_reason:
+                    # BUI-721: upsert_comic's PER-104 guard declined the write —
+                    # the row's year is still NULL. Report it as unresolved, not
+                    # as the successful write it never was.
+                    entry["resolved"] = False
+                    entry["skipped"] = skip_reason["code"]
+                    entry["year"] = resolution.year
+                    # BUI-788: a guard skip is unresolved for a THIRD kind of
+                    # reason — Metron answered fine, the write was refused. It is
+                    # terminal (the guard refuses the same write every time), so
+                    # it must not inflate the retryable count. Carrying its own
+                    # code into the same `reason` field is what keeps
+                    # `unresolved_by_reason` summing to `unresolved`.
+                    _note_unresolved(entry, skip_reason["code"], False)
+                else:
+                    resolved_count += 1
+                    entry["resolved"] = True
+                    entry["year"] = resolution.year
+                    entry["comic_id_after"] = new_comic_id
+                    entry["merged"] = new_comic_id != row["id"]
             else:
+                # Preview only — upsert_comic (and its PER-104 guard) is never
+                # called, so there is nothing to disprove this optimistic read.
                 resolved_count += 1
                 entry["resolved"] = True
                 entry["year"] = resolution.year
-                entry["comic_id_after"] = new_comic_id
-                entry["merged"] = new_comic_id != row["id"]
-        else:
-            # Preview only — upsert_comic (and its PER-104 guard) is never
-            # called, so there is nothing to disprove this optimistic read.
-            resolved_count += 1
-            entry["resolved"] = True
-            entry["year"] = resolution.year
-        results.append(entry)
+            results.append(entry)
 
-    unresolved_count = len(rows) - resolved_count
-    # `next_offset` must advance by however many of THIS page's rows are still
-    # in the `year IS NULL` population on the next call — those are the ones a
-    # plain LIMIT would otherwise re-serve at the head. In a real run that is
-    # the unresolved ones (a written row leaves the population). In a DRY RUN
-    # nothing is written, so *every* scanned row stays — advancing by
-    # `unresolved_count` there re-scans the resolvable ones, and when a whole
-    # page resolves it advances by zero and the caller loops forever burning a
-    # Metron call per row per round. `dry_run=True` is this endpoint's default
-    # and the paging protocol above says to call until `scanned: 0`, so that
-    # loop is the reachable default path, not a corner case.
-    consumed = len(rows) if dry_run else unresolved_count
-    return {
-        "dry_run": dry_run,
-        "active_only": active_only,
-        "offset": offset,
-        "next_offset": offset + consumed,
-        "scanned": len(rows),
-        "resolved": resolved_count,
-        "unresolved": unresolved_count,
-        # BUI-788: the unresolved count split by cause, and how much of it a
-        # re-run could still recover. `unresolved` alone reads as "Metron
-        # doesn't know these books" — which is what made BUI-773's 90-row
-        # residual look structural when 5 of the 90 resolved on a retry.
-        # These two always agree with `unresolved`: every unresolved row is
-        # counted under exactly one reason.
-        "unresolved_by_reason": unresolved_by_reason,
-        "retryable_unresolved": sum(
-            1 for e in results if e.get("resolved") is False and e.get("retryable") is True
-        ),
-        "results": results,
-    }
+        unresolved_count = scanned_count - resolved_count
+        # `next_offset` must advance by however many of THIS page's rows are still
+        # in the `year IS NULL` population on the next call — those are the ones a
+        # plain LIMIT would otherwise re-serve at the head. In a real run that is
+        # the unresolved ones (a written row leaves the population). In a DRY RUN
+        # nothing is written, so *every* scanned row stays — advancing by
+        # `unresolved_count` there re-scans the resolvable ones, and when a whole
+        # page resolves it advances by zero and the caller loops forever burning a
+        # Metron call per row per round. `dry_run=True` is this endpoint's default
+        # and the paging protocol above says to call until `scanned: 0`, so that
+        # loop is the reachable default path, not a corner case.
+        # BUI-914: `scanned_count`, not `len(rows)` — identical unless the
+        # credentials short-circuit halted the page, where advancing by the page
+        # size would page the caller PAST rows that were never scanned. The
+        # per-mode choice itself is BUI-721's and is unchanged.
+        consumed = scanned_count if dry_run else unresolved_count
+        return {
+            "dry_run": dry_run,
+            "active_only": active_only,
+            "offset": offset,
+            "next_offset": offset + consumed,
+            "scanned": scanned_count,
+            "resolved": resolved_count,
+            "unresolved": unresolved_count,
+            # BUI-788: the unresolved count split by cause, and how much of it a
+            # re-run could still recover. `unresolved` alone reads as "Metron
+            # doesn't know these books" — which is what made BUI-773's 90-row
+            # residual look structural when 5 of the 90 resolved on a retry.
+            # These two always agree with `unresolved`: every unresolved row is
+            # counted under exactly one reason.
+            "unresolved_by_reason": unresolved_by_reason,
+            "retryable_unresolved": sum(
+                1 for e in results if e.get("resolved") is False and e.get("retryable") is True
+            ),
+            # BUI-914: the one endpoint-level operator signal. `credentials` is a
+            # per-row reason like any other, and as a per-row reason it is right —
+            # but it is the only one that means "nothing about this population is
+            # knowable until an operator fixes the server", so it is also reported
+            # once at the top, where an aggregate reader cannot miss it, and the
+            # pass halts. `false` on every healthy response, so a caller can gate
+            # on it unconditionally.
+            "metron_credentials_missing": credentials_missing,
+            "metron_credentials_message": (
+                (
+                    "Metron credentials are missing or rejected on the comics "
+                    "server, so no row can resolve. Set METRON_USERNAME and "
+                    "METRON_PASSWORD in ~/.comics-server/.env, launchctl kickstart "
+                    "the server, then re-run this pass from offset=0. Halted after "
+                    f"{scanned_count} of {len(rows)} scanned row(s)."
+                )
+                if credentials_missing
+                else None
+            ),
+            "results": results,
+        }
 
 
 # ---------------------------------------------------------------------------

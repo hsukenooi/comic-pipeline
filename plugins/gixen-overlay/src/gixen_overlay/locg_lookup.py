@@ -65,7 +65,9 @@ the 90 were false negatives. Two changes close it:
    rather than by keeping two constants in two packages in sync by hand, and
    converts a silent 30s stall into a fast in-band "throttled" verdict. It is
    deliberately NOT a fix in the other direction: raising `LOCG_TIMEOUT_SECONDS`
-   would only deepen the event-loop stall this endpoint already has.
+   only buys the caller a longer wait per row (and, until BUI-912 moved the
+   `backfill-year` call site onto `asyncio.to_thread`, deepened an event-loop
+   stall as well — see the constant's own comment below).
 """
 from __future__ import annotations
 
@@ -86,12 +88,18 @@ LOCG_CMD = os.environ.get("LOCG_CMD", "locg")
 # Bounded so a hung CLI invocation can't stall `extract-comics`.
 #
 # BUI-788: this is a HARD ceiling on purpose and must not be raised to "give
-# throttled rows room". `POST /api/comics/backfill-year` calls this
-# synchronously from an async handler on a single-process server, so every
-# second here blocks the sync loop and every other request — at `limit=3` the
-# health gate has already reported "server is not responding" for ~90s. The
-# throttle problem is fixed by shrinking the CHILD's sleep to fit this budget
-# (below), not by growing the budget.
+# throttled rows room". The throttle problem is fixed by shrinking the CHILD's
+# sleep to fit this budget (below), not by growing the budget.
+#
+# BUI-912 corrects WHY the ceiling is hard. The original reason was that
+# `POST /api/comics/backfill-year` called this synchronously from an async
+# handler on a single-process server, so every second here froze the sync loop
+# and every other request (at `limit=3` the health gate read as a ~90s outage).
+# That call site now awaits this through `asyncio.to_thread`, so seconds spent
+# here no longer block the loop — but they are still WALL CLOCK the caller pays
+# per row, still the budget the child's sleep cap is derived from, and raising
+# them still buys a throttled row nothing (the child sleeps past the moment we
+# kill it). Same ceiling, one fewer reason.
 LOCG_TIMEOUT_SECONDS = 30
 
 # The rate-limit retry sleep the child CLI is allowed, handed to it as
