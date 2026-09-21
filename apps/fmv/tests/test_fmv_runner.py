@@ -8,6 +8,7 @@ import json
 
 from unittest.mock import MagicMock, patch
 import pytest
+import requests
 
 import fmv_math
 import fmv_runner
@@ -7025,3 +7026,246 @@ class TestGradedRunEndToEnd:
                            server_url=server_url)
         out = capsys.readouterr().out
         assert "cgc-ldr" in out
+
+
+# ─── BUI-947: the exclusion stamp ─────────────────────────────────────────────
+
+
+class _FakeResponse:
+    """The three attributes `_post_comps_exclusions` reads off a response."""
+
+    def __init__(self, status_code=200, payload=None, bad_json=False):
+        self.status_code = status_code
+        self.ok = 200 <= status_code < 300
+        self._payload = payload if payload is not None else {}
+        self._bad_json = bad_json
+
+    def json(self):
+        if self._bad_json:
+            raise ValueError("not json")
+        return self._payload
+
+    def raise_for_status(self):
+        """Only the unrelated heartbeat POST calls this; the exclusion stamp
+        reads `status_code`/`ok` itself so a 404 stays a value, not a raise."""
+        if not self.ok:
+            raise requests.HTTPError(f"HTTP {self.status_code}")
+
+
+def _graded_harness():
+    """`TestGradedRunEndToEnd`'s book/result/run helpers, reused rather than
+    re-copied. They touch no instance state, so an instance made here behaves
+    identically; inheriting the class instead would re-collect every one of
+    its tests under a second name."""
+    return TestGradedRunEndToEnd()
+
+
+def _ledger_row(product_id="L1", comic_id=42):
+    return {"product_id": product_id, "comic_id": comic_id, "price": 760,
+            "grade": 4.5, "sold_date": "2026-08-25", "certifier": "cgc",
+            "label": "universal", "page_quality": "unknown"}
+
+
+class TestCompsExclusionStamp:
+    """BUI-947: `comic-fmv` makes BUI-946's in-memory drop DURABLE by posting
+    the dropped ledger rows to `POST /api/comics/comps/exclude`.
+
+    Every test here also asserts the book still PRICED. That is the point of
+    the ticket's fail-soft requirement: a ledger-bookkeeping write must never
+    be able to take down the number the operator is about to bid on.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_unsupported_flag(self):
+        """`_COMPS_EXCLUDE_UNSUPPORTED` is process-global by design (one 404
+        silences the rest of the run). Reset it around every test so an
+        ordering accident can't make a later test pass for the wrong reason."""
+        fmv_runner._COMPS_EXCLUDE_UNSUPPORTED = False
+        yield
+        fmv_runner._COMPS_EXCLUDE_UNSUPPORTED = False
+
+    def _run_with_stamp(self, tmp_path, server_url, *, dropped_ids,
+                        ledger, responses=None, side_effect=None):
+        h = _graded_harness()
+        calls = []
+
+        def _fake_post(url, json=None, **kwargs):
+            # `run()` also POSTs the BUI-602 heartbeat through this same
+            # module attribute; only the exclusion stamp is under test here,
+            # so everything else is answered 200 and not recorded.
+            if not url.endswith("/api/comics/comps/exclude"):
+                return _FakeResponse(200, {})
+            calls.append({"url": url, "body": json})
+            if side_effect is not None:
+                raise side_effect
+            queue = responses or []
+            if len(calls) <= len(queue):
+                return queue[len(calls) - 1]
+            return _FakeResponse(200, {"stamped": len(json["product_ids"])})
+
+        result = h._slab_result(graded_identity_dropped_ids=dropped_ids)
+        with patch("fmv_runner.requests.post", _fake_post):
+            row, _upsert, _posted = h._run(
+                h._book(), result, tmp_path, server_url, ledger=ledger)
+        return row, calls
+
+    def test_a_dropped_ledger_row_is_stamped_on_the_server(
+            self, tmp_path, server_url):
+        row, calls = self._run_with_stamp(
+            tmp_path, server_url,
+            dropped_ids=[{"product_id": "L1", "code": "cross_title"}],
+            ledger=[_ledger_row()])
+        assert len(calls) == 1
+        assert calls[0]["url"] == f"{server_url}/api/comics/comps/exclude"
+        assert calls[0]["body"] == {"comic_id": 42, "product_ids": ["L1"],
+                                    "code": "cross_title"}
+        assert row["comps_excluded_posted"] == 1
+        assert row["fmv"]["ledger_dropped"] == 1
+        assert row["fmv"]["fmv_high"] is not None
+
+    def test_each_code_is_its_own_call(self, tmp_path, server_url):
+        """The endpoint stamps one reason per call, so the reason written on
+        every row is the reason that call carried — never a batch's majority."""
+        row, calls = self._run_with_stamp(
+            tmp_path, server_url,
+            dropped_ids=[{"product_id": "L1", "code": "cross_title"},
+                         {"product_id": "L2", "code": "store_variant"}],
+            ledger=[_ledger_row("L1"), _ledger_row("L2")])
+        bodies = sorted((c["body"]["code"], tuple(c["body"]["product_ids"]))
+                        for c in calls)
+        assert bodies == [("cross_title", ("L1",)),
+                          ("store_variant", ("L2",))]
+        assert row["comps_excluded_posted"] == 2
+
+    def test_nothing_is_posted_when_nothing_was_dropped(
+            self, tmp_path, server_url):
+        """The common case by far. A run that drops nothing must not touch the
+        endpoint at all — including on a server that does not have it."""
+        row, calls = self._run_with_stamp(
+            tmp_path, server_url, dropped_ids=[], ledger=[_ledger_row()])
+        assert calls == []
+        assert row["comps_excluded_posted"] == 0
+        assert row["fmv"]["ledger_dropped"] == 0
+
+    def test_a_dropped_id_with_no_stored_row_posts_nothing(
+            self, tmp_path, server_url):
+        """A guard-dropped LIVE comp that was never archived has nothing to
+        stamp. Posting its id anyway would only fill the server's `not_found`."""
+        row, calls = self._run_with_stamp(
+            tmp_path, server_url,
+            dropped_ids=[{"product_id": "never-stored", "code": "printing"}],
+            ledger=[_ledger_row()])
+        assert calls == []
+        assert row["comps_excluded_posted"] == 0
+
+    def test_a_404_is_silent_after_the_first_and_never_fails_the_run(
+            self, tmp_path, server_url, capsys):
+        """An older comics server has no such route. The book must still
+        price, and the run must say so ONCE rather than once per book."""
+        row, calls = self._run_with_stamp(
+            tmp_path, server_url,
+            dropped_ids=[{"product_id": "L1", "code": "cross_title"}],
+            ledger=[_ledger_row()],
+            responses=[_FakeResponse(404)])
+        assert len(calls) == 1
+        assert row["comps_excluded_posted"] == 0
+        assert row["fmv"]["fmv_high"] is not None
+        assert fmv_runner._COMPS_EXCLUDE_UNSUPPORTED is True
+        err = capsys.readouterr().err
+        assert "POST /api/comics/comps/exclude" in err
+
+        # A second book in the same process must not re-ask.
+        _, calls2 = self._run_with_stamp(
+            tmp_path, server_url,
+            dropped_ids=[{"product_id": "L1", "code": "cross_title"}],
+            ledger=[_ledger_row()])
+        assert calls2 == []
+
+    def test_a_transport_error_never_touches_the_price(
+            self, tmp_path, server_url):
+        """Unlike the 404, a connection error is transient — it must warn and
+        continue, and must NOT silence stamping for the rest of the run."""
+        row, calls = self._run_with_stamp(
+            tmp_path, server_url,
+            dropped_ids=[{"product_id": "L1", "code": "cross_title"}],
+            ledger=[_ledger_row()],
+            side_effect=requests.ConnectionError("boom"))
+        assert len(calls) == 1
+        assert row["comps_excluded_posted"] == 0
+        assert row["fmv"]["fmv_high"] is not None
+        assert fmv_runner._COMPS_EXCLUDE_UNSUPPORTED is False
+
+    def test_a_500_never_touches_the_price(self, tmp_path, server_url):
+        row, _calls = self._run_with_stamp(
+            tmp_path, server_url,
+            dropped_ids=[{"product_id": "L1", "code": "cross_title"}],
+            ledger=[_ledger_row()],
+            responses=[_FakeResponse(500)])
+        assert row["comps_excluded_posted"] == 0
+        assert row["fmv"]["fmv_high"] is not None
+        assert fmv_runner._COMPS_EXCLUDE_UNSUPPORTED is False
+
+    def test_rows_straddling_two_books_are_not_stamped(
+            self, tmp_path, server_url):
+        """`comic_id` comes from the rows themselves. Two distinct ids means
+        the read straddled books, and stamping the wrong book's pool is worse
+        than not stamping at all."""
+        row, calls = self._run_with_stamp(
+            tmp_path, server_url,
+            dropped_ids=[{"product_id": "L1", "code": "cross_title"},
+                         {"product_id": "L2", "code": "cross_title"}],
+            ledger=[_ledger_row("L1", comic_id=42),
+                    _ledger_row("L2", comic_id=43)])
+        assert calls == []
+        assert row["comps_excluded_posted"] == 0
+
+    def test_an_unparseable_2xx_body_is_not_credited(
+            self, tmp_path, server_url):
+        """The stamp probably landed, but this count must never claim more
+        than the server confirmed."""
+        row, calls = self._run_with_stamp(
+            tmp_path, server_url,
+            dropped_ids=[{"product_id": "L1", "code": "cross_title"}],
+            ledger=[_ledger_row()],
+            responses=[_FakeResponse(200, bad_json=True)])
+        assert len(calls) == 1
+        assert row["comps_excluded_posted"] == 0
+
+    def test_the_summary_warns_when_a_drop_went_unstamped(
+            self, tmp_path, server_url, capsys):
+        """`ledger_dropped=1, stamped=0` is the silent-nothing-stored shape
+        this module keeps getting burned by, so `run()` says it out loud."""
+        self._run_with_stamp(
+            tmp_path, server_url,
+            dropped_ids=[{"product_id": "L1", "code": "cross_title"}],
+            ledger=[_ledger_row()],
+            responses=[_FakeResponse(500)])
+        assert "were STAMPED excluded in the ledger" in capsys.readouterr().err
+
+    def test_the_summary_is_quiet_when_every_drop_was_stamped(
+            self, tmp_path, server_url, capsys):
+        self._run_with_stamp(
+            tmp_path, server_url,
+            dropped_ids=[{"product_id": "L1", "code": "cross_title"}],
+            ledger=[_ledger_row()])
+        assert "STAMPED excluded" not in capsys.readouterr().err
+
+    def test_the_ledger_read_never_asks_for_excluded_rows(self, server_url):
+        """The other half of the stamp, at `_merge_slab_pool`'s ledger INPUT:
+        the server hides a stamped row by DEFAULT, and this caller — the one
+        sanctioned ledger read in the pricing path, feeding both the live
+        graded merge and `_graded_ledger_advisory` — must never opt back in.
+        Sending `include_excluded=true` here would re-admit every row this
+        ticket exists to keep out, silently."""
+        captured = {}
+
+        def _fake(url, *, params, **kw):
+            captured.update(params)
+            return []
+
+        with patch("fmv_runner._get_json_or_warn", _fake):
+            fmv_runner._fetch_ledger_comps(
+                server_url, title="Invincible", issue="1", year=2003,
+                pool="slab", certifier="cgc", label="universal")
+        assert "include_excluded" not in captured
+        assert captured["pool"] == "slab"

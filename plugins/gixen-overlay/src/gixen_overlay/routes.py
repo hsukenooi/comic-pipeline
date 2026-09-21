@@ -45,6 +45,7 @@ from gixen_overlay.db import (
     get_won_auctions_cost_basis,
     get_comps,
     get_fmv_history,
+    stamp_comps_excluded,
     DEFAULT_OUTCOME_GRADE_WINDOW,
     DEFAULT_OUTCOME_RECENCY_DAYS,
     DEFAULT_CALIBRATION_MIN_LOSSES,
@@ -57,6 +58,7 @@ from gixen_overlay.locg_lookup import resolve_year_and_locg
 from gixen_overlay.models import (
     UpsertComicRequest,
     CompsIngestRequest,
+    CompsExcludeRequest,
     LocgLinkRequest,
     LinkFmvRequest,
     VerifyRequest,
@@ -551,6 +553,7 @@ async def api_comics_comps(
     days: float | None = None,
     pool: str | None = None,
     provider: str | None = None,
+    include_excluded: bool = False,
     limit: int = DEFAULT_COMPS_READ_LIMIT,
 ):
     """BUI-662: read the comps ledger for one book — DIAGNOSTIC/ARCHIVE ONLY.
@@ -603,6 +606,14 @@ async def api_comics_comps(
     a fetch failure, `_fetch_ledger_comps` (BUI-698) stopped logging it as
     one — this endpoint still 400s exactly as before; only the caller's
     noise changed.
+
+    **BUI-947:** `include_excluded` (default false) is the read half of the
+    exclusion stamp. Stamped rows are INVISIBLE by default, so the sanctioned
+    pricing caller above is filtered without knowing the concept exists — and
+    so is every other reader that does not opt in. Pass `include_excluded=true`
+    only to AUDIT what was stamped (`excluded_code` / `excluded_at` come back
+    on every row either way, since this returns `SELECT *`); it is never the
+    right flag for anything that builds a pool.
     """
     db = request.app.state.db
     rows = get_comps(
@@ -615,11 +626,63 @@ async def api_comics_comps(
         days=days,
         pool=pool,
         provider=provider,
+        include_excluded=include_excluded,
         limit=limit,
     )
     if rows is None:
         raise HTTPException(status_code=400, detail=_UNRESOLVABLE_IDENTITY_DETAIL)
     return [dict(r) for r in rows]
+
+
+@router.post("/api/comics/comps/exclude")
+async def api_comics_comps_exclude(req: CompsExcludeRequest, request: Request):
+    """BUI-947: stamp `pool='slab'` comps of one book as excluded from pools.
+
+    The write half of the exclusion stamp, and the residual BUI-946 could not
+    close. BUI-946 drops a ledger row at MERGE time when this run's live fetch
+    re-examined the same listing and its graded guards rejected it. A listing
+    that has aged past the provider's ~90-day sold window is never re-fetched,
+    so no fetch ever reports it, and its stored copy keeps entering the slab
+    pool at 0.5 weight for up to 365 days. Stamping it here takes it out of
+    every pool for good, in one place, for every reader.
+
+    STAMP, NEVER DELETE. The row stays, with `excluded_code` naming which
+    guard judged it and `excluded_at` when. The listing is usually
+    unre-fetchable by then, so this row is the only surviving record that it
+    existed — and a wrong exclusion has to be discoverable and reversible,
+    which a DELETE would make neither.
+
+    Body: `{comic_id, product_ids: [...], code}`. Exactly one `code` per call
+    — group by code caller-side rather than sending a mixed batch, so the
+    reason on every stamped row is the reason that call carried.
+
+    Semantics, matched to the neighbouring comps routes:
+      * 404 — `comic_id` names no known book. The sibling GET 400s an
+        unresolvable `(title, issue)`; this takes an explicit id, and a
+        missing row addressed by primary key is a 404, not a bad query.
+      * 422 — an unknown `code`, an empty `product_ids`, or a missing field
+        (`CompsExcludeRequest`). The whole call is refused before anything is
+        stamped, and `LedgerRoute` persists the refusal to `rejected_writes`.
+      * 200 — `{comic_id, code, stamped, already_stamped, not_found}`.
+
+    A RAW row is never stamped by this endpoint, whatever is sent: every code
+    in the vocabulary comes from a GRADED-mode-only guard, so it has no
+    meaning for a raw comp, and this project's standing lesson is that
+    silently thinning the raw pool is the expensive direction. A product_id
+    that resolves to a raw row comes back in `not_found` — reported, not
+    obeyed.
+
+    IDEMPOTENT: a row already stamped is counted in `already_stamped` and
+    left exactly as it was, so re-running the BUI-947 sweep over an
+    already-swept archive writes nothing and changes no `excluded_at`.
+    """
+    db = request.app.state.db
+    result = stamp_comps_excluded(db, req.comic_id, req.product_ids, req.code)
+    if result is None:
+        raise HTTPException(
+            status_code=404, detail=f"comic_id {req.comic_id} not in DB"
+        )
+    return result
 
 
 @router.get("/api/comics/fmv-history")

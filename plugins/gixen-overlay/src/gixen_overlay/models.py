@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, field_validator
 from gixen_overlay.db import (
     COMP_PAGE_QUALITIES,
     COMP_PAGE_QUALITY_UNKNOWN,
+    COMPS_EXCLUSION_CODES,
     COMPS_POOLS,
     COMPS_PROVENANCES,
     FMV_CERTIFIER_NONE,
@@ -752,4 +753,47 @@ class CompsIngestRequest(BaseModel):
     def _non_empty(cls, v: list[CompItem]) -> list[CompItem]:
         if not v:
             raise ValueError("comps must be a non-empty list")
+        return v
+
+
+class CompsExcludeRequest(BaseModel):
+    """POST /api/comics/comps/exclude — stamp slab comps as excluded (BUI-947).
+
+    Unlike `CompsIngestRequest` above, `comic_id` is REQUIRED and not
+    nullable. An exclusion is always a judgement about ONE book's pool — the
+    guard that produced it ran with that book's issue number and variant in
+    hand — and a product_id is unique per (provider, pool), never across
+    books. There is no honest "stamp this everywhere".
+
+    `product_ids` are strings because the column is TEXT; an int in the JSON
+    body is coerced by pydantic rather than silently failing to match later.
+
+    `code` is validated against `COMPS_EXCLUSION_CODES`, imported from
+    `gixen_overlay.db` so this and `stamp_comps_excluded` share one source of
+    truth. An unknown code 422s the WHOLE call before anything is stamped —
+    `LedgerRoute` persists that to `rejected_writes` for free, which matters
+    more here than for most writes: the producer is `comic-fmv` forwarding a
+    code invented in `apps/ebay`, across the HTTP-only package boundary where
+    nothing at build time can notice a new guard code the server has never
+    heard of.
+    """
+
+    comic_id: int
+    product_ids: list[str]
+    code: str
+
+    @field_validator("product_ids")
+    @classmethod
+    def _non_empty_ids(cls, v: list[str]) -> list[str]:
+        if not v:
+            raise ValueError("product_ids must be a non-empty list")
+        return v
+
+    @field_validator("code")
+    @classmethod
+    def _validate_code(cls, v: str) -> str:
+        if v not in COMPS_EXCLUSION_CODES:
+            raise ValueError(
+                f"code must be one of: {', '.join(COMPS_EXCLUSION_CODES)}"
+            )
         return v
