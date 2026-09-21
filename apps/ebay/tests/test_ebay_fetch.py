@@ -358,6 +358,54 @@ class TestParseItem:
         # auction_response has no Publication Year and no title paren year.
         assert ebay_fetch.parse_item(auction_response)["cover_year"] is None
 
+    @staticmethod
+    def _bin_item(title, aspects):
+        return {
+            "itemId": "v1|222|0",
+            "title": title,
+            "buyingOptions": ["FIXED_PRICE"],
+            "price": {"value": "899.00", "currency": "USD"},
+            "itemEndDate": "2026-10-01T00:00:00.000Z",
+            "condition": "Used",
+            "localizedAspects": [
+                {"name": name, "value": value} for name, value in aspects.items()
+            ],
+            "itemWebUrl": "https://www.ebay.com/itm/222",
+        }
+
+    def test_certified_flag_is_wired_from_the_certification_result(self):
+        """BUI-942: parse_item passes certified=True for a slab, so a BARE title
+        year corroborates the Publication Year (spike listing 198651466110)."""
+        item = self._bin_item(
+            "Giant-Size X-Men #1 CGC 8.0 OW/W 1st New X-Men 1975 Marvel",
+            {"Professional Grader": "CGC", "Grade": "8.0", "Publication Year": "1975"},
+        )
+        parsed = ebay_fetch.parse_item(item)
+        assert parsed["grade_source"] == "certified"
+        assert parsed["cover_year"] == 1975
+
+    def test_certified_cover_date_survives_a_missing_publication_year(self):
+        """Spike listing 298687063023: item specifics carry no Publication Year
+        at all, so the title's "3/66" cover date is the only year signal."""
+        item = self._bin_item(
+            "Fantastic Four #48   3/66   1st Appearance of SILVER SURFER! CGC 7.0",
+            {"Certification Number": "1234567001", "Grade": "7.0"},
+        )
+        parsed = ebay_fetch.parse_item(item)
+        assert parsed["certifier"] == "cgc"
+        assert parsed["cover_year"] == 1966
+
+    def test_raw_listing_keeps_the_paren_only_gate(self):
+        """The relaxation is certified-only: the same bare-year title with no
+        certifier still yields no year (BUI-316 behavior, unchanged)."""
+        item = self._bin_item(
+            "Giant-Size X-Men #1 1st New X-Men 1975 Marvel VF",
+            {"Publication Year": "1975"},
+        )
+        parsed = ebay_fetch.parse_item(item)
+        assert parsed["certifier"] is None
+        assert parsed["cover_year"] is None
+
     def test_description_truncation(self, auction_response):
         auction_response["shortDescription"] = "A" * 600
         result = ebay_fetch.parse_item(auction_response)

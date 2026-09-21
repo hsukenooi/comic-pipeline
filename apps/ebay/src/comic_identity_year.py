@@ -104,6 +104,52 @@ def _all_title_years(title: str) -> "list[int]":
     return paren_years + bare_years
 
 
+# ─── Month/2-digit-year cover dates (BUI-942) ───────────────────────────────
+# Silver/Bronze-Age sellers routinely write the book's printed COVER DATE in
+# the title as "3/66" instead of a 4-digit year ("Fantastic Four #48  3/66  1st
+# Silver Surfer! CGC 7.0" — spike listing 298687063023, whose item specifics
+# carry NO Publication Year at all, so no 4-digit signal exists anywhere).
+# Unlike a bare or parenthesized 4-digit year, this form is PER-ISSUE by
+# construction: a volume start year is never written "3/66", so it cannot be
+# the BUI-129 category error (series year_began used as an issue-level gate).
+# That is what lets confident_cover_year accept it as the ONLY year signal on a
+# certified listing, where a bare 4-digit year still needs corroboration.
+#
+# The pattern is deliberately narrow, because the shape "N/NN" collides with
+# several things a comic title really does contain:
+#   - month 1 is EXCLUDED ("1/50", "1/25") — a ratio/incentive variant is
+#     always written with numerator 1, and "1/50" would otherwise read as
+#     January 1950. Cost: a genuine January cover date in slash form is not
+#     read (stays blank — the safe direction).
+#   - the year must be 30-99 → 19xx only. A 20xx cover date in slash form is
+#     vanishingly rare (the convention is a Golden/Silver/Bronze-Age one),
+#     while "9/10"-style scores and "/25"//50" ratio denominators are common;
+#     restricting to 19xx drops both.
+#   - no digit, "/", "." or "#" immediately before, and no digit or "/"
+#     immediately after, so "3/15/66" (a full M/D/YY date) and "#5/50" (a
+#     numbered copy) do not read as a cover date.
+_COVER_DATE_RE = re.compile(r"(?<![\d/.#])(0?[2-9]|1[0-2])/([3-9]\d)(?![\d/])")
+
+
+def _title_cover_date_years(title: str) -> "list[int]":
+    """Every 19xx year stated as a month/2-digit-year cover date in *title*.
+
+    Examples:
+      "Fantastic Four #48  3/66  CGC 7.0"      → [1966]
+      "X-Men #1 9/63 10/63"                    → [1963, 1963]
+      "Spawn #1 CGC 9.8 1/50 ratio variant"    → []        (month 1 excluded)
+      "Batman #227 CGC 4.5 condition 9/10"     → []        (year 10 not 30-99)
+      "Action Comics #1 3/15/66 lot"           → []        (full M/D/YY date)
+      "Sketch cover #5/50 CGC 9.6"             → []        (numbered copy)
+    """
+    years: list[int] = []
+    for m in _COVER_DATE_RE.finditer(title or ""):
+        yr = 1900 + int(m.group(2))
+        if _is_plausible_year(yr):
+            years.append(yr)
+    return years
+
+
 # ─── Edition classification (annual-nests-in-parent vs Giant-Size-own-series) ─
 # These duplicate the regex BODIES already in _EDITION_PATTERNS (kept generic
 # there for hard_reject's "does title contain any edition word" check) because
@@ -261,6 +307,8 @@ def _coerce_publication_year(item_specifics: "dict | None") -> "int | None":
 def confident_cover_year(
     title: "str | None",
     item_specifics: "dict | None",
+    *,
+    certified: bool = False,
 ) -> "int | None":
     """Return a per-issue cover year to forward to /comic:collection-check ONLY
     when two independent signals corroborate it — else None (year-agnostic).
@@ -270,6 +318,30 @@ def confident_cover_year(
       2. a parenthesized year in the listing title (_title_paren_years) agrees
          with it within ±1 — the same cover-vs-onsale tolerance the matcher's
          own year gate uses (BUI-214/251).
+
+    CERTIFIED RELAXATION (BUI-942). ``certified=True`` — set by the caller only
+    for a slab listing (``grade_source == "certified"``) — widens WHICH title
+    year may corroborate, and adds one stand-alone signal:
+      2b. a BARE (unparenthesized) plausible year in the title also corroborates
+          (_all_title_years). Slab sellers spend the title's paren budget on the
+          cert ("CGC 8.0 (OW/W)") and write the year bare — "Giant-Size X-Men #1
+          CGC 8.0 OW/W 1st New X-Men 1975 Marvel". The year RETURNED is still
+          the item-specifics Publication Year, so a stray bare number can only
+          ever confirm a year we already hold; it never becomes the answer.
+      2c. a month/2-digit-year cover date (_title_cover_date_years, e.g. "3/66")
+          may stand ALONE when the listing has no Publication Year aspect at
+          all. This is the only single-signal path, and it is safe for a
+          different reason than corroboration: the form is per-issue by
+          construction (a series year_began is never written "3/66"), so it
+          cannot be the BUI-129 category error, and the pattern itself is
+          narrowed hard against ratio variants / scores / full dates (see
+          _COVER_DATE_RE). Ambiguity suppresses: two DIFFERENT cover-date years
+          in one title emit nothing.
+
+    What the relaxation deliberately does NOT do: a bare 4-digit year never
+    stands alone (it is exactly the volume-start-year shape BUI-129 was), and
+    nothing changes for a raw listing — ``certified`` defaults to False, so the
+    well-exercised raw path keeps the BUI-316 paren-only gate verbatim.
 
     The Publication Year is the authoritative per-issue cover year and is what
     we return; the title's parenthesized year is the corroborating check. This
@@ -294,17 +366,42 @@ def confident_cover_year(
     it needs a genuine double-mis-tag rather than the normal volume-decoration
     convention, and the direction is a missed match (duplicate-buy risk), not
     silent data loss. See test_correlated_wrong_year_is_the_accepted_residual.
+    (BUI-942 widens that same residual slightly for certified listings — a bare
+    title year can now be the mis-tagged twin — but not its shape: a wrong year
+    still requires BOTH signals wrong AND mutually consistent within ±1. A
+    wrong title year alone still suppresses, because it fails to corroborate
+    the correct Publication Year.)
     """
     # A reprint format's Publication Year is the original issue's year, not the
     # copy the buyer is holding — forwarding it would falsely match the owned
-    # original. Refuse outright, before any corroboration.
+    # original. Refuse outright, before any corroboration. Unconditional: a
+    # certified reprint/facsimile slab is the same hazard as a raw one.
     if _classify_edition_kind(title or "") in ("facsimile", "reprint"):
         return None
 
     pub_year = _coerce_publication_year(item_specifics)
-    if pub_year is None:
+
+    # BUI-942: which title years may corroborate the Publication Year. Raw
+    # keeps BUI-316's paren-only pool; a slab also gets bare years and
+    # month/2-digit-year cover dates.
+    cover_date_years = _title_cover_date_years(title or "") if certified else []
+    if certified:
+        corroborators = _all_title_years(title or "") + cover_date_years
+    else:
+        corroborators = _title_paren_years(title or "")
+
+    if pub_year is not None:
+        # The Publication Year stays the authoritative per-issue value and the
+        # only thing ever returned on this path; the title year is the check.
+        if any(abs(py - pub_year) <= 1 for py in corroborators):
+            return pub_year
         return None
 
-    if any(abs(py - pub_year) <= 1 for py in _title_paren_years(title or "")):
-        return pub_year
+    # No Publication Year aspect at all (spike listing 298687063023 carries
+    # only Certification Number / Grade / Publisher). A month/2-digit-year
+    # cover date in a CERTIFIED title may stand alone — but only when the
+    # title states exactly one such year; two different ones are ambiguous.
+    distinct_cover_dates = set(cover_date_years)
+    if len(distinct_cover_dates) == 1:
+        return distinct_cover_dates.pop()
     return None

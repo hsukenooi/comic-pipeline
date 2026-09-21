@@ -904,7 +904,14 @@ def parse_item(data):
         # Publication Year corroborate it (and it's not a facsimile/reprint).
         # None when not confident — the check then stays year-agnostic (never
         # forwards a wrong year, so it can't reintroduce BUI-129).
-        "cover_year": confident_cover_year(title, item_specifics),
+        # BUI-942: on a CERTIFIED listing a bare title year also corroborates,
+        # and a "3/66"-style cover date may stand alone — slab titles spend
+        # their parens on the cert, so the paren-only gate left 6 of the 8
+        # spike slabs yearless. certified is keyed off the same signal that
+        # sets grade_source == "certified" above.
+        "cover_year": confident_cover_year(
+            title, item_specifics, certified=bool(certification.certifier),
+        ),
         "item_specifics": item_specifics,
         "description_snippet": description_snippet,
         "listing_url": listing_url,
