@@ -1,0 +1,214 @@
+{
+ "_source": "comics server comps ledger, pool='slab' comic_id=1025 (read-only sqlite3 .backup copy, 2026-09-21) — the pool the server actually holds for this book",
+ "target": {
+  "item_id": "336749516844",
+  "title": "Invincible",
+  "issue": "1",
+  "year": 2003,
+  "publisher": "Image Comics",
+  "grade": 9.4,
+  "certifier": "cgc",
+  "label": "universal",
+  "page_quality": "white"
+ },
+ "comps": [
+  {
+   "product_id": "366488620024",
+   "title": "Invincible #1 CGC 8.5 1st Print High Grade! 1st Invincible Omni Man 2003 Image",
+   "price": 2078.0,
+   "grade": 8.5,
+   "sold_date": "2026-06-30",
+   "buying_format": "auction",
+   "certifier": "cgc",
+   "label": "universal",
+   "page_quality": "unknown"
+  },
+  {
+   "product_id": "366571556229",
+   "title": "Invincible #1 CGC 8.5 1st Print High Grade! 1st Invincible Omni Man 2003 Image",
+   "price": 2225.0,
+   "grade": 8.5,
+   "sold_date": "2026-08-18",
+   "buying_format": "auction",
+   "certifier": "cgc",
+   "label": "universal",
+   "page_quality": "unknown"
+  },
+  {
+   "product_id": "178443361140",
+   "title": "Invincible #1 Image Comics 2003 Larrys Limited Edition CGC 9.2 W/ Custom Label",
+   "price": 610.0,
+   "grade": 9.2,
+   "sold_date": "2026-08-27",
+   "buying_format": null,
+   "certifier": "cgc",
+   "label": "universal",
+   "page_quality": "white"
+  },
+  {
+   "product_id": "168523155306",
+   "title": "Invincible #1 CGC 9.2 #126322004 (Image Comics Malibu Comics January 2003)",
+   "price": 2302.0,
+   "grade": 9.2,
+   "sold_date": "2026-07-18",
+   "buying_format": "auction",
+   "certifier": "cgc",
+   "label": "universal",
+   "page_quality": "unknown"
+  },
+  {
+   "product_id": "407122558887",
+   "title": "Invincible #1 CGC 9.2 1st Print Incredible! 1st Invincible Omni Man 2003 Image",
+   "price": 2685.0,
+   "grade": 9.2,
+   "sold_date": "2026-08-06",
+   "buying_format": null,
+   "certifier": "cgc",
+   "label": "universal",
+   "page_quality": "unknown"
+  },
+  {
+   "product_id": "366546550834",
+   "title": "Invincible #1 CGC 9.2 1st Print Incredible! 1st Invincible Omni Man 2003 Image",
+   "price": 2922.0,
+   "grade": 9.2,
+   "sold_date": "2026-08-04",
+   "buying_format": "auction",
+   "certifier": "cgc",
+   "label": "universal",
+   "page_quality": "unknown"
+  },
+  {
+   "product_id": "377343786478",
+   "title": "Invincible #1 CGC 9.2 1st Print High Grade! 1st Invincible Omni Man 2003 Image",
+   "price": 2995.0,
+   "grade": 9.2,
+   "sold_date": "2026-08-19",
+   "buying_format": null,
+   "certifier": "cgc",
+   "label": "universal",
+   "page_quality": "unknown"
+  },
+  {
+   "product_id": "366511817790",
+   "title": "Invincible #1 High Grade 1st App. WHITE Pages Kirkman Image Comics 2003 CGC 9.4",
+   "price": 3609.0,
+   "grade": 9.4,
+   "sold_date": "2026-07-06",
+   "buying_format": "auction",
+   "certifier": "cgc",
+   "label": "universal",
+   "page_quality": "white"
+  },
+  {
+   "product_id": "358709092665",
+   "title": "Invincible #1 Larry’s Comics Limited Edition Variant CGC 9.6 Image Comics 2003.",
+   "price": 750.0,
+   "grade": 9.6,
+   "sold_date": "2026-06-26",
+   "buying_format": null,
+   "certifier": "cgc",
+   "label": "universal",
+   "page_quality": "unknown"
+  },
+  {
+   "product_id": "137385453611",
+   "title": "Invincible #1 1st App of Invincible Omni Man 2003 Image CGC 9.6 Amazon Kirkman",
+   "price": 4500.0,
+   "grade": 9.6,
+   "sold_date": "2026-07-02",
+   "buying_format": null,
+   "certifier": "cgc",
+   "label": "universal",
+   "page_quality": "unknown"
+  },
+  {
+   "product_id": "366561460527",
+   "title": "Invincible #1 (Limited Edition) Larry's Wonderful World Image Comic 2003 CGC 9.8",
+   "price": 629.0,
+   "grade": 9.8,
+   "sold_date": "2026-08-02",
+   "buying_format": "auction",
+   "certifier": "cgc",
+   "label": "universal",
+   "page_quality": "unknown"
+  },
+  {
+   "product_id": "820042246593",
+   "title": "Invincible #1 - Image Comics 2003 CGC 9.8 Larry's VARIANT",
+   "price": 786.0,
+   "grade": 9.8,
+   "sold_date": "2026-08-31",
+   "buying_format": null,
+   "certifier": "cgc",
+   "label": "universal",
+   "page_quality": "unknown"
+  },
+  {
+   "product_id": "800556772082",
+   "title": "Invincible #1 - Image Comics 2003 CGC 9.8 Larry's Wonderful World VARIANT",
+   "price": 807.0,
+   "grade": 9.8,
+   "sold_date": "2026-08-31",
+   "buying_format": null,
+   "certifier": "cgc",
+   "label": "universal",
+   "page_quality": "unknown"
+  },
+  {
+   "product_id": "398378976543",
+   "title": "Image Comics Invincible #1 (2003) CGC 9.8 White Pages 1st Issue",
+   "price": 5000.0,
+   "grade": 9.8,
+   "sold_date": "2026-09-09",
+   "buying_format": null,
+   "certifier": "cgc",
+   "label": "universal",
+   "page_quality": "white"
+  },
+  {
+   "product_id": "227410467853",
+   "title": "Invincible #1 (2003) CGC 9.8 NM First Print, Image Comics",
+   "price": 7800.0,
+   "grade": 9.8,
+   "sold_date": "2026-07-01",
+   "buying_format": null,
+   "certifier": "cgc",
+   "label": "universal",
+   "page_quality": "unknown"
+  },
+  {
+   "product_id": "206465629363",
+   "title": "Invincible #1 CGC 9.8 1st Print Stunning Book 1st Invincible Omni Man 2003 Image",
+   "price": 8000.0,
+   "grade": 9.8,
+   "sold_date": "2026-08-05",
+   "buying_format": null,
+   "certifier": "cgc",
+   "label": "universal",
+   "page_quality": "unknown"
+  },
+  {
+   "product_id": "206391613806",
+   "title": "Invincible #1 CGC 9.8 1st Print Stunning Book 1st Invincible Omni Man 2003 Image",
+   "price": 8200.0,
+   "grade": 9.8,
+   "sold_date": "2026-07-21",
+   "buying_format": "auction",
+   "certifier": "cgc",
+   "label": "universal",
+   "page_quality": "unknown"
+  },
+  {
+   "product_id": "257560338051",
+   "title": "Invincible #1 CGC 9.8 First Printing (2003) Image Comics Kirkman",
+   "price": 9500.0,
+   "grade": 9.8,
+   "sold_date": "2026-06-26",
+   "buying_format": null,
+   "certifier": "cgc",
+   "label": "universal",
+   "page_quality": "unknown"
+  }
+ ]
+}

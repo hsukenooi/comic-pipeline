@@ -5365,3 +5365,236 @@ class TestPrintingGuardCredentialFallback:
         monkeypatch.setattr(sc.ebay_fetch, "get_token", lambda cid, sec, base: seen.append(cid) or "tok")
         assert sc._printing_guard_token()[0] == "tok"
         assert seen == ["env-id"]
+
+
+# ─── BUI-922/938: graded-pool-only identity guards ─────────────────────────
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+# The two junk comps BUI-922 was filed on, verbatim from the 2026-09-19
+# `ebay-sold-comps --include-graded` pull of Batman #227.
+AMPERSAND_LOT = ("Batman #227 CGC 4.0 OW Pages (1970) & "
+                 "Batman #232 CGC 6.0 White Pages (1971)")
+CROSS_TITLE = ("House of Secrets #88 (DC 1970) CGC 8.5 OWW Neal Adams Cover. "
+               "Batman 227 Inspo")
+
+
+class TestMultibookGradedLot:
+    """BUI-922: two #NNN tokens joined by &/+/and, each with its own grade."""
+
+    @pytest.mark.parametrize("title", [
+        AMPERSAND_LOT,
+        "Batman #227 CGC 4.0 OW Pages (1970) + Batman #232 CGC 6.0 (1971)",
+        "Hulk #180 CGC 5.0 and Hulk #181 CGC 4.5 Marvel 1974",
+    ])
+    def test_excluded_in_graded_mode(self, title):
+        assert sc.hard_exclude(title, graded_target="cgc")
+        assert sc.hard_exclude(title, graded_target="cbcs")
+
+    def test_raw_path_is_unchanged(self):
+        # The whole point of putting this on the graded-only branch: the raw
+        # LOCAL_EXCLUDE_RE path keeps admitting exactly what it admitted
+        # before (this title survives raw hard_exclude across the offline
+        # corpus today, and must keep doing so).
+        assert not sc.hard_exclude(AMPERSAND_LOT)
+        assert not sc.hard_exclude(AMPERSAND_LOT, graded_target=None)
+
+    @pytest.mark.parametrize("title", [
+        # One graded book that merely mentions a second thing.
+        "Amazing Spider-Man #129 CGC 6.0 1st Punisher & Jackal appearance",
+        "Batman #227 CGC 4.5 Neal Adams Cover & Robin backup story",
+        # Two issue tokens, only one grade — not two graded books.
+        "Batman #227 CGC 4.5 (1970) & #232 reader copy",
+        # A grade on each side but only one issue token.
+        "Batman #227 CGC 4.5 OW/W & 9.2 case included",
+        # The genuine target listings from the same pool.
+        "Batman #227 1970 CGC 4.5 3975479007 Neal Adams Cover Robin Classic Cover",
+        "Batman #227 CGC 7.5 Beautiful Book! Vol 1 Classic Detective Comics 31 Cover 1970",
+    ])
+    def test_single_book_titles_survive(self, title):
+        assert not sc._multibook_graded_lot(title)
+        assert not sc.hard_exclude(title, graded_target="cgc")
+
+
+class TestCrossTitleComp:
+    """BUI-922: a different <Series> #<issue> leading the title."""
+
+    @pytest.mark.parametrize("title,issue", [
+        (CROSS_TITLE, "227"),
+        ("FOOM #10 Marvel Comics JUNE 1975 Magazine CGC GRADED 2.5 "
+         "PRE-Giant-Size X-Men #1", "1"),
+        ("Marvel Super Action #1 CGC 7.0 Reprint Captain America 100 1977", "100"),
+    ])
+    def test_cross_title_excluded(self, title, issue):
+        assert sc.graded_identity_exclude(title, issue=issue) == "cross_title"
+
+    @pytest.mark.parametrize("title,issue", [
+        # The target leads; a foreign issue token AFTER it is a reference,
+        # not a rival series — this is the false positive the positional
+        # rule exists to avoid.
+        ("Batman #227 (DC 1970) CGC 6.5 FN+ Detective Comics #31 cover homage", "227"),
+        ("Batman #227 CGC 7.5 Beautiful Book! Vol 1 Classic Detective Comics 31 Cover 1970", "227"),
+        # A cert number is not an issue token.
+        ("Invincible #1 CGC 9.2 #126322004 (Image Comics Malibu Comics January 2003)", "1"),
+        ("Batman #227 CGC 8.5 1970 4744708001", "227"),
+        # "2nd" must not read as a mention of issue 2 (see _cross_title_comp).
+        ("Invincible #2 CGC 9.6 Image 2nd Battle Beast Low Print Run", "2"),
+        # A spaced "# 48" is still the target's own issue.
+        ("Fantastic Four # 48 (Marvel Comics 1966) CGC 9.4 1st Silver Surfer", "48"),
+    ])
+    def test_target_led_titles_survive(self, title, issue):
+        assert sc.graded_identity_exclude(title, issue=issue) is None
+
+    def test_non_numeric_or_missing_issue_disables_the_guard(self):
+        for issue in (None, "", "4AU", "1/2"):
+            assert sc.graded_identity_exclude(CROSS_TITLE, issue=issue) is None
+
+    def test_target_never_named_is_left_alone(self):
+        # Deliberately NOT folded in: a comp that never names the target is a
+        # different, unmeasured class (see _cross_title_comp's comment).
+        assert sc.graded_identity_exclude(
+            "House of Secrets #88 (DC 1970) CGC 8.5 OWW Neal Adams Cover",
+            issue="227") is None
+
+
+class TestStoreVariantComp:
+    """BUI-938: store/retailer variants out of a non-variant target's pool."""
+
+    @pytest.mark.parametrize("title", [
+        "Invincible #1 - Image Comics 2003 CGC 9.8 Larry's Wonderful World VARIANT",
+        "Invincible #1 - Image Comics 2003 CGC 9.8 Larry's VARIANT",
+        "Invincible #1 Image Comics 2003 Larrys Limited Edition CGC 9.2 W/ Custom Label",
+        "Invincible #1 Larry’s Comics Limited Edition Variant CGC 9.6 Image Comics 2003.",
+        "Invincible #1 (Limited Edition) Larry's Wonderful World Image Comic 2003 CGC 9.8",
+        "INVINCIBLE #1 CBCS 9.6 Larry's Exclusive 2003 signed Robert Kirkman Image Comics",
+        "Invincible #1 CGC 9.8 Retailer Incentive Image Comics 2003",
+    ])
+    def test_store_variants_excluded(self, title):
+        assert sc.graded_identity_exclude(title, issue="1") == "store_variant"
+
+    @pytest.mark.parametrize("title", [
+        # "Custom label" alone is a Universal slab with an art label — the
+        # same book, and BUI-938 names it explicitly as a must-keep.
+        "Silver Surfer #4 (1969) Marvel Comics CGC 4.5 CUSTOM LABEL",
+        "Ultimate Fallout #4 CGC 9.8 White Pages Custom Label Marvel 2011",
+        # Measured false positives of the broader lexicon that was rejected:
+        # a PRICE variant and a first print, neither a store/retailer variant.
+        "Daredevil #146 30 Cent Variant (Marvel Comics June 1977) CGC 9.0",
+        "Marvel Comics Ultimate Fallout #4 (2011) CGC 9.2 1st Printing Variant A",
+    ])
+    def test_non_store_variant_titles_survive(self, title):
+        assert sc.graded_identity_exclude(title, issue="4") is None
+
+    def test_guard_is_off_when_the_target_is_itself_a_variant(self):
+        title = "Invincible #1 - Image Comics 2003 CGC 9.8 Larry's Wonderful World VARIANT"
+        assert sc.graded_identity_exclude(
+            title, issue="1", target_is_variant=True) is None
+
+
+class TestGradedIdentityGuardsOverSavedPools:
+    """The two saved 2026-09-21 pools, filtered by the shipped guards."""
+
+    def _pool(self, name):
+        return json.loads((FIXTURES / name).read_text())
+
+    def _survivors(self, data):
+        target = data["target"]
+        kept, dropped = [], {}
+        for comp in data["comps"]:
+            title = comp["title"]
+            if sc.hard_exclude(title, graded_target=target["certifier"]):
+                dropped[title] = "hard_exclude"
+                continue
+            code = sc.graded_identity_exclude(
+                title, issue=target["issue"],
+                target_is_variant=bool(target.get("variant")))
+            if code:
+                dropped[title] = code
+                continue
+            kept.append(comp)
+        return kept, dropped
+
+    def test_batman_227_pool_sheds_exactly_the_lot_and_the_cross_title(self):
+        data = self._pool("graded_pool_bui922_batman227.json")
+        kept, dropped = self._survivors(data)
+        assert dropped == {
+            AMPERSAND_LOT: "hard_exclude",      # BUI-922 multi-book lot
+            CROSS_TITLE: "cross_title",         # BUI-922 House of Secrets #88
+        }
+        assert len(kept) == len(data["comps"]) - 2
+        assert all("Batman #227" in c["title"] for c in kept)
+
+    def test_invincible_1_pool_sheds_exactly_the_store_variants(self):
+        data = self._pool("graded_pool_bui938_invincible1_live.json")
+        kept, dropped = self._survivors(data)
+        assert set(dropped.values()) == {"store_variant"}
+        assert len(dropped) == 4
+        assert len(kept) == 5
+        # Every survivor is a first-print sale in the $2,302-$9,500 band the
+        # store variants ($610-$807) were sitting beside.
+        assert min(c["price"] for c in kept) >= 2302.0
+
+    def test_server_held_invincible_pool_sheds_only_the_store_variants(self):
+        data = self._pool("graded_pool_bui938_invincible1_server.json")
+        kept, dropped = self._survivors(data)
+        assert set(dropped.values()) == {"store_variant"}
+        assert len(dropped) == 5
+        assert len(kept) == len(data["comps"]) - 5
+
+
+class TestGradedIdentityGuardsInFetch:
+    """BUI-922/938 wired into fetch_book_comps — graded only, and counted."""
+
+    _comp = TestGradedFetchMode._comp
+    _wire = TestGradedFetchMode._wire
+
+    JUNK = [
+        (AMPERSAND_LOT, 1399.99),
+        (CROSS_TITLE, 525.0),
+        ("Batman #227 - Image Comics 2003 CGC 8.0 Larry's Wonderful World VARIANT", 610.0),
+    ]
+    GENUINE = ("Batman #227 1970 CGC 4.5 3975479007 Neal Adams Cover Robin", 700.0)
+
+    def _results(self):
+        rows = [self._comp(f"j{i}", t, p) for i, (t, p) in enumerate(self.JUNK)]
+        rows.append(self._comp("good", *self.GENUINE))
+        return [rows]
+
+    def test_graded_mode_drops_all_three_and_counts_them(self, tmp_path, monkeypatch):
+        self._wire(tmp_path, monkeypatch, self._results())
+        out = sc.fetch_book_comps(
+            {"title": "Batman", "issue": "227", "year": 1970, "grade": 4.5,
+             "certifier": "cgc"},
+            "key",
+        )
+        assert [c["title"] for c in out["slab_comps"]] == [self.GENUINE[0]]
+        assert out["comps"] == []
+        assert out["graded_identity_dropped"] == {
+            "cross_title": 1, "store_variant": 1,
+        }
+
+    def test_raw_mode_never_runs_the_guards(self, tmp_path, monkeypatch):
+        self._wire(tmp_path, monkeypatch, self._results())
+        out = sc.fetch_book_comps(
+            {"title": "Batman", "issue": "227", "year": 1970, "grade": 4.5},
+            "key",
+        )
+        # No certifier ⇒ no graded_target ⇒ every guard is bypassed and the
+        # raw pool keeps exactly what LOCAL_EXCLUDE_RE/is_comp_excluded let
+        # through, including the ampersand lot.
+        assert out["graded_identity_dropped"] == {
+            "cross_title": 0, "store_variant": 0,
+        }
+        kept = {c["title"] for c in out["comps"]}
+        assert AMPERSAND_LOT in kept
+        assert CROSS_TITLE in kept
+
+    def test_a_variant_target_keeps_its_own_variant_comps(self, tmp_path, monkeypatch):
+        self._wire(tmp_path, monkeypatch, self._results())
+        out = sc.fetch_book_comps(
+            {"title": "Batman", "issue": "227", "year": 1970, "grade": 4.5,
+             "certifier": "cgc", "variant": "Larry's Wonderful World"},
+            "key",
+        )
+        assert out["graded_identity_dropped"]["store_variant"] == 0
+        assert any("Larry's" in c["title"] for c in out["slab_comps"])

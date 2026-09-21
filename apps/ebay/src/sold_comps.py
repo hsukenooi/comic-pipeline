@@ -1712,6 +1712,51 @@ _GRADED_MODE_EXCLUDE_RE = re.compile(
 )
 
 
+# ─── BUI-922: ampersand-joined multi-book graded lot ───────────────────────
+#
+# `Batman #227 CGC 4.0 OW Pages (1970) & Batman #232 CGC 6.0 White Pages
+# (1971)` — two books, one price, one parsed grade. It reaches a priced pool
+# because every gate in front of it is satisfied: `parse_grade` takes the
+# first grade (4.0), `_is_slab_comp` sees a certifier, and `_LOT_RE`'s own
+# 2-member ampersand branch needs the two numeric members ADJACENT across the
+# "&" (`#64, #65 & #66`) — here they are separated by each book's own grade,
+# page quality and year, so nothing fires.  The effect is not a nudged
+# quantile: at $1,399.99 the bogus 4.0 rung sits ABOVE the genuine 5.5
+# ($899) and 6.0 ($900) rungs and inverts the ladder, which is what refused
+# Batman #227 @4.5 with `ladder_non_monotone` on 2026-09-19.
+#
+# The rule is "two `#NNN` tokens joined by &/+/and, EACH carrying its own
+# numeric grade".  Requiring a grade on both sides is what keeps it off the
+# ordinary single-issue title that merely mentions two things
+# ("… #129 CGC 6.0 1st Punisher & Jackal"): measured over the offline
+# corpus's 23,488 comps, it fires on 2 (the same listing, cached twice) and
+# on nothing else, in graded and raw shape alike.
+#
+# GRADED MODE ONLY, deliberately.  A lot is a lot on the raw path too, and
+# extending it there is a real (measured) follow-up — but the raw
+# `LOCAL_EXCLUDE_RE` path stays byte-for-byte untouched by this ticket, and
+# the raw corpus gives the extension 2 members and no priced-pool movement
+# to justify it with.
+_MULTIBOOK_JOINER_RE = re.compile(r"\s(?:&|\+|and)\s", re.IGNORECASE)
+# One lot "member": `#NNN`, bounded so it can bind neither to a longer run
+# (a year, a cert number) nor to half of a decimal grade.
+_MULTIBOOK_ISSUE_RE = re.compile(r"#\s*\d{1,3}(?!\d)(?!\.\d)")
+
+
+def _multibook_graded_lot(title: str) -> bool:
+    """True when `title` names two or more separately GRADED books joined by
+    "&" / "+" / "and" — see the block comment above (BUI-922)."""
+    if not title:
+        return False
+    graded_members = 0
+    for part in _MULTIBOOK_JOINER_RE.split(title):
+        if _MULTIBOOK_ISSUE_RE.search(part) and _NUMERIC_GRADE_RE.search(part):
+            graded_members += 1
+            if graded_members >= 2:
+                return True
+    return False
+
+
 def hard_exclude(title: str, *, graded_target: str | None = None) -> bool:
     """True when `title` must never enter any comp pool.
 
@@ -1721,13 +1766,171 @@ def hard_exclude(title: str, *, graded_target: str | None = None) -> bool:
     `_GRADED_MODE_EXCLUDE_RE`'s comment) — every other caller (graded_target
     absent/None, the overwhelming common case, including the raw path and
     the BUI-348/BUI-524 include_graded-only modes) is byte-for-byte
-    unaffected.
+    unaffected.  BUI-922 adds the ampersand multi-book lot on the same
+    graded-only branch, for the same reason.
     """
     if comic_identity.is_comp_excluded(title):
         return True
     if graded_target in ("cgc", "cbcs"):
+        if _multibook_graded_lot(title):  # BUI-922
+            return True
         return bool(_GRADED_MODE_EXCLUDE_RE.search(title))
     return bool(LOCAL_EXCLUDE_RE.search(title))
+
+
+# ─── BUI-922/938: graded-pool guards that need the TARGET's identity ───────
+#
+# `hard_exclude` takes a bare title, which is enough for a lot (BUI-922's
+# half above) and not enough for these two: one needs the target's issue
+# number, the other needs to know whether the target is itself a variant.
+# Both are GRADED MODE ONLY — the call site in `fetch_book_comps` runs them
+# only when `graded_target` is set, so the raw pool is unchanged, and a
+# graded run's non-slab `comps` are never archived either
+# (`fmv_runner._graded_upsert_row` posts `[]` for them), so nothing here can
+# reach a raw pool through the ledger later.
+
+# --- Cross-title contamination (BUI-922) -----------------------------------
+#
+# `House of Secrets #88 (DC 1970) CGC 8.5 OWW Neal Adams Cover. Batman 227
+# Inspo` is admitted into the Batman #227 pool because the title name-drops
+# the target; `FOOM #10 … PRE-Giant-Size X-Men #1` is admitted into the
+# Giant-Size X-Men #1 pool the same way.  The shape is always the same: a
+# DIFFERENT `<Series> #<issue>` leads the title, and the target appears only
+# afterwards, as a reference.
+#
+# So the test is positional, not lexical: a `#NNN` token that is not the
+# target's issue, occurring BEFORE the first mention of the target's issue,
+# with some series text in front of it.  The order is what makes it safe —
+# `Batman #227 CGC 6.5 … Detective Comics #31 homage` mentions the target
+# first, so the later `#31` never counts, and the whole homage/reference
+# vocabulary ("cover", "homage", "inspo", "ad for", "pre-dates") needs no
+# lexicon of its own.
+#
+# The target's SERIES NAME is deliberately not consulted.  Matching a series
+# name against a free title is the raw matcher's job (comic_identity's
+# `match_listing`/`score_against_wish`), and pulling it in here is exactly
+# the widening the ticket warns against — measured, it buys nothing: read by
+# hand, all 92 titles this fires on across the offline corpus are genuinely
+# a different book (many of them two-book lots), 0 false positives.
+_CROSS_TITLE_ISSUE_RE = re.compile(r"#\s*(\d{1,4})(?!\d)")
+_CROSS_TITLE_SERIES_RE = re.compile(r"[A-Za-z]{3,}")
+
+
+def _target_issue_digits(issue) -> str | None:
+    """The target issue as a plain digit string, or None when it is not one
+    (a letter-suffixed or fractional issue) — then the guard does not apply."""
+    digits = str(issue).strip().lstrip("#").strip() if issue is not None else ""
+    return digits if re.fullmatch(r"\d{1,4}", digits) else None
+
+
+def _cross_title_comp(title: str, issue) -> bool:
+    """True when a different `<Series> #<issue>` LEADS `title`, before the
+    first mention of the target's own issue number (BUI-922)."""
+    if not title:
+        return False
+    digits = _target_issue_digits(issue)
+    if digits is None:
+        return False
+    # The trailing `(?!\w)` is load-bearing: without it the single-digit
+    # issue "2" matches inside "2nd Battle Beast", which would move the
+    # target's apparent first mention LATER in the title and make the guard
+    # fire MORE often — the wrong direction for a money-path exclusion.
+    target_hit = re.search(r"(?<![\w.])" + digits + r"(?!\w)(?!\.\d)", title)
+    if target_hit is None:
+        # The target is not named at all. That is a different (and rarer)
+        # defect than the one measured here, so it is left alone rather than
+        # folded in on inference: the base query quotes "<title> <issue>", so
+        # a comp that never names the issue is already unusual, and dropping
+        # it would be an unmeasured second class riding on this one's tests.
+        return False
+    for m in _CROSS_TITLE_ISSUE_RE.finditer(title):
+        if m.start() >= target_hit.start():
+            break
+        if int(m.group(1)) == int(digits):
+            continue
+        # The documented shape is `<Other Title> #<other issue>`: require
+        # some series text in front of the foreign issue token, so a title
+        # that merely OPENS with a number is not read as a rival series.
+        if not _CROSS_TITLE_SERIES_RE.search(title[:m.start()]):
+            continue
+        return True
+    return False
+
+
+# --- Store / retailer variant (BUI-938) ------------------------------------
+#
+# Five of the nine live comps in the 2026-09-21 Invincible #1 pool are the
+# Larry's Comics store variant — "Larry's Wonderful World VARIANT", "Larrys
+# Limited Edition … Custom Label", $610-$807 — sitting in the same 9.2/9.6/
+# 9.8 rungs as $2,302-$9,500 first-print sales.  At 0.08x to 0.26x their own
+# rung's leave-one-out median they do not nudge a quantile; they invert the
+# ladder, which is what refused Invincible #1 @9.4.
+#
+# The lexicon is deliberately NARROWER than the ticket's opening list.  Bare
+# `variant` and bare `exclusive` were measured and dropped:
+#
+#   * bare `variant` fires on `Daredevil #146 30 Cent Variant` — a PRICE
+#     variant, not a store one — and that pool's only two comps are that
+#     listing, so the broad rule takes a priced pool ($60 @9.0) to
+#     `no_certifier_pool`.  It also fires on `Ultimate Fallout #4 … CGC 9.2
+#     1st Printing Variant A`, which is a first print.
+#   * dropping both changes NOTHING on the graded corpus otherwise: the
+#     narrow rule still catches all 9 Larry's members (including "Larry's
+#     VARIANT" and the CBCS "Larry's Exclusive", via the possessive branch),
+#     and the measured pool movement is identical.
+#
+# A store variant IS a genuinely different product, so this is an identity
+# guard; it is also (unlike BUI-668's "unrestored" case) the sole cause of a
+# ladder inversion in both pools it touches — 1/5 and 1/4 inverted rungs go
+# to 0.  Direction is reported honestly in the ticket: removing comps this
+# far below their own rung RAISES the band (UP 4 / DOWN 0, +$2,425 net over
+# the two pools), because the cap it was holding down was being held down by
+# the wrong book.
+_STORE_VARIANT_RE = re.compile(
+    r"""
+      \blimited\s+edition\b
+    | \bretailer\s+(?:incentive|exclusive)\b
+    | \b(?:store|shop|retailer)\s+(?:variant|exclusive)\b
+    # A store possessive followed, within a few words, by the thing it
+    # qualifies: "Larry's VARIANT", "Larry's Wonderful World VARIANT",
+    # "Larry's Comics Limited Edition Variant", "Larry's Exclusive".
+    | \b[\w.\-]+['’]s(?:\s+[\w.\-]+){0,3}\s+(?:variants?|exclusives?|edition)\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _store_variant_comp(title: str) -> bool:
+    """True when `title` names a store/retailer variant (BUI-938).
+
+    "Custom label" alone is NOT this class and must stay in the pool: a
+    Universal slab with an art label is the same book (`Silver Surfer #4 …
+    CGC 4.5 CUSTOM LABEL` is a legitimate comp, and `Larrys Limited Edition
+    … W/ Custom Label` is caught by "limited edition", not by the label).
+    """
+    return bool(title) and bool(_STORE_VARIANT_RE.search(title))
+
+
+GRADED_IDENTITY_CODES = ("cross_title", "store_variant")
+
+
+def graded_identity_exclude(title: str, *, issue=None,
+                            target_is_variant: bool = False) -> str | None:
+    """The BUI-922/938 code for a comp that must not enter a GRADED pool, or
+    None to keep it.
+
+    `target_is_variant` — when the TARGET listing is itself a variant, the
+    store-variant guard is switched off entirely rather than inverted: the
+    pipeline's `variant` field is a query keyword of whatever text the
+    identify step captured ("Newsstand", "Direct", a store name), not a
+    normalized identity, so it can say "this target is some variant" and
+    cannot say "this comp is the SAME variant". Off is the honest reading.
+    """
+    if _cross_title_comp(title, issue):
+        return "cross_title"
+    if not target_is_variant and _store_variant_comp(title):
+        return "store_variant"
+    return None
 
 
 # ─── Grade parsing ────────────────────────────────────────────────────────────
@@ -2284,6 +2487,12 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
     # return at the bottom must carry the same keys as the success return.
     printing_dropped = 0
     printing_unverified = 0
+    # BUI-922/938: per-code counts of the comps the graded-only identity
+    # guards dropped. Bound here, beside printing_dropped, for the same
+    # reason — both returns carry the same keys. Every code is always
+    # present so a caller reads "0" rather than a missing key; all zero for
+    # every raw call, which never runs the guards at all.
+    graded_identity_dropped = dict.fromkeys(GRADED_IDENTITY_CODES, 0)
     # BUI-678: comps the BUI-675 currency gate rejected (title present, price
     # object present, currency proven non-USD) — summed across every tier's
     # `_run` call below. A response that loses ALL its comps to this gate is a
@@ -2411,6 +2620,16 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
                     continue
                 if hard_exclude(comp["title"], graded_target=graded_target):
                     continue
+                # BUI-922/938: the two guards that need the TARGET's identity
+                # rather than just the comp's title. Graded mode only — a raw
+                # call never reaches this branch, so its pool is unchanged.
+                if graded_target:
+                    code = graded_identity_exclude(
+                        comp["title"], issue=issue,
+                        target_is_variant=bool(variant))
+                    if code:
+                        graded_identity_dropped[code] += 1
+                        continue
                 seen_ids.add(comp["product_id"])
                 # BUI-657/KTD6: stamp provenance on the comp at the point it
                 # joins the pool — provider/tier/query are already in scope
@@ -2699,6 +2918,9 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
             # comp in it priced at or above its rung's leave-one-out median.
             "printing_dropped": printing_dropped,
             "printing_unverified": printing_unverified,
+            # BUI-922/938: {code: count} for the graded-only identity guards
+            # (cross_title, store_variant). All zeros on every raw call.
+            "graded_identity_dropped": graded_identity_dropped,
         }
     except Exception as e:  # noqa: BLE001 — BUI-537: preserve the partial
         # trail rather than losing it; see the docstring above. `book.get(...)`
@@ -2727,6 +2949,7 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
             "non_usd_dropped": non_usd_dropped_total,
             "printing_dropped": printing_dropped,
             "printing_unverified": printing_unverified,
+            "graded_identity_dropped": graded_identity_dropped,
             "error": str(e),
         }
 
