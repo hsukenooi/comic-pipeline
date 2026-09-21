@@ -1,0 +1,170 @@
+{
+ "_source": "/comic:buy 2026-09-21 run, results.json row for eBay item 137753816595 — the LIVE slab_comps the graded fetch returned",
+ "target": {
+  "item_id": "137753816595",
+  "title": "Batman",
+  "issue": "227",
+  "year": 1970,
+  "publisher": "DC Comics",
+  "grade": 4.5,
+  "certifier": "cgc",
+  "label": "universal",
+  "page_quality": "unknown"
+ },
+ "comps": [
+  {
+   "product_id": "137509084134",
+   "title": "Batman #227 CGC 8.5 1970 4744708001",
+   "price": 3300.0,
+   "grade": 8.5,
+   "sold_date": "2026-07-23",
+   "buying_format": null,
+   "certifier": "cgc",
+   "label": "universal",
+   "page_quality": "unknown"
+  },
+  {
+   "product_id": "327345745913",
+   "title": "House of Secrets #88 (DC 1970) CGC 8.5 OWW Neal Adams Cover. Batman 227 Inspo",
+   "price": 525.0,
+   "grade": 8.5,
+   "sold_date": "2026-09-11",
+   "buying_format": "auction",
+   "certifier": "cgc",
+   "label": "universal",
+   "page_quality": "ow_w"
+  },
+  {
+   "product_id": "398158886334",
+   "title": "Batman #227 1970 CGC 8.5 VF+ OW/W ",
+   "price": 3000.0,
+   "grade": 8.5,
+   "sold_date": "2026-07-21",
+   "buying_format": null,
+   "certifier": "cgc",
+   "label": "universal",
+   "page_quality": "ow_w"
+  },
+  {
+   "product_id": "127945002984",
+   "title": "Batman #227 CGC 4.0 OW Pages (1970) & Batman #232 CGC 6.0 White Pages (1971)",
+   "price": 1399.99,
+   "grade": 4.0,
+   "sold_date": "2026-07-23",
+   "buying_format": null,
+   "certifier": "cgc",
+   "label": "universal",
+   "page_quality": "ow"
+  },
+  {
+   "product_id": "358799682262",
+   "title": "Batman #227 - DC Comics 1970 CGC 8.0 Robin backup story. Hanging panels. Classic",
+   "price": 2372.0,
+   "grade": 8.0,
+   "sold_date": "2026-08-19",
+   "buying_format": null,
+   "certifier": "cgc",
+   "label": "universal",
+   "page_quality": "unknown"
+  },
+  {
+   "product_id": "147456918121",
+   "title": "Batman #227 Classic Cover Neal Adams High Grade Bronze Age DC Comic 1970 CGC 9.0",
+   "price": 3255.0,
+   "grade": 9.0,
+   "sold_date": "2026-08-02",
+   "buying_format": "auction",
+   "certifier": "cgc",
+   "label": "universal",
+   "page_quality": "unknown"
+  },
+  {
+   "product_id": "117368696536",
+   "title": "Batman #227 1970 CGC FN+ 6.5 OW High Definition Scans**",
+   "price": 1350.0,
+   "grade": 6.5,
+   "sold_date": "2026-08-26",
+   "buying_format": null,
+   "certifier": "cgc",
+   "label": "universal",
+   "page_quality": "ow"
+  },
+  {
+   "product_id": "327253516176",
+   "title": "Batman #227 (DC 1970) CGC 6.5 FN+   OW Pages  Classic Cover",
+   "price": 1449.0,
+   "grade": 6.5,
+   "sold_date": "2026-07-12",
+   "buying_format": null,
+   "certifier": "cgc",
+   "label": "universal",
+   "page_quality": "ow"
+  },
+  {
+   "product_id": "137640882775",
+   "title": "Batman #227 CGC 2.0 1970 4460404006",
+   "price": 580.0,
+   "grade": 2.0,
+   "sold_date": "2026-08-24",
+   "buying_format": null,
+   "certifier": "cgc",
+   "label": "universal",
+   "page_quality": "unknown"
+  },
+  {
+   "product_id": "257607400966",
+   "title": "Batman #227 CGC 5.5 1970 DC Neal Adams Never Pressed Or Cleaned Classic Cover",
+   "price": 899.0,
+   "grade": 5.5,
+   "sold_date": "2026-07-12",
+   "buying_format": "auction",
+   "certifier": "cgc",
+   "label": "universal",
+   "page_quality": "unknown"
+  },
+  {
+   "product_id": "117273892093",
+   "title": "Batman #227 (1970) CGC 6.0 - Classic cover by Neal Adams",
+   "price": 900.0,
+   "grade": 6.0,
+   "sold_date": "2026-06-28",
+   "buying_format": null,
+   "certifier": "cgc",
+   "label": "universal",
+   "page_quality": "unknown"
+  },
+  {
+   "product_id": "307178174860",
+   "title": "Batman #227 1970 CGC 4.5 3975479007 Neal Adams Cover Robin Classic Cover",
+   "price": 700.0,
+   "grade": 4.5,
+   "sold_date": "2026-09-17",
+   "buying_format": null,
+   "certifier": "cgc",
+   "label": "universal",
+   "page_quality": "unknown"
+  },
+  {
+   "product_id": "127938194158",
+   "title": "Batman #227 1970 CGC 2.5 4735113016 Neal Adams Cover Robin Classic Cover",
+   "price": 500.0,
+   "grade": 2.5,
+   "sold_date": "2026-06-25",
+   "buying_format": null,
+   "certifier": "cgc",
+   "label": "universal",
+   "page_quality": "unknown"
+  },
+  {
+   "product_id": "206339676817",
+   "title": "Batman #227 CGC 7.5 Beautiful Book! Vol 1 Classic Detective Comics 31 Cover 1970",
+   "price": 2250.0,
+   "grade": 7.5,
+   "sold_date": "2026-06-23",
+   "buying_format": "auction",
+   "certifier": "cgc",
+   "label": "universal",
+   "page_quality": "unknown"
+  }
+ ]
+}
