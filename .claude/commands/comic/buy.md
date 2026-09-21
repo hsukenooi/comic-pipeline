@@ -225,11 +225,12 @@ The CLI returns `max_bid = round_clean(bid_factor × fmv_high)` per row. `bid_fa
 | 2 | Invincible #1 | NM (assumed) | $270–320 | $192 | LOW conf, n=2, bid_haircut=0.60 |
 | 3 | Batman #609 | NM | $40–50 | $40 | ⚠️ ends 2026-05-11 |
 | 4 | Fantastic Four #63 | NM+ 9.6 | needs-manual | — | manual_review=one_sided — hand-price or skip |
+| 5 | Batman #227 | CGC 4.5 | needs-manual (exact=$700@2026-09-17, below=4:$1400 n1, above=5.5:$899 n1) | — | manual_review=ladder_non_monotone — hand-price or skip |
 ```
 
 Clean-number rounding: $5 step below $50, $10 step from $50–$200, $25 step above $200.
 
-A `needs-manual` row (`flag_reason` set) has no CLI-computed max bid. Present it without a proposed number; the user supplies a hand-derived max bid (via the `fmv.md` interpolation / CGC-proxy methods) or skips it. Don't fabricate a max from the absent FMV.
+A `needs-manual` row (`flag_reason` set) has no CLI-computed max bid. Present it without a proposed number; the user supplies a hand-derived max bid (via the `fmv.md` interpolation / CGC-proxy methods) or skips it. Don't fabricate a max from the absent FMV. **A refused graded (slab) row carries its evidence along with the reason (BUI-940)** — row 5 above: the exact-grade sale with its sold date, and the nearest priced rung below/above the target grade, straight off the brief line's `fmv_notes` (`exact=`/`below=`/`above=` tokens) — present it beside `manual_review=<reason>` so the user can hand-price without reopening the results file. A raw `needs-manual` row, or a graded pre-fetch punt (`label_*`/`certifier_other`) that never fetched comps, carries none of this — present those with the reason alone, same as before.
 
 An **advisory (ledger)** row (`source: "ledger-advisory"`, BUI-663) is the same rule with a sharper edge, because unlike a needs-manual row it *does* show a band: the band came from stored comps after the live fetch failed, and `max_bid` is `null` on purpose. Present the range in the FMV column and `—` in Max Bid, noting `LEDGER-ADVISORY — not a live price`. **Do not compute `0.8 × fmv_high` yourself** — the withheld cap is the entire safety property of this row, and a proposed number reinstates exactly the risk it was withheld to avoid. It also has no `comic_id`, so even if the user hand-prices it, Step 5's FMV link will not attach; prefer re-running `comic-fmv` once the providers recover.
 

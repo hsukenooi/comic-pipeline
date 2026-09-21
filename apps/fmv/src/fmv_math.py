@@ -1585,6 +1585,50 @@ def bucket_effective_n(comps: Iterable[dict]) -> dict[float, float]:
     return out
 
 
+def _exact_sales_detail(exact_comps: Iterable[dict]) -> list[dict]:
+    """Price + sold-date detail for the exact-grade bucket (BUI-940).
+
+    Sorted by price, same order as `exact_sales`. `exact_comps` is always a
+    subset of `graded_pool`'s output, whose `known`-date guard means every
+    kept comp already has a parseable date — `_graded_comp_date` is never
+    None here.
+    """
+    return sorted(
+        ({"price": float(c["price"]), "sold_date": _graded_comp_date(c).isoformat()}
+         for c in exact_comps),
+        key=lambda d: d["price"],
+    )
+
+
+def _nearest_rungs(
+    ladder: Mapping[float, float], eff_n: Mapping[float, float],
+    target_grade: float, min_bucket_n: float,
+) -> dict:
+    """The nearest anchor-eligible rung below and above `target_grade` (BUI-940).
+
+    Unlike `_bracket_interpolate` — which returns nothing unless BOTH sides
+    have an eligible rung, since a one-sided bracket can't interpolate —
+    this reports whichever side has one, independently. That is the whole
+    point: it is evidence for a human reading a refused row, including the
+    one-sided `outside_ladder` case and the possibly-thin `ladder_too_thin`
+    case, not an input to the pricing math. Eligibility uses the SAME bar
+    `_graded_ladder` anchors on (`eff_n >= min_bucket_n`), so this can never
+    surface a rung the pricing math itself would have refused to use.
+    """
+    def _side(grades: list[float]) -> dict | None:
+        if not grades:
+            return None
+        g = grades[0]
+        return {"grade": g, "median": ladder[g], "n": eff_n.get(g, 0.0)}
+
+    below = sorted((g for g in ladder
+                    if g < target_grade and eff_n.get(g, 0.0) >= min_bucket_n),
+                   reverse=True)
+    above = sorted(g for g in ladder
+                   if g > target_grade and eff_n.get(g, 0.0) >= min_bucket_n)
+    return {"below": _side(below), "above": _side(above)}
+
+
 def _graded_result(**over) -> dict:
     """The graded mode's output dict, shaped like `compute_fmv`'s.
 
@@ -1643,6 +1687,16 @@ def _graded_result(**over) -> dict:
         "page_quality_fallback_reason": None,
         "exact_effective_n": 0.0,
         "exact_sales": [],
+        # BUI-940: price+date detail for the exact-grade bucket, additive
+        # alongside `exact_sales` (which stays a bare sorted price list so no
+        # existing reader/golden row moves). Same sort order as `exact_sales`.
+        "exact_sales_detail": [],
+        # BUI-940: the nearest anchor-eligible rung below/above the target,
+        # `{"below": {"grade", "median", "n"} | None, "above": {...} | None}`
+        # or None when never computed (e.g. a pre-fetch `graded_punt`, or
+        # `no_certifier_pool` — nothing to show a neighbour from). Populated
+        # by `_graded_ladder` for every ladder-tier outcome, refusal or not.
+        "nearest_rungs": None,
         "pool_n": 0,
         "pool_undated_dropped": 0,
         "pool_stale_dropped": 0,
@@ -1790,6 +1844,7 @@ def graded_fmv(comps: list[dict], target_grade: float, *,
     exact_comps = [c for c in pool if float(c["grade"]) == target_grade]
     identity["exact_effective_n"] = eff_n.get(target_grade, 0.0)
     identity["exact_sales"] = sorted(float(c["price"]) for c in exact_comps)
+    identity["exact_sales_detail"] = _exact_sales_detail(exact_comps)
 
     if identity["exact_effective_n"] >= GRADED_EXACT_MIN_EFFECTIVE_N:
         return _graded_direct(exact_comps, ladder, eff_n, target_grade, identity)
@@ -1810,8 +1865,9 @@ def graded_fmv(comps: list[dict], target_grade: float, *,
             ladder = bucket_weighted_medians(pool)
             eff_n = bucket_effective_n(pool)
             identity["exact_effective_n"] = eff_n.get(target_grade, 0.0)
-            identity["exact_sales"] = sorted(
-                float(c["price"]) for c in pool if float(c["grade"]) == target_grade)
+            widened_exact = [c for c in pool if float(c["grade"]) == target_grade]
+            identity["exact_sales"] = sorted(float(c["price"]) for c in widened_exact)
+            identity["exact_sales_detail"] = _exact_sales_detail(widened_exact)
 
     return _graded_ladder(pool, ladder, eff_n, target_grade, identity)
 
@@ -1901,6 +1957,12 @@ def _graded_ladder(pool: list[dict], ladder: dict[float, float],
     """The LADDER tier: drop the target rung and interpolate its neighbours."""
     ladder_ex = {g: v for g, v in ladder.items() if g != target_grade}
     eff_ex = {g: v for g, v in eff_n.items() if g != target_grade}
+    # BUI-940: computed once, up front, so every return below — refusal or
+    # priced — carries the same evidence. Independent of `bracket` below (see
+    # `_nearest_rungs`'s docstring): a one-sided `outside_ladder` case still
+    # gets whichever side exists, which `bracket` alone cannot express.
+    identity["nearest_rungs"] = _nearest_rungs(
+        ladder_ex, eff_ex, target_grade, GRADED_LADDER_MIN_BUCKET_N)
     # Counted over ANCHOR-ELIGIBLE rungs (effective n >= min_bucket_n) rather
     # than over every surviving key: a rung that cannot anchor cannot hold up
     # a bracket either, so counting it would only swap this honest
