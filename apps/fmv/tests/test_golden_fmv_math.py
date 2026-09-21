@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,11 @@ import pytest
 import fmv_math
 
 BASELINE = Path(__file__).parent / "fixtures" / "fmv_math_golden.json"
+# BUI-930: the graded (slab) mode's own baseline, in its OWN file. Kept apart
+# from the raw one on purpose — the ticket's acceptance criterion is "no raw
+# golden fixture changes", and a shared file makes every graded regeneration a
+# diff against the raw rows an operator then has to read past.
+GRADED_BASELINE = Path(__file__).parent / "fixtures" / "fmv_math_graded_golden.json"
 
 # The frozen keys (discrete / clean-rounded — no raw floats whose precision
 # would make the baseline brittle). ungraded_anchor (BUI-522) is a small
@@ -115,10 +121,193 @@ def test_every_case_has_a_baseline_entry():
     )
 
 
+# ─── Graded (slab) mode — BUI-930 ────────────────────────────────────────────
+#
+# Pinned BEFORE the runner was wired (plan U7's execution note), so the money
+# decision — which tier priced the book, and what it capped the bid at — is
+# frozen independently of the fetch that feeds it. Several rows are the real
+# 2026-09-21 spike pools, named so.
+
+# Every comp age is measured from this fixed date, so the fixture weighs the
+# same today as in a year. `graded_pool` uses the pool's own newest comp as
+# the reference, never a clock, which is what makes that possible.
+_SLAB_REF = date(2026, 9, 1)
+
+_GRADED_FROZEN = (
+    "n", "effective_n", "flag_reason", "fmv_low", "fmv_high", "median",
+    "max_bid", "confidence", "bid_factor", "pricing_basis",
+    "envelope_clamped", "page_quality_fallback", "pool_n",
+    "pool_undated_dropped", "pool_stale_dropped", "exact_effective_n",
+)
+
+
+def _slab(rows):
+    """(price, grade, age_days, page_quality) -> slab comp dicts.
+
+    `age_days is None` means an UNDATED comp (neither `sold_date` nor
+    `first_seen_at`), which the graded pool excludes outright. A negative
+    marker is not needed: an age past 365 days is simply given as such.
+    """
+    out = []
+    for i, row in enumerate(rows):
+        price, grade, age = row[0], row[1], row[2]
+        pq = row[3] if len(row) > 3 else "unknown"
+        comp = {"product_id": f"slab{i}", "title": f"CGC {grade}",
+                "price": price, "grade": grade, "page_quality": pq,
+                "certifier": "cgc", "label": "universal"}
+        if age is not None:
+            comp["sold_date"] = (_SLAB_REF - timedelta(days=age)).isoformat()
+        out.append(comp)
+    return out
+
+
+# (name, comps, target_grade, page_quality)
+GRADED_CASES = [
+    # AE2 — six live sales at the exact grade. Direct, rubric confidence, no
+    # clamp (effective n is past OUTLIER_ROBUST_BUCKET_N).
+    ("ae2_direct_six_exact_sales",
+     _slab([(1200, 9.8, 5), (1199.95, 9.8, 12), (1269.49, 9.8, 20),
+            (1225, 9.8, 8), (1250, 9.8, 30), (1180, 9.8, 2),
+            (605, 9.6, 5), (550, 9.6, 9), (524, 9.6, 14),
+            (387, 9.4, 20), (380, 9.4, 25)]), 9.8, None),
+
+    # AE4, first half — the real Fantastic Four #48 spike pool. Two $2,000
+    # sales at 7.0 with $1,425 (6.5) and $2,000 (7.5) rungs: direct, and the
+    # envelope clamp pulls the band BELOW both actual sales.
+    ("ae4_direct_two_sales_envelope_clamped",
+     _slab([(2000, 7.0, 18), (2000, 7.0, 1), (1425, 6.5, 12),
+            (2000, 7.5, 41), (1152, 6.0, 12), (755, 4.5, 46),
+            (650, 5.0, 28), (649, 3.5, 12), (600, 3.5, 50),
+            (402, 2.5, 12), (365, 1.5, 12), (10500, 9.4, 18)]), 7.0, None),
+
+    # AE4, second half — THE money case. One 4.5 sale at $700, priced BELOW
+    # the $900 4.0 rung. The answer must be the 4.0->5.5 interpolation
+    # ($1,067 -> $1,075 clean), never the $700 sale, and it must carry LOW
+    # and the 0.60 cap.
+    ("ae4_ladder_lone_exact_sale_is_never_the_price",
+     _slab([(700, 4.5, 3), (500, 2.5, 60), (900, 4.0, 40),
+            (1400, 5.5, 50), (1500, 6.0, 55)]), 4.5, None),
+
+    # Effective n 1.5 (one live sale + one 120-day ledger sale) is BELOW the
+    # exact tier's floor, so the same pool that would price directly on two
+    # live sales goes to the ladder instead.
+    ("effective_n_one_and_a_half_goes_to_ladder",
+     _slab([(2000, 7.0, 0), (1900, 7.0, 120), (1425, 6.5, 10),
+            (2000, 7.5, 10), (1150, 6.0, 10)]), 7.0, None),
+
+    # Effective n 2.5 (two live + one 120-day) clears the floor: direct, and
+    # still clamped because 2.5 < OUTLIER_ROBUST_BUCKET_N.
+    ("effective_n_two_and_a_half_is_direct_clamped",
+     _slab([(2000, 7.0, 0), (2000, 7.0, 3), (1900, 7.0, 120),
+            (1425, 6.5, 10), (2000, 7.5, 10), (1150, 6.0, 10)]), 7.0, None),
+
+    # An UNDATED comp and a 400-day comp are both dropped before anything is
+    # counted; a 200-day one joins at half weight.
+    ("pool_drops_undated_and_over_a_year",
+     _slab([(3000, 9.4, 5), (3100, 9.4, 10), (9999, 9.4, None),
+            (8888, 9.4, 400), (2800, 9.4, 200),
+            (2500, 9.2, 10), (3500, 9.6, 10)]), 9.4, None),
+
+    # R30 — a 9.4 target is interpolated between 9.2 and 9.6 and is NEVER
+    # pooled with the 9.6 sales, however many of them there are.
+    ("target_94_interpolates_never_pools_96",
+     _slab([(2000, 8.5, 20), (2500, 9.2, 15), (3500, 9.6, 10),
+            (3600, 9.6, 12), (5000, 9.8, 8)]), 9.4, None),
+
+    # The three ladder refusals.
+    ("refuses_outside_ladder",
+     _slab([(1000, 9.0, 10), (1200, 9.2, 10), (1400, 9.4, 10),
+            (1800, 9.6, 10)]), 9.8, None),
+    ("refuses_ladder_too_thin",
+     _slab([(2500, 9.2, 10), (3500, 9.6, 10)]), 9.4, None),
+    ("refuses_ladder_non_monotone",
+     _slab([(2000, 8.5, 20), (3000, 9.2, 15), (2500, 9.6, 10),
+            (4000, 9.8, 8)]), 9.4, None),
+
+    # Page quality: two same-quality comps are enough to scope the pool to
+    # them; one is not, and the fallback is recorded.
+    ("page_quality_prefers_two_matching",
+     _slab([(3000, 9.4, 5, "white"), (3200, 9.4, 6, "white"),
+            (1000, 9.4, 7, "ow_w"), (1100, 9.4, 8, "ow_w"),
+            (900, 9.2, 9, "ow_w"), (1500, 9.6, 10, "ow_w")]), 9.4, "white"),
+    ("page_quality_falls_back_on_a_single_match",
+     _slab([(3000, 9.4, 5, "white"),
+            (1000, 9.4, 7, "ow_w"), (1100, 9.4, 8, "ow_w"),
+            (900, 9.2, 9, "ow_w"), (1500, 9.6, 10, "ow_w")]), 9.4, "white"),
+
+    # Nothing survives the age filter -> no pool at all, not a thin one.
+    ("refuses_no_certifier_pool_when_every_comp_is_undated",
+     _slab([(3000, 9.4, None), (2500, 9.2, None)]), 9.4, None),
+
+    # The gap the envelope clamp cannot reach: a 2-sale exact bucket at the
+    # TOP of the ladder has no rung above it to be bounded by. Two sales five
+    # times apart are not one market, so the book is refused rather than
+    # capped off the higher one (BUI-179's guard, BUI-930's placement).
+    ("refuses_too_sparse_unclamped_divergent_pair",
+     _slab([(1000, 9.8, 5), (5000, 9.8, 9), (2000, 9.6, 10),
+            (1500, 9.4, 10)]), 9.8, None),
+    # ... and the same shape with the two sales in agreement still prices,
+    # so the guard is a dispersion test and not a ban on thin top rungs.
+    ("unclamped_pair_in_agreement_still_prices_direct",
+     _slab([(4800, 9.8, 5), (5000, 9.8, 9), (2000, 9.6, 10),
+            (1500, 9.4, 10)]), 9.8, None),
+]
+
+
+def _run_graded(case) -> dict:
+    _name, comps, grade, pq = case
+    out = fmv_math.graded_fmv(comps, grade, certifier="cgc", label="universal",
+                              page_quality=pq)
+    return {k: out[k] for k in _GRADED_FROZEN}
+
+
+def _load_graded_baseline() -> dict:
+    return json.loads(GRADED_BASELINE.read_text())
+
+
+@pytest.mark.parametrize("case", GRADED_CASES, ids=[c[0] for c in GRADED_CASES])
+def test_graded_fmv_matches_golden(case):
+    baseline = _load_graded_baseline()
+    name = case[0]
+    assert name in baseline, f"no graded golden baseline for {name!r} — regenerate"
+    assert _run_graded(case) == baseline[name]
+
+
+def test_every_graded_case_has_a_baseline_entry():
+    baseline = _load_graded_baseline()
+    assert {c[0] for c in GRADED_CASES} == set(baseline), (
+        "GRADED_CASES and the graded golden baseline have diverged — regenerate"
+    )
+
+
+def test_the_lone_exact_sale_is_not_the_golden_price():
+    """The one assertion the golden dict cannot make on its own.
+
+    `ae4_ladder_lone_exact_sale_is_never_the_price` would still pass its
+    frozen comparison if a regression made the lone $700 sale the answer and
+    the baseline were regenerated alongside it. Naming the forbidden value
+    here means the regeneration cannot quietly bless it.
+    """
+    baseline = _load_graded_baseline()["ae4_ladder_lone_exact_sale_is_never_the_price"]
+    assert baseline["pricing_basis"] == "ladder"
+    assert baseline["fmv_high"] != 700
+    assert baseline["fmv_high"] > 900, (
+        "the interpolated price must sit between the 4.0 and 5.5 rungs, not "
+        "at or below the lone 4.5 sale"
+    )
+    assert baseline["confidence"] == "LOW"
+    assert baseline["bid_factor"] == 0.60
+    assert baseline["max_bid"] == fmv_math.clean_round(
+        baseline["fmv_high"] * 0.60)
+
+
 def _regen() -> None:
     data = {c[0]: _run(c) for c in CASES}
     BASELINE.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
     print(f"wrote {BASELINE} ({len(data)} cases)")
+    graded = {c[0]: _run_graded(c) for c in GRADED_CASES}
+    GRADED_BASELINE.write_text(json.dumps(graded, indent=2, sort_keys=True) + "\n")
+    print(f"wrote {GRADED_BASELINE} ({len(graded)} cases)")
 
 
 if __name__ == "__main__":

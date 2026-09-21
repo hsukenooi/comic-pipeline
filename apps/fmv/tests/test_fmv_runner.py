@@ -98,6 +98,16 @@ def _make_comp(price, grade, product_id="x"):
             "price": price, "grade": grade, "sold_date": "", "buying_format": ""}
 
 
+def _make_slab_comp(price, grade, product_id="s", *, sold_date="2026-09-01",
+                    certifier="cgc", label="universal", page_quality="unknown"):
+    """BUI-930: one entry as `ebay-sold-comps`' graded mode returns it — the
+    parsed comp plus the three `parse_slab_fields` keys."""
+    return {"product_id": product_id, "title": f"CGC {grade} comic {price}",
+            "price": price, "grade": grade, "sold_date": sold_date,
+            "buying_format": "", "certifier": certifier, "label": label,
+            "page_quality": page_quality}
+
+
 def _stale_hand_lookup(row):
     """A `_db_lookup` side_effect: the normal freshness-gated lookup
     (max_age_days=7 etc.) misses (simulating a stale/absent row), but the
@@ -2050,13 +2060,14 @@ class TestRunSkipsPermanentWriteRejection:
         assert rows[1]["max_bid"] is not None
 
 
-class TestCertifiedRowPuntsToNeedsManual:
-    """BUI-928 (plan U11, R35): a certified (CGC/CBCS) row must never be
-    priced from the raw market before the graded FMV mode ships. `run` short-
-    circuits it to needs_manual (`flag_reason: "graded_mode_unavailable"`)
-    BEFORE `_split_by_db_cache`, the comp fetch, or the upsert ever see it —
-    unlike every other skip class in this file, this one never reaches the
-    server at all."""
+class TestCertifiedRowRoutesToGradedMode:
+    """BUI-930 (plan U7) replacing BUI-928 (U11): a certified row now PRICES —
+    or punts with a graded reason — and `graded_mode_unavailable` is gone.
+
+    What must not change is the other half of BUI-928's guarantee: a certified
+    row is never priced from the RAW market. These tests assert the routing
+    (graded branch, never `_compute_and_upsert_one`) and that raw books in the
+    same batch are untouched."""
 
     def _batch(self):
         return [
@@ -2068,7 +2079,13 @@ class TestCertifiedRowPuntsToNeedsManual:
 
     def _fake_results(self):
         comps = [_make_comp(p, 9.0) for p in [50, 55, 60, 65, 70]]
+        slab = [_make_slab_comp(p, g, f"s{i}") for i, (p, g) in enumerate(
+            [(1000, 8.5), (1200, 9.0), (1250, 9.0), (1500, 9.2)])]
         return [
+            {"input": {"_req_id": 0, "title": "Slab", "issue": "1",
+                       "year": 1990, "grade": 9.0, "item_id": "1"},
+             "comps": [], "slab_comps": slab,
+             "queries_used": [{"tier": "base", "cached": False}]},
             {"input": {"_req_id": 1, "title": "Raw", "issue": "1",
                        "year": 1990, "grade": 9.0, "item_id": "2"},
              "comps": comps, "queries_used": [{"tier": "base", "cached": False}]},
@@ -2079,95 +2096,90 @@ class TestCertifiedRowPuntsToNeedsManual:
         batch_path.write_text(json.dumps(self._batch()))
         out_path = tmp_path / "out.json"
         fetch_mock = MagicMock(return_value=self._fake_results())
-        upsert_mock = MagicMock(return_value={"comic_id": 99, "fmv_id": 5})
+        upsert_mock = MagicMock(return_value={"comic_id": 99, "fmv_id": 5,
+                                              "certifier": "cgc"})
         with patch("fmv_runner._fetch_comps", fetch_mock), \
-             patch("fmv_runner._upsert_fmv", upsert_mock):
+             patch("fmv_runner._upsert_fmv", upsert_mock), \
+             patch("fmv_runner._probe_certifier_support", return_value=True):
             fmv_runner.run(batch_path=str(batch_path), out_path=str(out_path),
                            max_age_days=7, force=False, quiet=True,
                            server_url=server_url, **kwargs)
         out = json.loads(out_path.read_text())
         return out, fetch_mock, upsert_mock
 
-    def test_certified_row_is_needs_manual_with_zero_fetch_and_upsert_calls(
-            self, tmp_path, server_url):
+    def test_certified_row_prices_from_the_slab_pool(self, tmp_path, server_url):
         out, fetch_mock, upsert_mock = self._run(tmp_path, server_url)
         assert len(out) == 2
 
-        # The certified row: needs_manual, flag_reason set, no price.
-        assert out[0]["source"] == "needs_manual_certified"
-        assert out[0]["fmv"]["flag_reason"] == "graded_mode_unavailable"
-        assert out[0]["fmv"]["max_bid"] is None
-        assert "comic_id" not in out[0]
-        assert out[0]["db_row"] is None
+        slab_row = out[0]
+        assert slab_row["source"] == "fresh"
+        assert slab_row["fmv"]["graded"] is True
+        assert slab_row["fmv"]["certifier"] == "cgc"
+        assert slab_row["fmv"]["pricing_basis"] == "direct"
+        # Priced off the two 9.0 slab sales, never off the raw comps.
+        assert slab_row["fmv"]["fmv_high"] >= 1000
+        assert slab_row["fmv"].get("flag_reason") is None
+        # The reason BUI-928 existed is gone, in both directions.
+        assert slab_row["fmv"].get("flag_reason") != "graded_mode_unavailable"
 
-        # The raw row still prices normally, exactly as today.
+        # The raw row still prices normally, exactly as before.
         assert out[1]["source"] == "fresh"
         assert out[1]["fmv"]["n"] == 5
-        assert out[1]["comic_id"] == 99
-        assert out[1]["fmv_id"] == 5
+        assert out[1]["fmv"].get("graded") is not True
 
-        # ZERO fetch calls and ZERO upsert calls for the certified book: the
-        # only _fetch_comps call was sent exactly the one raw book, and the
-        # only _upsert_fmv call was for the raw book's title.
+        # ONE subprocess call carried BOTH books — the graded mode rides the
+        # same batch (ebay-sold-comps switches itself per book on `certifier`).
         assert fetch_mock.call_count == 1
-        sent_books = fetch_mock.call_args.args[0]
-        assert len(sent_books) == 1
-        assert sent_books[0]["title"] == "Raw"
-        assert all(b.get("title") != "Slab" for b in sent_books)
+        sent = fetch_mock.call_args.args[0]
+        assert {b["title"] for b in sent} == {"Slab", "Raw"}
+        assert next(b for b in sent if b["title"] == "Slab")["certifier"] == "cgc"
 
-        assert upsert_mock.call_count == 1
-        upsert_inp = upsert_mock.call_args.args[1]
-        assert upsert_inp["title"] == "Raw"
-
-    def test_certified_row_brief_line_has_null_max_bid_comic_id_fmv_id(
+    def test_certified_brief_line_carries_the_price_identity(
             self, tmp_path, server_url, capsys):
         batch_path = tmp_path / "batch.json"
         batch_path.write_text(json.dumps(self._batch()))
         fetch_mock = MagicMock(return_value=self._fake_results())
-        upsert_mock = MagicMock(return_value={"comic_id": 99, "fmv_id": 5})
+        upsert_mock = MagicMock(return_value={"comic_id": 99, "fmv_id": 5,
+                                              "certifier": "cgc"})
         with patch("fmv_runner._fetch_comps", fetch_mock), \
-             patch("fmv_runner._upsert_fmv", upsert_mock):
+             patch("fmv_runner._upsert_fmv", upsert_mock), \
+             patch("fmv_runner._probe_certifier_support", return_value=True):
             fmv_runner.run(batch_path=str(batch_path), out_path=None,
                            max_age_days=7, force=False, quiet=True, brief=True,
                            server_url=server_url)
-        cap = capsys.readouterr()
-        lines = [ln for ln in cap.out.splitlines() if ln.strip()]
-        assert len(lines) == 2
-        rows = [json.loads(ln) for ln in lines]
+        rows = [json.loads(ln) for ln in
+                capsys.readouterr().out.splitlines() if ln.strip()]
+        assert len(rows) == 2
+        assert rows[0]["certifier"] == "cgc"
+        assert rows[0]["label"] == "universal"
+        assert rows[0]["pricing_basis"] == "direct"
+        assert rows[0]["comic_id"] == 99
+        # A raw row's brief line still carries nulls, not sentinels.
+        assert rows[1]["certifier"] is None
+        assert rows[1]["pricing_basis"] is None
 
-        certified_row = rows[0]
-        assert certified_row["source"] == "needs_manual_certified"
-        assert certified_row["flag_reason"] == "graded_mode_unavailable"
-        assert certified_row["max_bid"] is None
-        assert certified_row["comic_id"] is None
-        assert certified_row["fmv_id"] is None
-
-        raw_row = rows[1]
-        assert raw_row["source"] == "fresh"
-        assert raw_row["max_bid"] is not None
-        assert raw_row["comic_id"] == 99
-        assert raw_row["fmv_id"] == 5
-
-    def test_all_certifier_vocabulary_values_other_than_none_punt(
-            self, tmp_path, server_url):
-        for certifier in ("cgc", "CGC", "cbcs", "other"):
-            batch = [{"item_id": "1", "title": "Slab", "issue": "1",
-                      "year": 1990, "grade": 9.0, "certifier": certifier}]
-            batch_path = tmp_path / f"batch-{certifier}.json"
-            batch_path.write_text(json.dumps(batch))
-            out_path = tmp_path / f"out-{certifier}.json"
-            fetch_mock = MagicMock(return_value=[])
-            upsert_mock = MagicMock()
-            with patch("fmv_runner._fetch_comps", fetch_mock), \
-                 patch("fmv_runner._upsert_fmv", upsert_mock):
-                fmv_runner.run(batch_path=str(batch_path), out_path=str(out_path),
-                               max_age_days=7, force=False, quiet=True,
-                               server_url=server_url)
-            out = json.loads(out_path.read_text())
-            assert out[0]["source"] == "needs_manual_certified"
-            assert out[0]["fmv"]["flag_reason"] == "graded_mode_unavailable"
-            fetch_mock.assert_not_called()
-            upsert_mock.assert_not_called()
+    def test_certifier_other_punts_with_no_fetch(self, tmp_path, server_url):
+        batch = [{"item_id": "1", "title": "Slab", "issue": "1",
+                  "year": 1990, "grade": 9.0, "certifier": "other"}]
+        batch_path = tmp_path / "batch-other.json"
+        batch_path.write_text(json.dumps(batch))
+        out_path = tmp_path / "out-other.json"
+        fetch_mock = MagicMock(return_value=[])
+        upsert_mock = MagicMock(return_value={"comic_id": 7, "fmv_id": 3,
+                                              "certifier": "other"})
+        with patch("fmv_runner._fetch_comps", fetch_mock), \
+             patch("fmv_runner._upsert_fmv", upsert_mock), \
+             patch("fmv_runner._probe_certifier_support", return_value=True):
+            fmv_runner.run(batch_path=str(batch_path), out_path=str(out_path),
+                           max_age_days=7, force=False, quiet=True,
+                           server_url=server_url)
+        out = json.loads(out_path.read_text())
+        assert out[0]["fmv"]["flag_reason"] == "certifier_other"
+        fetch_mock.assert_not_called()
+        # It IS upserted — a punted slab still gets a comic_id so
+        # /comic:verify reports needs_manual rather than the severer no_comic.
+        assert upsert_mock.call_count == 1
+        assert out[0]["comic_id"] == 7
 
     def test_certifier_none_or_absent_stays_on_the_raw_path(
             self, tmp_path, server_url):
@@ -3297,44 +3309,50 @@ class TestStitch:
         assert out[2]["source"] == "skipped_rejected"
         assert out[2]["fmv"] is None
 
-    def test_certified_needs_manual_gets_its_own_source_and_flag_reason(self):
-        """BUI-928: unlike the other three skips, a certified punt DOES carry
-        a `flag_reason` (so it renders like any other needs-manual row) while
-        still projecting null max_bid/comic_id/fmv_id — nothing was ever
-        upserted for it."""
+    def test_schema_mismatch_gets_its_own_source_and_no_fmv(self):
+        """BUI-930: the fourth skip carries `fmv: None`, like the two skips
+        above it and unlike BUI-928's punt, which it replaces. Nothing is
+        known about this book's price — the server could not even describe
+        what market a stored price belongs to — so there is no flag_reason to
+        report either: a flag_reason is a PRICING verdict, and none was
+        reached."""
         book = _make_book("a", "Slab", "1", 1990, 9.0)
         book["certifier"] = "cgc"
-        out = fmv_runner._stitch([book], {}, {}, {}, {}, {},
-                                 {0: book})
-        assert out[0]["source"] == "needs_manual_certified"
-        assert out[0]["fmv"]["flag_reason"] == "graded_mode_unavailable"
-        assert out[0]["fmv"]["max_bid"] is None
+        out = fmv_runner._stitch([book], {}, {}, {}, {}, {}, {0: book})
+        assert out[0]["source"] == "skipped_schema_mismatch"
+        assert out[0]["fmv"] is None
         assert out[0]["db_row"] is None
+        assert "certifier" in out[0]["error"]
         brief = fmv_runner._brief_row(out[0])
-        assert brief["flag_reason"] == "graded_mode_unavailable"
+        assert brief["source"] == "skipped_schema_mismatch"
         assert brief["max_bid"] is None
+        assert brief["flag_reason"] is None
         assert brief["comic_id"] is None
         assert brief["fmv_id"] is None
 
-    def test_certified_needs_manual_defaults_to_empty_when_omitted(self):
-        """Back-compat: existing callers that don't pass certified_needs_manual
+    def test_schema_mismatch_defaults_to_empty_when_omitted(self):
+        """Back-compat: existing callers that don't pass schema_mismatch
         still work."""
         books = [_make_book("a", "A", "1", 1990, 9.0)]
         out = fmv_runner._stitch(books, {}, {}, {}, {}, {})
         assert out[0]["source"] == "error"
 
-    def test_certified_needs_manual_takes_precedence_when_index_collides(self):
+    def test_schema_mismatch_takes_precedence_when_index_collides(self):
         """A book's original index can only land in one bucket by construction
-        (run() filters certified rows out before any other bucket can claim
-        that index) — this proves _stitch's own ordering doesn't silently
-        prefer a different bucket if that invariant were ever violated."""
+        (run() filters schema-mismatched rows out before any other bucket can
+        claim that index) — this proves _stitch's own ordering doesn't
+        silently prefer a different bucket if that invariant were ever
+        violated. It matters in exactly the dangerous direction: the colliding
+        bucket here is `cached`, i.e. a stored band that would be served to a
+        slab target off a server that cannot say which market it describes."""
         book = _make_book("a", "Slab", "1", 1990, 9.0)
         cached_row = {"fmv_low": 5, "fmv_high": 10, "fmv_comps": 5,
                       "fmv_confidence": "low",
                       "title": "Slab", "issue": "1", "year": 1990, "grade": 9.0}
         out = fmv_runner._stitch([book], {0: cached_row}, {}, {}, {}, {},
                                  {0: book})
-        assert out[0]["source"] == "needs_manual_certified"
+        assert out[0]["source"] == "skipped_schema_mismatch"
+        assert out[0]["fmv"] is None
 
 
 # ─── Flagged-state presentation (BUI-86) ─────────────────────────────────────
@@ -4900,7 +4918,9 @@ class TestBriefProjection:
 
     BRIEF_KEYS = {"item_id", "comic_id", "fmv_id", "max_bid",
                   "flag_reason", "confidence", "fmv_low", "fmv_high",
-                  "fmv_notes", "source"}
+                  "fmv_notes", "source",
+                  # BUI-930: the price identity + basis. Null on a raw row.
+                  "certifier", "label", "pricing_basis"}
 
     def test_fresh_row_projects_top_level_ids(self):
         row = {
@@ -4918,7 +4938,11 @@ class TestBriefProjection:
                          "max_bid": 80, "flag_reason": None,
                          "confidence": "HIGH", "fmv_low": 90, "fmv_high": 100,
                          "fmv_notes": "window=n/a | cv=10% | label=HIGH",
-                         "source": "fresh"}
+                         "source": "fresh",
+                         # BUI-930: a RAW row projects nulls, not the
+                         # 'none'/'universal' sentinels.
+                         "certifier": None, "label": None,
+                         "pricing_basis": None}
 
     def test_fresh_row_fmv_notes_matches_upsert_notes(self):
         # BUI-505: the brief line's fmv_notes must be exactly what
@@ -5617,20 +5641,733 @@ class TestModernCgcProxyStaysRefused:
         assert slab < fmv_math.CGC_PROXY_MIN_SLAB_PRICE
 
 
-class TestPrintTableCertifiedPunt:
-    """BUI-928 follow-up: the certified punt row carries `confidence: None`
-    (nothing was priced), and `_print_table`'s `:<12` format spec crashed on
-    it during the live spike-batch probe, before any --brief line was emitted."""
+class TestPrintTableCertifiedRows:
+    """BUI-928 follow-up, kept for BUI-930: a row that never reached pricing
+    carries `confidence: None`, and `_print_table`'s `:<12` format spec
+    crashed on it during the live spike-batch probe, before any --brief line
+    was emitted. The rows that can carry it changed; the crash must not come
+    back."""
 
-    def test_print_table_renders_certified_punt_row(self, capsys):
+    def test_print_table_renders_a_graded_punt_row(self, capsys):
         row = {
             "input": {"title": "Batman", "issue": "227", "grade": 4.5},
-            "fmv": {"flag_reason": "graded_mode_unavailable", "max_bid": None,
-                    "n": 0, "confidence": None},
+            "fmv": {"flag_reason": "label_signature_series", "max_bid": None,
+                    "n": 0, "confidence": None, "graded": True},
             "comp_count_total": 0, "queries_used": [], "db_row": None,
-            "source": "needs_manual_certified", "breaker_tripped": False,
+            "source": "fresh", "breaker_tripped": False,
         }
         fmv_runner._print_table([row])
         out = capsys.readouterr().out
-        assert "graded_mode_unavailable" in out
-        assert "needs_manual_certified" in out
+        assert "label_signature_series" in out
+
+    def test_print_table_renders_a_schema_mismatch_row(self, capsys):
+        row = {
+            "input": {"title": "Batman", "issue": "227", "grade": 4.5},
+            "fmv": None,
+            "comp_count_total": 0, "queries_used": [], "db_row": None,
+            "source": "skipped_schema_mismatch", "breaker_tripped": False,
+        }
+        fmv_runner._print_table([row])
+        out = capsys.readouterr().out
+        assert "skip:schema" in out
+        assert "skipped_schema_mismatch" in out
+
+
+# ─── Graded (slab) pricing mode — BUI-930 ────────────────────────────────────
+
+class TestCertifierSupportProbe:
+    """Plan R29: ONE read decides whether this server can tell a slab price
+    apart from a raw one, BEFORE any certified row is looked up, fetched or
+    written. The discriminator is the mere PRESENCE of the `certifier` key —
+    the BUI-777 `"variant" in r` pattern — because on a VALUE test an old
+    server's silence is indistinguishable from a genuine raw `'none'`."""
+
+    def _get(self, payload, status=200):
+        resp = MagicMock()
+        resp.json.return_value = payload
+        resp.raise_for_status.return_value = None
+        if status != 200:
+            resp.raise_for_status.side_effect = (
+                fmv_runner.requests.exceptions.HTTPError(response=resp))
+            resp.status_code = status
+        return MagicMock(return_value=resp)
+
+    def test_rows_carrying_certifier_pass(self, server_url):
+        with patch("fmv_runner.requests.get",
+                   self._get([{"id": 1, "certifier": "none"}])):
+            assert fmv_runner._probe_certifier_support(server_url) is True
+
+    def test_a_null_certifier_still_proves_the_column_is_served(self, server_url):
+        """`list_comics` LEFT-JOINs `fmv`, so a comic with no price row at all
+        comes back with `certifier: null`. The KEY is the proof, not a value."""
+        with patch("fmv_runner.requests.get",
+                   self._get([{"id": 1, "certifier": None}])):
+            assert fmv_runner._probe_certifier_support(server_url) is True
+
+    def test_rows_without_the_key_fail(self, server_url):
+        with patch("fmv_runner.requests.get",
+                   self._get([{"id": 1, "title": "X", "grade": 9.0}])):
+            assert fmv_runner._probe_certifier_support(server_url) is False
+
+    def test_an_empty_list_fails_closed(self, server_url):
+        """Inconclusive, not reassuring: a server with no comics on file
+        cannot demonstrate its own schema, and "don't know" is not "yes" on
+        the one check standing between a slab price and the raw row."""
+        with patch("fmv_runner.requests.get", self._get([])):
+            assert fmv_runner._probe_certifier_support(server_url) is False
+
+    def test_a_failed_read_fails_closed(self, server_url):
+        with patch("fmv_runner.requests.get",
+                   side_effect=fmv_runner.requests.RequestException("boom")):
+            assert fmv_runner._probe_certifier_support(server_url) is False
+
+    def test_a_non_list_body_fails_closed(self, server_url):
+        with patch("fmv_runner.requests.get",
+                   self._get({"detail": "nope"})):
+            assert fmv_runner._probe_certifier_support(server_url) is False
+
+    def test_it_narrows_by_grade_first_then_falls_back(self, server_url):
+        """The narrow query is a few dozen rows against the whole table; the
+        unfiltered one is the only query guaranteed to answer if the table
+        holds anything at all."""
+        calls = []
+
+        def _get(url, params=None, timeout=None):
+            calls.append(params)
+            resp = MagicMock()
+            resp.raise_for_status.return_value = None
+            resp.json.return_value = ([] if params.get("grade") is not None
+                                      else [{"id": 1, "certifier": "none"}])
+            return resp
+
+        with patch("fmv_runner.requests.get", _get):
+            assert fmv_runner._probe_certifier_support(server_url,
+                                                       grade=9.8) is True
+        assert calls == [{"grade": 9.8}, {}]
+
+
+class TestProbeFailureRefusesEveryCertifiedRow:
+    def _batch(self):
+        return [
+            {"item_id": "1", "title": "Slab", "issue": "1", "year": 1990,
+             "grade": 9.0, "certifier": "cgc"},
+            {"item_id": "2", "title": "Raw", "issue": "1", "year": 1990,
+             "grade": 9.0},
+        ]
+
+    def test_zero_fetch_zero_post_and_no_lookup_for_the_certified_row(
+            self, tmp_path, server_url, capsys):
+        batch_path = tmp_path / "batch.json"
+        batch_path.write_text(json.dumps(self._batch()))
+        out_path = tmp_path / "out.json"
+        fetch_mock = MagicMock(return_value=[
+            {"input": {"_req_id": 1, "title": "Raw", "issue": "1",
+                       "year": 1990, "grade": 9.0, "item_id": "2"},
+             "comps": [_make_comp(p, 9.0) for p in [50, 55, 60, 65, 70]],
+             "queries_used": [{"tier": "base", "cached": False}]},
+        ])
+        upsert_mock = MagicMock(return_value={"comic_id": 99, "fmv_id": 5})
+        lookup_mock = MagicMock(return_value=[])
+        with patch("fmv_runner._fetch_comps", fetch_mock), \
+             patch("fmv_runner._upsert_fmv", upsert_mock), \
+             patch("fmv_runner._db_lookup_by_identity", lookup_mock), \
+             patch("fmv_runner._probe_certifier_support", return_value=False):
+            fmv_runner.run(batch_path=str(batch_path), out_path=str(out_path),
+                           max_age_days=7, force=False, quiet=True,
+                           server_url=server_url)
+        out = json.loads(out_path.read_text())
+
+        slab_row = out[0]
+        assert slab_row["source"] == "skipped_schema_mismatch"
+        assert slab_row["fmv"] is None
+        assert slab_row["db_row"] is None
+
+        # ZERO fetch for it, ZERO upsert for it, and ZERO lookups about it.
+        sent = fetch_mock.call_args.args[0]
+        assert [b["title"] for b in sent] == ["Raw"]
+        assert upsert_mock.call_count == 1
+        assert upsert_mock.call_args.args[1]["title"] == "Raw"
+        assert all(c.kwargs.get("title") != "Slab"
+                   for c in lookup_mock.call_args_list)
+
+        # The raw book in the same batch prices normally.
+        assert out[1]["source"] == "fresh"
+        assert out[1]["comic_id"] == 99
+
+        err = capsys.readouterr().err
+        assert "certifier" in err and "deploy" in err.lower()
+
+    def test_the_probe_is_not_run_at_all_for_an_all_raw_batch(
+            self, tmp_path, server_url):
+        batch_path = tmp_path / "batch.json"
+        batch_path.write_text(json.dumps([self._batch()[1]]))
+        probe = MagicMock(return_value=True)
+        with patch("fmv_runner._fetch_comps", return_value=[
+                    {"input": {"_req_id": 0, "title": "Raw", "issue": "1",
+                               "year": 1990, "grade": 9.0, "item_id": "2"},
+                     "comps": [_make_comp(p, 9.0) for p in [50, 55, 60]],
+                     "queries_used": [{"tier": "base"}]}]), \
+             patch("fmv_runner._upsert_fmv",
+                   return_value={"comic_id": 1, "fmv_id": 2}), \
+             patch("fmv_runner._probe_certifier_support", probe):
+            fmv_runner.run(batch_path=str(batch_path), out_path=None,
+                           max_age_days=7, force=False, quiet=True,
+                           server_url=server_url)
+        probe.assert_not_called()
+
+
+class TestGradedPoolMerge:
+    """The live + ledger merge `_compute_graded_one` does before the math."""
+
+    def test_duplicate_product_id_counts_once_and_live_wins(self):
+        live = [_make_slab_comp(1000, 9.4, "dup", sold_date="2026-09-01")]
+        ledger = [{"product_id": "dup", "price": 400, "grade": 9.4,
+                   "first_seen_at": "2026-01-01"},
+                  {"product_id": "other", "price": 1100, "grade": 9.4,
+                   "sold_date": "2026-08-20"}]
+        pool = fmv_runner._merge_slab_pool(live, ledger)
+        assert len(pool) == 2
+        assert sorted(c["price"] for c in pool) == [1000.0, 1100.0]
+
+    def test_a_comp_without_a_product_id_is_kept(self):
+        live = [{"price": 1000, "grade": 9.4, "sold_date": "2026-09-01"},
+                {"price": 1100, "grade": 9.4, "sold_date": "2026-09-02"}]
+        assert len(fmv_runner._merge_slab_pool(live, [])) == 2
+
+    def test_unusable_prices_and_grades_are_dropped(self):
+        live = [{"product_id": "a", "price": None, "grade": 9.4},
+                {"product_id": "b", "price": 100, "grade": None},
+                {"product_id": "c", "price": True, "grade": 9.4},
+                {"product_id": "d", "price": 900, "grade": 9.4}]
+        pool = fmv_runner._merge_slab_pool(live, [])
+        assert [c["product_id"] for c in pool] == ["d"]
+
+    def test_the_pool_projection_drops_ledger_bookkeeping(self):
+        ledger = [{"product_id": "x", "price": 900, "grade": 9.4,
+                   "sold_date": "2026-09-01", "seen_count": 4,
+                   "conflict_count": 1, "provenance": "live"}]
+        pool = fmv_runner._merge_slab_pool([], ledger)
+        assert "seen_count" not in pool[0]
+        assert "conflict_count" not in pool[0]
+
+
+class TestGradedLedgerRead:
+    """`_fetch_ledger_comps` is the ONE function in apps/fmv allowed to GET
+    the comps ledger (the AST tripwire in the overlay's test_fmv_history.py
+    enforces it), so the slab read goes through it too."""
+
+    def _rows(self):
+        return [
+            {"product_id": "a", "price": 1000, "grade": 9.4,
+             "certifier": "cgc", "label": "universal"},
+            {"product_id": "b", "price": 400, "grade": 9.4,
+             "certifier": "cbcs", "label": "universal"},
+            {"product_id": "c", "price": 3000, "grade": 9.4,
+             "certifier": "cgc", "label": "signature_series"},
+            {"product_id": "d", "price": 900, "grade": 9.4},
+        ]
+
+    def test_slab_pool_is_filtered_to_one_certifier_and_label(self, server_url):
+        with patch("fmv_runner._get_json_or_warn", return_value=self._rows()):
+            rows = fmv_runner._fetch_ledger_comps(
+                server_url, title="X", issue="1", year=1990, pool="slab",
+                certifier="cgc", label="universal")
+        assert [r["product_id"] for r in rows] == ["a"]
+
+    def test_a_row_missing_the_key_is_dropped_from_a_slab_read(self, server_url):
+        """Fail-closed in the expensive direction: an unkeyed `pool='slab'`
+        row could be a CBCS sale about to be priced into a CGC ladder."""
+        with patch("fmv_runner._get_json_or_warn", return_value=self._rows()):
+            rows = fmv_runner._fetch_ledger_comps(
+                server_url, title="X", issue="1", year=1990, pool="slab",
+                certifier="cgc", label="universal")
+        assert all(r["product_id"] != "d" for r in rows)
+
+    def test_the_raw_read_is_unchanged(self, server_url):
+        captured = {}
+
+        def _fake(url, *, params, **kw):
+            captured.update(params)
+            return self._rows()
+
+        with patch("fmv_runner._get_json_or_warn", _fake):
+            rows = fmv_runner._fetch_ledger_comps(
+                server_url, title="X", issue="1", year=1990)
+        assert captured["pool"] == "raw"
+        assert len(rows) == 4          # no certifier/label filtering at all
+
+
+class TestGradedPersistence:
+    def _fmv(self, **over):
+        fmv = fmv_math.graded_punt("no_certifier_pool", certifier="cgc",
+                                   label="universal")
+        fmv.update(over)
+        return fmv
+
+    def test_upsert_body_carries_the_identity_and_basis(self, server_url):
+        fmv = self._fmv(flag_reason=None, fmv_low=1000, fmv_high=1200,
+                        n=3, pricing_basis="ladder")
+        with patch("fmv_runner._post_json",
+                   return_value={"comic_id": 1, "fmv_id": 2,
+                                 "certifier": "cgc"}) as post:
+            fmv_runner._upsert_fmv(server_url,
+                                   {"title": "X", "issue": "1", "grade": 9.4},
+                                   fmv)
+        body = post.call_args.args[1]
+        assert body["certifier"] == "cgc"
+        assert body["label"] == "universal"
+        assert body["pricing_basis"] == "ladder"
+
+    def test_a_raw_upsert_body_sends_none_of_the_three(self, server_url):
+        """The raw path must not move. The server's own contract is that an
+        absent certifier MEANS raw, and it DERIVES `pricing_basis` from the
+        notes when the field is omitted — sending our own would override that
+        derivation with a duplicate of it."""
+        raw = fmv_math.compute_fmv(
+            [{"price": p, "grade": 9.0, "product_id": str(p)}
+             for p in (50, 55, 60, 65, 70)], target_grade=9.0)
+        with patch("fmv_runner._post_json",
+                   return_value={"comic_id": 1, "fmv_id": 2}) as post:
+            fmv_runner._upsert_fmv(server_url,
+                                   {"title": "X", "issue": "1", "grade": 9.0},
+                                   raw)
+        body = post.call_args.args[1]
+        assert "certifier" not in body
+        assert "label" not in body
+        assert "pricing_basis" not in body
+
+    def test_a_missing_certifier_echo_refuses_to_link_the_row(self, server_url):
+        """The SECOND check, never the gate. Reaching it means the probe
+        passed and the server then failed to echo, which is not a state this
+        code can reason about — so it refuses to hand back ids a slab bid
+        could be linked to."""
+        fmv = self._fmv(flag_reason=None, fmv_low=1000, fmv_high=1200)
+        with patch("fmv_runner._post_json",
+                   return_value={"comic_id": 1, "fmv_id": 2}):
+            with pytest.raises(fmv_runner._UpsertRejected) as exc:
+                fmv_runner._upsert_fmv(
+                    server_url, {"title": "X", "issue": "1", "grade": 9.4}, fmv)
+        assert "certifier" in str(exc.value)
+
+    def test_a_wrong_certifier_echo_also_refuses(self, server_url):
+        fmv = self._fmv(flag_reason=None, fmv_low=1000, fmv_high=1200)
+        with patch("fmv_runner._post_json",
+                   return_value={"comic_id": 1, "fmv_id": 2,
+                                 "certifier": "none"}):
+            with pytest.raises(fmv_runner._UpsertRejected):
+                fmv_runner._upsert_fmv(
+                    server_url, {"title": "X", "issue": "1", "grade": 9.4}, fmv)
+
+
+class TestGradedCacheHit:
+    """The stored-label collapse trap: `_confidence_to_db_label` writes LOW
+    and MEDIUM-LOW alike as 'low', so the stored confidence cannot carry the
+    0.60 signal back. `pricing_basis` is the column that can."""
+
+    def test_a_ladder_row_reproduces_low_and_the_sixty_percent_cap(self):
+        row = {"fmv_low": 1000, "fmv_high": 1200, "fmv_comps": 5,
+               "fmv_confidence": "low", "fmv_notes": "window=n/a | basis=ladder",
+               "certifier": "cgc", "label": "universal",
+               "pricing_basis": "ladder"}
+        out = fmv_runner._fmv_from_db_row(row)
+        assert out["confidence"] == "LOW"
+        assert out["bid_factor"] == 0.60
+        assert out["max_bid"] == fmv_math.clean_round(1200 * 0.60)
+        assert out["graded"] is True
+        assert out["certifier"] == "cgc"
+        assert out["pricing_basis"] == "ladder"
+
+    def test_a_ladder_row_is_not_rescued_by_a_reworded_note(self):
+        """BUI-769's lesson: a notes prefix fails OPEN on a reword. The column
+        holds even when the note says nothing at all."""
+        row = {"fmv_low": 1000, "fmv_high": 1200, "fmv_comps": 5,
+               "fmv_confidence": "low", "fmv_notes": "hand-adjusted, see thread",
+               "certifier": "cgc", "label": "universal",
+               "pricing_basis": "ladder"}
+        assert fmv_runner._fmv_from_db_row(row)["bid_factor"] == 0.60
+
+    def test_a_direct_graded_row_keeps_the_full_factor(self):
+        row = {"fmv_low": 1000, "fmv_high": 1200, "fmv_comps": 5,
+               "fmv_confidence": "medium", "fmv_notes": "window=n/a",
+               "certifier": "cgc", "label": "universal",
+               "pricing_basis": "direct"}
+        out = fmv_runner._fmv_from_db_row(row)
+        assert out["bid_factor"] == fmv_math.BASE_BID_FACTOR
+
+    def test_a_raw_interpolated_row_with_no_column_still_bids_sixty(self):
+        """The fallback the column does not replace: a row written before
+        `pricing_basis` existed carries only the BUI-306 notes token."""
+        row = {"fmv_low": 180, "fmv_high": 180, "fmv_comps": 4,
+               "fmv_confidence": "low",
+               "fmv_notes": ("window=±2.0 | cv=n/a | label=LOW | "
+                             "interpolated=grade 5→9 (median $50→$310); "
+                             "confidence reduced")}
+        out = fmv_runner._fmv_from_db_row(row)
+        assert out["interpolated"] is True
+        assert out["bid_factor"] == 0.60
+        assert out["max_bid"] == fmv_math.clean_round(180 * 0.60)
+        assert out["graded"] is False
+
+    def test_the_interpolated_basis_column_restores_it_too(self):
+        row = {"fmv_low": 180, "fmv_high": 180, "fmv_comps": 4,
+               "fmv_confidence": "low", "fmv_notes": "window=±2.0",
+               "pricing_basis": "interpolated"}
+        out = fmv_runner._fmv_from_db_row(row)
+        assert out["interpolated"] is True
+        assert out["bid_factor"] == 0.60
+
+    def test_a_raw_row_with_no_identity_columns_is_unchanged(self):
+        row = {"fmv_low": 100, "fmv_high": 120, "fmv_comps": 6,
+               "fmv_confidence": "high", "fmv_notes": "window=±0.5"}
+        out = fmv_runner._fmv_from_db_row(row)
+        assert out["graded"] is False
+        assert out["certifier"] == "none"
+        assert out["bid_factor"] == fmv_math.BASE_BID_FACTOR
+
+
+class TestHandPricedGuardIsCertifierAware:
+    """A hand-priced RAW 9.6 and a cgc 9.6 are two different rows now. Each
+    must protect itself and neither must protect the other."""
+
+    def _rows(self):
+        return [
+            {"title": "X-Men", "issue": "1", "grade": 9.6, "variant": None,
+             "certifier": "none", "label": "universal",
+             "fmv_provenance": "hand", "fmv_notes": "hand § raw"},
+            {"title": "X-Men", "issue": "1", "grade": 9.6, "variant": None,
+             "certifier": "cgc", "label": "universal",
+             "fmv_provenance": "machine", "fmv_notes": "basis=direct"},
+        ]
+
+    def _lookup(self, server_url, **kw):
+        with patch("fmv_runner._get_json_or_warn", return_value=self._rows()):
+            return fmv_runner._db_lookup_by_identity(
+                server_url, title="X-Men", issue="1", grade=9.6,
+                variant=None, **kw)
+
+    def test_a_certified_lookup_never_sees_the_raw_hand_priced_row(
+            self, server_url, real_identity_lookup):
+        rows = self._lookup(server_url, certifier="cgc", label="universal")
+        assert [r["certifier"] for r in rows] == ["cgc"]
+
+    def test_a_raw_lookup_never_sees_the_slab_row(self, server_url,
+                                                  real_identity_lookup):
+        rows = self._lookup(server_url)
+        assert [r["certifier"] for r in rows] == ["none"]
+
+    def test_a_certified_lookup_names_the_certifier_in_the_query(
+            self, server_url, real_identity_lookup):
+        captured = {}
+
+        def _fake(url, *, params, **kw):
+            captured.update(params)
+            return []
+
+        with patch("fmv_runner._get_json_or_warn", _fake):
+            fmv_runner._db_lookup_by_identity(
+                server_url, title="X-Men", issue="1", grade=9.6, variant=None,
+                certifier="cgc", label="universal")
+        assert captured["certifier"] == "cgc"
+
+    def test_a_raw_lookup_sends_no_certifier_param(self, server_url,
+                                                   real_identity_lookup):
+        captured = {}
+
+        def _fake(url, *, params, **kw):
+            captured.update(params)
+            return []
+
+        with patch("fmv_runner._get_json_or_warn", _fake):
+            fmv_runner._db_lookup_by_identity(
+                server_url, title="X-Men", issue="1", grade=9.6, variant=None)
+        assert "certifier" not in captured
+
+    def test_rows_from_an_old_server_are_matched_not_dropped(
+            self, server_url, real_identity_lookup):
+        """BUI-777's deploy-skew rule, copied: a row that does not CARRY the
+        key came from a server that cannot answer the question. Reading that
+        silence as `'none'` would make a certified book match NOTHING, and a
+        book with an empty candidate set RECOMPUTES — so a hand-priced row
+        would go from protected to overwritten by a version skew alone."""
+        old_rows = [{"title": "X-Men", "issue": "1", "grade": 9.6,
+                     "variant": None, "fmv_provenance": "hand",
+                     "fmv_notes": "hand § raw"}]
+        with patch("fmv_runner._get_json_or_warn", return_value=old_rows):
+            rows = fmv_runner._db_lookup_by_identity(
+                server_url, title="X-Men", issue="1", grade=9.6, variant=None)
+        assert len(rows) == 1
+
+
+class TestGradedRunEndToEnd:
+    """`run` -> `_compute_graded_one` -> upsert, with the fetch faked."""
+
+    def _slab_result(self, req_id=0, **over):
+        result = {
+            "input": {"_req_id": req_id, "title": "Batman", "issue": "227",
+                      "year": 1974, "grade": 4.5, "item_id": "1",
+                      "certifier": "cgc"},
+            "comps": [],
+            "slab_comps": [
+                _make_slab_comp(700, 4.5, "e0", sold_date="2026-09-01"),
+                _make_slab_comp(900, 4.0, "e1", sold_date="2026-08-20"),
+                _make_slab_comp(1400, 5.5, "e2", sold_date="2026-08-10"),
+                _make_slab_comp(1500, 6.0, "e3", sold_date="2026-08-05"),
+            ],
+            "queries_used": [{"tier": "base", "cached": False}],
+            "printing_dropped": 2, "printing_unverified": 1,
+        }
+        result.update(over)
+        return result
+
+    def _book(self, **over):
+        book = {"item_id": "1", "title": "Batman", "issue": "227",
+                "year": 1974, "grade": 4.5, "certifier": "cgc"}
+        book.update(over)
+        return book
+
+    def _run(self, book, result, tmp_path, server_url, ledger=None,
+             upsert=None):
+        batch_path = tmp_path / "b.json"
+        batch_path.write_text(json.dumps([book]))
+        out_path = tmp_path / "o.json"
+        upsert_mock = upsert or MagicMock(
+            return_value={"comic_id": 42, "fmv_id": 7, "certifier": "cgc"})
+        post_comps = MagicMock(return_value=True)
+        with patch("fmv_runner._fetch_comps",
+                   return_value=([result] if result else [])), \
+             patch("fmv_runner._upsert_fmv", upsert_mock), \
+             patch("fmv_runner._post_comps", post_comps), \
+             patch("fmv_runner._fetch_ledger_comps", return_value=ledger or []), \
+             patch("fmv_runner._probe_certifier_support", return_value=True):
+            fmv_runner.run(batch_path=str(batch_path), out_path=str(out_path),
+                           max_age_days=7, force=False, quiet=True,
+                           server_url=server_url)
+        return json.loads(out_path.read_text())[0], upsert_mock, post_comps
+
+    def test_the_lone_exact_sale_is_not_the_price(self, tmp_path, server_url):
+        row, upsert, _ = self._run(self._book(), self._slab_result(),
+                                   tmp_path, server_url)
+        fmv = row["fmv"]
+        assert fmv["pricing_basis"] == "ladder"
+        assert fmv["fmv_high"] != 700
+        assert fmv["bid_factor"] == 0.60
+        assert row["comic_id"] == 42
+        # The persisted notes name the sale that was seen and rejected, so an
+        # auditor can tell the guard RAN rather than assume it.
+        persisted = fmv_runner._build_notes(upsert.call_args.args[2])
+        assert "$700" in persisted
+        assert "NOT used as the price" in persisted
+        assert "basis=ladder" in persisted
+        assert "certifier=cgc" in persisted
+
+    def test_ledger_comps_join_the_pool(self, tmp_path, server_url):
+        """A second 4.5 sale from the ledger lifts the exact bucket to
+        effective n 2 and flips the book from `ladder` to `direct`."""
+        ledger = [{"product_id": "L1", "price": 760, "grade": 4.5,
+                   "sold_date": "2026-08-25", "certifier": "cgc",
+                   "label": "universal", "page_quality": "unknown"}]
+        row, _, _ = self._run(self._book(), self._slab_result(), tmp_path,
+                              server_url, ledger=ledger)
+        assert row["fmv"]["pricing_basis"] == "direct"
+        assert row["fmv"]["exact_effective_n"] == 2.0
+
+    def test_only_the_live_slab_comps_are_archived(self, tmp_path, server_url):
+        ledger = [{"product_id": "L1", "price": 760, "grade": 4.5,
+                   "sold_date": "2026-08-25", "certifier": "cgc",
+                   "label": "universal"}]
+        _, _, post_comps = self._run(self._book(), self._slab_result(),
+                                     tmp_path, server_url, ledger=ledger)
+        raw_arg, slab_arg = post_comps.call_args.args[2:4]
+        assert raw_arg == []
+        assert [c["product_id"] for c in slab_arg] == ["e0", "e1", "e2", "e3"]
+
+    def test_a_comp_of_another_certifier_never_enters_the_pool(
+            self, tmp_path, server_url):
+        result = self._slab_result()
+        result["slab_comps"].append(
+            _make_slab_comp(99999, 4.5, "cbcs1", certifier="cbcs"))
+        row, _, _ = self._run(self._book(), result, tmp_path, server_url)
+        assert row["fmv"]["exact_effective_n"] == 1.0
+        assert row["fmv"]["pricing_basis"] == "ladder"
+
+    def test_a_signature_series_target_punts_with_no_fetch(
+            self, tmp_path, server_url):
+        batch_path = tmp_path / "b.json"
+        batch_path.write_text(json.dumps(
+            [self._book(label="signature_series")]))
+        out_path = tmp_path / "o.json"
+        fetch = MagicMock(return_value=[])
+        upsert = MagicMock(return_value={"comic_id": 42, "fmv_id": 7,
+                                         "certifier": "cgc"})
+        with patch("fmv_runner._fetch_comps", fetch), \
+             patch("fmv_runner._upsert_fmv", upsert), \
+             patch("fmv_runner._probe_certifier_support", return_value=True):
+            fmv_runner.run(batch_path=str(batch_path), out_path=str(out_path),
+                           max_age_days=7, force=False, quiet=True,
+                           server_url=server_url)
+        row = json.loads(out_path.read_text())[0]
+        assert row["fmv"]["flag_reason"] == "label_signature_series"
+        assert row["fmv"]["max_bid"] is None
+        fetch.assert_not_called()
+        assert row["comic_id"] == 42          # still linked (BUI-44 parity)
+
+    def test_a_bin_listing_keeps_the_band_and_withholds_the_cap(
+            self, tmp_path, server_url):
+        ledger = [{"product_id": "L1", "price": 760, "grade": 4.5,
+                   "sold_date": "2026-08-25", "certifier": "cgc",
+                   "label": "universal"}]
+        row, upsert, _ = self._run(self._book(listing_type="BIN"),
+                                   self._slab_result(), tmp_path, server_url,
+                                   ledger=ledger)
+        fmv = row["fmv"]
+        assert fmv["fmv_low"] is not None and fmv["fmv_high"] is not None
+        assert fmv["max_bid"] is None
+        assert fmv["flag_reason"] is None     # it PRICED; it just has no cap
+        assert "BIN" in fmv_runner._build_notes(fmv)
+        # R34: the price is still written.
+        assert upsert.call_count == 1
+
+    def test_provider_outage_prices_advisory_from_slab_comps_only(
+            self, tmp_path, server_url, capsys):
+        outage = self._slab_result(
+            comps=[], slab_comps=[],
+            queries_used=[{"tier": "base", "error": "RateLimiter 10001"}])
+        ledger = [
+            {"product_id": "L1", "price": 700, "grade": 4.5,
+             "sold_date": "2026-09-01", "certifier": "cgc",
+             "label": "universal"},
+            {"product_id": "L2", "price": 720, "grade": 4.5,
+             "sold_date": "2026-08-28", "certifier": "cgc",
+             "label": "universal"},
+            {"product_id": "L3", "price": 900, "grade": 4.0,
+             "sold_date": "2026-08-20", "certifier": "cgc",
+             "label": "universal"},
+        ]
+        row, upsert, _ = self._run(self._book(), outage, tmp_path, server_url,
+                                   ledger=ledger)
+        assert row["source"] == "ledger-advisory"
+        assert row["fmv"]["fmv_high"] is not None
+        assert row["fmv"]["max_bid"] is None
+        assert row["comic_id"] is None
+        upsert.assert_not_called()
+        assert "NO bid cap" in capsys.readouterr().err
+
+    def test_provider_outage_with_too_few_stored_comps_is_a_plain_fetch_err(
+            self, tmp_path, server_url):
+        outage = self._slab_result(
+            comps=[], slab_comps=[],
+            queries_used=[{"tier": "base", "error": "RateLimiter 10001"}])
+        ledger = [{"product_id": "L1", "price": 700, "grade": 4.5,
+                   "sold_date": "2026-09-01", "certifier": "cgc",
+                   "label": "universal"}]
+        row, upsert, _ = self._run(self._book(), outage, tmp_path, server_url,
+                                   ledger=ledger)
+        assert row["source"] == "error"
+        assert row["fmv"] is None
+        upsert.assert_not_called()
+
+    def test_a_graded_row_is_never_handed_to_the_raw_rescue_tiers(self):
+        priced = {"input": {"title": "X", "issue": "1", "year": 1967,
+                            "grade": 4.5},
+                  "fmv": fmv_math.graded_punt("no_certifier_pool",
+                                              certifier="cgc",
+                                              label="universal"),
+                  "source": "fresh"}
+        assert fmv_runner._is_unpriced_raw(priced) is False
+        thin = dict(priced)
+        thin["fmv"] = {**priced["fmv"], "fmv_high": 1200, "n": 2,
+                       "confidence": "LOW"}
+        assert fmv_runner._is_thin_or_low_confidence_priced(thin) is False
+
+    def test_a_letter_grade_is_coerced_before_the_punt_is_written(
+            self, tmp_path, server_url):
+        """`POST /api/comics` types `grade` as a float. A wish-list batch can
+        carry `"VF+"`, and the punt path upserts too — posting the string
+        would 422 the whole write and lose the punt's own record of WHY the
+        book is unpriceable."""
+        book = self._book(grade="VF+", label="restored")
+        batch_path = tmp_path / "b.json"
+        batch_path.write_text(json.dumps([book]))
+        upsert = MagicMock(return_value={"comic_id": 5, "fmv_id": 6,
+                                         "certifier": "cgc"})
+        with patch("fmv_runner._fetch_comps", return_value=[]), \
+             patch("fmv_runner._upsert_fmv", upsert), \
+             patch("fmv_runner._probe_certifier_support", return_value=True):
+            fmv_runner.run(batch_path=str(batch_path), out_path=None,
+                           max_age_days=7, force=False, quiet=True,
+                           server_url=server_url)
+        posted_inp = upsert.call_args.args[1]
+        assert posted_inp["grade"] == 8.5
+        assert upsert.call_args.args[2]["flag_reason"] == "label_restored"
+
+    def test_a_slab_comp_with_no_certifier_is_refused_not_assumed(
+            self, tmp_path, server_url):
+        """Fail-closed against package skew: an `ebay-sold-comps` that
+        predates BUI-929 returns slab comps with no `certifier`/`label`, and
+        those could be ANY certifier. Dropping them costs a hand-priced book;
+        assuming they match costs a CBCS ladder priced as CGC."""
+        result = self._slab_result()
+        for comp in result["slab_comps"]:
+            comp.pop("certifier")
+            comp.pop("label")
+        row, _, _ = self._run(self._book(), result, tmp_path, server_url)
+        assert row["fmv"]["flag_reason"] == "no_certifier_pool"
+        assert row["fmv"]["max_bid"] is None
+
+    def test_a_cached_bin_row_does_not_grow_a_cap_on_the_second_run(
+            self, tmp_path, server_url):
+        """R34 has to survive a cache hit. A cache hit recomputes `max_bid`
+        from the stored `fmv_high`, so without the rule on this path the
+        SECOND run of the same BIN listing quietly hands back the cap the
+        first run withheld."""
+        book = self._book(listing_type="BIN", locg_id=555)
+        cached_row = {"fmv_low": 1000, "fmv_high": 1200, "fmv_comps": 4,
+                      "fmv_confidence": "low", "fmv_notes": "basis=direct",
+                      "certifier": "cgc", "label": "universal",
+                      "pricing_basis": "direct", "locg_id": 555,
+                      "grade": 4.5, "locg_variant_id": None}
+        out = fmv_runner._stitch([book], {0: cached_row}, {}, {}, {}, {}, {})
+        fmv = out[0]["fmv"]
+        assert fmv["fmv_high"] == 1200
+        assert fmv["max_bid"] is None
+        assert fmv["bin_listing"] is True
+
+    def test_a_cached_auction_row_keeps_its_cap(self, tmp_path, server_url):
+        book = self._book(listing_type="Auction", locg_id=555)
+        cached_row = {"fmv_low": 1000, "fmv_high": 1200, "fmv_comps": 4,
+                      "fmv_confidence": "low", "fmv_notes": "basis=direct",
+                      "certifier": "cgc", "label": "universal",
+                      "pricing_basis": "direct", "locg_id": 555,
+                      "grade": 4.5, "locg_variant_id": None}
+        out = fmv_runner._stitch([book], {0: cached_row}, {}, {}, {}, {}, {})
+        assert out[0]["fmv"]["max_bid"] is not None
+
+    def test_a_raw_bin_row_is_untouched(self):
+        """R34 is scoped to certified rows; this ticket must not move the raw
+        path's behaviour for a BIN listing one way or the other."""
+        book = {"item_id": "1", "title": "X", "issue": "1", "grade": 9.0,
+                "listing_type": "BIN", "locg_id": 7}
+        cached_row = {"fmv_low": 100, "fmv_high": 120, "fmv_comps": 6,
+                      "fmv_confidence": "high", "fmv_notes": "window=±0.5",
+                      "locg_id": 7, "grade": 9.0, "locg_variant_id": None}
+        out = fmv_runner._stitch([book], {0: cached_row}, {}, {}, {}, {}, {})
+        assert out[0]["fmv"]["max_bid"] is not None
+        assert "bin_listing" not in out[0]["fmv"]
+
+    def test_the_table_marks_a_graded_row_with_its_certifier(
+            self, tmp_path, server_url, capsys):
+        batch_path = tmp_path / "b.json"
+        batch_path.write_text(json.dumps([self._book()]))
+        with patch("fmv_runner._fetch_comps",
+                   return_value=[self._slab_result()]), \
+             patch("fmv_runner._upsert_fmv",
+                   return_value={"comic_id": 42, "fmv_id": 7,
+                                 "certifier": "cgc"}), \
+             patch("fmv_runner._post_comps", return_value=True), \
+             patch("fmv_runner._fetch_ledger_comps", return_value=[]), \
+             patch("fmv_runner._probe_certifier_support", return_value=True):
+            fmv_runner.run(batch_path=str(batch_path), out_path=None,
+                           max_age_days=7, force=False, quiet=False,
+                           server_url=server_url)
+        out = capsys.readouterr().out
+        assert "cgc-ldr" in out

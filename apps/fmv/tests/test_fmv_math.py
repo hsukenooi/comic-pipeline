@@ -1636,3 +1636,340 @@ class TestForcedFlagReason:
         forced = fm.compute_fmv([], target_grade=9.0,
                                 forced_flag_reason="variant_dropped")
         assert forced["flag_reason"] == "variant_dropped"
+
+
+# ─── Graded (slab) pricing mode — BUI-930 ────────────────────────────────────
+
+_GREF = date(2026, 9, 1)
+
+
+def _slab_comp(price, grade, *, age=0, page_quality="unknown",
+               product_id=None, first_seen_age=None):
+    """One slab comp. `age=None` leaves it UNDATED unless `first_seen_age`
+    supplies the ledger's own `first_seen_at` fallback."""
+    comp = {"product_id": product_id or f"p{price}-{grade}",
+            "title": f"CGC {grade}", "price": price, "grade": grade,
+            "page_quality": page_quality, "certifier": "cgc",
+            "label": "universal"}
+    if age is not None:
+        comp["sold_date"] = (_GREF - timedelta(days=age)).isoformat()
+    if first_seen_age is not None:
+        comp["first_seen_at"] = (_GREF - timedelta(days=first_seen_age)).isoformat()
+    return comp
+
+
+def _graded(comps, grade, **kw):
+    kw.setdefault("certifier", "cgc")
+    kw.setdefault("label", "universal")
+    return fm.graded_fmv(comps, grade, **kw)
+
+
+class TestGradedCompWeights:
+    def test_fresh_stale_and_excluded_bands(self):
+        assert fm.graded_comp_weight(0) == 1.0
+        assert fm.graded_comp_weight(90) == 1.0
+        assert fm.graded_comp_weight(91) == 0.5
+        assert fm.graded_comp_weight(365) == 0.5
+        assert fm.graded_comp_weight(366) is None
+        assert fm.graded_comp_weight(None) is None
+
+    def test_pool_reference_is_the_newest_comp_not_a_clock(self):
+        """The whole fixture story depends on this: ages are measured against
+        the pool's own newest comp, so a golden row weighs the same forever."""
+        old = [_slab_comp(100, 9.0, age=4000), _slab_comp(110, 9.0, age=4030)]
+        kept, undated, stale = fm.graded_pool(old)
+        assert (undated, stale) == (0, 0)
+        assert [c["weight"] for c in kept] == [1.0, 1.0]
+
+    def test_undated_comp_is_excluded_not_weighted_one(self):
+        comps = [_slab_comp(100, 9.0, age=0), _slab_comp(999, 9.0, age=None)]
+        kept, undated, stale = fm.graded_pool(comps)
+        assert [c["price"] for c in kept] == [100]
+        assert (undated, stale) == (1, 0)
+
+    def test_first_seen_at_is_the_fallback_age_basis(self):
+        comps = [_slab_comp(100, 9.0, age=0),
+                 _slab_comp(200, 9.0, age=None, first_seen_age=120)]
+        kept, undated, stale = fm.graded_pool(comps)
+        assert (undated, stale) == (0, 0)
+        assert [c["weight"] for c in kept] == [1.0, 0.5]
+
+    def test_two_hundred_day_comp_joins_at_half_weight(self):
+        comps = [_slab_comp(100, 9.0, age=0), _slab_comp(200, 9.0, age=200)]
+        kept, _, _ = fm.graded_pool(comps)
+        assert sum(c["weight"] for c in kept) == 1.5
+
+    def test_pool_copies_rather_than_mutating_the_callers_comps(self):
+        """The same list is POSTed to the comps ledger, where `weight` is not
+        a `CompItem` field."""
+        comps = [_slab_comp(100, 9.0, age=0)]
+        fm.graded_pool(comps)
+        assert "weight" not in comps[0]
+
+    def test_bool_price_never_enters_the_pool(self):
+        comps = [{"product_id": "x", "price": True, "grade": 9.0,
+                  "sold_date": "2026-09-01"}]
+        kept, _, _ = fm.graded_pool(comps)
+        assert kept == []
+
+
+class TestGradedBuckets:
+    def test_weighted_medians_reduce_to_bucket_medians_when_unweighted(self):
+        comps = [{"price": 10, "grade": 9.0}, {"price": 30, "grade": 9.0},
+                 {"price": 50, "grade": 9.4}]
+        assert fm.bucket_weighted_medians(comps) == fm.bucket_medians(comps)
+
+    def test_weighted_median_moves_toward_the_heavier_comp(self):
+        comps = [{"price": 100, "grade": 9.0, "weight": 1.0},
+                 {"price": 200, "grade": 9.0, "weight": 0.5}]
+        assert fm.bucket_weighted_medians(comps)[9.0] < 150
+
+    def test_effective_n_is_the_weight_sum(self):
+        comps = [{"price": 100, "grade": 9.0, "weight": 1.0},
+                 {"price": 200, "grade": 9.0, "weight": 0.5},
+                 {"price": 300, "grade": 9.4, "weight": 1.0}]
+        assert fm.bucket_effective_n(comps) == {9.0: 1.5, 9.4: 1.0}
+
+
+class TestGradedExactTier:
+    def test_two_live_sales_price_directly(self):
+        comps = [_slab_comp(1000, 9.4, age=1), _slab_comp(1100, 9.4, age=2),
+                 _slab_comp(800, 9.2, age=3), _slab_comp(1400, 9.6, age=4)]
+        out = _graded(comps, 9.4)
+        assert out["pricing_basis"] == "direct"
+        assert out["flag_reason"] is None
+        assert out["fmv_high"] is not None
+
+    def test_a_96_sale_never_enters_a_94_targets_exact_bucket(self):
+        """R30 — strictly exact. The 9.6 sales are three times the price and
+        must not move the 9.4 band by a cent; they may only anchor the
+        ladder."""
+        comps = [_slab_comp(1000, 9.4, age=1), _slab_comp(1100, 9.4, age=2),
+                 _slab_comp(800, 9.2, age=3)]
+        narrow = _graded(comps, 9.4)
+        wide = _graded(comps + [_slab_comp(3000, 9.6, age=4),
+                                _slab_comp(3200, 9.6, age=5)], 9.4)
+        assert narrow["fmv_low"] == wide["fmv_low"]
+        assert narrow["fmv_high"] == wide["fmv_high"]
+        assert narrow["exact_effective_n"] == wide["exact_effective_n"] == 2.0
+
+    def test_grade_confidence_is_ignored_for_a_certified_row(self):
+        """A certified grade is not a photo judgement (R20), so there is no
+        photo-coverage haircut to take — `graded_fmv` has no parameter for one
+        and pins `grade_confidence` to None on the way out."""
+        comps = [_slab_comp(1000, 9.4, age=1), _slab_comp(1010, 9.4, age=2),
+                 _slab_comp(1020, 9.4, age=3),
+                 _slab_comp(800, 9.2, age=3), _slab_comp(1400, 9.6, age=4)]
+        out = _graded(comps, 9.4)
+        assert out["grade_confidence"] is None
+        assert out["bid_factor"] == fm.BASE_BID_FACTOR
+
+    def test_the_clamp_only_lowers_and_is_reported(self):
+        comps = [_slab_comp(5000, 9.4, age=1), _slab_comp(5000, 9.4, age=2),
+                 _slab_comp(1000, 9.2, age=3), _slab_comp(1400, 9.6, age=4)]
+        out = _graded(comps, 9.4)
+        assert out["envelope_clamped"] is True
+        assert out["fmv_high"] < 5000
+        assert out["fmv_low"] <= out["fmv_high"]
+
+    def test_a_robust_bucket_is_not_clamped(self):
+        comps = [_slab_comp(5000, 9.4, age=1), _slab_comp(5000, 9.4, age=2),
+                 _slab_comp(5000, 9.4, age=3),
+                 _slab_comp(1000, 9.2, age=3), _slab_comp(1400, 9.6, age=4)]
+        out = _graded(comps, 9.4)
+        assert out["envelope_clamped"] is False
+        assert out["fmv_high"] == 5000
+
+
+class TestGradedLadderTier:
+    def _rungs(self):
+        return [_slab_comp(900, 4.0, age=10), _slab_comp(1400, 5.5, age=12),
+                _slab_comp(1500, 6.0, age=14), _slab_comp(500, 2.5, age=16)]
+
+    def test_a_lone_exact_sale_is_recorded_but_never_priced(self):
+        lone = _slab_comp(700, 4.5, age=1)
+        out = _graded(self._rungs() + [lone], 4.5)
+        assert out["pricing_basis"] == "ladder"
+        assert out["exact_sales"] == [700.0]
+        assert out["exact_effective_n"] == 1.0
+        assert out["fmv_high"] != 700
+        assert 900 < out["fmv_high"] < 1400
+
+    def test_removing_the_target_rung_is_what_makes_it_an_interpolation(self):
+        """Regression guard for the one line that carries the whole rule: with
+        the rung LEFT IN, `_cgc_ladder_price_and_clamp` returns the lone sale
+        (merely bounded from above), which is the outcome this tier exists to
+        prevent."""
+        comps = self._rungs() + [_slab_comp(700, 4.5, age=1)]
+        ladder = fm.bucket_weighted_medians(fm.graded_pool(comps)[0])
+        counts = fm.bucket_effective_n(fm.graded_pool(comps)[0])
+        with_rung, _ = fm._cgc_ladder_price_and_clamp(
+            ladder, 4.5, counts=counts, min_bucket_n=1)
+        assert with_rung == 700.0          # the trap
+        assert _graded(comps, 4.5)["fmv_high"] != 700   # the guard
+
+    def test_ladder_is_low_confidence_and_the_sixty_percent_cap(self):
+        out = _graded(self._rungs() + [_slab_comp(700, 4.5, age=1)], 4.5)
+        assert out["confidence"] == "LOW"
+        assert out["bid_factor"] == 0.60
+        assert out["max_bid"] == fm.clean_round(out["fmv_high"] * 0.60)
+
+    def test_no_exact_sale_at_all_still_interpolates(self):
+        out = _graded(self._rungs(), 4.5)
+        assert out["pricing_basis"] == "ladder"
+        assert out["exact_sales"] == []
+
+    def test_refuses_below_three_remaining_rungs(self):
+        comps = [_slab_comp(900, 4.0, age=10), _slab_comp(1400, 5.5, age=12),
+                 _slab_comp(700, 4.5, age=1)]
+        assert _graded(comps, 4.5)["flag_reason"] == "ladder_too_thin"
+
+    def test_refuses_outside_the_observed_ladder(self):
+        comps = [_slab_comp(900, 4.0, age=10), _slab_comp(1400, 5.5, age=12),
+                 _slab_comp(1500, 6.0, age=14)]
+        assert _graded(comps, 9.8)["flag_reason"] == "outside_ladder"
+
+    def test_refuses_when_the_neighbours_invert(self):
+        comps = [_slab_comp(2000, 8.5, age=10), _slab_comp(3000, 9.2, age=12),
+                 _slab_comp(2500, 9.6, age=14), _slab_comp(4000, 9.8, age=16)]
+        assert _graded(comps, 9.4)["flag_reason"] == "ladder_non_monotone"
+
+    def test_a_violation_away_from_the_target_does_not_refuse(self):
+        """Scoped to the NEIGHBOURS on purpose. A slab ladder is one sale per
+        rung, so a violation somewhere is the norm — a whole-ladder rule
+        refused all four ladder books in the 2026-09-21 spike corpus, i.e. it
+        would not be a guard, it would be an off switch."""
+        comps = [_slab_comp(2000, 8.5, age=10), _slab_comp(2500, 9.2, age=12),
+                 _slab_comp(3500, 9.6, age=14), _slab_comp(3000, 9.8, age=16)]
+        out = _graded(comps, 9.4)
+        assert out["flag_reason"] is None
+        assert out["pricing_basis"] == "ladder"
+
+    def test_a_stale_only_rung_is_skipped_as_an_anchor(self):
+        """A rung whose only sale is 91-365 days old sums to 0.5 effective
+        sales, below `GRADED_LADDER_MIN_BUCKET_N`, so it cannot be a bracket
+        END — the bracket widens past it to the next eligible rung, exactly as
+        `interpolate_grade_curve` does with a thin one on the raw path. The
+        4.0 rung here is the nearest below the 4.5 target and is skipped in
+        favour of 2.5."""
+        fresh = [_slab_comp(900, 4.0, age=10), _slab_comp(1400, 5.5, age=12),
+                 _slab_comp(1500, 6.0, age=14), _slab_comp(500, 2.5, age=16)]
+        stale = [_slab_comp(900, 4.0, age=200)] + fresh[1:]
+        assert _graded(fresh, 4.5)["graded_ladder"]["grade_below"] == 4.0
+        out = _graded(stale, 4.5)
+        assert out["graded_ladder"]["grade_below"] == 2.5
+        assert out["pricing_basis"] == "ladder"
+
+    def test_rungs_over_a_year_behind_the_pool_are_dropped_not_weighted(self):
+        """Age is POOL-RELATIVE, so "everything is stale" is not a reachable
+        state — the newest comp defines age zero whatever the calendar says
+        (see `TestGradedCompWeights`). What IS reachable is a pool whose older
+        rungs sit more than a year behind its newest comp: those are dropped
+        outright, and a ladder that loses too many of them is refused rather
+        than interpolated across the gap."""
+        comps = [_slab_comp(2000, 7.0, age=0), _slab_comp(900, 4.0, age=400),
+                 _slab_comp(1400, 5.5, age=410), _slab_comp(500, 2.5, age=420)]
+        out = _graded(comps, 4.5)
+        assert out["pool_stale_dropped"] == 3
+        assert out["pool_n"] == 1
+        assert out["flag_reason"] == "ladder_too_thin"
+
+
+class TestGradedPageQuality:
+    def _pool(self, whites):
+        pool = [_slab_comp(1000 + i, 9.4, age=i, page_quality="ow_w",
+                           product_id=f"o{i}") for i in range(4)]
+        pool += [_slab_comp(3000 + i, 9.4, age=i, page_quality="white",
+                            product_id=f"w{i}") for i in range(whites)]
+        return pool
+
+    def test_two_matching_comps_scope_the_pool(self):
+        out = _graded(self._pool(2), 9.4, page_quality="white")
+        assert out["page_quality_fallback"] is False
+        assert out["pool_n"] == 2
+        assert out["fmv_low"] >= 3000
+
+    def test_one_matching_comp_falls_back_and_says_so(self):
+        out = _graded(self._pool(1), 9.4, page_quality="white")
+        assert out["page_quality_fallback"] is True
+        assert out["pool_n"] == 5
+
+    def test_unknown_target_quality_is_not_a_filter(self):
+        """`unknown` is the ABSENCE of a reading. Preferring the comps whose
+        quality we also failed to read is a filter on parser coverage, not a
+        quality match."""
+        for value in (None, "unknown"):
+            out = _graded(self._pool(2), 9.4, page_quality=value)
+            assert out["page_quality_fallback"] is False
+            assert out["pool_n"] == 6
+
+
+class TestGradedRefusalShape:
+    @pytest.mark.parametrize("reason,comps,grade", [
+        ("no_certifier_pool", [], 9.4),
+        ("ladder_too_thin",
+         [{"price": 100, "grade": 9.2, "sold_date": "2026-09-01"},
+          {"price": 200, "grade": 9.6, "sold_date": "2026-09-01"}], 9.4),
+    ])
+    def test_a_refusal_is_the_ordinary_needs_manual_shape(self, reason, comps,
+                                                          grade):
+        out = _graded(comps, grade)
+        assert out["flag_reason"] == reason
+        assert out["fmv_low"] is out["fmv_high"] is out["median"] is None
+        assert out["max_bid"] is None
+        assert out["confidence"] == "LOW"
+        assert out["pricing_basis"] is None
+
+    def test_every_reason_is_declared(self):
+        """The runner posts these to `POST /api/comics`, where an unlisted
+        value 422s and the server discards the WHOLE upsert."""
+        assert set(fm.GRADED_FLAG_REASONS) == {
+            "no_certifier_pool", "ladder_too_thin", "ladder_non_monotone",
+            "outside_ladder", "too_sparse"}
+
+    def test_a_punt_reports_no_pool_rather_than_an_empty_one(self):
+        """`slab_pool=0` in the notes would read as "we looked at this
+        certifier's sales and found none", which is a different claim from
+        "we never looked"."""
+        punt = fm.graded_punt("certifier_other", certifier="other",
+                              label="universal")
+        assert punt["pool_n"] is None
+
+    def test_punt_matches_the_priced_shape(self):
+        punt = fm.graded_punt("label_signature_series", certifier="cgc",
+                              label="signature_series")
+        priced = _graded([_slab_comp(1000, 9.4, age=1),
+                          _slab_comp(1100, 9.4, age=2),
+                          _slab_comp(900, 9.2, age=3),
+                          _slab_comp(1400, 9.6, age=4)], 9.4)
+        assert set(punt) == set(priced)
+        assert punt["flag_reason"] == "label_signature_series"
+        assert punt["label"] == "signature_series"
+
+
+class TestGradedNeverTouchesTheRawMachinery:
+    def test_graded_output_declares_no_raw_tier(self):
+        out = _graded([_slab_comp(1000, 9.4, age=1),
+                       _slab_comp(1100, 9.4, age=2),
+                       _slab_comp(900, 9.2, age=3),
+                       _slab_comp(1400, 9.6, age=4)], 9.4)
+        assert out["graded"] is True
+        assert out["cgc_proxy"] is False
+        assert out["cgc_ladder"] is None
+        assert out["ungraded_anchor"] is None
+        assert out["anchor_diverges"] is False
+        assert out["cgc_cross_check"] is None
+        # `pricing_basis` is the carrier now; setting `interpolated` too would
+        # make the notes and the table announce the same fact twice.
+        assert out["interpolated"] is False
+        assert out["window"] is None
+
+    def test_graded_never_calls_build_pool(self, monkeypatch):
+        def _boom(*a, **k):  # pragma: no cover - the assertion is that it is
+            raise AssertionError("graded_fmv must never widen a grade window")
+        monkeypatch.setattr(fm, "build_pool", _boom)
+        out = _graded([_slab_comp(1000, 9.4, age=1),
+                       _slab_comp(1100, 9.4, age=2),
+                       _slab_comp(900, 9.2, age=3),
+                       _slab_comp(1400, 9.6, age=4)], 9.4)
+        assert out["fmv_high"] is not None
