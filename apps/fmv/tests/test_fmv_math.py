@@ -1661,7 +1661,16 @@ def _slab_comp(price, grade, *, age=0, page_quality="unknown",
 def _graded(comps, grade, **kw):
     kw.setdefault("certifier", "cgc")
     kw.setdefault("label", "universal")
+    # BUI-948: `as_of` is required, and every fixture in this file builds its
+    # comps as an age relative to `_GREF`, so pinning it to `_GREF` is what
+    # keeps `age=N` meaning "N days old" — and keeps every pre-BUI-948
+    # expectation in this file exactly as it was.
+    kw.setdefault("as_of", _GREF)
     return fm.graded_fmv(comps, grade, **kw)
+
+
+def _pool(comps, as_of=_GREF):
+    return fm.graded_pool(comps, as_of=as_of)
 
 
 class TestGradedCompWeights:
@@ -1673,43 +1682,98 @@ class TestGradedCompWeights:
         assert fm.graded_comp_weight(366) is None
         assert fm.graded_comp_weight(None) is None
 
-    def test_pool_reference_is_the_newest_comp_not_a_clock(self):
-        """The whole fixture story depends on this: ages are measured against
-        the pool's own newest comp, so a golden row weighs the same forever."""
+    def test_pool_reference_is_the_supplied_as_of_not_the_newest_comp(self):
+        """BUI-948. This pool's two comps are 30 days apart and BOTH more than
+        a year old. The pre-BUI-948 rule aged them against each other, so the
+        newer one weighed 1.0 and a decade-old sale could anchor a four-figure
+        cap; against the calendar both are simply gone."""
         old = [_slab_comp(100, 9.0, age=4000), _slab_comp(110, 9.0, age=4030)]
-        kept, undated, stale = fm.graded_pool(old)
-        assert (undated, stale) == (0, 0)
-        assert [c["weight"] for c in kept] == [1.0, 1.0]
+        kept, undated, stale = _pool(old)
+        assert kept == []
+        assert (undated, stale) == (0, 2)
+
+    def test_as_of_is_required_so_no_caller_can_inherit_a_clock(self):
+        """The parameter has no default on purpose: a default would let a new
+        call site silently pick a reference nobody chose."""
+        with pytest.raises(TypeError):
+            fm.graded_pool([_slab_comp(100, 9.0, age=0)])
+        with pytest.raises(TypeError):
+            fm.graded_fmv([_slab_comp(100, 9.0, age=0)], 9.0,
+                          certifier="cgc", label="universal")
+
+    def test_moving_as_of_forward_demotes_a_comp_it_does_not_move_the_pool(self):
+        """The same fixed pool, read on two different days. A 60-day sale is
+        full weight today and half weight 60 days later — the behaviour the
+        newest-comp rule could not express, because the pool's own newest date
+        never moves."""
+        comps = [_slab_comp(100, 9.0, age=60)]
+        assert [c["weight"] for c in _pool(comps)[0]] == [1.0]
+        later, _, _ = _pool(comps, as_of=_GREF + timedelta(days=60))
+        assert [c["weight"] for c in later] == [0.5]
+
+    def test_a_comp_past_365_days_from_as_of_is_excluded_not_demoted(self):
+        """The hard cut BUI-948 measured and kept. The pool's own newest comp
+        is this same 300-day sale, which under the old rule made it the
+        reference and weighted it 1.0."""
+        comps = [_slab_comp(100, 9.0, age=300)]
+        assert [c["weight"] for c in _pool(comps)[0]] == [0.5]
+        gone, undated, stale = _pool(comps, as_of=_GREF + timedelta(days=66))
+        assert gone == []
+        assert (undated, stale) == (0, 1)
+
+    def test_a_future_sold_date_clamps_to_full_weight_never_negative(self):
+        comps = [_slab_comp(100, 9.0, age=-30)]
+        assert [c["weight"] for c in _pool(comps)[0]] == [1.0]
 
     def test_undated_comp_is_excluded_not_weighted_one(self):
         comps = [_slab_comp(100, 9.0, age=0), _slab_comp(999, 9.0, age=None)]
-        kept, undated, stale = fm.graded_pool(comps)
+        kept, undated, stale = _pool(comps)
         assert [c["price"] for c in kept] == [100]
         assert (undated, stale) == (1, 0)
+
+    def test_an_all_undated_pool_reports_every_comp_undated(self):
+        """The early return BUI-948 deleted used to produce this count; the
+        ordinary loop must still produce it."""
+        comps = [_slab_comp(100, 9.0, age=None),
+                 _slab_comp(200, 9.4, age=None)]
+        kept, undated, stale = _pool(comps)
+        assert kept == []
+        assert (undated, stale) == (2, 0)
 
     def test_first_seen_at_is_the_fallback_age_basis(self):
         comps = [_slab_comp(100, 9.0, age=0),
                  _slab_comp(200, 9.0, age=None, first_seen_age=120)]
-        kept, undated, stale = fm.graded_pool(comps)
+        kept, undated, stale = _pool(comps)
         assert (undated, stale) == (0, 0)
         assert [c["weight"] for c in kept] == [1.0, 0.5]
 
+    def test_first_seen_at_ages_against_as_of_like_any_other_date(self):
+        """A ledger row with no `sold_date` is aged on `first_seen_at`, and
+        BUI-948 moved that basis onto the calendar too — otherwise the one
+        class of comp most likely to be old would be the one still measured
+        against the pool."""
+        comps = [_slab_comp(100, 9.0, age=0),
+                 _slab_comp(200, 9.0, age=None, first_seen_age=80)]
+        assert [c["weight"] for c in _pool(comps)[0]] == [1.0, 1.0]
+        later, _, _ = _pool(comps, as_of=_GREF + timedelta(days=20))
+        assert [c["weight"] for c in later] == [1.0, 0.5]
+
     def test_two_hundred_day_comp_joins_at_half_weight(self):
         comps = [_slab_comp(100, 9.0, age=0), _slab_comp(200, 9.0, age=200)]
-        kept, _, _ = fm.graded_pool(comps)
+        kept, _, _ = _pool(comps)
         assert sum(c["weight"] for c in kept) == 1.5
 
     def test_pool_copies_rather_than_mutating_the_callers_comps(self):
         """The same list is POSTed to the comps ledger, where `weight` is not
         a `CompItem` field."""
         comps = [_slab_comp(100, 9.0, age=0)]
-        fm.graded_pool(comps)
+        _pool(comps)
         assert "weight" not in comps[0]
 
     def test_bool_price_never_enters_the_pool(self):
         comps = [{"product_id": "x", "price": True, "grade": 9.0,
                   "sold_date": "2026-09-01"}]
-        kept, _, _ = fm.graded_pool(comps)
+        kept, _, _ = _pool(comps)
         assert kept == []
 
 
@@ -1732,6 +1796,30 @@ class TestGradedBuckets:
 
 
 class TestGradedExactTier:
+    def test_the_tier_gate_reads_the_as_of_weights_not_the_pool_relative_ones(self):
+        """BUI-948's money consequence, at the gate that decides the haircut.
+
+        One fixed pool, two as-of dates. Its two 9.4 sales are 50 days apart;
+        read on the day the newer one sold they are both fresh, effective n is
+        2.0 and the book prices DIRECT. Read 100 days later they are 100 and
+        150 days old, effective n is 1.0, and the same two sales send the book
+        to the ladder at 0.60. The pre-BUI-948 reference could only ever
+        produce the first answer, whatever the calendar said — which is the
+        mechanism behind the corpus-wide drop from 71 effective-n-2 rungs to
+        44.
+        """
+        comps = [_slab_comp(1000, 9.4, age=100), _slab_comp(1100, 9.4, age=150),
+                 _slab_comp(800, 9.2, age=10), _slab_comp(1400, 9.6, age=10),
+                 _slab_comp(1600, 9.8, age=10)]
+        fresh = _graded(comps, 9.4, as_of=_GREF - timedelta(days=100))
+        assert fresh["exact_effective_n"] == 2.0
+        assert fresh["pricing_basis"] == "direct"
+
+        aged = _graded(comps, 9.4)
+        assert aged["exact_effective_n"] == 1.0
+        assert aged["pricing_basis"] == "ladder"
+        assert aged["bid_factor"] == 0.60
+
     def test_two_live_sales_price_directly(self):
         comps = [_slab_comp(1000, 9.4, age=1), _slab_comp(1100, 9.4, age=2),
                  _slab_comp(800, 9.2, age=3), _slab_comp(1400, 9.6, age=4)]
@@ -1801,8 +1889,8 @@ class TestGradedLadderTier:
         (merely bounded from above), which is the outcome this tier exists to
         prevent."""
         comps = self._rungs() + [_slab_comp(700, 4.5, age=1)]
-        ladder = fm.bucket_weighted_medians(fm.graded_pool(comps)[0])
-        counts = fm.bucket_effective_n(fm.graded_pool(comps)[0])
+        ladder = fm.bucket_weighted_medians(_pool(comps)[0])
+        counts = fm.bucket_effective_n(_pool(comps)[0])
         with_rung, _ = fm._cgc_ladder_price_and_clamp(
             ladder, 4.5, counts=counts, min_bucket_n=1)
         assert with_rung == 700.0          # the trap
@@ -1860,13 +1948,13 @@ class TestGradedLadderTier:
         assert out["graded_ladder"]["grade_below"] == 2.5
         assert out["pricing_basis"] == "ladder"
 
-    def test_rungs_over_a_year_behind_the_pool_are_dropped_not_weighted(self):
-        """Age is POOL-RELATIVE, so "everything is stale" is not a reachable
-        state — the newest comp defines age zero whatever the calendar says
-        (see `TestGradedCompWeights`). What IS reachable is a pool whose older
-        rungs sit more than a year behind its newest comp: those are dropped
-        outright, and a ladder that loses too many of them is refused rather
-        than interpolated across the gap."""
+    def test_rungs_over_a_year_before_as_of_are_dropped_not_weighted(self):
+        """A pool whose older rungs sit more than a year before the as-of date
+        loses them outright, and a ladder that loses too many is refused
+        rather than interpolated across the gap. Since BUI-948 "everything is
+        stale" is also reachable — the whole pool can be past 365 days at once
+        — and `TestGradedCompWeights` covers that case; here one fresh rung
+        survives so the assertion is about the ladder, not the pool."""
         comps = [_slab_comp(2000, 7.0, age=0), _slab_comp(900, 4.0, age=400),
                  _slab_comp(1400, 5.5, age=410), _slab_comp(500, 2.5, age=420)]
         out = _graded(comps, 4.5)

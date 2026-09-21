@@ -1421,9 +1421,21 @@ def compute_fmv(comps: list[dict], target_grade: float,
 # only"). Live provider comps span eBay's ~90-day sold window; the comps
 # ledger reaches further back, and those older observations are worth having
 # on a market this thin — at half weight, and never past a year.
+#
+# Ages are measured against the CALENDAR `as_of` date `graded_pool`'s caller
+# supplies, not against the pool's own newest sale (BUI-948). See that
+# function's docstring for the measurement that replaced the newest-comp rule.
 GRADED_FRESH_MAX_AGE_DAYS = 90     # weight 1.0 up to here
 GRADED_STALE_MAX_AGE_DAYS = 365    # weight GRADED_STALE_WEIGHT up to here
 GRADED_STALE_WEIGHT = 0.5          # 91–365 days
+# The 365-day cut stays HARD rather than becoming a third, lower band
+# (BUI-948 weighed 0.25-to-730-days as the alternative). Measured on the
+# 2026-09-21 ledger corpus — 344 slab comps, 56 pools, 204 rungs — the oldest
+# stored slab comp is 152 days old and NOT ONE is past 365 on the calendar, so
+# a 366–730 band would have rescued 0 rungs and 0 rows while adding a weight
+# nothing in the corpus exercises. Re-measure before adding one: the case for
+# it is a rung whose only sale has aged past a year, and that rung does not
+# exist yet.
 # Undated comps are EXCLUDED, not weighted 1.0 (the raw path's neutral
 # default). The two paths differ because the raw pool is all live, ~90-day
 # data where "no date" means the parser missed a field; the slab pool merges a
@@ -1476,9 +1488,9 @@ def _is_graded_price(value: object) -> bool:
 def graded_comp_weight(age_days: float | None) -> float | None:
     """Age weight for one slab comp, or None when the comp is EXCLUDED.
 
-    `age_days` is measured against the pool's own newest comp (see
-    `graded_pool`), never a wall clock — the same determinism rule
-    `_recency_weights` follows, so a fixture pool weighs the same today and
+    Pure: an age in, a weight out. `age_days` is measured by `graded_pool`
+    against the `as_of` date ITS caller supplies (BUI-948) — this module never
+    reads a clock, so a fixture that pins `as_of` weighs the same today and
     next year. None (undated) is excluded; see GRADED_STALE_WEIGHT's comment.
     """
     if age_days is None:
@@ -1499,39 +1511,57 @@ def _graded_comp_date(comp: dict) -> date | None:
     recency, i.e. the conservative direction: it can only make a comp look
     NEWER than it is by the lag between sale and first observation, which is
     days, and it can never resurrect a comp older than the 365-day cutoff.
+    That holds unchanged against a calendar `as_of` (BUI-948): both dates are
+    aged from the same reference, so the bound is still one-directional.
     """
     return (_parse_sold_date(comp.get("sold_date"))
             or _parse_sold_date(comp.get("first_seen_at")))
 
 
-def graded_pool(comps: Iterable[dict]) -> tuple[list[dict], int, int]:
-    """Weight and filter a slab comp pool.
+def graded_pool(comps: Iterable[dict], *,
+                as_of: date) -> tuple[list[dict], int, int]:
+    """Weight and filter a slab comp pool, aged against the CALENDAR.
 
     Returns `(kept, undated_dropped, stale_dropped)`. Each kept comp is a
     SHALLOW COPY carrying a `weight` key — copies so the caller's own list
     (which it also posts to the comps ledger) is never mutated with a field
     that is not part of the `CompItem` contract.
 
-    The reference date is the pool's newest parseable comp date, matching
-    `_recency_weights` (deterministic, no clock). A pool whose comps are ALL
-    old therefore weighs them all 1.0 relative to each other — correct, and
-    the same property the raw path has: recency weighting answers "which of
-    these is the freshest evidence", never "is this market stale".
+    `as_of` is the reference date every comp's age is measured from, and it is
+    REQUIRED — no default, no clock in this module. `comic-fmv` passes
+    `date.today()` (`fmv_runner._graded_as_of`, the one clock site on this
+    path); a test passes a fixed date and gets the same answer forever.
+
+    BUI-948 replaced the previous reference — the pool's OWN newest comp —
+    because on a market this thin that rule cannot tell a fresh pool from a
+    stale one. A pool whose newest sale was eight months old aged that sale to
+    0 days and weighted it 1.0. Measured on the 2026-09-21 ledger corpus (344
+    slab comps in 56 pools, 204 rungs): 36% of comps were weighted higher than
+    their calendar age deserves, and rungs at effective n >= 2 — the exact
+    tier's gate — fell from 71 to 44 once re-aged against the calendar. The
+    depth those 71 rungs reported was partly an artifact of the reference.
+
+    The raw path deliberately KEEPS its newest-comp half-life (`_recency_weights`,
+    BUI-287) until that drift is measured on its own corpus; only the slab path
+    moved. The two are not required to agree, because they answer different
+    questions: the raw pool is all live ~90-day data where relative recency is
+    the only thing there is to ask, while this pool merges a ledger that
+    genuinely reaches back years, where "how old is this, really" has an answer.
+
+    A `sold_date` in the FUTURE (bad provider data, or a timezone edge) clamps
+    to age 0 rather than going negative — the same full weight the old rule
+    always gave the newest comp, so nothing regresses through that door.
     """
     usable = [c for c in comps
               if _is_graded_price(c.get("price")) and c.get("grade") is not None]
-    dated = [(c, _graded_comp_date(c)) for c in usable]
-    known = [d for _, d in dated if d is not None]
-    if not known:
-        return [], len(usable), 0
-    reference = max(known)
     kept: list[dict] = []
     undated = stale = 0
-    for comp, when in dated:
+    for comp in usable:
+        when = _graded_comp_date(comp)
         if when is None:
             undated += 1
             continue
-        weight = graded_comp_weight(max((reference - when).days, 0))
+        weight = graded_comp_weight(max((as_of - when).days, 0))
         if weight is None:
             stale += 1
             continue
@@ -1589,9 +1619,8 @@ def _exact_sales_detail(exact_comps: Iterable[dict]) -> list[dict]:
     """Price + sold-date detail for the exact-grade bucket (BUI-940).
 
     Sorted by price, same order as `exact_sales`. `exact_comps` is always a
-    subset of `graded_pool`'s output, whose `known`-date guard means every
-    kept comp already has a parseable date — `_graded_comp_date` is never
-    None here.
+    subset of `graded_pool`'s output, which drops every comp `_graded_comp_date`
+    could not parse, so the call below is never None here.
     """
     detail = []
     for c in exact_comps:
@@ -1761,7 +1790,7 @@ def graded_punt(reason: str, *, certifier: str, label: str,
 
 
 def graded_fmv(comps: list[dict], target_grade: float, *,
-               certifier: str, label: str,
+               certifier: str, label: str, as_of: date,
                page_quality: str | None = None) -> dict:
     """Price a CERTIFIED slab from same-certifier, same-label slab sales.
 
@@ -1770,6 +1799,10 @@ def graded_fmv(comps: list[dict], target_grade: float, *,
     on `product_id` — the caller does that merge; this function does the
     math). Each comp needs `price` and `grade`, plus `sold_date` or
     `first_seen_at` for its age weight and optionally `page_quality`.
+
+    `as_of` is the calendar date every comp is aged against, required and
+    passed straight through to `graded_pool` (BUI-948) — see there for why it
+    is not defaulted and why the pool's own newest comp no longer serves.
 
     Returns a `compute_fmv`-shaped dict. A refusal is the ordinary needs-manual
     shape (`flag_reason` set, every price None, confidence LOW) — the graded
@@ -1853,7 +1886,7 @@ def graded_fmv(comps: list[dict], target_grade: float, *,
     the rungs a straight line is drawn between are the ones whose order
     decides whether that line means anything.
     """
-    full_pool, undated_dropped, stale_dropped = graded_pool(comps)
+    full_pool, undated_dropped, stale_dropped = graded_pool(comps, as_of=as_of)
     pool, pq_fallback, pq_reason = _graded_page_quality_filter(full_pool, page_quality)
     identity: dict = {
         "certifier": certifier,
