@@ -49,14 +49,16 @@ output.
 return does not reach the caller on its own; going idle without this call leaves the
 dispatcher with nothing to read (BUI-569).
 
-The columns, unchanged from the hand-built table this replaces:
+The columns `ebay-fetch --identify` emits — pass them through exactly as printed, and
+never add, drop or reorder one:
 
 ```
-| # | Comic | Issue | Year | Grade | Variant | Type | Current Price | Bids | Seller | Ends | Notes |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| [1](https://www.ebay.com/itm/298217294954) | Amazing Spider-Man | #300 | 1988 | NM- | — | Auction | $102.50 | 12 | beatlebluecat | 2d | — |
-| [2](https://www.ebay.com/itm/318141695576) | Amazing Spider-Man | #300 | — | — | Newsstand | Auction | $5.00 | 0 | comicsRus | ⚠️ 47m | ⚠️ Grade not stated |
-| [3](https://www.ebay.com/itm/555555555) | Batman | #608 | — | VF | — | BIN | $250.00 | — | someseller | — | ⚠️ Buy It Now |
+| # | Comic | Issue | Year | Grade | Variant | Type | Current Price | Bids | Seller | Ends | Notes | Defects | Cert | PQ |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| [1](https://www.ebay.com/itm/298217294954) | Amazing Spider-Man | #300 | 1988 | NM- | — | Auction | $102.50 | 12 | beatlebluecat | 2d | — | — | — | — |
+| [2](https://www.ebay.com/itm/318141695576) | Amazing Spider-Man | #300 | — | — | Newsstand | Auction | $5.00 | 0 | comicsRus | ⚠️ 47m | ⚠️ Grade not stated | — | — | — |
+| [3](https://www.ebay.com/itm/555555555) | Batman | #608 | — | VF | — | BIN | $250.00 | — | someseller | — | ⚠️ Buy It Now | — | — | — |
+| [4](https://www.ebay.com/itm/137743677922) | The Amazing Spider-Man | #103 | 1971 | GD | — | Auction | $0.99 | 1 | timemachinecomics | 3d | grade from title | ⚠️ loose/detached staple: "1st 6 wraps detached bottom staple" | — | — |
 ```
 
 - The `#` column links to the listing; there is no separate Item ID column.
@@ -65,9 +67,18 @@ The columns, unchanged from the hand-built table this replaces:
 - **Notes** carries the flags: no grade anywhere, description-only grade, grade taken
   from the title, Buy It Now (skipped at the Gixen step), lot listings, and titles the
   parser could not identify.
+- **Defects** (BUI-919) carries the seller's own condition text classified against the
+  standing buy rule — moisture damage, rust, or a loose/detached staple — with the
+  phrase that fired. `/comic:buy` Step 1.5 drops those rows before FMV, so never
+  soften, omit or re-word this cell. Blank means the text was scanned and nothing
+  matched, most often because the seller wrote no condition note.
+- **Cert / PQ** (BUI-923) carry a slab's certifier plus non-Universal label, and its
+  page quality; both are blank on a raw listing.
 
 ## Follow-ups
 
 You stay addressable after returning the table (BUI-366). For a follow-up that needs a
 field the table does not show (item specifics, the description snippet, the raw end
-date), run `ebay-fetch --json <id>` for just that listing and answer from it.
+date, the full seller condition note behind a `Defects` cell — `condition_description`
+/ `condition_defects`), run `ebay-fetch --json <id>` for just that listing and answer
+from it.
