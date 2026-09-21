@@ -40,6 +40,24 @@ def _no_sold_comps_secondary(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_printing_guard_credentials(monkeypatch):
+    """BUI-929: pin the printing guard's Browse API credentials to 'absent'
+    for every test, same reasoning as `_no_sold_comps_secondary` above — a
+    dev machine's real environment/.env can hold real EBAY_CLIENT_ID/
+    EBAY_CLIENT_SECRET values (ebay-fetch's own config needs them). Without
+    this, any test whose slab_comps pool happens to contain a price outlier
+    would have `_printing_guard` silently make a REAL OAuth token request
+    and Browse API call instead of exercising the guard's own logic —
+    exactly the local-vs-CI divergence class `_no_sold_comps_secondary`
+    exists to prevent, now for a different credential pair. Tests that
+    exercise the guard's real-credential path set these explicitly via
+    monkeypatch.setenv() after this fixture runs.
+    """
+    monkeypatch.delenv("EBAY_CLIENT_ID", raising=False)
+    monkeypatch.delenv("EBAY_CLIENT_SECRET", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_raw_response_capture(monkeypatch, tmp_path):
     """BUI-614: redirect the raw-response capture file to a per-test tmp path.
 

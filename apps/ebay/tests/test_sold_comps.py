@@ -4928,3 +4928,405 @@ class TestCompProvenance:
         entry = out["queries_used"][0]
         assert {"tier", "nkw", "raw_results", "new_comps", "cached", "ebay_url",
                 "page", "outcome", "provider", "non_usd_dropped"} == set(entry)
+
+
+# ─── BUI-929: graded-target build_query (positive certifier term) ───────────
+
+class TestBuildQueryGraded:
+    def test_cgc_target_omits_exclusions_and_adds_certifier(self):
+        q = sc.build_query("Amazing Spider-Man", "50", year=1967,
+                           graded_target="cgc")
+        for t in ("-cgc", "-cbcs", "-graded", "-slab"):
+            assert t not in q
+        assert q.split()[-1].lower() == "cgc"
+
+    def test_cbcs_target_omits_exclusions_and_adds_certifier(self):
+        q = sc.build_query("Amazing Spider-Man", "50", year=1967,
+                           graded_target="cbcs")
+        for t in ("-cgc", "-cbcs", "-graded", "-slab"):
+            assert t not in q
+        assert q.split()[-1].lower() == "cbcs"
+
+    def test_graded_target_leaves_rest_of_query_intact(self):
+        q = sc.build_query("Amazing Spider-Man", "50", year=1967,
+                           publisher="Marvel", graded_target="cgc")
+        assert '"Amazing Spider-Man 50"' in q
+        assert "1967" in q
+        assert "marvel comics" in q
+
+    def test_graded_target_absent_or_unrecognized_keeps_default_behavior(self):
+        base = sc.build_query("Amazing Spider-Man", "50", year=1967)
+        assert sc.build_query("Amazing Spider-Man", "50", year=1967,
+                              graded_target=None) == base
+        # An unrecognized value is not treated as a certifier term — falls
+        # back to exclude_graded, same as omitting it entirely.
+        assert sc.build_query("Amazing Spider-Man", "50", year=1967,
+                              graded_target="psa") == base
+
+
+# ─── BUI-929: parse_slab_fields ──────────────────────────────────────────────
+
+class TestParseSlabFields:
+    # BUI-754 corpus rule: every title here is either a real surviving comp
+    # from the 2026-09-19 spike (docs/plans/2026-09-21-001 origin, slab_out.json
+    # in that session's scratchpad) or, for the "Qualified" label (absent from
+    # that spike's results), the same real "CGC 9.8 Qualified" fragment
+    # test_grade_tokens.py's own BUI-923 corpus already pins for resolve_label.
+
+    def test_signature_series_via_ss_and_autograph(self):
+        # Real spike/corpus title (also pinned in TestHardExclude's
+        # test_signed_copies_are_excluded — same title, opposite mode).
+        title = "X-MEN #13 CGC 6.0 OW-W 1965 KIRBY, Goldberg autograph/signature 2nd JUGGERNAUT"
+        fields = sc.parse_slab_fields(title)
+        assert fields["certifier"] == "cgc"
+        assert fields["label"] == "signature_series"
+        assert fields["page_quality"] == "ow_w"
+
+    def test_qualified_label(self):
+        title = "Ultimate Fallout #4 CGC 9.6 Qualified Marvel Comics 2011"
+        fields = sc.parse_slab_fields(title)
+        assert fields["label"] == "qualified"
+
+    def test_cbcs_certifier(self):
+        # Real spike title.
+        title = "Ultimate Fallout #4 CBCS 9.8 1st Print 1st Miles Morales Marvel Comics 2011 Key"
+        fields = sc.parse_slab_fields(title)
+        assert fields["certifier"] == "cbcs"
+
+    def test_ow_w_page_quality(self):
+        # Real spike title.
+        title = "Batman #227 1970 CGC 8.5 VF+ OW/W"
+        fields = sc.parse_slab_fields(title)
+        assert fields["page_quality"] == "ow_w"
+
+    def test_defaults_when_no_label_or_page_quality_token(self):
+        # Real spike title with neither a label nor a page-quality token.
+        title = "Ultimate Fallout 4 CGC 9.8 Marvel Comics 2011"
+        fields = sc.parse_slab_fields(title)
+        assert fields["certifier"] == "cgc"
+        assert fields["label"] == "universal"
+        assert fields["page_quality"] == "unknown"
+
+
+# ─── BUI-929: hard_exclude(graded_target=...) — labeled, not deleted ────────
+
+class TestGradedModeHardExclude:
+    # Same real corpus title TestHardExclude.test_signed_copies_are_excluded
+    # already pins as excluded in the (default) raw mode.
+    SIGNED_SLAB_TITLE = (
+        "X-MEN #13 CGC 6.0 OW-W 1965 KIRBY, Goldberg autograph/signature 2nd JUGGERNAUT"
+    )
+    RESTORED_TITLE = "Captain America #100 VG- 3.5 RESTORED 1968"
+
+    def test_signature_signed_autograph_restored_survive_in_graded_mode(self):
+        for title in (self.SIGNED_SLAB_TITLE, self.RESTORED_TITLE):
+            assert not sc.hard_exclude(title, graded_target="cgc"), title
+
+    def test_same_titles_still_excluded_in_raw_mode(self):
+        # graded_target absent/None must be byte-for-byte the pre-BUI-929
+        # behavior — these are the exact titles already pinned excluded in
+        # TestHardExclude.
+        for title in (self.SIGNED_SLAB_TITLE, self.RESTORED_TITLE):
+            assert sc.hard_exclude(title)
+            assert sc.hard_exclude(title, graded_target=None)
+
+    def test_pgx_and_psa_still_excluded_in_graded_mode(self):
+        assert sc.hard_exclude("ASM #5 PSA 8 graded", graded_target="cgc")
+        assert sc.hard_exclude("X-Men #13 PGX 9.0 Marvel", graded_target="cgc")
+
+    def test_condition_and_lot_exclusions_still_apply_in_graded_mode(self):
+        assert sc.hard_exclude("Coverless ASM #5 1963", graded_target="cgc")
+        assert sc.hard_exclude("X-Men vol 2 #1", graded_target="cgc")
+
+
+# ─── BUI-929: fetch_book_comps in graded mode (certifier field) ─────────────
+
+class TestGradedFetchMode:
+    def _comp(self, pid, title, price):
+        return {
+            "product_id": pid,
+            "title": title,
+            "price": {"raw": f"${price}", "extracted": price},
+            "sold_date": "",
+            "buying_format": "auction",
+        }
+
+    def _wire(self, tmp_path, monkeypatch, results_per_query):
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        calls = []
+
+        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1,
+                       record_attempt=None, breaker=None):
+            calls.append(nkw)
+            idx = len(calls) - 1
+            results = results_per_query[idx] if idx < len(results_per_query) else []
+            return ({
+                "organic_results": results,
+                "search_metadata": {"ebay_url": "ok&LH_Sold=1"},
+            }, False, 1234567890.0)
+
+        monkeypatch.setattr(sc, "fetch", fake_fetch)
+        return calls
+
+    def test_runs_exactly_one_query_never_widening_tiers(self, tmp_path, monkeypatch):
+        # A thin, year-having, variant-carrying vintage book would normally
+        # trigger broaden/alt-masthead/variant-drop tiers on the raw path —
+        # none of that may fire for a certified target.
+        calls = self._wire(tmp_path, monkeypatch, [[]])
+        out = sc.fetch_book_comps(
+            {"title": "Amazing Spider-Man", "issue": "50", "year": 1967,
+             "variant": "Newsstand", "grade": 9.8, "certifier": "cgc"},
+            "key",
+        )
+        assert len(calls) == 1
+        assert {q["tier"] for q in out["queries_used"]} == {"base"}
+        assert "-cgc" not in calls[0]
+        assert calls[0].split()[-1].lower() == "cgc"
+
+    def test_cbcs_certifier_biases_query_to_cbcs(self, tmp_path, monkeypatch):
+        calls = self._wire(tmp_path, monkeypatch, [[]])
+        sc.fetch_book_comps(
+            {"title": "Ultimate Fallout", "issue": "4", "year": 2011,
+             "certifier": "cbcs"},
+            "key",
+        )
+        assert len(calls) == 1
+        assert calls[0].split()[-1].lower() == "cbcs"
+
+    def test_slab_comps_carry_certifier_label_page_quality(self, tmp_path, monkeypatch):
+        results = [[
+            self._comp("s1", "Ultimate Fallout 4 CGC 9.8 Marvel Comics 2011", 1200.0),
+        ]]
+        self._wire(tmp_path, monkeypatch, results)
+        out = sc.fetch_book_comps(
+            {"title": "Ultimate Fallout", "issue": "4", "year": 2011,
+             "certifier": "cgc"},
+            "key",
+        )
+        assert out["comps"] == []
+        assert len(out["slab_comps"]) == 1
+        slab = out["slab_comps"][0]
+        assert slab["certifier"] == "cgc"
+        assert slab["label"] == "universal"
+        assert slab["page_quality"] == "unknown"
+
+    def test_signature_series_comp_labeled_in_graded_mode_excluded_in_raw_mode(
+        self, tmp_path, monkeypatch,
+    ):
+        # Real corpus title (also pinned excluded in TestHardExclude).
+        title = "X-MEN #13 CGC 6.0 OW-W 1965 KIRBY, Goldberg autograph/signature 2nd JUGGERNAUT"
+        results = [[self._comp("s1", title, 900.0)]]
+        self._wire(tmp_path, monkeypatch, results)
+        out = sc.fetch_book_comps(
+            {"title": "X-Men", "issue": "13", "year": 1965, "certifier": "cgc"},
+            "key",
+        )
+        assert len(out["slab_comps"]) == 1
+        assert out["slab_comps"][0]["label"] == "signature_series"
+
+        # Same title, no certifier field: raw-mode inclusive tier's
+        # hard_exclude still drops it outright, byte-for-byte unchanged.
+        results2 = [
+            [self._comp("r1", "X-Men #13 FN 1965 Marvel", 20.0)],
+            [self._comp("r2", "X-Men #13 FN 1965 Marvel", 20.0)],
+            [self._comp("r3", "X-Men #13 FN 1965 Marvel", 20.0), self._comp("s1", title, 900.0)],
+        ]
+        self._wire(tmp_path, monkeypatch, results2)
+        out2 = sc.fetch_book_comps(
+            {"title": "X-Men", "issue": "13", "year": 1965},
+            "key",
+        )
+        assert out2["slab_comps"] == []
+
+    def test_provider_failure_returns_standard_error_shape(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(sc.time, "sleep", lambda *_: None)
+
+        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1,
+                       record_attempt=None, breaker=None):
+            raise requests.ConnectionError("refused")
+
+        monkeypatch.setattr(sc, "fetch", fake_fetch)
+
+        out = sc.fetch_book_comps(
+            {"title": "Amazing Spider-Man", "issue": "50", "year": 1967,
+             "certifier": "cgc"},
+            "key",
+        )
+        assert out["comps"] == []
+        assert out["slab_comps"] == []
+        errors = [q for q in out["queries_used"] if "error" in q]
+        assert len(errors) >= 1
+        assert "refused" in errors[0]["error"]
+        assert out["printing_dropped"] == 0
+        assert out["printing_unverified"] == 0
+
+
+# ─── BUI-929: printing guard ─────────────────────────────────────────────────
+
+class TestPrintingGuard:
+    def _slab(self, pid, title, price, grade=9.8):
+        return {"product_id": pid, "title": title, "price": price, "grade": grade}
+
+    def test_outlier_below_half_median_gets_fetched_and_dropped(self):
+        # 4 real, un-truncated "CGC 9.8" spike titles at ~$1200, plus 2
+        # constructed $215 "2nd Print" comps — ticket-sanctioned "style"
+        # titles (BUI-754 corpus rule carve-out: same real "Ultimate
+        # Fallout #4 CGC 9.8" fragment the other four comps use, combined
+        # with the real "2nd Print" token already pinned in
+        # TestHardExclude's BUI-645 corpus).
+        rung = [
+            self._slab("a", "Ultimate Fallout 4 CGC 9.8 Marvel Comics 2011", 1200.0),
+            self._slab("b", "Ultimate Fallout #4 CGC 9.8 White Pages 1st Miles Morales Marvel Comics 2011", 1250.0),
+            self._slab("c", "Ultimate Fallout #4 (2011) Marvel Comics 1st app Miles Morales 1st Print CGC 9.8", 1150.0),
+            self._slab("d", "Ultimate Fallout 4 CGC 9.8 Marvel Comics 2011", 1225.0),
+            self._slab("e1", "Ultimate Fallout #4 CGC 9.8 2nd Print", 215.0),
+            self._slab("e2", "Ultimate Fallout #4 CGC 9.8 2nd Print Marvel Comics 2011", 215.0),
+        ]
+        fetched_ids = []
+
+        def fetch_description(comp):
+            fetched_ids.append(comp["product_id"])
+            return "Marvel Comics 2011 Second Printing"
+
+        result = sc._printing_guard(rung, fetch_description=fetch_description)
+
+        assert sorted(fetched_ids) == ["e1", "e2"]
+        assert result == {"printing_dropped": 2, "printing_unverified": 0}
+        survivor_ids = {c["product_id"] for c in rung}
+        assert survivor_ids == {"a", "b", "c", "d"}
+
+    def test_leave_one_out_median_catches_outlier_a_self_inclusive_median_would_miss(self):
+        # A 2-comp rung: $1200 legit + $550 "outlier". Under a NAIVE median
+        # that includes the comp being judged, this rung's median is
+        # (1200+550)/2 = 875, so 0.5x875 = $437.50 — the $550 comp is NOT
+        # below that and never even gets fetched, which is exactly the
+        # self-dilution bug _printing_guard's docstring documents choosing
+        # leave-one-out to avoid. Under leave-one-out, the $550 comp is
+        # judged against the OTHER comp alone ($1200): threshold 0.5x1200 =
+        # $600, and $550 IS below that, so it gets fetched. This test fails
+        # under a self-inclusive-median implementation and passes only under
+        # leave-one-out — pinning the documented design decision, not just
+        # the observable outcome.
+        rung = [
+            self._slab("legit", "Ultimate Fallout 4 CGC 9.8 Marvel Comics 2011", 1200.0),
+            self._slab("outlier", "Ultimate Fallout #4 CGC 9.8 2nd Print", 550.0),
+        ]
+        fetched_ids = []
+
+        def fetch_description(comp):
+            fetched_ids.append(comp["product_id"])
+            return "Second Printing"
+
+        result = sc._printing_guard(rung, fetch_description=fetch_description)
+        assert fetched_ids == ["outlier"]
+        assert result == {"printing_dropped": 1, "printing_unverified": 0}
+        assert {c["product_id"] for c in rung} == {"legit"}
+
+    def test_outlier_with_no_fetched_text_is_kept_and_unverified(self):
+        rung = [
+            self._slab("a", "Ultimate Fallout 4 CGC 9.8 Marvel Comics 2011", 1200.0),
+            self._slab("b", "Ultimate Fallout #4 CGC 9.8 White Pages 1st Miles Morales Marvel Comics 2011", 1250.0),
+            self._slab("e", "Ultimate Fallout #4 CGC 9.8 2nd Print", 215.0),
+        ]
+
+        def fetch_description_404(comp):
+            return None  # 404 / purged / network failure — see docstring
+
+        result = sc._printing_guard(rung, fetch_description=fetch_description_404)
+        assert result == {"printing_dropped": 0, "printing_unverified": 1}
+        assert {c["product_id"] for c in rung} == {"a", "b", "e"}
+
+    def test_outlier_with_silent_text_is_kept_and_unverified(self):
+        rung = [
+            self._slab("a", "Ultimate Fallout 4 CGC 9.8 Marvel Comics 2011", 1200.0),
+            self._slab("b", "Ultimate Fallout #4 CGC 9.8 White Pages 1st Miles Morales Marvel Comics 2011", 1250.0),
+            self._slab("e", "Ultimate Fallout #4 CGC 9.8 2nd Print", 215.0),
+        ]
+
+        def fetch_description_empty(comp):
+            return ""  # fetch succeeded; the listing just has no useful text
+
+        result = sc._printing_guard(rung, fetch_description=fetch_description_empty)
+        assert result == {"printing_dropped": 0, "printing_unverified": 1}
+        assert {c["product_id"] for c in rung} == {"a", "b", "e"}
+
+    def test_normal_priced_reprint_titled_comp_never_fetched_or_dropped(self):
+        # Real spike-adjacent corpus title class (BUI-645): a genuine first
+        # print honestly described as containing/being a reprint of earlier
+        # material. At a normal (non-outlier) price it must never even
+        # trigger a description fetch.
+        rung = [
+            self._slab("a", "Ultimate Fallout 4 CGC 9.8 Marvel Comics 2011", 1200.0),
+            self._slab("b", "X-MEN 79 1972 Marvel Comics CGC 9.8 Reprint X-Men 31 Cyclops", 1180.0),
+        ]
+
+        def fetch_description(comp):
+            raise AssertionError("must not be called for a normal-priced comp")
+
+        result = sc._printing_guard(rung, fetch_description=fetch_description)
+        assert result == {"printing_dropped": 0, "printing_unverified": 0}
+        assert {c["product_id"] for c in rung} == {"a", "b"}
+
+    def test_single_comp_rung_never_guarded(self):
+        # No OTHER sale in the rung to judge this comp against.
+        rung = [self._slab("a", "Ultimate Fallout #4 CGC 9.8 2nd Print", 215.0)]
+
+        def fetch_description(comp):
+            raise AssertionError("must not be called — nothing to compare against")
+
+        result = sc._printing_guard(rung, fetch_description=fetch_description)
+        assert result == {"printing_dropped": 0, "printing_unverified": 0}
+        assert len(rung) == 1
+
+    def test_bare_reprint_in_description_text_never_drops(self):
+        # BUI-645, reused at the description-text level: bare "reprint"/
+        # "reprints" must never be a drop signal, even when the guard DOES
+        # fetch a genuine below-median outlier's text.
+        assert sc._has_printing_token("Reprints an earlier story") is False
+        assert sc._has_printing_token("This is a reprint edition") is False
+        assert sc._has_printing_token("Second Printing, White Pages") is True
+        assert sc._has_printing_token("3rd Print") is True
+        assert sc._has_printing_token("Facsimile Edition") is True
+        assert sc._has_printing_token("") is False
+        assert sc._has_printing_token(None) is False
+
+
+class TestPrintingGuardTokenAndDescriptionHelpers:
+    def test_printing_guard_token_missing_credentials_returns_none(self, monkeypatch):
+        monkeypatch.delenv("EBAY_CLIENT_ID", raising=False)
+        monkeypatch.delenv("EBAY_CLIENT_SECRET", raising=False)
+        assert sc._printing_guard_token() == (None, None)
+
+    def test_printing_guard_token_swallows_systemexit_from_get_token(self, monkeypatch):
+        # ebay_fetch.get_token() sys.exit(1)s on a bad/failed token request —
+        # the printing guard must degrade, not crash the whole batch.
+        monkeypatch.setenv("EBAY_CLIENT_ID", "id")
+        monkeypatch.setenv("EBAY_CLIENT_SECRET", "secret")
+
+        def fake_get_token(*a, **k):
+            raise SystemExit(1)
+
+        monkeypatch.setattr(sc.ebay_fetch, "get_token", fake_get_token)
+        assert sc._printing_guard_token() == (None, None)
+
+    def test_default_fetch_description_no_credentials_returns_none(self, monkeypatch):
+        monkeypatch.delenv("EBAY_CLIENT_ID", raising=False)
+        monkeypatch.delenv("EBAY_CLIENT_SECRET", raising=False)
+        assert sc._default_fetch_description({"product_id": "123"}) is None
+
+    def test_default_fetch_description_no_product_id_returns_none(self):
+        assert sc._default_fetch_description({}) is None
+
+    def test_default_fetch_description_uses_ebay_fetch_helper(self, monkeypatch):
+        monkeypatch.setattr(sc, "_printing_guard_token", lambda: ("tok", "https://api.ebay.com"))
+        calls = []
+
+        def fake_fetch_item_description(item_id, token, base_url, retries=3):
+            calls.append((item_id, token, base_url))
+            return "Second Printing"
+
+        monkeypatch.setattr(sc.ebay_fetch, "fetch_item_description", fake_fetch_item_description)
+        text = sc._default_fetch_description({"product_id": "999"})
+        assert text == "Second Printing"
+        assert calls == [("999", "tok", "https://api.ebay.com")]

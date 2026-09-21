@@ -518,6 +518,10 @@ def extract_comps(sc: types.ModuleType, raw: RawResponse) -> list[dict]:
         comp["from_cache"] = raw.from_cache
         comp["observed_at"] = observed_at
         comp["pool"] = "slab" if (route_slabs and sc._is_slab_comp(comp)) else "raw"
+        if comp["pool"] == "slab":
+            # BUI-929: mirror the live pooling loop, which stamps certifier,
+            # label, and page_quality on every slab comp it routes.
+            comp.update(sc.parse_slab_fields(comp["title"]))
         comp["provenance"] = raw.provenance
         comps.append(comp)
     return comps
@@ -643,7 +647,10 @@ def _resolve_server_url(explicit: str | None) -> str:
 # from (the cache filename's digest / the capture record's canonical_url).
 # Composed, those give live `query` == echoed `query` on real data.
 VERIFIED_FIELDS = ("product_id", "title", "price", "grade", "sold_date",
-                   "buying_format", "link", "provider")
+                   "buying_format", "link", "provider",
+                   # BUI-929: every slab-pool comp the live path returns carries
+                   # these three, parsed from the title by `parse_slab_fields`.
+                   "certifier", "label", "page_quality")
 # Fields the backfill deliberately does NOT reproduce, each with its reason in
 # the module docstring. Listed so `verify_shape` can prove the live comp has
 # exactly VERIFIED_FIELDS + these and nothing else: a NEW stamped field on the

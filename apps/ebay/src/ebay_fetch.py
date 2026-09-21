@@ -599,6 +599,34 @@ def fetch_item(item_id, token, base_url, retries=3):
     return data
 
 
+def fetch_item_description(item_id, token, base_url, retries=3):
+    """Fetch one item's description text from the Browse API (BUI-929).
+
+    Built for sold_comps.py's printing guard: it needs one listing's free-
+    text description to look for an ordinal printing / facsimile token, not
+    the full parsed item shape parse_item() produces. Reuses
+    fetch_item_with_status() (not fetch_item()) so the "not found at all"
+    (404/network error, data is None) case is indistinguishable from any
+    other total-fetch-failure and both collapse to the same return value —
+    the caller (the printing guard) already treats "no text" as one
+    uniform "couldn't verify" outcome regardless of *why* the text is
+    missing, so there is nothing for a status code to add here.
+
+    Returns the item's `description` field (the Browse API's full listing
+    HTML/text) when present and non-empty, else its `shortDescription`
+    field, else None. None is also returned when the fetch itself failed —
+    a caller cannot (and per the guard's own contract, must not try to)
+    distinguish "fetched successfully but the item has no description text"
+    from "the fetch failed"; both mean "no printing-token evidence available
+    for this comp".
+    """
+    data, _status = fetch_item_with_status(item_id, token, base_url, retries=retries)
+    if data is None:
+        return None
+    text = data.get("description") or data.get("shortDescription")
+    return text or None
+
+
 def _grade_from_text(text):
     """Try to extract a comic grade from arbitrary text.
 
