@@ -56,6 +56,7 @@ from ebay_fetch import (
     save_seller_alias,
     search_seller_listings,
 )
+from grade_tokens import extract_title_certification, resolve_label  # BUI-932
 
 
 # ─── Server URL resolution (BUI-220) ──────────────────────────────────────────
@@ -245,7 +246,7 @@ def prepare_wish_items(wish_list):
     return out
 
 
-def match_listing(title, wish_items):
+def match_listing(title, wish_items, include_graded=False):
     """Return (best_wish_item, score) or (None, 0.0) for an eBay listing title.
 
     Requires:
@@ -262,8 +263,13 @@ def match_listing(title, wish_items):
     pre-refactor performance (O(1) shared string processing, not
     O(len(wish_items))). See score_against_wish's docstring for why the
     scoring behavior itself is unchanged.
+
+    *include_graded* (BUI-932, default False) is forwarded to identify_comic
+    so a certified title's ComicIdentity doesn't carry a "CGC slab"
+    reject_reasons note when the caller has deliberately opted into scoring
+    slabs — see identify_comic's docstring.
     """
-    identity = identify_comic(title)
+    identity = identify_comic(title, include_graded=include_graded)
     best = None
     best_score = 0.0
 
@@ -276,6 +282,36 @@ def match_listing(title, wish_items):
     if best_score >= 0.65:
         return best, best_score
     return None, 0.0
+
+
+def title_certification_fields(title):
+    """Return the certifier/grade/label_hint/grade_source fields (BUI-932) a
+    match row carries for *title*, parsed title-only via grade_tokens
+    (no item-specifics fetch — the scan tools only have the search-result
+    title to work with).
+
+    Returns {"certifier": None, "grade": None, "label_hint": None,
+    "grade_source": None} for a raw (non-certified) title. For a certified
+    one, label_hint falls back to "universal" when no label token is found
+    (mirrors ebay_fetch.extract_certification's ``resolve_label(...) or
+    "universal"`` convention) and grade_source is the literal "title" —
+    distinct from identify's "certified" grade_source, since this path never
+    consults item specifics.
+    """
+    certifier, grade, _bare_mention = extract_title_certification(title)
+    if certifier is None:
+        return {
+            "certifier": None,
+            "grade": None,
+            "label_hint": None,
+            "grade_source": None,
+        }
+    return {
+        "certifier": certifier,
+        "grade": grade,
+        "label_hint": resolve_label(title) or "universal",
+        "grade_source": "title",
+    }
 
 
 # ─── Claude verification ──────────────────────────────────────────────────────
@@ -619,6 +655,12 @@ def _build_verification_prompt(chunk, edition_words, foreign_examples, later_pri
 
     Assembles the numbered listing/wish pairs (with an optional "Correct
     series:" hint per candidate) into the verification prompt template.
+
+    BUI-932: a candidate carrying a `certifier` (seller-scan and
+    wishlist-sellers both attach one when --include-graded surfaced a
+    CGC/CBCS slab) gets an extra line telling the model it's grading a slab,
+    not a raw copy — the model's series/issue/edition judgment still applies,
+    but it should not be confused by grading terminology in the title.
     """
     pairs_parts = []
     for idx, cand in enumerate(chunk, 1):
@@ -629,6 +671,13 @@ def _build_verification_prompt(chunk, edition_words, foreign_examples, later_pri
         sn = cand.get("_series_name")
         if sn:
             pair_text += f"\n   Correct series: {sn}"
+        if cand.get("certifier"):
+            grade = cand.get("grade")
+            grade_txt = f" grade {grade}" if grade is not None else ""
+            pair_text += (
+                f"\n   Note: this listing is a certified/graded slab "
+                f"({cand['certifier'].upper()}{grade_txt})."
+            )
         pairs_parts.append(pair_text)
     pairs = "\n".join(pairs_parts)
     return f"""You are a comic book expert. For each listing/wish-item pair, decide if the listing is a genuine match — same series, same issue number, same edition type.
@@ -1126,7 +1175,8 @@ def _seller_result(seller, username, *, matches=None, dropped=None,
 
 
 def _scan_one_seller(seller_arg, username, token, base_url, wish_items,
-                    max_results, show_seen, no_reject_cache=False):
+                    max_results, show_seen, no_reject_cache=False,
+                    include_graded=False):
     """Scan one seller — crash-isolating wrapper around `_scan_one_seller_impl`.
 
     BUI-542: `show_seen` and `no_reject_cache` used to be a single `show_all`
@@ -1155,6 +1205,7 @@ def _scan_one_seller(seller_arg, username, token, base_url, wish_items,
         return _scan_one_seller_impl(
             seller_arg, username, token, base_url, wish_items,
             max_results, show_seen, no_reject_cache,
+            include_graded=include_graded,
         )
     except Exception as e:  # noqa: BLE001 — BUI-319: isolate a per-seller crash
         print(
@@ -1175,7 +1226,8 @@ def _scan_one_seller(seller_arg, username, token, base_url, wish_items,
 
 
 def _scan_one_seller_impl(seller_arg, username, token, base_url, wish_items,
-                    max_results, show_seen, no_reject_cache=False):
+                    max_results, show_seen, no_reject_cache=False,
+                    include_graded=False):
     """Scan one seller's active listings against the (already-fetched) wish
     list and verify candidates with Claude. Returns a per-seller result dict:
 
@@ -1223,12 +1275,15 @@ def _scan_one_seller_impl(seller_arg, username, token, base_url, wish_items,
         title = listing.get("title")
         if not title:
             continue
-        if "cgc" in title.lower():
+        # BUI-932: --include-graded lets a certified (CGC/CBCS) title reach
+        # matching instead of being dropped here outright. Default False so
+        # a scheduled run's output is unchanged until the operator opts in.
+        if not include_graded and "cgc" in title.lower():
             continue
         if listing["item_id"] in seen_ids:
             continue
         seen_ids.add(listing["item_id"])
-        wish, score = match_listing(title, wish_items)
+        wish, score = match_listing(title, wish_items, include_graded=include_graded)
         if not wish:
             continue
         # BUI-245: run the same deterministic reject chain wishlist_sellers uses
@@ -1240,6 +1295,7 @@ def _scan_one_seller_impl(seller_arg, username, token, base_url, wish_items,
         if should_reject(
             title, wish["series"], wish["issue"],
             wish.get("_series_name"), wish.get("_release_year"),
+            include_graded=include_graded,
         ):
             continue
         candidates.append({
@@ -1247,6 +1303,9 @@ def _scan_one_seller_impl(seller_arg, username, token, base_url, wish_items,
             "wish_id": wish["id"],
             "wish_name": wish["name"],
             "match_score": round(score, 2),
+            # BUI-932: certifier/grade/label_hint/grade_source, parsed from
+            # the title alone — all None for a raw (non-certified) listing.
+            **title_certification_fields(title),
             # Private fields (BUI-245): carry the decorated series name so
             # verify_with_claude's "Correct series:" era hint activates for this
             # candidate too. Stripped before output — see _strip_private below.
@@ -1449,6 +1508,16 @@ def main(argv=None):
         default=None,
         help="eBay environment (overrides config)",
     )
+    parser.add_argument(
+        "--include-graded",
+        action="store_true",
+        help="BUI-932: also surface CGC/CBCS-certified (slab) listings, "
+             "which are skipped by default. A match row for a slab carries "
+             "certifier/grade/label_hint fields parsed from the title. The "
+             "first run with this on will surface the entire slab backlog "
+             "for every seller you've already scanned, since slabs were "
+             "never marked seen before now.",
+    )
     args = parser.parse_args(argv)
 
     # BUI-542: --all is kept as a combined alias for the two split flags
@@ -1456,6 +1525,7 @@ def main(argv=None):
     # force-re-verify" behavior for anyone still passing --all.
     show_seen = args.show_seen or args.all
     no_reject_cache = args.no_reject_cache or args.all
+    include_graded = args.include_graded
 
     # BUI-298/BUI-542: --username/--add-alias/--forget are single-seller
     # conveniences (override or register ONE alias, or forget ONE seller's
@@ -1578,6 +1648,7 @@ def main(argv=None):
             executor.submit(
                 _scan_one_seller, seller_arg, username, token, base_url,
                 wish_items, args.max_results, show_seen, no_reject_cache,
+                include_graded,
             ): (idx, seller_arg, username)
             for idx, seller_arg, username in resolvable
         }

@@ -35,6 +35,8 @@ from dataclasses import dataclass, field
 # change. See comic_identity_year.py's module docstring for the cluster
 # boundaries and why _classify_edition_kind's back-reference into this module
 # is a deferred (call-time) import rather than a top-level one.
+from grade_tokens import strip_certification_tokens  # BUI-932
+
 from comic_identity_year import (  # noqa: F401 — re-exported for callers
     _all_title_years,
     _ANNUAL_RE,
@@ -92,9 +94,16 @@ def _strip_grades(text):
     number. Covers decimal grades ('7.0', '9.4') and grade-letter-prefixed
     bare integers ('VF 9', 'VF/NM 9', 'NM 8', 'FN+ 6'). A plain bare integer
     with no grade-letter prefix is deliberately left alone so a real issue
-    number ('X-Men 9', '#9') still matches. See BUI-135."""
+    number ('X-Men 9', '#9') still matches. See BUI-135.
+
+    BUI-932: also strips certifier names (CGC/CBCS), the Signature Series
+    abbreviation (SS), and page-quality tokens (OW/W, White Pages, ...) via
+    grade_tokens.strip_certification_tokens, so a certified title's own
+    _title_norm reads the same as its raw counterpart once include_graded
+    lets it reach this matching path — see that function's docstring."""
     text = _GRADE_RE.sub(" ", text)
     text = _GRADE_LETTER_RE.sub(" ", text)
+    text = strip_certification_tokens(text)
     return text
 
 
@@ -684,7 +693,7 @@ def extract_variant_text(title: str) -> str:
 # ─── hard_reject / should_reject (BUI-221/245) ───────────────────────────────
 
 
-def hard_reject(title, series, issue):
+def hard_reject(title, series, issue, include_graded=False):
     """Return True if the listing title is an obvious non-match for this wish item.
 
     Conservative pre-filter: only drops clear mismatches — never rejects a
@@ -692,22 +701,27 @@ def hard_reject(title, series, issue):
     should call this before match_listing to shrink the candidate pool cheaply.
 
     Rules applied in order:
-      1. CGC slab — "cgc" in title.  This scan is raw/ungraded only; mirrors
-         the existing ``if "cgc" in ...`` skip in main() so callers using
-         hard_reject get that guard for free.
+      1. CGC slab — "cgc" in title.  This scan is raw/ungraded only by
+         default; mirrors the existing ``if "cgc" in ...`` skip in main() so
+         callers using hard_reject get that guard for free. BUI-932:
+         ``include_graded=True`` skips this rule so a certified listing can
+         reach the rest of the chain instead of being dropped outright.
       2. Edition mismatch — title contains Annual / Giant-Size / Giant Size /
          King-Size / King Size / Special / Treasury (word-boundary,
          case-insensitive) but the wish-item ``series`` does NOT contain that
          same word.  Example: "Avengers Annual #1" is rejected for a wish item
          whose series is "The Avengers", but kept for "Avengers Annual".
       3. Multi-comic lot — title matches a lot/collection/complete-run/set-of
-         or issue-range pattern (e.g. "#1–#10").
+         or issue-range pattern (e.g. "#1–#10"). Still applies when
+         include_graded=True: a lot of slabs is still a lot, not a single
+         purchasable book (BUI-932 test: "a lot titled with slabs is still
+         rejected by the lot rule").
       4. Missing issue number — if ``issue`` is not None, the normalised title
          must contain it as a bounded token (#N or bare N), using the same
          word-boundary regex as match_listing so the two are consistent.
     """
     # Rule 1: CGC slab
-    if "cgc" in title.lower():
+    if not include_graded and "cgc" in title.lower():
         return True
 
     # Rule 2: edition mismatch
@@ -754,6 +768,7 @@ def should_reject(
     issue: "str | None",
     series_name: "str | None" = None,
     release_year: "str | None" = None,
+    include_graded: bool = False,
 ) -> bool:
     """Return True if *title* is a deterministic non-match for this wish item.
 
@@ -771,8 +786,12 @@ def should_reject(
     *series_name* and *release_year* are optional — pass them whenever the
     caller has a decorated LOCG series name / per-issue release year so the
     era-gate signals can fire; omitting them just fails those checks open.
+
+    *include_graded* (BUI-932, default False) is forwarded to hard_reject's
+    CGC-slab rule only — every other gate in the chain applies to a
+    certified listing exactly as it would to a raw one.
     """
-    if hard_reject(title, series, issue):
+    if hard_reject(title, series, issue, include_graded=include_graded):
         return True
     if era_mismatch(title, series_name, release_year):
         return True
@@ -1699,7 +1718,7 @@ def _lot_series_text(stripped_title: str) -> str:
 # ─── identify_comic() ──────────────────────────────────────────────────────
 
 
-def identify_comic(title: "str | None") -> ComicIdentity:
+def identify_comic(title: "str | None", include_graded: bool = False) -> ComicIdentity:
     """Extract a best-effort ComicIdentity from a freeform eBay listing title.
 
     This is the "title alone in, structured guess out" direction — the
@@ -1708,6 +1727,11 @@ def identify_comic(title: "str | None") -> ComicIdentity:
     conservative: populate confidence/reject_reasons rather than guessing
     wildly (BUI-253). See ComicIdentity's docstring for the field semantics
     and the confidence tier table.
+
+    *include_graded* (BUI-932, default False) suppresses the "CGC slab"
+    reject reason below so a caller that has opted into surfacing slabs
+    (seller-scan / wishlist-sellers with --include-graded) doesn't carry a
+    stale reject note for a listing it deliberately chose to keep.
     """
     raw_title = title or ""
     identity = ComicIdentity(title=raw_title)
@@ -1720,7 +1744,7 @@ def identify_comic(title: "str | None") -> ComicIdentity:
     identity._title_norm = _normalize(stripped)
 
     # --- deterministic reject signals (independent of series/issue) -------
-    if "cgc" in raw_title.lower():
+    if not include_graded and "cgc" in raw_title.lower():
         identity.reject_reasons.append("CGC slab")
     if _digital_reject(raw_title):
         identity.reject_reasons.append("digital-only listing")

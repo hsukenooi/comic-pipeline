@@ -1360,6 +1360,26 @@ class TestTitleKey:
         title = "Incredible Hulk #181 FN/VF"
         assert ws._title_key(title) == ws._title_key(title)
 
+    # ── BUI-932: certifier/label tokens strip out of the key too ───────────
+
+    def test_cgc_slab_keys_same_as_raw_counterpart(self):
+        """A slab title and its raw counterpart must produce the same key so
+        a cross-seller/verdict cache hit still fires once --include-graded
+        lets a slab reach this path."""
+        assert ws._title_key("Ultimate Fallout #4 CGC 9.8 OW/W") == ws._title_key(
+            "Ultimate Fallout #4"
+        )
+
+    def test_cbcs_slab_keys_same_as_raw_counterpart(self):
+        assert ws._title_key("Batman #1 CBCS 9.6 White Pages") == ws._title_key(
+            "Batman #1"
+        )
+
+    def test_signature_series_abbreviation_stripped(self):
+        assert ws._title_key("Amazing Spider-Man #300 CGC SS 9.8") == ws._title_key(
+            "Amazing Spider-Man #300"
+        )
+
 
 class TestTitleKeyedCache:
     """BUI-223: cache is keyed by (title_key, wish_name), not (item_id, wish_name)."""
@@ -1940,6 +1960,116 @@ class TestMatchResultsForWishBui227:
         data = json.loads(output)
         for match in data["sellers"][0]["matches"]:
             assert "_series_name" not in match
+
+
+# ─── BUI-932: include_graded lets a certified listing reach scoring ─────────
+
+
+class TestMatchResultsForWishIncludeGraded:
+    def _wish_item(self, series="Ultimate Fallout", issue="4"):
+        return {
+            "id": "w1",
+            "name": f"{series} #{issue}",
+            "series": series,
+            "issue": issue,
+            "_tokens": ["ultimate", "fallout"],
+            "_series_name": None,
+            "_release_year": None,
+        }
+
+    def _result(self, title, item_id="1"):
+        return {
+            "title": title,
+            "item_id": item_id,
+            "seller": "comicseller",
+            "current_price": "$50.00",
+            "end_date": "2026-07-01",
+            "end_date_iso": "2026-07-01T12:00:00Z",
+            "listing_url": "https://www.ebay.com/itm/" + item_id,
+        }
+
+    def test_flag_off_cgc_listing_dropped(self):
+        wish = self._wish_item()
+        results = [self._result("Ultimate Fallout #4 CGC 9.8")]
+        matches = ws.match_results_for_wish(results, wish)
+        assert matches == []
+
+    def test_flag_on_cgc_listing_kept_with_certification_fields(self):
+        wish = self._wish_item()
+        results = [self._result("Ultimate Fallout #4 CGC 9.8 OW/W")]
+        matches = ws.match_results_for_wish(results, wish, include_graded=True)
+        assert len(matches) == 1
+        m = matches[0]
+        assert m["certifier"] == "cgc"
+        assert m["grade"] == 9.8
+        assert m["label_hint"] == "universal"
+        assert m["grade_source"] == "title"
+
+    def test_flag_on_raw_listing_carries_none_certification_fields(self):
+        wish = self._wish_item()
+        results = [self._result("Ultimate Fallout #4 NM")]
+        matches = ws.match_results_for_wish(results, wish, include_graded=True)
+        assert len(matches) == 1
+        m = matches[0]
+        assert m["certifier"] is None
+        assert m["grade"] is None
+        assert m["label_hint"] is None
+        assert m["grade_source"] is None
+
+    def test_flag_on_grade_digits_do_not_orphan_into_issue(self):
+        """BUI-932 regression (memory: seller-scan grade-digit false
+        positive): '9.8' must not satisfy a wish for issue #9 or #8."""
+        wish9 = self._wish_item(issue="9")
+        results = [self._result("Ultimate Fallout #4 CGC 9.8")]
+        assert ws.match_results_for_wish(results, wish9, include_graded=True) == []
+
+        wish8 = self._wish_item(issue="8")
+        assert ws.match_results_for_wish(results, wish8, include_graded=True) == []
+
+
+class TestMainIncludeGradedFlag:
+    """BUI-932: main()'s --include-graded argparse flag threads through to
+    every match_results_for_wish call — end to end through main(), not just
+    the unit-level TestMatchResultsForWishIncludeGraded above."""
+
+    def _run(self, extra_args, mock_match):
+        wish_list, wish_items = _two_wish_items()
+        with (
+            patch.object(ws, "fetch_wish_list", return_value=wish_list),
+            patch.object(ws, "prepare_wish_items", return_value=wish_items),
+            patch(
+                "wishlist_sellers.load_config",
+                return_value=("id", "sec", "https://api.ebay.com"),
+            ),
+            patch("wishlist_sellers.get_token", return_value="tok"),
+            patch("wishlist_sellers.ebay_search_cache.get", return_value=None),
+            patch("wishlist_sellers.search_by_keyword", return_value=[]),
+            patch("wishlist_sellers.ebay_search_cache.put"),
+            patch("wishlist_sellers.ebay_search_cache.filter_active", return_value=[]),
+            patch.object(ws, "match_results_for_wish", mock_match),
+            patch.object(ws, "get_item_aspects", return_value=None),
+            patch.object(ws, "fetch_seen_item_ids", return_value=set()),
+            patch.object(ws, "_server_base", return_value=""),
+            patch.object(ws, "verify_with_claude", MagicMock(return_value=([], [], []))),
+            patch.object(ws, "record_items_seen", MagicMock()),
+        ):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                ws.main(extra_args)
+
+    def test_flag_off_default_passes_include_graded_false(self):
+        mock_match = MagicMock(return_value=[])
+        self._run([], mock_match)
+        assert mock_match.called
+        for call in mock_match.call_args_list:
+            assert call.kwargs.get("include_graded") is False
+
+    def test_flag_on_passes_include_graded_true(self):
+        mock_match = MagicMock(return_value=[])
+        self._run(["--include-graded"], mock_match)
+        assert mock_match.called
+        for call in mock_match.call_args_list:
+            assert call.kwargs.get("include_graded") is True
 
 
 # ─── BUI-232: trading-card reject in match_results_for_wish ─────────────────

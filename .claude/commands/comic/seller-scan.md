@@ -109,6 +109,28 @@ seller-scan <seller> --forget           # clear this seller's seen-set, then sca
 
 Seen-tracking is **best-effort**: if the comics server is unreachable, the scan warns and shows all matches rather than aborting. This is deliberately the opposite of the **wish-list fetch below, which hard-fails** — see `docs/solutions/workflow-issues/seller-scan-verification-batching-seen-tracking-rationale.md` for why each side made the opposite choice. `--forget` follows the same best-effort posture (a failed removal just means already-seen matches stay hidden as before), but — since it's an explicit action rather than an automatic side effect — reports success or failure to stderr either way.
 
+## Surfacing graded (slab) listings (BUI-932)
+
+By default every CGC/CBCS-certified listing is skipped — the scan is raw
+(ungraded) only unless you opt in:
+
+```bash
+seller-scan <seller> --include-graded
+```
+
+With the flag, a matched slab's row carries `certifier` (`cgc`/`cbcs`),
+`grade` (a float), `label_hint` (`universal`/`signature_series`/...), and
+`grade_source: "title"` — all parsed from the listing title alone (no
+item-specifics fetch). A raw match still carries these keys, all `null`.
+The Haiku verifier is told when a candidate is a slab so it isn't thrown
+by grading terminology in the title.
+
+**The first run with `--include-graded` on will surface your entire slab
+backlog** for every seller you've already scanned — slabs were never
+recorded as seen before this flag existed, so nothing about them is in the
+seen-set yet. Expect a large batch of matches on that first run; subsequent
+runs behave normally (only new slab matches surface).
+
 ## Output
 
 **If this skill is running as a dispatched sub-agent** (rather than inline in

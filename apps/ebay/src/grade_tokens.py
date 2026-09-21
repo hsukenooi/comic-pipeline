@@ -311,3 +311,46 @@ def extract_title_certification(title):
         return certifier, grade, False
     bare_mention = resolve_certifier_token(title) is not None
     return None, None, bare_mention
+
+
+# ─── Title-key stripping (BUI-932) ──────────────────────────────────────────
+#
+# seller-scan and wishlist-sellers build a title-matching string / cache key
+# by stripping grade tokens (comic_identity._strip_grades) so a decimal grade
+# can't orphan into a false issue-number match. BUI-932 lets a certified
+# (CGC/CBCS) title reach that same matching path behind the new
+# include_graded flag, so its certification tokens need stripping too --
+# otherwise a slab and the same book's raw listing key differently
+# ("Ultimate Fallout #4 CGC 9.8 OW/W" must key identically to "Ultimate
+# Fallout #4"), and a stray "CGC"/"SS"/page-quality word sits in the scored
+# text for no reason.
+#
+# Deliberately narrower than resolve_label's full label vocabulary (no
+# Qualified/Restored/Conserved) and leaves PGX alone -- this is a
+# title-matching aid for the two scan tools, not price-identity label
+# resolution (see resolve_label for that).
+_TITLE_KEY_CERT_PATTERNS = (
+    re.compile(r'\bcgc\b', re.IGNORECASE),
+    re.compile(r'\bcbcs\b', re.IGNORECASE),
+    re.compile(r'\bss\b', re.IGNORECASE),
+)
+
+
+def strip_certification_tokens(text):
+    """Remove certifier names (CGC/CBCS), the Signature Series abbreviation
+    (SS), and page-quality tokens (OW/W, OW, C/OW, White (Pages), Cream)
+    from free text.
+
+    Used by comic_identity._strip_grades and wishlist_sellers._title_key
+    (BUI-932) so a slab title's certification tokens don't depress a wish
+    match score or split a title-key cache hit from its raw counterpart.
+    Reuses _PAGE_QUALITY_PATTERNS verbatim, most-specific-first, for the
+    same reason resolve_page_quality does (see its comment above).
+    """
+    if not text:
+        return text
+    for pattern in _TITLE_KEY_CERT_PATTERNS:
+        text = pattern.sub(" ", text)
+    for pattern, _value in _PAGE_QUALITY_PATTERNS:
+        text = pattern.sub(" ", text)
+    return text
