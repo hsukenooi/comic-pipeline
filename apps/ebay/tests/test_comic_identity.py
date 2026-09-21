@@ -512,6 +512,18 @@ class TestIdentifyComicRejectReasons:
         assert "CGC slab" in ident.reject_reasons
         assert any("facsimile" in r for r in ident.reject_reasons)
 
+    # ── BUI-932: include_graded ─────────────────────────────────────────────
+
+    def test_include_graded_suppresses_cgc_slab_reason(self):
+        ident = ci.identify_comic(
+            "Amazing Spider-Man #300 CGC 9.8", include_graded=True
+        )
+        assert "CGC slab" not in ident.reject_reasons
+
+    def test_include_graded_default_false_keeps_old_behavior(self):
+        ident = ci.identify_comic("Amazing Spider-Man #300 CGC 9.8")
+        assert "CGC slab" in ident.reject_reasons
+
 
 # ─── Confidence tiers (explicit, one test per documented tier) ────────────
 

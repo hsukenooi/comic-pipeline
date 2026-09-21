@@ -624,6 +624,140 @@ class TestMatchListing:
         assert wish is not None
 
 
+# ─── BUI-932: include_graded lets a CGC/CBCS title reach scoring ─────────────
+
+
+class TestMatchListingIncludeGraded:
+    def _items(self, names):
+        return seller_scan.prepare_wish_items(
+            [{"id": i, "name": n} for i, n in enumerate(names)]
+        )
+
+    def test_flag_off_default_still_scores_cgc_titles(self):
+        """match_listing itself never consulted reject_reasons — a CGC title
+        was always scoreable here; the flag only gates the two callers'
+        pre-filters (seller_scan.main's skip, should_reject). Locks in that
+        match_listing's own default behavior is unchanged."""
+        items = self._items(["Amazing Spider-Man #300"])
+        wish, score = seller_scan.match_listing(
+            "Amazing Spider-Man #300 CGC 9.8", items
+        )
+        assert wish is not None
+
+    def test_flag_on_scores_slab_title_cleanly(self):
+        items = self._items(["Ultimate Fallout #4"])
+        wish, score = seller_scan.match_listing(
+            "Ultimate Fallout #4 CGC 9.8 OW/W", items, include_graded=True
+        )
+        assert wish is not None
+        assert wish["name"] == "Ultimate Fallout #4"
+        assert score >= 0.65
+
+    def test_grade_digits_do_not_orphan_into_issue_9_or_8(self):
+        """BUI-932 regression (memory: 'seller-scan grade-digit false
+        positive' — CGC grade digits like '9.8' can match as issue numbers
+        at score 1.00). Now that include_graded lets this title reach
+        scoring, '9.8' must still never satisfy wish issue #9 or #8."""
+        items = self._items([
+            "Ultimate Fallout #4", "Ultimate Fallout #9", "Ultimate Fallout #8",
+        ])
+        wish, score = seller_scan.match_listing(
+            "Ultimate Fallout #4 CGC 9.8", items, include_graded=True
+        )
+        assert wish is not None
+        assert wish["name"] == "Ultimate Fallout #4"
+
+
+class TestTitleCertificationFields:
+    """seller_scan.title_certification_fields (BUI-932) — parses
+    certifier/grade/label_hint/grade_source from a listing title alone."""
+
+    def test_raw_title_all_none(self):
+        assert seller_scan.title_certification_fields(
+            "Amazing Spider-Man #300 NM Marvel 1988"
+        ) == {
+            "certifier": None,
+            "grade": None,
+            "label_hint": None,
+            "grade_source": None,
+        }
+
+    def test_cgc_grade_defaults_to_universal_label(self):
+        fields = seller_scan.title_certification_fields(
+            "Ultimate Fallout #4 CGC 9.8"
+        )
+        assert fields["certifier"] == "cgc"
+        assert fields["grade"] == 9.8
+        assert fields["label_hint"] == "universal"
+        assert fields["grade_source"] == "title"
+
+    def test_cgc_ss_yields_signature_series_label(self):
+        fields = seller_scan.title_certification_fields(
+            "Amazing Spider-Man #300 CGC SS 9.8"
+        )
+        assert fields["certifier"] == "cgc"
+        assert fields["grade"] == 9.8
+        assert fields["label_hint"] == "signature_series"
+
+    def test_cbcs_grade_recognized(self):
+        fields = seller_scan.title_certification_fields(
+            "Batman #1 CBCS 9.6"
+        )
+        assert fields["certifier"] == "cbcs"
+        assert fields["grade"] == 9.6
+
+
+# ─── BUI-932: --include-graded end-to-end through _scan_one_seller ──────────
+
+
+class TestScanOneSellerIncludeGraded:
+    def _wire(self, monkeypatch, title):
+        monkeypatch.setattr(
+            seller_scan, "search_seller_listings",
+            lambda username, token, base_url, max_results=1000: [
+                {"item_id": "X1", "title": title},
+            ],
+        )
+        monkeypatch.setattr(seller_scan, "parse_item_summary", lambda raw: dict(raw))
+        monkeypatch.setattr(seller_scan, "fetch_seen_item_ids", lambda seller: set())
+        monkeypatch.setattr(
+            seller_scan, "verify_with_claude",
+            lambda cands, **kwargs: (list(cands), [], []),
+        )
+        monkeypatch.setattr(seller_scan, "record_items_seen", lambda ids, seller: None)
+
+    def _wish(self):
+        return [{
+            "id": 1, "name": "Ultimate Fallout #4",
+            "series": "Ultimate Fallout", "issue": "4",
+            "_tokens": ["ultimate", "fallout"],
+            "_series_name": None, "_release_year": None,
+        }]
+
+    def test_flag_off_slab_listing_dropped_unchanged(self, monkeypatch):
+        """Default (flag off) run: a CGC listing never surfaces — the
+        pre-BUI-932 behavior, byte-for-byte."""
+        self._wire(monkeypatch, "Ultimate Fallout #4 CGC 9.8")
+        result = seller_scan._scan_one_seller(
+            "seller1", "seller1", "tok", "http://x", self._wish(), 1000, False,
+        )
+        assert result["matches"] == []
+        assert result["error"] is None
+
+    def test_flag_on_slab_listing_surfaces_with_certification_fields(self, monkeypatch):
+        self._wire(monkeypatch, "Ultimate Fallout #4 CGC 9.8")
+        result = seller_scan._scan_one_seller(
+            "seller1", "seller1", "tok", "http://x", self._wish(), 1000, False,
+            include_graded=True,
+        )
+        assert len(result["matches"]) == 1
+        m = result["matches"][0]
+        assert m["certifier"] == "cgc"
+        assert m["grade"] == 9.8
+        assert m["label_hint"] == "universal"
+        assert m["grade_source"] == "title"
+
+
 # ─── BUI-88: wish-list fetched over HTTP from the comics server API ────────────
 
 
@@ -1033,6 +1167,29 @@ class TestHardRejectCGC:
         # A raw ungraded title must NOT be rejected on account of rule 1.
         assert not seller_scan.hard_reject(
             "Amazing Spider-Man #300 NM Marvel 1988", "Amazing Spider-Man", "300"
+        )
+
+    # ── BUI-932: include_graded ─────────────────────────────────────────────
+
+    def test_include_graded_skips_rule1(self):
+        assert not seller_scan.hard_reject(
+            "CGC Amazing Spider-Man #300 9.8 NM", "Amazing Spider-Man", "300",
+            include_graded=True,
+        )
+
+    def test_include_graded_default_is_false(self):
+        """Omitting include_graded entirely keeps the old CGC-reject behavior."""
+        assert seller_scan.hard_reject(
+            "CGC Amazing Spider-Man #300 9.8 NM", "Amazing Spider-Man", "300",
+        )
+
+    def test_include_graded_lot_of_slabs_still_rejected(self):
+        """BUI-932 test scenario: a lot titled with slabs is still rejected
+        by the (unrelated, still-active) lot rule."""
+        assert seller_scan.hard_reject(
+            "CGC Slab Lot of 5 Amazing Spider-Man Comics #1-5",
+            "Amazing Spider-Man", "1",
+            include_graded=True,
         )
 
 
@@ -2587,7 +2744,7 @@ class TestMainDroppedCandidatesExit:
         monkeypatch.setattr(seller_scan, "search_seller_listings", fake_search)
         monkeypatch.setattr(seller_scan, "parse_item_summary", lambda raw: dict(raw))
         monkeypatch.setattr(
-            seller_scan, "match_listing", lambda title, wish_items: (wish_items[0], 0.9)
+            seller_scan, "match_listing", lambda title, wish_items, **kwargs: (wish_items[0], 0.9)
         )
         monkeypatch.setattr(seller_scan, "should_reject", lambda *a, **k: False)
         monkeypatch.setattr(seller_scan, "fetch_seen_item_ids", lambda seller: set())
@@ -3018,7 +3175,7 @@ class TestMainDroppedCandidatesExit:
         monkeypatch.setattr(seller_scan, "search_seller_listings", fake_search)
         monkeypatch.setattr(seller_scan, "parse_item_summary", lambda raw: dict(raw))
         monkeypatch.setattr(
-            seller_scan, "match_listing", lambda title, wish_items: (wish_items[0], 0.9)
+            seller_scan, "match_listing", lambda title, wish_items, **kwargs: (wish_items[0], 0.9)
         )
         monkeypatch.setattr(seller_scan, "should_reject", lambda *a, **k: False)
         monkeypatch.setattr(seller_scan, "fetch_seen_item_ids", lambda seller: set())
@@ -3041,6 +3198,64 @@ class TestMainDroppedCandidatesExit:
         assert payload["sellers"][0]["username"] == "newstore_login"
         # The alias was persisted for next time.
         assert ebay_fetch.load_seller_aliases()["newstore"] == "newstore_login"
+
+
+class TestMainIncludeGraded:
+    """BUI-932: --include-graded threads through main() end to end."""
+
+    def _wire_main(self, *args, **kwargs):
+        return TestMainDroppedCandidatesExit()._wire_main(*args, **kwargs)
+
+    def test_flag_off_default_drops_cgc_listing(self, monkeypatch, capsys):
+        recorded = {}
+        self._wire_main(
+            monkeypatch,
+            verify_return_by_username={
+                "seller1": lambda cands: (list(cands), [], [])
+            },
+            record_sink=recorded,
+        )
+        monkeypatch.setattr(
+            seller_scan, "search_seller_listings",
+            lambda username, token, base_url, max_results=1000: [
+                {"item_id": f"{username}-A1", "title": "Amazing Spider-Man #300 CGC 9.8"},
+            ],
+        )
+
+        code = seller_scan.main(["seller1", "--json"])
+
+        assert code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["sellers"][0]["matches"] == []
+
+    def test_flag_on_surfaces_cgc_listing_with_certification_fields(
+        self, monkeypatch, capsys
+    ):
+        recorded = {}
+        self._wire_main(
+            monkeypatch,
+            verify_return_by_username={
+                "seller1": lambda cands: (list(cands), [], [])
+            },
+            record_sink=recorded,
+        )
+        monkeypatch.setattr(
+            seller_scan, "search_seller_listings",
+            lambda username, token, base_url, max_results=1000: [
+                {"item_id": f"{username}-A1", "title": "Amazing Spider-Man #300 CGC 9.8"},
+            ],
+        )
+
+        code = seller_scan.main(["seller1", "--include-graded", "--json"])
+
+        assert code == 0
+        payload = json.loads(capsys.readouterr().out)
+        matches = payload["sellers"][0]["matches"]
+        assert len(matches) == 1
+        assert matches[0]["certifier"] == "cgc"
+        assert matches[0]["grade"] == 9.8
+        assert matches[0]["label_hint"] == "universal"
+        assert matches[0]["grade_source"] == "title"
 
 
 class TestSkippedCountAndForceReverify:
@@ -3110,7 +3325,7 @@ class TestSkippedCountAndForceReverify:
         )
         # Override the always-match stub so no candidate survives matching.
         monkeypatch.setattr(
-            seller_scan, "match_listing", lambda title, wish_items: (None, 0.0)
+            seller_scan, "match_listing", lambda title, wish_items, **kwargs: (None, 0.0)
         )
 
         code = seller_scan.main(["seller1", "--json"])
@@ -3456,7 +3671,7 @@ class TestSellerLevelParallelism:
         monkeypatch.setattr(seller_scan, "search_seller_listings", fake_search)
         monkeypatch.setattr(seller_scan, "parse_item_summary", lambda raw: dict(raw))
         monkeypatch.setattr(
-            seller_scan, "match_listing", lambda title, wish_items: (wish_items[0], 0.9)
+            seller_scan, "match_listing", lambda title, wish_items, **kwargs: (wish_items[0], 0.9)
         )
         monkeypatch.setattr(seller_scan, "should_reject", lambda *a, **k: False)
         monkeypatch.setattr(seller_scan, "fetch_seen_item_ids", lambda seller: set())
@@ -3728,7 +3943,7 @@ class TestWorkerCrashIsolation:
         monkeypatch.setattr(seller_scan, "parse_item_summary", lambda raw: dict(raw))
         monkeypatch.setattr(
             seller_scan, "match_listing",
-            lambda title, wish_items: (wish_items[0], 0.9),
+            lambda title, wish_items, **kwargs: (wish_items[0], 0.9),
         )
         monkeypatch.setattr(seller_scan, "should_reject", lambda *a, **k: False)
         monkeypatch.setattr(seller_scan, "fetch_seen_item_ids", lambda seller: set())
@@ -4441,6 +4656,30 @@ class TestVerifyWithClaudePromptEnrichment:
         prompt = self._capture_prompt(matches, monkeypatch)
         assert "Correct series:" not in prompt
 
+    def test_certifier_present_adds_slab_note(self, monkeypatch):
+        """BUI-932: a candidate carrying a certifier tells the model it's
+        looking at a certified/graded slab, not a raw copy."""
+        matches = [{
+            "title": "Ultimate Fallout #4 CGC 9.8",
+            "wish_name": "Ultimate Fallout #4",
+            "certifier": "cgc",
+            "grade": 9.8,
+        }]
+        prompt = self._capture_prompt(matches, monkeypatch)
+        assert "certified/graded slab" in prompt
+        assert "CGC" in prompt
+        assert "9.8" in prompt
+
+    def test_certifier_absent_no_slab_note(self, monkeypatch):
+        """A raw (non-certified) candidate gets no slab note."""
+        matches = [{
+            "title": "Amazing Spider-Man #7",
+            "wish_name": "Amazing Spider-Man #7",
+            "certifier": None,
+        }]
+        prompt = self._capture_prompt(matches, monkeypatch)
+        assert "certified/graded slab" not in prompt
+
     def test_rejects_only_parsing_still_works(self, monkeypatch):
         """The enriched prompt doesn't break the JSON rejects-only parsing contract."""
         matches = [
@@ -4734,6 +4973,14 @@ class TestShouldReject:
         assert seller_scan.should_reject(
             "Amazing Spider-Man #15 CGC 9.4", "Amazing Spider-Man", "15",
         ) is True
+
+    def test_cgc_slab_kept_when_include_graded(self):
+        """BUI-932: --include-graded lets a certified title past the shared
+        CGC-slab gate; every other check in the chain still applies."""
+        assert seller_scan.should_reject(
+            "Amazing Spider-Man #15 CGC 9.4", "Amazing Spider-Man", "15",
+            include_graded=True,
+        ) is False
 
     def test_edition_mismatch_rejected(self):
         assert seller_scan.should_reject(

@@ -71,6 +71,7 @@ from seller_scan import (
     publication_year_mismatch,
     record_items_seen,
     should_reject,  # BUI-245: shared deterministic reject chain
+    title_certification_fields,  # BUI-932: certifier/grade/label_hint parsing
     verify_with_claude,
 )
 
@@ -131,12 +132,21 @@ def is_degenerate_series(wish_item: dict) -> bool:
 def _title_key(title: str) -> str:
     """Stable cache key for a listing title.
 
-    Strip grade tokens (decimal CGC grades and grade-letter+integer combos)
-    then normalize to lowercase alphanumeric.  The same comic title from two
-    different sellers, or a relisted item with a new item_id, produces the
-    same key — enabling cross-seller and relist cache hits.
+    Strip grade tokens (decimal CGC grades, grade-letter+integer combos,
+    and — BUI-932 — certifier/SS/page-quality tokens) then normalize to
+    lowercase alphanumeric.  The same comic title from two different
+    sellers, or a relisted item with a new item_id, produces the same key —
+    enabling cross-seller and relist cache hits.
+
+    BUI-932: whitespace is collapsed (split + rejoin) after normalizing.
+    _strip_grades now removes more than one token from a certified title
+    ("CGC 9.8 OW/W"), each replaced by a single space, which would otherwise
+    leave a different run of spaces than the same book's raw listing has —
+    breaking the exact-string cache-key equality this function promises
+    ("Ultimate Fallout #4 CGC 9.8 OW/W" must key identically to "Ultimate
+    Fallout #4").
     """
-    return _normalize(_strip_grades(title))
+    return " ".join(_normalize(_strip_grades(title)).split())
 
 
 def _verdict_key(match: dict) -> tuple[str, str]:
@@ -225,6 +235,11 @@ def is_pristine_match(match: dict) -> bool:
 
     # Condition 3: hard_reject should already have filtered these upstream, but
     # confirm defensively — a hard-rejected title is never pristine.
+    # BUI-932: deliberately called WITHOUT include_graded (always defaults to
+    # False here), even when the caller ran with --include-graded — a
+    # certified listing must never take the pristine auto-accept shortcut,
+    # only the Haiku-verified path, since grading terminology in the title
+    # needs a model's judgment, not a mechanical prefix match.
     if hard_reject(title, series, issue):
         return False
 
@@ -347,12 +362,19 @@ def verdict_put(
 # ─── Pipeline functions ───────────────────────────────────────────────────────
 
 
-def match_results_for_wish(results: list, wish_item: dict) -> list:
+def match_results_for_wish(
+    results: list, wish_item: dict, include_graded: bool = False
+) -> list:
     """Apply hard_reject + match_listing to *results* for a single *wish_item*.
 
     Returns a list of match dicts each carrying:
     {seller, item_id, title, wish_name, price, end_date, end_date_iso,
-     listing_url, score, _series, _issue, _series_name}
+     listing_url, score, certifier, grade, label_hint, grade_source,
+     _series, _issue, _series_name}
+
+    *include_graded* (BUI-932, default False) is forwarded to should_reject
+    and match_listing so a CGC/CBCS-certified listing reaches scoring
+    instead of being dropped by the shared CGC-slab gate.
     """
     series = wish_item["series"]
     issue = wish_item["issue"]
@@ -370,9 +392,12 @@ def match_results_for_wish(results: list, wish_item: dict) -> list:
         # candidate loop can never drift apart on what counts as an obvious
         # non-match. Fail-open on era signals when release_year/series_name
         # are missing (unchanged from before the extraction).
-        if should_reject(title, series, issue, wish_series_name, wish_item.get("_release_year")):
+        if should_reject(
+            title, series, issue, wish_series_name, wish_item.get("_release_year"),
+            include_graded=include_graded,
+        ):
             continue
-        wish, score = match_listing(title, [wish_item])
+        wish, score = match_listing(title, [wish_item], include_graded=include_graded)
         if wish is not None and score >= MATCH_SCORE_FLOOR:
             seller = item.get("seller")
             if not seller:
@@ -387,6 +412,9 @@ def match_results_for_wish(results: list, wish_item: dict) -> list:
                 "end_date_iso": item.get("end_date_iso"),
                 "listing_url": item.get("listing_url"),
                 "score": round(score, 2),
+                # BUI-932: certifier/grade/label_hint/grade_source, parsed
+                # from the title alone — all None for a raw listing.
+                **title_certification_fields(title),
                 # Private fields for Haiku context + dedup; stripped before output
                 "_series": series,
                 "_issue": issue,
@@ -797,7 +825,19 @@ def main(argv=None):  # noqa: C901 — the pipeline is inherently linear/long
             "false positives that the title-based gates cannot see."
         ),
     )
+    parser.add_argument(
+        "--include-graded",
+        action="store_true",
+        help="BUI-932: also surface CGC/CBCS-certified (slab) listings, "
+             "which are skipped by default. A match row for a slab carries "
+             "certifier/grade/label_hint fields parsed from the title, and "
+             "the Haiku verifier is told the listing is a slab. The first "
+             "run with this on will surface the entire slab backlog across "
+             "your whole wish list, since slabs were never marked seen "
+             "before now.",
+    )
     args = parser.parse_args(argv)
+    include_graded = args.include_graded
 
     mode = args.buying_options
     ebay_buying = _BUYING_OPTIONS_MAP[mode]
@@ -885,7 +925,7 @@ def main(argv=None):  # noqa: C901 — the pipeline is inherently linear/long
         # BUI-242: run match_results_for_wish for ALL wish items sharing this keyword
         # (e.g. two Avengers #1 volumes) so their distinct era gates both apply.
         for wish_item in wish_items_for_kw:
-            hits = match_results_for_wish(results, wish_item)
+            hits = match_results_for_wish(results, wish_item, include_graded=include_graded)
             all_matches.extend(hits)
 
     print(f"  {len(all_matches)} raw match(es) before dedup", file=sys.stderr)

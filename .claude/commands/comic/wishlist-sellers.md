@@ -77,6 +77,18 @@ For bare-title matches — listings with no parenthesized year and no "vol N" in
 
 Pass `--no-item-specifics` to skip this step (useful for bounded runs where you want to avoid the extra Browse API calls and prefer to let Haiku verify handle residual ambiguity).
 
+### `--include-graded` (BUI-932, default off: raw listings only)
+
+By default every CGC/CBCS-certified (slab) listing is dropped before matching. Pass `--include-graded` to surface them too:
+
+```bash
+wishlist-sellers --include-graded
+```
+
+A slab match row carries `certifier` (`cgc`/`cbcs`), `grade` (a float), `label_hint` (`universal`/`signature_series`/...), and `grade_source: "title"`, all parsed from the listing title alone — a raw match still carries these keys, all `null`. The Haiku verifier is told when a candidate is a slab so grading terminology in the title doesn't confuse its series/issue judgment.
+
+**The first run with `--include-graded` on will surface your entire slab backlog across the whole wish list** — slabs were never recorded as seen before this flag existed, so the incremental seen-set (see "Only new finds by default" below) has nothing to suppress on that first pass. Expect a large batch of matches; subsequent runs behave normally (only new slab matches surface).
+
 ## Series and era filtering
 
 The pipeline runs several deterministic gates to avoid surfacing the wrong volume of a long-running series (e.g. the 2022 Amazing Spider-Man relaunch when you want the 1963 original), before any Haiku call:
