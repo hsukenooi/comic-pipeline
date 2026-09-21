@@ -227,6 +227,32 @@ def run(*, batch_path: str | None, out_path: str | None,
         _normalize_book_title(book)
         _normalize_book_year(book)
 
+    # 0. BUI-928 (plan U11, R35): punt every CERTIFIED row to needs_manual
+    #    before ANY of the three things below ever see it — the DB-cache split
+    #    (whose no-locg_id path always issues a real hand-priced-provenance
+    #    GET, BUI-775), the comp fetch, and the upsert. A slab priced off the
+    #    raw market at its numeric grade is exactly the bug the whole CGC slab
+    #    project exists to remove, and the graded pricing mode that CAN price
+    #    one (U6/U7) doesn't exist yet. `certifier` absent, None, empty, or the
+    #    literal raw sentinel `"none"` (R21's vocabulary: `none|cgc|cbcs|other`)
+    #    stays on the raw path unchanged; anything else short-circuits here.
+    #    `raw_idx` records, for each surviving book's position in `raw_books`,
+    #    its ORIGINAL position in `books` — every index-keyed bucket
+    #    `_split_by_db_cache` hands back is relative to `raw_books` (its own
+    #    internal `enumerate`), and `_stitch` below walks the ORIGINAL `books`
+    #    list, so those indices are translated back immediately after the call
+    #    rather than threading two index spaces through the rest of `run`.
+    certified_needs_manual: dict[int, dict] = {}
+    raw_books: list[dict] = []
+    raw_idx: list[int] = []
+    for i, book in enumerate(books):
+        certifier = book.get("certifier")
+        if certifier is not None and str(certifier).strip().lower() not in ("", "none"):
+            certified_needs_manual[i] = book
+        else:
+            raw_idx.append(i)
+            raw_books.append(book)
+
     # 1. DB cache reuse (skipped if --force). Also separates out hand-priced
     #    rows (BUI-533): a default run must skip them entirely (skipped_hand),
     #    while a --force run proceeds but reports what it's about to overwrite
@@ -237,8 +263,16 @@ def run(*, batch_path: str | None, out_path: str | None,
     #    (skipped_lookup_error), never folded into the hand-priced count.
     (cached, needs_compute, skipped_hand, force_overwrite_notes,
      skipped_lookup_error) = _split_by_db_cache(
-        books, server_url=server_url, max_age_days=max_age_days, force=force,
+        raw_books, server_url=server_url, max_age_days=max_age_days, force=force,
     )
+    # BUI-928: translate raw_books-relative indices back to books-relative
+    # ones — see the comment on `raw_idx` above.
+    cached = {raw_idx[k]: v for k, v in cached.items()}
+    skipped_hand = {raw_idx[k]: v for k, v in skipped_hand.items()}
+    force_overwrite_notes = {raw_idx[k]: v for k, v in force_overwrite_notes.items()}
+    skipped_lookup_error = {raw_idx[k]: v for k, v in skipped_lookup_error.items()}
+    for b in needs_compute:
+        b["_idx"] = raw_idx[b["_idx"]]
     if force_overwrite_notes:
         _echo_hand_override_notes(force_overwrite_notes, books)
 
@@ -317,9 +351,10 @@ def run(*, batch_path: str | None, out_path: str | None,
         )
 
     # 4. Stitch cached + fresh + hand-priced-skipped + lookup-error-skipped +
-    #    write-rejected-skipped
+    #    write-rejected-skipped + certified-punted (BUI-928)
     final = _stitch(books, cached, fresh_fmvs, skipped_hand,
-                    skipped_lookup_error, skipped_rejected)
+                    skipped_lookup_error, skipped_rejected,
+                    certified_needs_manual)
 
     if not quiet:
         _print_table(final)
@@ -407,6 +442,22 @@ def run(*, batch_path: str | None, out_path: str | None,
             "Each was priced in-memory but NOT persisted, and is NOT linked "
             "to a comic_id/fmv_id. See each row's `error` for the server's "
             "reason.",
+            err=True,
+        )
+
+    # BUI-928: a FOURTH skip class, reported separately from the three above.
+    # Unlike every other bucket, this book never reached the server at all —
+    # no hand-priced lookup, no comp fetch, no upsert — because a certifier
+    # was present and the graded pricing mode (plan U6/U7) doesn't exist yet.
+    # Loud for the same reason as the others: a certified row must never
+    # silently price off the raw market, which is the exact bug this project
+    # exists to remove (R35).
+    if certified_needs_manual:
+        click.echo(
+            f"⚠️  {len(certified_needs_manual)} book(s) need MANUAL pricing: "
+            "certified (CGC/CBCS) row(s) — the graded pricing mode isn't "
+            "shipped yet, so comic-fmv refuses to price them from the raw "
+            "market. Hand-price these (flag_reason=graded_mode_unavailable).",
             err=True,
         )
 
@@ -2892,8 +2943,9 @@ def _stitch(books: list[dict], cached: dict[int, dict],
             fresh: dict[int, dict],
             skipped_hand: dict[int, dict] | None = None,
             skipped_lookup_error: dict[int, str] | None = None,
-            skipped_rejected: dict[int, str] | None = None) -> list[dict]:
-    """Combine cached, fresh, and all three kinds of skipped result back into
+            skipped_rejected: dict[int, str] | None = None,
+            certified_needs_manual: dict[int, dict] | None = None) -> list[dict]:
+    """Combine cached, fresh, and all four kinds of skipped result back into
     the input order. `skipped_hand` (BUI-533) reuses the existing DB row
     exactly like `cached` does (never recomputed), tagged with a distinct
     `source` so the table/summary/--brief can tell a protected hand-priced
@@ -2914,13 +2966,40 @@ def _stitch(books: list[dict], cached: dict[int, dict],
     it carries no price in the stitched row — `fmv: None` — deliberately:
     `_print_table` checks `fmv.get("fmv_low")` before it ever looks at
     `source`, so a non-null fmv here would render as an ordinary priced row
-    and defeat the whole point of a loud, unmistakable skip."""
+    and defeat the whole point of a loud, unmistakable skip.
+
+    `certified_needs_manual` (BUI-928, plan U11) is a fourth, and the only one
+    that never reached `run`'s DB-cache split, fetch, or upsert at all — the
+    book carries a `certifier` other than `none`/empty/None and the graded
+    pricing mode doesn't exist yet, so `run` short-circuits it before any of
+    the three. Unlike the other three skips, its `fmv` is NOT null — it carries
+    `flag_reason: "graded_mode_unavailable"` so it renders exactly like any
+    other needs-manual row (`_print_table`'s `fmv.get("flag_reason")` branch,
+    `manual:<reason>`), while `max_bid`/`comic_id`/`fmv_id` still project null
+    (no top-level `comic_id` key, `db_row: None` — see `_brief_row`) because,
+    unlike a normal needs-manual row, nothing was ever upserted for it."""
     skipped_hand = skipped_hand or {}
     skipped_lookup_error = skipped_lookup_error or {}
     skipped_rejected = skipped_rejected or {}
+    certified_needs_manual = certified_needs_manual or {}
     out: list[dict] = []
     for i, book in enumerate(books):
-        if i in cached:
+        if i in certified_needs_manual:
+            out.append({
+                "input": _input_summary(book),
+                "fmv": {
+                    "flag_reason": "graded_mode_unavailable",
+                    "max_bid": None,
+                    "n": 0,
+                    "confidence": None,
+                },
+                "comp_count_total": 0,
+                "queries_used": [],
+                "db_row": None,
+                "source": "needs_manual_certified",
+                "breaker_tripped": False,
+            })
+        elif i in cached:
             row = cached[i]
             out.append({
                 "input": _input_summary(book),
@@ -3196,7 +3275,8 @@ def _brief_row(r: dict) -> dict:
       - source (BUI-549) → the row's own `source` verbatim (`"fresh"`,
         `"cached"`, `"cgc-proxy"`, `"skipped_hand_priced"`,
         `"skipped_lookup_error"`, `"skipped_rejected"` (BUI-639),
-        `"ledger-advisory"` (BUI-663), or `"error"`). Without this, a
+        `"needs_manual_certified"` (BUI-928), `"ledger-advisory"` (BUI-663),
+        or `"error"`). Without this, a
         `skipped_lookup_error` row (hand-priced provenance unverifiable —
         the lookup FAILED or answered ambiguously, row left
         completely untouched) projects identically to an ordinary
