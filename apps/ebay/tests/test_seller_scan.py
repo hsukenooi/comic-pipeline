@@ -757,6 +757,28 @@ class TestScanOneSellerIncludeGraded:
         assert m["label_hint"] == "universal"
         assert m["grade_source"] == "title"
 
+    # ── BUI-934: the real reject path in _scan_one_seller_impl's own listing
+    # loop, exercised with a CBCS-titled slab (not CGC) — proves this site
+    # (the third of the three real reject sites) rejects every certifier
+    # token grade_tokens knows, not just literal "cgc".
+
+    def test_flag_off_cbcs_slab_listing_dropped(self, monkeypatch):
+        self._wire(monkeypatch, "Ultimate Fallout #4 CBCS 9.8")
+        result = seller_scan._scan_one_seller(
+            "seller1", "seller1", "tok", "http://x", self._wish(), 1000, False,
+        )
+        assert result["matches"] == []
+        assert result["error"] is None
+
+    def test_flag_on_cbcs_slab_listing_surfaces(self, monkeypatch):
+        self._wire(monkeypatch, "Ultimate Fallout #4 CBCS 9.8")
+        result = seller_scan._scan_one_seller(
+            "seller1", "seller1", "tok", "http://x", self._wish(), 1000, False,
+            include_graded=True,
+        )
+        assert len(result["matches"]) == 1
+        assert result["matches"][0]["certifier"] == "cbcs"
+
 
 # ─── BUI-88: wish-list fetched over HTTP from the comics server API ────────────
 
@@ -1167,6 +1189,33 @@ class TestHardRejectCGC:
         # A raw ungraded title must NOT be rejected on account of rule 1.
         assert not seller_scan.hard_reject(
             "Amazing Spider-Man #300 NM Marvel 1988", "Amazing Spider-Man", "300"
+        )
+
+    # ── BUI-934: every certifier token grade_tokens knows, not just "cgc" ────
+
+    def test_cbcs_in_title_rejected(self):
+        assert seller_scan.hard_reject(
+            "Batman #1 CBCS 9.8", "Batman", "1"
+        )
+
+    def test_cbcs_lowercase_rejected(self):
+        assert seller_scan.hard_reject(
+            "batman #1 cbcs 9.8", "Batman", "1"
+        )
+
+    def test_pgx_in_title_rejected(self):
+        assert seller_scan.hard_reject(
+            "Amazing Spider-Man #300 PGX 9.6", "Amazing Spider-Man", "300"
+        )
+
+    def test_certifier_token_glued_to_other_letters_not_rejected(self):
+        """BUI-934: word-boundary matched — a certifier token that is not
+        its own word (e.g. glued inside another token) must not false-hit.
+        Under the old naive `"cgc" in title.lower()` substring check this
+        title WOULD have been (wrongly) rejected."""
+        assert not seller_scan.hard_reject(
+            "Amazing Spider-Man #300 SUPERCGCFAN Edition NM",
+            "Amazing Spider-Man", "300",
         )
 
     # ── BUI-932: include_graded ─────────────────────────────────────────────

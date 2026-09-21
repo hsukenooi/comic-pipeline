@@ -470,6 +470,23 @@ class TestIdentifyComicRejectReasons:
         ident = ci.identify_comic("Amazing Spider-Man #300 CGC 9.8")
         assert "CGC slab" in ident.reject_reasons
 
+    # ── BUI-934: every certifier token grade_tokens knows, not just "cgc" ────
+
+    def test_cbcs_slab_flagged(self):
+        ident = ci.identify_comic("Batman #1 CBCS 9.8")
+        assert "CGC slab" in ident.reject_reasons
+
+    def test_pgx_slab_flagged(self):
+        ident = ci.identify_comic("Amazing Spider-Man #300 PGX 9.6")
+        assert "CGC slab" in ident.reject_reasons
+
+    def test_certifier_token_glued_to_other_letters_not_flagged(self):
+        """Word-boundary matched: a certifier token that isn't its own word
+        must not false-hit. Under the old naive `"cgc" in title.lower()`
+        substring check this title WOULD have been (wrongly) flagged."""
+        ident = ci.identify_comic("Amazing Spider-Man #300 SUPERCGCFAN Edition NM")
+        assert "CGC slab" not in ident.reject_reasons
+
     def test_digital_only_flagged(self):
         ident = ci.identify_comic("Amazing Spider-Man #300 Digital Only")
         assert "digital-only listing" in ident.reject_reasons

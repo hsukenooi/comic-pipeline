@@ -56,7 +56,11 @@ from ebay_fetch import (
     save_seller_alias,
     search_seller_listings,
 )
-from grade_tokens import extract_title_certification, resolve_label  # BUI-932
+from grade_tokens import (  # BUI-932/BUI-934
+    extract_title_certification,
+    resolve_certifier_token,
+    resolve_label,
+)
 
 
 # ─── Server URL resolution (BUI-220) ──────────────────────────────────────────
@@ -1275,10 +1279,12 @@ def _scan_one_seller_impl(seller_arg, username, token, base_url, wish_items,
         title = listing.get("title")
         if not title:
             continue
-        # BUI-932: --include-graded lets a certified (CGC/CBCS) title reach
-        # matching instead of being dropped here outright. Default False so
-        # a scheduled run's output is unchanged until the operator opts in.
-        if not include_graded and "cgc" in title.lower():
+        # BUI-932: --include-graded lets a certified (CGC/CBCS/PGX) title
+        # reach matching instead of being dropped here outright. Default
+        # False so a scheduled run's output is unchanged until the operator
+        # opts in. BUI-934: any known certifier token, not just literal
+        # "cgc" — a CBCS/PGX-titled slab must be rejected too.
+        if not include_graded and resolve_certifier_token(title) is not None:
             continue
         if listing["item_id"] in seen_ids:
             continue
