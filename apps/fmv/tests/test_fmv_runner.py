@@ -5987,6 +5987,146 @@ class TestGradedPoolMerge:
             fmv_runner._merge_slab_pool([], ledger, dropped_ids=None)
 
 
+class TestIdentityAwareDedupe:
+    """BUI-936: a cross-provider duplicate — different `product_id`, same
+    grade/price/sold-date/title — collapses to ONE comp in the slab merge.
+
+    `_merge_slab_pool`'s pre-existing `product_id` dedupe (`TestGradedPoolMerge`
+    above) can't catch this: two providers scraping the SAME eBay listing can
+    each report a different `product_id` for it (see `_comp_identity_key`'s
+    docstring). These tests exercise the second, identity-keyed pass added on
+    top of it.
+    """
+
+    def test_a_cross_provider_duplicate_collapses_to_one_comp(self):
+        live = [{"product_id": "ebay-itm-111",
+                 "title": "CGC 9.4 Amazing Spider-Man 300", "price": 1200,
+                 "grade": 9.4, "sold_date": "2026-08-01",
+                 "certifier": "cgc", "label": "universal"}]
+        ledger = [{"product_id": "serp-999888",
+                   "title": "CGC 9.4 Amazing Spider-Man 300", "price": 1200,
+                   "grade": 9.4, "sold_date": "2026-08-01",
+                   "certifier": "cgc", "label": "universal"}]
+        pool = fmv_runner._merge_slab_pool(live, ledger)
+        assert len(pool) == 1
+        # LIVE WINS, same direction as the product_id-keyed dedupe.
+        assert pool[0]["product_id"] == "ebay-itm-111"
+
+    def test_title_case_and_whitespace_differences_still_match(self):
+        live = [{"product_id": "a",
+                 "title": "  CGC 9.4  Amazing Spider-Man 300 ",
+                 "price": 1200, "grade": 9.4, "sold_date": "2026-08-01"}]
+        ledger = [{"product_id": "b",
+                   "title": "cgc 9.4 amazing spider-man 300",
+                   "price": 1200, "grade": 9.4, "sold_date": "2026-08-01"}]
+        pool = fmv_runner._merge_slab_pool(live, ledger)
+        assert len(pool) == 1
+
+    def test_two_different_sales_sharing_price_grade_and_date_are_kept(self):
+        # The adversarial boundary the ticket calls out: a price+grade+date
+        # match alone must NOT collapse two genuinely different sales — here
+        # a base copy and a newsstand copy that happened to sell for the same
+        # price on the same day. Distinct titles keep them apart.
+        live = [{"product_id": "a", "title": "CGC 9.4 Amazing Spider-Man 300",
+                 "price": 1200, "grade": 9.4, "sold_date": "2026-08-01"}]
+        ledger = [{"product_id": "b",
+                   "title": "CGC 9.4 Amazing Spider-Man 300 Newsstand",
+                   "price": 1200, "grade": 9.4, "sold_date": "2026-08-01"}]
+        pool = fmv_runner._merge_slab_pool(live, ledger)
+        assert len(pool) == 2
+
+    def test_a_missing_title_is_not_force_matched(self):
+        # Conservative default: with no title on either side the identity
+        # key can't be built at all, so two comps that coincidentally share
+        # price+grade+date are kept rather than risk a false collapse.
+        live = [{"product_id": "a", "price": 1200, "grade": 9.4,
+                 "sold_date": "2026-08-01"}]
+        ledger = [{"product_id": "b", "price": 1200, "grade": 9.4,
+                   "sold_date": "2026-08-01"}]
+        pool = fmv_runner._merge_slab_pool(live, ledger)
+        assert len(pool) == 2
+
+    def test_a_different_sold_date_is_not_force_matched(self):
+        live = [{"product_id": "a", "title": "CGC 9.4 Amazing Spider-Man 300",
+                 "price": 1200, "grade": 9.4, "sold_date": "2026-08-01"}]
+        ledger = [{"product_id": "b",
+                   "title": "CGC 9.4 Amazing Spider-Man 300",
+                   "price": 1200, "grade": 9.4, "sold_date": "2026-08-15"}]
+        pool = fmv_runner._merge_slab_pool(live, ledger)
+        assert len(pool) == 2
+
+
+class TestGradedLedgerAdvisoryEffectiveNFloor:
+    """BUI-936: `_graded_ledger_advisory`'s depth floor gates on the SAME
+    weighted, identity-aware effective-n notion `graded_fmv`'s exact tier
+    prices off (`fmv_math.graded_pool` + `fmv_math.bucket_effective_n`), not
+    raw ledger row count.
+    """
+
+    def _row(self, product_id, *, price, sold_date, grade=9.4):
+        return {"product_id": product_id, "title": f"CGC {grade} comic {price}",
+                "price": price, "grade": grade, "sold_date": sold_date,
+                "certifier": "cgc", "label": "universal", "comic_id": 77}
+
+    def _inp(self):
+        return {"title": "Fantastic Four", "issue": "46", "year": 1961}
+
+    def test_three_stale_rows_clear_row_count_but_not_effective_n(self):
+        # The newest of the three sits at the pool's own reference (weight
+        # 1.0); the other two are 91-365 days older, at
+        # fmv_math.GRADED_STALE_WEIGHT (0.5) each — effective n = 2.0, under
+        # LEDGER_ADVISORY_MIN_POOL (3), even though the raw row count (3)
+        # would have cleared the pre-BUI-936 floor.
+        rows = [
+            self._row("p1", price=1000, sold_date="2026-09-01"),
+            self._row("p2", price=1050, sold_date="2026-02-01"),
+            self._row("p3", price=1100, sold_date="2026-01-01"),
+        ]
+        with patch("fmv_runner._fetch_ledger_comps", return_value=rows):
+            out = fmv_runner._graded_ledger_advisory(
+                "http://test-server", inp=self._inp(), target_grade=9.4,
+                certifier="cgc", label="universal", page_quality=None)
+        assert out is None
+
+    def test_a_pool_with_effective_n_at_the_floor_still_prices(self):
+        # Non-vacuity: two full-weight (fresh) rows plus two half-weight
+        # (stale) rows reach effective n == 3 and price — proving the None
+        # above is the floor refusing a thin pool, not a broken pool always
+        # refusing.
+        rows = [
+            self._row("p1", price=1000, sold_date="2026-09-01"),
+            self._row("p2", price=1050, sold_date="2026-08-25"),
+            self._row("p3", price=1100, sold_date="2026-02-01"),
+            self._row("p4", price=1150, sold_date="2026-01-01"),
+        ]
+        with patch("fmv_runner._fetch_ledger_comps", return_value=rows):
+            out = fmv_runner._graded_ledger_advisory(
+                "http://test-server", inp=self._inp(), target_grade=9.4,
+                certifier="cgc", label="universal", page_quality=None)
+        assert out is not None
+        assert out["fmv"]["max_bid"] is None
+        assert out["fmv"]["fmv_high"] is not None
+
+    def test_a_cross_provider_duplicate_lowers_effective_n_below_the_floor(self):
+        # BUI-936's two fixes compound: without the identity dedupe, this
+        # pool's raw weighted sum would be 3.0 (three FRESH rows, each
+        # weight 1.0) and would clear the floor on effective n alone — but
+        # p3 is a duplicate of p2 (same price/grade/date/title, a different
+        # product_id, as if a second provider reported the same sale).
+        # Deduped down to 2 genuine sales, effective n is 2.0, under the
+        # floor.
+        rows = [
+            self._row("p1", price=1000, sold_date="2026-09-01"),
+            self._row("p2", price=1050, sold_date="2026-08-15"),
+            self._row("p3", price=1050, sold_date="2026-08-15"),  # dup of p2
+        ]
+        with patch("fmv_runner._fetch_ledger_comps", return_value=rows):
+            out = fmv_runner._graded_ledger_advisory(
+                "http://test-server", inp=self._inp(), target_grade=9.4,
+                certifier="cgc", label="universal", page_quality=None)
+        assert out is None
+
+
 class TestGradedLedgerRead:
     """`_fetch_ledger_comps` is the ONE function in apps/fmv allowed to GET
     the comps ledger (the AST tripwire in the overlay's test_fmv_history.py

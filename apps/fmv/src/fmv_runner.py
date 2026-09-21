@@ -2011,6 +2011,87 @@ def _is_priceable_number(value: object) -> TypeGuard[float]:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
+def _comp_identity_key(comp: dict) -> tuple[float, float, str, str] | None:
+    """BUI-936: an identity key for a comp that doesn't depend on the
+    source's own `product_id`.
+
+    Two providers can scrape the SAME eBay listing and disagree on
+    `product_id`. apps/ebay/src/sold_comps.py's `parse_comp_sold_comps`
+    docstring claims sold-comps.com's `itemId` shares SerpApi's `product_id`
+    namespace (both the eBay item number) — but `parse_comp` reads SerpApi's
+    OWN `product_id` field first, falling back to `item_id` only when it's
+    absent, and that first field is a Google-assigned id, not always the eBay
+    item number. So the same listing, observed once via each provider (or via
+    the same provider on two runs where the id representation drifted),
+    carries two different `product_id` values and escapes a dedupe keyed on
+    it alone.
+
+    Grade, price and sold date are the facts of the sale itself — true
+    however many providers reported it — and title is the one field every
+    parser copies verbatim off the same eBay page. Agreement on all four
+    together is strong evidence of one sale, not a four-way coincidence.
+
+    Returns None — excluding the comp from identity dedupe, never
+    force-matching it — whenever any of the four is missing or blank: this
+    key can fail to catch a duplicate it lacks the evidence for, but must
+    never collapse two comps it can't actually compare (two genuinely
+    different sales that happen to share a price, grade and date, but whose
+    titles — or presence of a title at all — differ or are unknown, are left
+    as two comps). Title is case/whitespace-normalized (both providers copy
+    the same underlying title text, so this only absorbs incidental
+    formatting, not a different listing); sold_date is compared as the raw
+    string both providers already emit into this field.
+    """
+    price, grade = comp.get("price"), comp.get("grade")
+    sold_date, title = comp.get("sold_date"), comp.get("title")
+    if price is None or grade is None or not sold_date or not title:
+        return None
+    normalized_title = " ".join(str(title).split()).casefold()
+    if not normalized_title:
+        return None
+    return (float(price), float(grade), str(sold_date), normalized_title)
+
+
+def _dedupe_pool_by_identity(comps: list[dict]) -> list[dict]:
+    """Collapse comps that are the SAME underlying sale into one entry.
+
+    Shared by the raw and slab ledger-advisory pools (`_ledger_advisory`,
+    `_graded_ledger_advisory`) and the slab live+ledger merge
+    (`_merge_slab_pool`) — every place this module pools comps sourced from
+    more than one provider or run. First occurrence in `comps` wins, so a
+    caller that orders by priority (a live observation before a ledger
+    snapshot, this run before an older one) keeps the copy it prefers.
+
+    Two independent passes:
+
+      1. `product_id`, when the comp carries one — the dedupe key this
+         module used before BUI-936.
+      2. BUI-936: `_comp_identity_key` — same grade, price, sold date and
+         title — for a comp whose `product_id` didn't already catch it (the
+         common case for a cross-provider duplicate; see that function's
+         docstring). Skipped, not force-matched, whenever the key can't be
+         built: this pass can only fail to catch a duplicate, never collapse
+         two comps it can't actually compare.
+    """
+    out: list[dict] = []
+    seen_ids: set[str] = set()
+    seen_identity: set[tuple] = set()
+    for comp in comps:
+        pid = comp.get("product_id")
+        key = str(pid) if pid not in (None, "") else None
+        if key is not None:
+            if key in seen_ids:
+                continue
+            seen_ids.add(key)
+        identity_key = _comp_identity_key(comp)
+        if identity_key is not None:
+            if identity_key in seen_identity:
+                continue
+            seen_identity.add(identity_key)
+        out.append(comp)
+    return out
+
+
 def _ledger_advisory(server_url: str, *, inp: dict, target_grade: float,
                      grade_window: float | None) -> dict | None:
     """A degraded-mode ADVISORY band for one book, or None to keep the
@@ -2041,6 +2122,15 @@ def _ledger_advisory(server_url: str, *, inp: dict, target_grade: float,
     path merges them; this one does not, so an advisory band is explicitly not
     the number a live run would have produced, and nothing here should be
     compared against one as though it were.
+
+    BUI-936: `rows` is deduped by `_dedupe_pool_by_identity` before it becomes
+    `comps` — this pool has no `_merge_slab_pool`-style live+ledger merge to
+    do the dedupe for it (it is ledger-only, since a live fetch already
+    failed by the time this runs), so without this pass a cross-provider
+    duplicate of the same sale — different `product_id`, same grade/price/
+    sold-date/title — would double-count. `rows` itself, used below for
+    `ledger_rows` and `comic_ids`, stays the raw fetched count/set — the same
+    convention `_graded_ledger_advisory` follows.
     """
     rows = _fetch_ledger_comps(
         server_url, title=inp.get("title"), issue=inp.get("issue"),
@@ -2048,10 +2138,11 @@ def _ledger_advisory(server_url: str, *, inp: dict, target_grade: float,
     )
     if not rows:
         return None
+    deduped_rows = _dedupe_pool_by_identity(rows)
     comps = [
         {"price": float(r["price"]), "grade": float(r["grade"]),
          "sold_date": r.get("sold_date") or "", "title": r.get("title") or ""}
-        for r in rows
+        for r in deduped_rows
         if _is_priceable_number(r.get("price"))
         and _is_priceable_number(r.get("grade"))
     ]
@@ -2419,15 +2510,18 @@ def _slab_pool_comp(comp: dict) -> dict | None:
 
 def _merge_slab_pool(live: list[dict], ledger: list[dict], *,
                      dropped_ids: set[str] | None = None) -> list[dict]:
-    """Live slab comps plus ledger slab comps, deduped on `product_id`.
+    """Live slab comps plus ledger slab comps, deduped by identity (BUI-936:
+    `product_id` first, then `_dedupe_pool_by_identity`'s grade+price+
+    sold-date+title fallback for a cross-provider duplicate that carries two
+    different `product_id`s — see that function's docstring).
 
     LIVE WINS on a collision, and the direction matters: the live row is
     today's observation of that listing, while the ledger row is a snapshot of
     an earlier one (`upsert_comps` never rewrites a stored price, KTD4), so
-    preferring the ledger copy would age the pool for no gain. A comp with no
-    `product_id` cannot be deduped and is kept as its own entry — dropping it
+    preferring the ledger copy would age the pool for no gain. A comp neither
+    dedupe pass can match to anything is kept as its own entry — dropping it
     would silently thin a pool that is already one sale per rung, and the only
-    cost of keeping it is a double-count of a comp that no source identified.
+    cost of keeping it is a double-count of a comp no source identified.
 
     `dropped_ids` (BUI-946): product_ids `ebay-sold-comps`' graded-only
     guards (the ampersand-lot/cross_title/store_variant/printing checks,
@@ -2436,8 +2530,8 @@ def _merge_slab_pool(live: list[dict], ledger: list[dict], *,
     just re-examined and rejected — one of BUI-946's motivating incidents was
     exactly this: the guard drops the listing from `live`, but its ledger
     copy from an earlier, pre-guard fetch re-enters the pool unless it is
-    skipped here too. Compared as strings (same normalization the dedup key
-    below already uses) so an int-vs-str product_id from either source can't
+    skipped here too. Compared as strings (same normalization the product_id
+    dedup key uses) so an int-vs-str product_id from either source can't
     silently fail to match. Only ever applied to `ledger` — a `live` comp
     sharing a dropped id was never appended to `live` in the first place (the
     guard drops it before `fetch_book_comps` returns), so this can only ever
@@ -2447,25 +2541,18 @@ def _merge_slab_pool(live: list[dict], ledger: list[dict], *,
     why those two stay unfiltered on purpose.
     """
     dropped = dropped_ids or set()
-    out: list[dict] = []
-    seen: set[str] = set()
+    projected: list[dict] = []
     for source, comps in (("live", live), ("ledger", ledger)):
         for comp in comps:
             if source == "ledger":
                 raw_pid = comp.get("product_id")
                 if raw_pid not in (None, "") and str(raw_pid) in dropped:
                     continue
-            projected = _slab_pool_comp(comp)
-            if projected is None:
+            proj = _slab_pool_comp(comp)
+            if proj is None:
                 continue
-            pid = projected.get("product_id")
-            key = str(pid) if pid not in (None, "") else None
-            if key is not None:
-                if key in seen:
-                    continue
-                seen.add(key)
-            out.append(projected)
-    return out
+            projected.append(proj)
+    return _dedupe_pool_by_identity(projected)
 
 
 def _graded_identity(inp: dict) -> tuple[str, str, str | None]:
@@ -2702,6 +2789,15 @@ def _graded_ledger_advisory(server_url: str, *, inp: dict,
     in `_compute_graded_one`), and BUI-947 is where the ledger itself gets
     stamped so a row like this stops re-entering ANY pool, advisory or
     otherwise, regardless of which path reads it.
+
+    BUI-936: the depth floor below gates on EFFECTIVE n, not raw row count.
+    `len(pool) < LEDGER_ADVISORY_MIN_POOL` let three 200-day-old comps
+    (`fmv_math.GRADED_STALE_WEIGHT == 0.5` each, so effective n 1.5) clear a
+    floor meant for three live-weight sales — the same age-weighting
+    `graded_fmv`'s exact tier prices off (`fmv_math.graded_pool` assigns the
+    `weight` key, `fmv_math.bucket_effective_n` sums it), reused rather than
+    re-implemented here so this gate can never disagree with the math that
+    runs right after it.
     """
     rows = _fetch_ledger_comps(
         server_url, title=inp.get("title"), issue=inp.get("issue"),
@@ -2710,7 +2806,9 @@ def _graded_ledger_advisory(server_url: str, *, inp: dict,
     if not rows:
         return None
     pool = _merge_slab_pool([], rows)
-    if len(pool) < LEDGER_ADVISORY_MIN_POOL:
+    weighted_pool, _, _ = fmv_math.graded_pool(pool)
+    effective_n = sum(fmv_math.bucket_effective_n(weighted_pool).values())
+    if effective_n < LEDGER_ADVISORY_MIN_POOL:
         return None
     fmv = fmv_math.graded_fmv(pool, target_grade, certifier=certifier,
                              label=label, page_quality=page_quality)
