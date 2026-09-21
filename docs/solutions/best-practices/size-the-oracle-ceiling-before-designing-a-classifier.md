@@ -230,6 +230,48 @@ Damian Wayne set priced as if it were one issue): both sat *above* their pools. 
 This is the same shape that made BUI-645 ship its ordinal half and withhold its bare half
 (UP 29 / DOWN 2 / 19 nulled). Two independent classes, one rule of thumb.
 
+## On a graded ladder, a polluted comp inverts a rung — it doesn't nudge a quantile
+
+The "which side of the pool median" test above was built and measured entirely on raw
+(ungraded) pools, where every comp competes inside one continuous quantile computation.
+BUI-922 and BUI-938 (PR #523, merged 0abdcf0) applied it to graded (slab) pools — priced off
+a CGC/CBCS grade ladder — and found the mechanism doesn't transfer as-is. A graded pool
+prices off rungs, often one or two sales at a given grade point, and a polluting comp there
+does not nudge a quantile — it *can be* the rung. Which side of the pool median it sits on
+stops being the question; whether it flips the ladder out of order is.
+
+**The rung mechanism, in evidence.** Batman #227's ampersand-lot comp ("Batman #227 CGC
+4.0 ... & Batman #232 CGC 6.0 ... $1,399.99") parses to a lone CGC 4.0 sale at $1,400 —
+above the genuine CGC 6.0 sale at $900. That's not a quantile nudge; it's an inverted ladder,
+a lower grade priced above a higher one. Measured over the offline corpus (1,116 cached
+responses, 23,488 comps) and 63 graded pools (54 ledger slab pools from a read-only backup
+plus the 8 CGC-spike pools): the ampersand class had 2 corpus matches, 0 false positives,
+moved 1 pool net -$525, and removed 1 of that pool's 2 ladder inversions. (The raw-path
+extension of this same lot shape was checked in the same pass and rejected — 2 members, no
+priced pool moves — so the ampersand guard stayed graded-mode-only, and `LOCAL_EXCLUDE_RE`
+is untouched.) The store/retailer variant class (BUI-938 — Larry's Comics variants at
+$610-807 sitting beside genuine 9.2-9.8 first-print sales of $2,302-9,500) had 9 members
+across 2 pools, every member 0.08x-0.26x its own rung's leave-one-out median, and removed
+both pools' ladder inversions. **The decisive test for both was rung leave-one-out median
+plus ladder monotonicity, not the raw-path median test.** Replayed: Batman #227 CGC 4.5 went
+from `ladder_non_monotone` to $775 (pool 14 to 12 comps); on an 18-comp server pool,
+Invincible #1 CGC 9.4 went from `ladder_non_monotone` to $3,650 (still refuses under
+`page_quality="white"` pending BUI-939).
+
+**A cap-raising exclusion still shipped — on a different carve-out.** The cross-title class
+(House of Secrets #88, admitted into Batman #227's 8.5 rung by name-dropping it) had 92
+corpus matches hand-read, 0 false positives, and moved 2 pools net +$400 (the 8.5 rung
+-10.3%, a separate 2.5 rung +54.8%) — cap-raising on net, the opposite of what this doc's
+median test predicts for a class worth excluding. It shipped anyway, on an **identity-error
+carve-out**: a different book is not a comp for this one, independent of which side of any
+median it sits on.
+
+**This is not yet a restamp.** Two measured graded pools (BUI-922, BUI-938) is too thin to
+extend this doc's BUI-608 `corrected` stamp to the "which side of the median" section
+itself — the rung mechanism may be raw-path-orthogonal, or it may turn out to be a special
+case of the median test. This doc's `status:` stays as it is until a third measured graded
+class agrees.
+
 ## A load-bearing removal is usually load-bearing for a good reason
 
 BUI-665 chased the one live consequence in "A shipped rule that raised a real bid cap" above:
