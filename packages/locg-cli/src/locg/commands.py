@@ -86,6 +86,27 @@ def _validate_grade(value: str) -> str:
     return value
 
 
+# BUI-927 (U5): certifier -> LOCG "Grading Company" text. Confirmed against a
+# real LOCG export: locg_export-sourced rows in the live collection store
+# carry exactly these two strings in `grading_company` (no other values seen
+# across 155 slabbed rows). 'other' (a real third-party certifier LOCG's
+# import form has no dedicated column for) and the default 'none' both leave
+# Grading Company blank -- 'other' still slabs the book (it has a genuine
+# third-party grade), 'none' does not.
+_CERTIFIER_TO_GRADING_COMPANY: dict[str, str] = {
+    "cgc": "CGC",
+    "cbcs": "CBCS",
+}
+
+
+def _locg_grade_string(grade: float) -> str:
+    """Format a numeric grade the way LOCG's bulk-import form expects it: one
+    of VALID_GRADES' strings, e.g. 9.0 stays "9.0", never "9" -- Python's
+    default float-to-str would drop that trailing zero and the import would
+    silently fail to match the grade."""
+    return f"{float(grade):.1f}"
+
+
 def _validate_price(value: str) -> str:
     """Coerce *value* via float(); return the canonical string form.
 
@@ -4696,6 +4717,15 @@ def _build_win_row(
     item_id = str(win.get("item_id") or "").strip()
     price = _resolve_price(win.get("current_bid"))
 
+    # BUI-927 (U5): the certified identity, read off the WIN itself (not
+    # identify_data -- it describes the physical book, not the series/issue
+    # match). Absent/"none" is the raw case this has always written; a real
+    # certifier value came straight off the bids row (BUI-926) via
+    # record_win_prep's _build_win_entry, so it's already lower-cased/
+    # validated there and needs no further coercion beyond the safe fallback.
+    win_certifier = str(win.get("certifier") or "none").strip().lower()
+    win_grade = win.get("grade")
+
     # date_purchased: date portion of end_date_iso
     date_purchased: Optional[str] = None
     if end_date:
@@ -5144,6 +5174,18 @@ def _build_win_row(
         if re.fullmatch(r"\d{4}", year_str):
             release_date = f"{year_str}-01-01"
 
+    # BUI-927 (U5): slabbing/grading/grading_company from the win's certified
+    # identity. `win_certifier == "none"` (absent or explicitly raw) writes
+    # today's exact defaults -- a raw win's row is unchanged by this ticket.
+    # `other` (a real third-party certifier LOCG's form has no column for)
+    # still slabs and grades the book; only the company stays blank, since
+    # there is no LOCG vocabulary word for it.
+    slab_slabbing = 0 if win_certifier == "none" else 1
+    slab_grading = (
+        _locg_grade_string(win_grade) if slab_slabbing and win_grade is not None else None
+    )
+    slab_grading_company = _CERTIFIER_TO_GRADING_COMPANY.get(win_certifier)
+
     row: dict[str, Any] = {
         # BUI-458: real publisher from Metron's full-issue detail (null on any
         # Metron miss — never a fabricated guess).
@@ -5165,9 +5207,9 @@ def _build_win_row(
         "owner": None,
         "purchase_store": "eBay",
         "signature": 0,
-        "slabbing": 0,
-        "grading": None,
-        "grading_company": None,
+        "slabbing": slab_slabbing,
+        "grading": slab_grading,
+        "grading_company": slab_grading_company,
         "local_added_at": _utcnow_iso(),
         "local_added_seq": _next_seq(),
         "pushed_to_locg_at": None,
@@ -5292,6 +5334,10 @@ def cmd_collection_record_win(
     Accepts a list of dicts with keys:
       item_id, current_bid, end_date_iso,
       identify_data: {series, issue, year?, variant_text?}
+      grade?, certifier?, cert_number? — BUI-927 (U5): the certified identity
+      carried from the bids row (BUI-926). Omitted or ``certifier`` absent/
+      "none" means raw, unchanged from before this ticket; ``certifier`` cgc/
+      cbcs/other writes the row slabbed (see :func:`_build_win_row`).
 
     Resolves canonical Series Name via the R36 chain:
       1. series_name_index (high confidence, no Metron call)

@@ -1887,6 +1887,9 @@ def _make_ready_row(
     release_date: str = "1970-05-01",
     price_paid: Any = 27.86,
     date_purchased: Any = "2026-05-22",
+    slabbing: int = 0,
+    grading: Any = None,
+    grading_company: Any = None,
 ) -> dict[str, Any]:
     """Build a minimal agent_win row suitable for CSV export."""
     return {
@@ -1908,9 +1911,10 @@ def _make_ready_row(
         "owner": None,
         "purchase_store": "eBay",
         "signature": 0,
-        "slabbing": 0,
-        "grading": None,
-        "grading_company": None,
+        # BUI-927 (U5): a real slabbed row's fields, when the caller passes them.
+        "slabbing": slabbing,
+        "grading": grading,
+        "grading_company": grading_company,
         "local_added_at": "2026-05-22T10:00:00.000000Z",
         "local_added_seq": 1,
         "pushed_to_locg_at": None,
@@ -2137,6 +2141,23 @@ def test_generate_csv_fixed_fields(tmp_path):
     assert d[h.index("Purchase Store")] == "eBay"
     assert d[h.index("Signature")] == "0"
     assert d[h.index("Slabbing")] == "0"
+
+
+def test_generate_csv_slabbed_row_carries_grading_columns(tmp_path):
+    """BUI-927 (U5): a slabbed row's Slabbing/Grading/Grading Company export
+    the row's own values instead of the always-0/blank constants this used
+    to write — a raw row (test_generate_csv_fixed_fields above) still gets
+    0 and blanks."""
+    import csv
+    from locg.collection_io import generate_csv
+    row = _make_ready_row(slabbing=1, grading="7.0", grading_company="CGC")
+    generate_csv([row], tmp_path / "out.csv")
+    with open(tmp_path / "out.csv", newline="") as f:
+        rows = list(csv.reader(f))
+    h, d = rows[0], rows[1]
+    assert d[h.index("Slabbing")] == "1"
+    assert d[h.index("Grading")] == "7.0"
+    assert d[h.index("Grading Company")] == "CGC"
 
 
 def test_generate_csv_bitforbit_recipe(tmp_path):

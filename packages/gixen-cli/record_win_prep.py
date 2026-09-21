@@ -374,7 +374,7 @@ def _build_review_entry(win: dict, identity: dict, reason: str) -> dict:
     """Self-contained: carries everything needed to hand-build a wins entry
     once a human supplies the missing series/issue, without going back to the
     raw snipe list."""
-    return {
+    entry = {
         "item_id": win.get("item_id"),
         "title": win.get("title"),
         "current_bid": win.get("current_bid"),
@@ -390,6 +390,19 @@ def _build_review_entry(win: dict, identity: dict, reason: str) -> dict:
             "error": identity.get("error"),
         },
     }
+    # BUI-927 (U5): surface the certified identity here too, so a human
+    # resolving this review entry in /comic:collection-add's Step 2 can carry
+    # it into the resolved_reviews entry the same way they already carry
+    # item_id/current_bid/end_date_iso — see _build_win_entry for the "only
+    # send what was given" rationale.
+    certifier = win.get("certifier")
+    if certifier and certifier != "none":
+        entry["certifier"] = certifier
+    if win.get("grade") is not None:
+        entry["grade"] = win["grade"]
+    if win.get("cert_number") is not None:
+        entry["cert_number"] = win["cert_number"]
+    return entry
 
 
 def _build_win_entry(win: dict, identity: dict, *, issue: str) -> dict:
@@ -415,12 +428,28 @@ def _build_win_entry(win: dict, identity: dict, *, issue: str) -> dict:
     edition = identity.get("edition") or ""
     if edition and edition != "single-issue":
         identify_data["edition"] = edition
-    return {
+    entry = {
         "item_id": win.get("item_id"),
         "current_bid": win.get("current_bid"),
         "end_date_iso": win.get("end_date_iso"),
         "identify_data": identify_data,
     }
+    # BUI-927 (U5): carry the certified identity (BUI-926) from the /api/snipes
+    # row through to the collection record, so a certified win files into the
+    # collection as slabbed instead of silently dropping back to raw. Only
+    # sent when the bid actually carries one — `certifier` defaults to 'none'
+    # on the row itself (never absent/null), so it's the "none" value, not a
+    # missing key, that means raw here. Mirrors the seller_grade/photo_grade
+    # "only send what was given" convention (BUI-926): a raw win's entry stays
+    # byte-identical to before this ticket.
+    certifier = win.get("certifier")
+    if certifier and certifier != "none":
+        entry["certifier"] = certifier
+    if win.get("grade") is not None:
+        entry["grade"] = win["grade"]
+    if win.get("cert_number") is not None:
+        entry["cert_number"] = win["cert_number"]
+    return entry
 
 
 def entries_for_win(

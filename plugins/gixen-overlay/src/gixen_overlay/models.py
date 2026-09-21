@@ -459,6 +459,12 @@ class RecordWinCommitRequest(BaseModel):
     to an empty list so a call with nothing new (everything already seen, or
     nothing resolved in review) can omit either key and still get a fresh
     status read back.
+
+    Each entry in either list is an untyped dict (deliberately — see
+    ``cmd_collection_record_win``'s docstring for the shape), so BUI-927
+    (U5)'s optional ``grade``/``certifier``/``cert_number`` keys need no
+    schema change here: they pass through ``merged_wins`` to
+    ``cmd_collection_record_win`` exactly like every other key already does.
     """
 
     wins: list[dict] = Field(default_factory=list)

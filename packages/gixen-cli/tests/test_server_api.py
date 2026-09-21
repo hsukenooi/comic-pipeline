@@ -434,6 +434,35 @@ def test_get_snipes_serves_cached_data_when_gixen_down(api):
     assert isinstance(r.json(), list)
 
 
+def test_get_snipes_includes_certified_fields(api):
+    """BUI-927 (U5): grade/certifier/cert_number ride on /api/snipes rows —
+    the row shape record_win_prep._build_win_entry actually reads (not
+    /api/comics/snipes) — so a certified win's bid row identity survives
+    into the record-win payload."""
+    api.post("/api/bids", json={
+        "item_id": "927000001", "max_bid": 100.0,
+        "grade": 7.0, "certifier": "cgc", "cert_number": "4172733006",
+    })
+    r = api.get("/api/snipes")
+    assert r.status_code == 200
+    row = next(s for s in r.json() if s["item_id"] == "927000001")
+    assert row["grade"] == 7.0
+    assert row["certifier"] == "cgc"
+    assert row["cert_number"] == "4172733006"
+
+
+def test_get_snipes_raw_bid_certifier_defaults_none(api):
+    """A raw bid's certifier reads the column's NOT NULL DEFAULT 'none' —
+    never absent/null — so a reader must check the VALUE, not just
+    presence, to tell a raw bid from a certified one."""
+    api.post("/api/bids", json={"item_id": "927000002", "max_bid": 50.0})
+    r = api.get("/api/snipes")
+    row = next(s for s in r.json() if s["item_id"] == "927000002")
+    assert row["certifier"] == "none"
+    assert row["grade"] is None
+    assert row["cert_number"] is None
+
+
 def test_edit_bid(api):
     api.post("/api/bids", json={"item_id": "200000001", "max_bid": 50.0})
     r = api.patch("/api/bids/200000001", json={"max_bid": 75.0, "bid_offset": 10, "snipe_group": 0})
