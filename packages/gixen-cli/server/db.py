@@ -265,6 +265,18 @@ _COLUMN_MIGRATIONS = [
     # forensics. Nullable on ADD; _apply_migrations stamps pre-column rows
     # LEGACY and every writer tags its own rows so no NULL source persists.
     "ALTER TABLE group_wins ADD COLUMN source TEXT",
+    # BUI-926 (U4): the certified grade, certifier, and cert number captured
+    # by the buy flow at add time — record-win has no other source for a
+    # slab's grade (deriving it from bids -> fmv link fails whenever that
+    # link is absent or wrong, which is exactly why the verify ladder
+    # exists). `certifier` is NOT NULL DEFAULT 'none' (not nullable, unlike
+    # seller_grade/photo_grade above) so every pre-migration bid reads
+    # 'none' and stays inside every certifier='none' filter (seller
+    # reliability, first-party outcomes) instead of silently dropping out of
+    # them. `grade`/`cert_number` stay nullable — a raw bid has neither.
+    "ALTER TABLE bids ADD COLUMN grade REAL",
+    "ALTER TABLE bids ADD COLUMN certifier TEXT NOT NULL DEFAULT 'none'",
+    "ALTER TABLE bids ADD COLUMN cert_number TEXT",
 ]
 
 
@@ -301,7 +313,10 @@ _BIDS_TABLE_SQL = """
         group_changed_at    TEXT,
         max_bid_changed_at  TEXT,
         prior_status        TEXT,
-        removal_requested_at TEXT
+        removal_requested_at TEXT,
+        grade               REAL,
+        certifier           TEXT NOT NULL DEFAULT 'none',
+        cert_number         TEXT
     )
 """
 
@@ -768,21 +783,41 @@ def insert_bid(
     seller: str | None,
     seller_grade: float | None = None,
     photo_grade: float | None = None,
+    grade: float | None = None,
+    certifier: str | None = None,
+    cert_number: str | None = None,
 ) -> int:
-    # seller_grade/photo_grade are trailing defaults (BUI-78) so existing
-    # positional callers (e.g. _sync_gixen) keep working unchanged.
+    # seller_grade/photo_grade/grade/certifier/cert_number are trailing
+    # defaults (BUI-78, BUI-926) so existing positional callers (e.g.
+    # _sync_gixen) keep working unchanged.
+    #
+    # certifier defaults to None here (not 'none') so an omitted arg leaves
+    # the column's own `NOT NULL DEFAULT 'none'` do the work, rather than
+    # this function hard-coding the sentinel in two places.
     #
     # Caller must conn.commit() (BUI-407) — this used to self-commit, which
     # fragmented _sync_gixen's intended single end-of-cycle commit (see the
     # design doc's §2 finding 2). Every caller now commits explicitly.
-    cur = conn.execute(
-        """
-        INSERT INTO bids (item_id, max_bid, bid_offset, snipe_group, seller,
-                          seller_grade, photo_grade)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (item_id, max_bid, bid_offset, snipe_group, seller, seller_grade, photo_grade),
-    )
+    if certifier is None:
+        cur = conn.execute(
+            """
+            INSERT INTO bids (item_id, max_bid, bid_offset, snipe_group, seller,
+                              seller_grade, photo_grade, grade, cert_number)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (item_id, max_bid, bid_offset, snipe_group, seller, seller_grade,
+             photo_grade, grade, cert_number),
+        )
+    else:
+        cur = conn.execute(
+            """
+            INSERT INTO bids (item_id, max_bid, bid_offset, snipe_group, seller,
+                              seller_grade, photo_grade, grade, certifier, cert_number)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (item_id, max_bid, bid_offset, snipe_group, seller, seller_grade,
+             photo_grade, grade, certifier, cert_number),
+        )
     return cur.lastrowid
 
 
@@ -792,6 +827,9 @@ def update_bid_grades(
     seller: str | None = None,
     seller_grade: float | None = None,
     photo_grade: float | None = None,
+    grade: float | None = None,
+    certifier: str | None = None,
+    cert_number: str | None = None,
 ) -> None:
     """Update the live (PENDING) row's seller + grades from a buy-flow re-add.
 
@@ -802,19 +840,31 @@ def update_bid_grades(
     - Grades are observations, so they are **fill-NULL only** —
       `COALESCE(<col>, ?)` — completing an incomplete insert without editing an
       already-set grade (BUI-78 C2; re-grading is a deferred follow-up).
+    - BUI-926 (U4): `grade` and `cert_number` follow the same fill-NULL-only
+      rule as seller_grade/photo_grade above — a re-add never clobbers an
+      already-recorded certified grade or cert number. `certifier` follows
+      `seller`'s rule instead (supplied wins, else keep existing) — like
+      `seller`, it is a stated identity, not an observation, and the column's
+      NOT NULL DEFAULT 'none' means "keep existing" is always well-defined.
 
     No-op when all inputs are None.
 
     Caller must conn.commit() (BUI-407) — see insert_bid's docstring."""
-    if seller is None and seller_grade is None and photo_grade is None:
+    if (
+        seller is None and seller_grade is None and photo_grade is None
+        and grade is None and certifier is None and cert_number is None
+    ):
         return
     conn.execute(
         "UPDATE bids SET "
         "seller=COALESCE(?, seller), "
         "seller_grade=COALESCE(seller_grade, ?), "
-        "photo_grade=COALESCE(photo_grade, ?) "
+        "photo_grade=COALESCE(photo_grade, ?), "
+        "grade=COALESCE(grade, ?), "
+        "certifier=COALESCE(?, certifier), "
+        "cert_number=COALESCE(cert_number, ?) "
         "WHERE item_id=? AND status='PENDING'",
-        (seller, seller_grade, photo_grade, item_id),
+        (seller, seller_grade, photo_grade, grade, certifier, cert_number, item_id),
     )
 
 

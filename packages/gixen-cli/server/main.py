@@ -1967,6 +1967,23 @@ class AddBidRequest(BaseModel):
     seller: str | None = None
     seller_grade: float | None = None
     photo_grade: float | None = None
+    # BUI-926 (U4): the certified grade, certifier, and cert number — record-
+    # win has no other reliable source for a slab's grade (see db.py's
+    # insert_bid docstring). `certifier=None` means "not supplied by this
+    # request", NOT "explicitly raw" — mirrors the `seller_grade`/
+    # `photo_grade` "only send what was given" convention (and BUI-708's
+    # `snipe_group=None` passthrough) rather than `seller`'s own always-
+    # present-string shape. This is what lets a re-add/upsert that omits
+    # these fields leave an already-recorded certified grade untouched
+    # (db.py's insert_bid/update_bid_grades both treat certifier=None as
+    # "use the column's own NOT NULL DEFAULT 'none'" / "keep existing",
+    # never as an instruction to write the literal string 'none'). A client
+    # that wants to explicitly (re)state a bid as raw sends
+    # certifier: "none" — that value passes validation and is written like
+    # any other supplied value.
+    grade: float | None = None
+    certifier: str | None = None
+    cert_number: str | None = None
     # BUI-618 (U6): which caller made this write (cli/batch/dashboard),
     # recorded verbatim on the bid_decisions ledger row for this request.
     # Optional and unvalidated here — U7 (a later wave) populates it from the
@@ -2024,6 +2041,26 @@ class AddBidRequest(BaseModel):
         if len(v) > 128:
             raise ValueError("seller must be 1-128 characters")
         return v.lower()
+
+    @field_validator("certifier")
+    @classmethod
+    def certifier_known(cls, v: str | None) -> str | None:
+        # BUI-926 (U4): None ("not supplied") passes through untouched — see
+        # the field's own comment for why that must stay distinct from the
+        # literal string "none". Fixed vocabulary for a supplied value —
+        # 'other' covers a real third-party certifier (PSA, etc.) the
+        # pipeline doesn't specially handle yet (see the plan's R31);
+        # anything else is a client bug, not a value worth silently coercing.
+        if v is None:
+            return None
+        v = v.strip().lower()
+        if not v:
+            return None
+        if v not in ("none", "cgc", "cbcs", "other"):
+            raise ValueError(
+                f"certifier must be one of none/cgc/cbcs/other, got {v!r}"
+            )
+        return v
 
 
 class EditBidRequest(BaseModel):
@@ -2181,7 +2218,8 @@ async def _modify_and_update_bid(
     item_id: str, max_bid: float,
     bid_offset: int, snipe_group: int,
     seller: str | None = None, seller_grade: float | None = None,
-    photo_grade: float | None = None,
+    photo_grade: float | None = None, grade: float | None = None,
+    certifier: str | None = None, cert_number: str | None = None,
 ) -> sqlite3.Row:
     """Gixen modify_snipe (off-thread) + local update_bid. Re-raises
     GixenSnipeNotFoundError so the caller owns the not-found *policy* (add falls
@@ -2211,10 +2249,12 @@ async def _modify_and_update_bid(
     async with _write_locked():
         with write_transaction(_get_db_path()) as wconn:
             update_bid(wconn, item_id, max_bid, bid_offset, snipe_group)
-            # BUI-78 C2: fill any NULL seller/grade columns from this request
-            # without overwriting values a prior add already set.
+            # BUI-78 C2 / BUI-926 (U4): fill any NULL seller/grade/certified-
+            # identity columns from this request without overwriting values a
+            # prior add already set.
             update_bid_grades(wconn, item_id, seller=seller, seller_grade=seller_grade,
-                              photo_grade=photo_grade)
+                              photo_grade=photo_grade, grade=grade,
+                              certifier=certifier, cert_number=cert_number)
             return get_pending_bid_by_item_id(wconn, item_id) or get_bid_by_item_id(wconn, item_id)
 
 
@@ -2222,7 +2262,8 @@ async def _add_bid_row(
     item_id: str, max_bid: float,
     bid_offset: int, snipe_group: int,
     seller: str | None = None, seller_grade: float | None = None,
-    photo_grade: float | None = None,
+    photo_grade: float | None = None, grade: float | None = None,
+    certifier: str | None = None, cert_number: str | None = None,
 ) -> tuple[sqlite3.Row, bool]:
     """Gixen add_snipe (off-thread) + insert_bid; returns (row, created=True).
 
@@ -2261,6 +2302,7 @@ async def _add_bid_row(
                     wconn, item_id=item_id, max_bid=max_bid,
                     bid_offset=bid_offset, snipe_group=snipe_group, seller=seller,
                     seller_grade=seller_grade, photo_grade=photo_grade,
+                    grade=grade, certifier=certifier, cert_number=cert_number,
                 )
                 return wconn.execute(
                     "SELECT * FROM bids WHERE id=?", (bid_id,)
@@ -2272,10 +2314,11 @@ async def _add_bid_row(
         async with _write_locked():
             with write_transaction(_get_db_path()) as wconn:
                 update_bid(wconn, item_id, max_bid, bid_offset, snipe_group)
-                # BUI-78 C2: a racing sync insert won the row; still fill its
-                # NULL grades.
+                # BUI-78 C2 / BUI-926 (U4): a racing sync insert won the row;
+                # still fill its NULL grades/certified identity.
                 update_bid_grades(wconn, item_id, seller=seller, seller_grade=seller_grade,
-                                  photo_grade=photo_grade)
+                                  photo_grade=photo_grade, grade=grade,
+                                  certifier=certifier, cert_number=cert_number)
                 row = get_pending_bid_by_item_id(wconn, item_id) or get_bid_by_item_id(wconn, item_id)
                 return row, False
 
@@ -2400,7 +2443,8 @@ async def api_add_bid(req: AddBidRequest):
                     row = await _modify_and_update_bid(
                         req.item_id, req.max_bid, req.bid_offset, resolved_snipe_group,
                         seller=seller, seller_grade=req.seller_grade,
-                        photo_grade=req.photo_grade,
+                        photo_grade=req.photo_grade, grade=req.grade,
+                        certifier=req.certifier, cert_number=req.cert_number,
                     )
                     await _record_committed(row["id"])
                     return {**dict(row), "created": False, "advisories": advisories}
@@ -2415,7 +2459,8 @@ async def api_add_bid(req: AddBidRequest):
                         row, created = await _add_bid_row(
                             req.item_id, req.max_bid, req.bid_offset, resolved_snipe_group,
                             seller=seller, seller_grade=req.seller_grade,
-                            photo_grade=req.photo_grade,
+                            photo_grade=req.photo_grade, grade=req.grade,
+                            certifier=req.certifier, cert_number=req.cert_number,
                         )
                         await _record_committed(row["id"])
                         return {**dict(row), "created": created, "advisories": advisories}
@@ -2429,7 +2474,8 @@ async def api_add_bid(req: AddBidRequest):
             row, created = await _add_bid_row(
                 req.item_id, req.max_bid, req.bid_offset, resolved_snipe_group,
                 seller=seller, seller_grade=req.seller_grade,
-                photo_grade=req.photo_grade,
+                photo_grade=req.photo_grade, grade=req.grade,
+                certifier=req.certifier, cert_number=req.cert_number,
             )
             await _record_committed(row["id"])
             return {**dict(row), "created": created, "advisories": advisories}
