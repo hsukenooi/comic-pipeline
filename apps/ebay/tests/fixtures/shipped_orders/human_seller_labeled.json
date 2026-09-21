@@ -1,0 +1,33 @@
+{
+  "id": "fixture-human-seller",
+  "threadId": "fixture-human-seller",
+  "internalDate": "1751880000000",
+  "payload": {
+    "mimeType": "multipart/alternative",
+    "headers": [
+      {
+        "name": "From",
+        "value": "Example Comic Art <seller@example.test>"
+      },
+      {
+        "name": "Subject",
+        "value": "Re: Want List For A Buyer : buyer@example.test"
+      }
+    ],
+    "body": {},
+    "parts": [
+      {
+        "mimeType": "text/plain",
+        "body": {
+          "data": "SGkgSHN1LAoKWW91ciBhcnQgd2FzIHNlbnQgdG9kYXkgdmlhIFVTUFMgUHJpb3JpdHkgTWFpbC4gSGVyZSBpcyB5b3VyIHRyYWNraW5nIG51bWJlcjoKCjk0MDAxMTExMTExMTExMTExMTExMTQKClRoYW5rcyBhZ2FpbiBhbmQgZW5qb3khCgpGZWxpeAp3d3cuZXhhbXBsZS1hcnQudGVzdAoKPiBPbiBKdW4gNCwgMjAyNiwgYXQgNzowMCBQTSwgSAo="
+        }
+      },
+      {
+        "mimeType": "text/html",
+        "body": {
+          "data": "PGh0bWw-PGJvZHk-PHByZT5IaSBIc3UsCgpZb3VyIGFydCB3YXMgc2VudCB0b2RheSB2aWEgVVNQUyBQcmlvcml0eSBNYWlsLiBIZXJlIGlzIHlvdXIgdHJhY2tpbmcgbnVtYmVyOgoKOTQwMDExMTExMTExMTExMTExMTExNAoKVGhhbmtzIGFnYWluIGFuZCBlbmpveSEKCkZlbGl4Cnd3dy5leGFtcGxlLWFydC50ZXN0Cgo-IE9uIEp1biA0LCAyMDI2LCBhdCA3OjAwIFBNLCBICjwvcHJlPjwvYm9keT48L2h0bWw-"
+        }
+      }
+    ]
+  }
+}
