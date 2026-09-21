@@ -2570,13 +2570,18 @@ class TestIdentifyRow:
         """BUI-923: Cert/PQ are appended at the END of the row (not inserted
         after Grade), specifically so every other identify_row test's
         positional cells[N] assertions keep working unchanged \u2014 a raw
-        (uncertified) item renders both new columns as a blank dash."""
+        (uncertified) item renders both new columns as a blank dash.
+
+        BUI-919 added Defects BETWEEN Notes and Cert for the mirror-image
+        reason: cells[11] (Notes) and cells[-2]/cells[-1] (Cert/PQ) both stay
+        valid that way, and only this full-row literal moves. A listing with
+        no seller-disclosed defect renders it as a blank dash."""
         row = ebay_fetch.identify_row(1, _identify_item(), self.NOW)
         cells = self._cells(row)
         assert cells == [
             "[1](https://www.ebay.com/itm/298217294954)", "AMAZING SPIDER-MAN", "#300",
             "1988", "NM", "\u2014", "Auction", "$102.50", "12", "beatlebluecat", "2d", "\u2014",
-            "\u2014", "\u2014",
+            "\u2014", "\u2014", "\u2014",
         ]
 
     def test_grade_from_title_is_noted(self):

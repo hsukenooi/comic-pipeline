@@ -26,11 +26,11 @@ this context.
 
 The subagent returns a fully-formatted identification table — columns `# | Comic
 | Issue | Year | Grade | Variant | Type | Current Price | Bids | Seller | Ends |
-Notes | Cert | PQ`, with the `#` cell linking to the eBay listing. The per-column derivation
+Notes | Defects | Cert | PQ`, with the `#` cell linking to the eBay listing. The per-column derivation
 contract (confidence-gating, Ends computation, grade signals, no extra API call
 for price/bids) is owned by `ebay-fetch --identify` in
 `apps/ebay/src/ebay_fetch.py` (BUI-900); the agent passes its output through. Present the
-table as-is; three columns carry weight downstream:
+table as-is; four column groups carry weight downstream:
 
 - **Year** — forward it verbatim into `/comic:collection-check` (blank stays
   blank, never backfill a guess). It's a confidence-gated per-issue cover year
@@ -38,6 +38,19 @@ table as-is; three columns carry weight downstream:
   forwarding rule.
 - **Current Price / Bids** — carried forward for `/comic:buy` Steps 4–5; Step 4
   owns the no-re-fetch rule (BUI-359).
+- **Defects (BUI-919)** — the seller's own condition text, classified against the
+  standing buy rule: moisture damage, rust, or a loose/detached staple. A non-blank
+  cell names the defect and quotes the phrase that fired
+  (`⚠️ rust: "rusty staple"`); a blank cell means the text was scanned and nothing
+  matched — most often because the seller wrote no condition note at all, so it is
+  not a clean bill of health. `--json` carries the same finding as
+  `condition_defects` (a list of `{code, phrase, source}`, `code` ∈ `moisture` /
+  `rust` / `loose_staple`, `source` ∈ `condition_description` / `title`; an empty
+  list means "scanned, nothing found") plus the raw note as
+  `condition_description`. `/comic:buy` Step 1.5 drops these rows before FMV;
+  standalone, surface the column and let the user decide. Plain "staining",
+  "foxing", "tanning", spine tape and spine splits are deliberately **not**
+  triggers — `apps/ebay/src/condition_defects.py` is the one tested definition.
 - **Cert / PQ (BUI-923)** — `Cert` renders the certifier plus a non-Universal label
   (e.g. `CGC`, `CGC SS`); `PQ` renders the page quality (e.g. `OW/W`); both are
   blank for a raw (uncertified) listing. They summarize `--json`'s underlying
@@ -76,3 +89,4 @@ where a fresh spawn re-runs the whole identify step.
 | Assuming grade when `grade_source` is `"missing"` | The subagent flags it — don't override without evidence |
 | Missing variants | The subagent checks both `variant` field and `item_specifics` |
 | Treating `condition` field as grade | `condition` is eBay's generic label (e.g. "Like New"); the subagent uses the parsed `grade` field |
+| Reading the seller's note yourself to decide the standing rule | Read the `Defects` column / `condition_defects` field — `condition_defects.py` is the tested definition, and "staining" alone is out of scope by design (BUI-919) |

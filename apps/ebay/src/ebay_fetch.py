@@ -18,6 +18,7 @@ from urllib.parse import quote
 
 import grade_tokens
 from comic_identity import confident_cover_year, identify_comic
+from condition_defects import format_defect_cell, listing_defect_findings
 
 
 def _version_string() -> str:
@@ -833,6 +834,25 @@ def parse_item(data):
     condition = data.get("condition", None)
     condition_id = data.get("conditionId", None)
 
+    # BUI-919: the seller's own free-text condition note. `conditionDescription`
+    # is the Browse API key behind eBay's "Seller Notes" block — verified live
+    # on 2026-09-21 against timemachinecomics listings whose titles hide the
+    # grade behind "see condition description" (e.g. item 137743677922 returns
+    # "cover and 1st 6 wraps detached bottom staple"). It is absent on most
+    # listings, which is a genuine "the seller wrote nothing", not an error.
+    # `shortDescription` (`description_snippet` below) is NOT a substitute: it
+    # returns the store's return-policy boilerplate, identical across every
+    # listing of a store, which is what made the BUI-919 investigation think
+    # the text was unreachable.
+    condition_description = data.get("conditionDescription")
+    # Classify the FULL text, then truncate only what is echoed out — a cap
+    # applied first could hide a defect named at the end of a long note.
+    condition_defects = listing_defect_findings(
+        condition_description=condition_description, title=title,
+    )
+    if isinstance(condition_description, str) and len(condition_description) > 1000:
+        condition_description = condition_description[:1000]
+
     item_specifics_raw = data.get("localizedAspects", [])
     item_specifics = {s.get("name", ""): s.get("value") for s in item_specifics_raw if s.get("name")}
 
@@ -888,6 +908,12 @@ def parse_item(data):
         "condition": condition,
         "condition_id": condition_id,
         "condition_note": condition_note,
+        # BUI-919: the seller's free-text condition note, and the standing-rule
+        # defects found in it (plus the title). `condition_defects` is a list of
+        # {code, phrase, source}; an EMPTY list means "scanned, nothing found",
+        # never "not checked" — the field is always present.
+        "condition_description": condition_description,
+        "condition_defects": condition_defects,
         "grade": grade,
         "grade_source": grade_source,
         "grade_from_description": grade_from_description,
@@ -1430,6 +1456,12 @@ def print_table(items, fields=None):
 IDENTIFY_COLUMNS = (
     "#", "Comic", "Issue", "Year", "Grade", "Variant", "Type",
     "Current Price", "Bids", "Seller", "Ends", "Notes",
+    # BUI-919: inserted between Notes and Cert, NOT appended, so both the
+    # positive positional assertions (cells[11] == Notes) and the negative ones
+    # (cells[-2] == Cert, cells[-1] == PQ) in test_ebay_fetch.py stay valid.
+    # Carries the seller-disclosed standing-rule defect (moisture / rust /
+    # loose staple) with the phrase that fired; blank on a clean listing.
+    "Defects",
     # BUI-923: appended at the end, not inserted after Grade, so every
     # existing positional cells[N] assertion in test_ebay_fetch.py stays
     # valid \u2014 only test_clean_auction_row's full-row literal needed updating.
@@ -1572,11 +1604,17 @@ def identify_row(index, item, now):
     link = f"[{index}](https://www.ebay.com/itm/{item_id})"
     cert_cell = _cert_cell(item.get("certifier"), item.get("label"))
     pq_cell = _PAGE_QUALITY_DISPLAY.get(item.get("page_quality"))
+    # BUI-919: the standing-rule drop reason, phrase included. It is rendered
+    # in its own column rather than folded into Notes so /comic:buy's gate can
+    # read one cell and never has to parse a semicolon-joined note list.
+    defect_cell = format_defect_cell(item.get("condition_defects"))
     cells = [
         link, _cell(series), _cell(issue), _cell(item.get("cover_year")),
         _cell(grade_cell), _cell(item.get("variant")), _cell(listing_type),
         _cell(item.get("current_price")), bids_cell, _cell(item.get("seller")),
-        _cell(ends), _cell("; ".join(notes)), _cell(cert_cell), _cell(pq_cell),
+        _cell(ends), _cell("; ".join(notes)),
+        _cell(f"{_WARN} {defect_cell}" if defect_cell else None),
+        _cell(cert_cell), _cell(pq_cell),
     ]
     return "| " + " | ".join(cells) + " |"
 

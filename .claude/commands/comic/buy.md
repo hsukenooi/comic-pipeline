@@ -14,8 +14,10 @@ Each leaf skill is also usable standalone. Use this when the user provides eBay 
 ## Execution Pattern
 
 Each step either reads a leaf skill inline and follows it (`identify.md` at
-Step 1, `grade.md` at Step 2.5) or calls a CLI directly and interprets its
-output (Steps 2, 3, 5, 6). No step dispatches a leaf skill's executor contract
+Step 1, `grade.md` at Step 2.5), calls a CLI directly and interprets its
+output (Steps 2, 3, 5, 6), or reads a column the previous step already put in
+context (Step 1.5, the condition-defect gate — no call of its own).
+No step dispatches a leaf skill's executor contract
 to a sub-agent: the collection check is one CLI call (BUI-504), and
 verification rides along in Step 5's output and is read as JSON at Step 6
 (BUI-507). Leaf skills stay usable standalone — some (e.g. `verify.md`) carry
@@ -59,7 +61,7 @@ Without this, Step 1's seller-reliability advisory silently no-ops for the whole
 Read `~/Projects/comic-pipeline/.claude/commands/comic/identify.md` and follow it — name the identifier subagent (e.g. `comic-identifier`) at spawn time (BUI-366) so it stays addressable for follow-ups (§ Sub-agent reuse above; identify.md § Follow-ups).
 
 **Input:** eBay URLs from the user, or a `seller-scan --json` blob (BUI-576) — pull each match's `item_id` and fetch it fresh exactly as for a bare URL; the blob is an item_id source only, never a data source (carrying forward its title/price/end-time is the BUI-572 staleness trap). `wish_name` and `match_score` may ride along as display context — never as anything a later step reads or decides on.
-**Output:** Identification table (comic, issue, grade, variant, auction vs BIN, **current price**, **bid count**, **seller**).
+**Output:** Identification table (comic, issue, grade, variant, auction vs BIN, **current price**, **bid count**, **seller**, **seller-disclosed condition defects**).
 
 Gate: user confirms identifications are correct. Flag Buy It Now listings — they're skipped at the Gixen step. The table's **Current Price**, **Bids**, and **Ends** (raw `end_date_iso`) columns carry forward for Steps 4–5, together with the wall-clock time this table was captured (`identified_at`) — Step 4 owns the no-re-fetch rule and the data-age threshold that conditions it (BUI-359/BUI-567).
 
@@ -80,6 +82,32 @@ When `sample_size >= 1`, surface a line before the grade (Step 2.5) / bid-aggres
 - `avg_deviation` is `seller_grade − photo_grade` (**positive = over-grades**; render with an explicit sign). For `sample_size` 1–2, prefix **"early signal —"** and soften the wording.
 - `sample_size == 0` (or any error / no server): show nothing.
 - Advisory only — it never changes the grade, FMV, or max bid automatically.
+
+---
+
+## Step 1.5: Condition Defect Gate (standing rule, BUI-919)
+
+**Standing buy rule, 2026-09-16: never carry a book to purchase whose seller-disclosed condition text names moisture damage, rust, or a loose/detached staple — at any price and any stated grade.** All three get worse in storage rather than merely looking bad: moisture keeps spreading and reaches neighbouring books, staple rust stains the paper around it and transfers, and a book whose staple no longer holds will not hold its grade. A cheap copy with any of them is a book you replace later, not a placeholder you upgrade — $0.99 books have been cut under this rule.
+
+The gate is already computed. Step 1's table carries a **`Defects`** column (between `Notes` and `Cert`), and `ebay-fetch --json` carries the same finding as `condition_defects` — a list of `{code, phrase, source}` where `code` is `moisture` / `rust` / `loose_staple`, `phrase` is the seller's own words that fired, and `source` is `condition_description` (the seller's free-text note, eBay's `conditionDescription`) or `title`. An **empty list means "scanned, nothing found"**, never "not checked": the field is always present. The raw note is echoed as `condition_description` for the same rows.
+
+**Drop every row whose `Defects` cell is non-blank, and print each drop with its reason.** Mirror `/comic:seller-scan`'s no-silent-drops format (seller-scan.md § "No silent drops") — one line per drop, naming the listing, the defect, and the phrase:
+
+```
+Dropped 4 listing(s) on the condition-defect rule (BUI-919):
+  - [3] The X-Men #26  —  rust: "rusty staple"  (seller note: "VG condition, rusty staple, manufactured with one staple, staining")
+  - [5] The X-Men #71  —  loose/detached staple: "cover detached both staples"
+  - [6] Detective Comics #400  —  loose/detached staple: "1st wrap detached top staple"
+  - [7] Detective Comics #477  —  loose/detached staple: "1st 5 wraps detached bottom staple"
+```
+
+Quote the full `condition_description` alongside the phrase whenever the phrase alone is ambiguous, so the user can judge the drop without reopening the listing.
+
+Then **remove those rows from the working list** before Step 2. Running the gate here rather than just before Step 3 is deliberate: nothing downstream — no ownership check, no photo-grading sub-agent, no FMV provider request — is spent on a book that is already out, and the book still never reaches the FMV step, which is what the rule requires.
+
+- **The rule is not negotiable; a misread of the text is.** Never argue a book back in because it is cheap, high-graded or a grail — that is exactly the argument the rule exists to overrule. Do offer the user an override when the classifier plainly misread the words: a `title`-sourced `rust` hit on "Rusty" the New Mutants character reads very differently from a `condition_description` note reading "rusty staple", which is why the phrase and its source are printed. Re-add a row the user clears and carry on.
+- **Never infer the verdict yourself from the note text** — read the `Defects` column / `condition_defects` field. The classifier (`apps/ebay/src/condition_defects.py`) is the single tested definition of the rule, including what is deliberately *out* of scope: plain "staining", "foxing" and "tanning" are **not** triggers (a seller who writes "moisture damage" when they mean water writes plain "staining" otherwise, so the separate vocabulary is the signal), and neither are spine tape, a spine split or a missing piece of cover. Those are hand-grading calls for Step 2.5, not standing-rule drops. A hedge is not a negation either — "minimal rust" is rust.
+- **A blank `Defects` cell is not a clean bill of health.** Most listings carry no `conditionDescription` at all — the seller wrote nothing, so there was nothing to read. Structural damage still shows up in the photos at Step 2.5.
 
 ---
 
@@ -157,6 +185,8 @@ Gate: user confirms the assessed grades (or overrides any) before FMV. Map the g
 ---
 
 ## Step 3: FMV
+
+Every row that reaches this step has already cleared Step 1.5's condition-defect gate. Don't re-add a dropped row here — a book the standing rule refused is out regardless of what it prices at, and pricing it spends a provider request on a book you will not bid on.
 
 Run `comic-fmv` directly — do not read `fmv.md` mid-flow. The CLI handles fetch (via `ebay-fetch sold-comps`), cache, dedup, IQR, quartiles, confidence rubric, self-exclusion, and DB upsert.
 
