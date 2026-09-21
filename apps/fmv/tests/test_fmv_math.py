@@ -2136,6 +2136,71 @@ class TestGradedPageQualityLadderFallback:
         assert out["graded_ladder"]["grade_above"] == 9.6
 
 
+class TestGradedExactTierIsNotReRunAfterAWiden:
+    """BUI-943: a widened pool's exact-grade sales do not reopen the tier.
+
+    The pool here is a white 9.4 target over white 9.2/9.6/9.8 rungs plus TWO
+    full-weight cream 9.4 sales — enough effective n at the exact grade to
+    clear the exact tier's gate, if the gate were ever asked a second time on
+    the wider pool. It is not: the gate reads the page-quality-scoped bucket,
+    once.
+    """
+
+    _WHITE_RUNGS = [_slab_comp(610, 9.2, age=3, page_quality="white",
+                               product_id="w1"),
+                    _slab_comp(4200, 9.6, age=7, page_quality="white",
+                               product_id="w2"),
+                    _slab_comp(5000, 9.8, age=6, page_quality="white",
+                               product_id="w3")]
+    _CREAM_EXACTS = [_slab_comp(3400, 9.4, age=9, page_quality="cream",
+                                product_id="c1"),
+                     _slab_comp(3600, 9.4, age=12, page_quality="cream",
+                                product_id="c2")]
+
+    def test_two_exact_sales_of_another_quality_still_price_by_ladder(self):
+        out = _graded(self._WHITE_RUNGS + self._CREAM_EXACTS, 9.4,
+                      page_quality="white")
+        assert out["pricing_basis"] == "ladder"
+        assert out["confidence"] == "LOW"
+        assert out["bid_factor"] == 0.60
+        assert out["page_quality_fallback"] is True
+        assert out["page_quality_fallback_reason"] == "ladder_starved"
+        # The two cream sales are dropped with the rest of the target rung and
+        # the white 9.2/9.6 neighbours interpolate across the gap.
+        assert out["graded_ladder"]["grade_below"] == 9.2
+        assert out["graded_ladder"]["grade_above"] == 9.6
+        assert out["fmv_high"] == 2400
+        assert out["max_bid"] == 1450
+
+    def test_the_dropped_exact_sales_are_still_reported_as_evidence(self):
+        """`exact_effective_n` reads 2.0 on a `basis=ladder` row on purpose —
+        it is the widened pool's evidence, printed by `_build_notes` as
+        "recorded, NOT used as the price", and never an input to the tier."""
+        out = _graded(self._WHITE_RUNGS + self._CREAM_EXACTS, 9.4,
+                      page_quality="white")
+        assert out["exact_effective_n"] == 2.0
+        assert out["exact_sales"] == [3400.0, 3600.0]
+        assert [d["price"] for d in out["exact_sales_detail"]] == [3400.0, 3600.0]
+
+    def test_re_running_the_gate_would_have_raised_the_cap_not_the_band(self):
+        """Why the ladder wins the decision, measured rather than asserted.
+
+        Reading the same pool with NO page-quality reading is exactly what
+        re-running the gate on the widened pool would do — the same bucket, the
+        same envelope clamp. It lands on the identical $2,400 band and differs
+        only in the haircut, 0.80 against the ladder's 0.60. Equal evidence,
+        higher cap, paid for with the comps the preference declined.
+        """
+        pool = self._WHITE_RUNGS + self._CREAM_EXACTS
+        ladder_row = _graded(pool, 9.4, page_quality="white")
+        exact_rerun = _graded(pool, 9.4, page_quality=None)
+        assert exact_rerun["pricing_basis"] == "direct"
+        assert exact_rerun["fmv_high"] == ladder_row["fmv_high"] == 2400
+        assert exact_rerun["bid_factor"] == 0.80
+        assert exact_rerun["max_bid"] == 1925
+        assert ladder_row["max_bid"] < exact_rerun["max_bid"]
+
+
 class TestGradedPageQualityScopesTheExactBucketOnly:
     """BUI-937: the scoped pool is the exact BAND; the envelope is the market.
 

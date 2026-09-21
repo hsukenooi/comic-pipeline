@@ -1681,10 +1681,13 @@ def _graded_result(**over) -> dict:
         "page_quality": None,
         "page_quality_fallback": False,
         # None while `page_quality_fallback` is False; otherwise
-        # "too_few_matches" (fewer than 2 same-quality comps — BUI-930) or
-        # "ladder_starved" (2+ same-quality comps, but scoping to them would
-        # leave the ladder tier too thin — BUI-939). Additive: a reader that
-        # only checks the boolean sees the same thing it always has.
+        # "too_few_matches" (fewer than 2 same-quality comps, so nothing was
+        # scoped at all — BUI-930) or "ladder_starved" (2+ same-quality comps
+        # and the exact bucket WAS scoped to them, but it was too thin to
+        # price from, so the row is a ladder row and its rungs are the whole
+        # pool's — BUI-939, generalised by BUI-937 from "the scoped ladder
+        # ran short of rungs" to every scoped ladder row). Additive: a reader
+        # that only checks the boolean sees the same thing it always has.
         "page_quality_fallback_reason": None,
         "exact_effective_n": 0.0,
         "exact_sales": [],
@@ -1808,13 +1811,30 @@ def graded_fmv(comps: list[dict], target_grade: float, *,
         a same-quality band, so it can clamp a genuine page-quality premium
         away — the intended direction, since `min()` only ever lowers a cap
         and the alternative was a two-sale bucket setting a four-figure cap
-        unbounded.
+        unbounded. It cuts the other way too: a neighbour rung where another
+        quality sold HIGHER carries a higher weighted median, so the bound
+        (and a ladder row's bracket) can be looser than a same-quality read
+        would have been. That is the accepted price of never being starved —
+        the nearer rung is the better evidence, and the band still cannot
+        exceed the scoped bucket's own weighted Q75.
 
         A ladder-tier row whose scoped pool WAS narrower reports the widen in
         the two fields BUI-939 introduced for it (`page_quality_fallback=True`,
         `page_quality_fallback_reason="ladder_starved"`, distinguishable from
         the pre-existing `"too_few_matches"` fallback) — now on every such
         row, not only the ones a rung count would have rescued.
+
+        **The exact-tier gate is never re-run on the wider pool (BUI-943).**
+        The gate reads the scoped bucket, once. Sales at the target grade whose
+        page quality is not the target's stay what the ladder tier makes of any
+        target rung — dropped, and reported as evidence (`exact_effective_n`/
+        `exact_sales` are re-read on the wider pool for the notes' "recorded,
+        NOT used as the price" line, which is why that field can read >= 2 on a
+        `basis=ladder` row). Measured, the two rules price the same band: the
+        same envelope bounds it either way, and all that changes is the
+        haircut — 0.60 against 0.80, a $1,450 cap against a $1,925 one on the
+        case in the code below. Equal evidence, higher cap, paid for with the
+        comps the preference declined.
       * REFUSALS — `no_certifier_pool` (nothing survived the identity + age
         filters), `ladder_too_thin` (< 3 anchor-eligible rungs in the whole
         same-label pool), `outside_ladder` (no rung on one side — the proxy's
@@ -1854,7 +1874,11 @@ def graded_fmv(comps: list[dict], target_grade: float, *,
     # is the band.
     scoped_eff_n = bucket_effective_n(pool)
     exact_comps = [c for c in pool if float(c["grade"]) == target_grade]
-    identity["exact_effective_n"] = scoped_eff_n.get(target_grade, 0.0)
+    # Bound to a local, not read back out of `identity`, because `identity`'s
+    # copy is re-read on the wider pool below as EVIDENCE. This is the tier
+    # gate's one and only input (BUI-943).
+    exact_effective_n = scoped_eff_n.get(target_grade, 0.0)
+    identity["exact_effective_n"] = exact_effective_n
     identity["exact_sales"] = sorted(float(c["price"]) for c in exact_comps)
     identity["exact_sales_detail"] = _exact_sales_detail(exact_comps)
 
@@ -1866,13 +1890,26 @@ def graded_fmv(comps: list[dict], target_grade: float, *,
     ladder = bucket_weighted_medians(full_pool)
     eff_n = bucket_effective_n(full_pool)
 
-    if identity["exact_effective_n"] >= GRADED_EXACT_MIN_EFFECTIVE_N:
+    if exact_effective_n >= GRADED_EXACT_MIN_EFFECTIVE_N:
         return _graded_direct(exact_comps, ladder, eff_n, target_grade, identity)
 
     if len(pool) < len(full_pool):
         # Scoping was applied and the book is priced off the ladder, which
         # reads every quality — so the row says so, in the two fields BUI-939
         # introduced for exactly this disclosure.
+        #
+        # BUI-943: the gate above is NOT re-run on the wider pool, and the
+        # exact-grade fields re-read below are evidence, never a second gate.
+        # Two sales at the target grade whose page quality is not the target's
+        # WOULD clear `GRADED_EXACT_MIN_EFFECTIVE_N` here — and on a measured
+        # case (a white 9.4 target over 9.2/9.6/9.8 white rungs and two cream
+        # 9.4 sales) both rules land on the SAME $2,400 band, because the same
+        # envelope bounds it either way. The only thing that differs is the
+        # haircut: 0.60 as a ladder point, 0.80 as a rubric-graded exact
+        # bucket — a $1,450 cap against a $1,925 one. Equal band, higher cap,
+        # bought with the very comps the page-quality preference declined: the
+        # exact tier is the page-quality-preferring tier by definition
+        # (BUI-937), and the wider pool is the ladder's.
         identity["page_quality_fallback"] = True
         identity["page_quality_fallback_reason"] = "ladder_starved"
         identity["pool_n"] = len(full_pool)
