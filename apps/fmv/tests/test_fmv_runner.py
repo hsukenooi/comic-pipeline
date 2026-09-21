@@ -5948,6 +5948,44 @@ class TestGradedPoolMerge:
         assert "seen_count" not in pool[0]
         assert "conflict_count" not in pool[0]
 
+    def test_dropped_ids_skips_the_matching_ledger_row(self):
+        # BUI-946
+        ledger = [{"product_id": "bad", "price": 50, "grade": 9.4,
+                   "sold_date": "2026-09-01"},
+                  {"product_id": "good", "price": 1000, "grade": 9.4,
+                   "sold_date": "2026-09-01"}]
+        pool = fmv_runner._merge_slab_pool([], ledger, dropped_ids={"bad"})
+        assert [c["product_id"] for c in pool] == ["good"]
+
+    def test_dropped_ids_never_removes_a_live_comp(self):
+        # BUI-946: a live comp sharing a dropped id was never appended to
+        # `live` by fetch_book_comps in the first place (the guard drops it
+        # before returning), so dropped_ids can only ever thin the LEDGER
+        # side — this pins that dropped_ids is not applied to `live` too.
+        live = [_make_slab_comp(1000, 9.4, "same-id")]
+        ledger = [{"product_id": "same-id", "price": 400, "grade": 9.4,
+                   "sold_date": "2026-01-01"}]
+        pool = fmv_runner._merge_slab_pool(live, ledger, dropped_ids={"same-id"})
+        assert len(pool) == 1
+        assert pool[0]["price"] == 1000.0
+
+    def test_dropped_ids_compares_as_strings(self):
+        # BUI-946 adversarial case: an int product_id on one side and a str
+        # on the other must still match — the same normalization the
+        # existing dedupe key uses.
+        ledger = [{"product_id": 12345, "price": 50, "grade": 9.4,
+                   "sold_date": "2026-09-01"}]
+        pool = fmv_runner._merge_slab_pool([], ledger, dropped_ids={"12345"})
+        assert pool == []
+
+    def test_dropped_ids_defaults_to_no_filtering(self):
+        # BUI-946: every existing caller (no dropped_ids kwarg) reproduces
+        # the pre-BUI-946 unfiltered merge exactly.
+        ledger = [{"product_id": "x", "price": 900, "grade": 9.4,
+                   "sold_date": "2026-09-01"}]
+        assert fmv_runner._merge_slab_pool([], ledger) == \
+            fmv_runner._merge_slab_pool([], ledger, dropped_ids=None)
+
 
 class TestGradedLedgerRead:
     """`_fetch_ledger_comps` is the ONE function in apps/fmv allowed to GET
@@ -6268,6 +6306,66 @@ class TestGradedRunEndToEnd:
                               server_url, ledger=ledger)
         assert row["fmv"]["pricing_basis"] == "direct"
         assert row["fmv"]["exact_effective_n"] == 2.0
+
+    def test_ledger_row_sharing_a_dropped_product_id_is_excluded(
+            self, tmp_path, server_url):
+        """BUI-946: a ledger comp whose product_id the live fetch's guards
+        just excluded must NOT join the pool — the exact defect this ticket
+        fixes (a stored pre-guard copy re-admitting the same listing).
+        Mirrors test_ledger_comps_join_the_pool's shape (a would-be second
+        4.5 sale) but this one must NOT flip the book to `direct`."""
+        ledger = [{"product_id": "L1", "price": 760, "grade": 4.5,
+                   "sold_date": "2026-08-25", "certifier": "cgc",
+                   "label": "universal", "page_quality": "unknown"}]
+        result = self._slab_result(
+            graded_identity_dropped_ids=[{"product_id": "L1", "code": "cross_title"}])
+        row, upsert, _ = self._run(self._book(), result, tmp_path, server_url,
+                                   ledger=ledger)
+        fmv = row["fmv"]
+        assert fmv["pricing_basis"] == "ladder"
+        assert fmv["exact_effective_n"] == 1.0
+        assert fmv["ledger_dropped"] == 1
+        persisted = fmv_runner._build_notes(upsert.call_args.args[2])
+        assert "ledger_dropped=1" in persisted
+
+    def test_ledger_row_with_an_unrelated_product_id_is_kept(
+            self, tmp_path, server_url):
+        """The flip side: a dropped id that does NOT match any ledger row's
+        product_id changes nothing — same outcome as
+        test_ledger_comps_join_the_pool, plus ledger_dropped==0 and no
+        ledger_dropped= note token (falsy-gated)."""
+        ledger = [{"product_id": "L1", "price": 760, "grade": 4.5,
+                   "sold_date": "2026-08-25", "certifier": "cgc",
+                   "label": "universal", "page_quality": "unknown"}]
+        result = self._slab_result(
+            graded_identity_dropped_ids=[{"product_id": "some-other-id",
+                                          "code": "store_variant"}])
+        row, upsert, _ = self._run(self._book(), result, tmp_path, server_url,
+                                   ledger=ledger)
+        fmv = row["fmv"]
+        assert fmv["pricing_basis"] == "direct"
+        assert fmv["exact_effective_n"] == 2.0
+        assert fmv["ledger_dropped"] == 0
+        persisted = fmv_runner._build_notes(upsert.call_args.args[2])
+        assert "ledger_dropped=" not in persisted
+
+    def test_missing_graded_identity_dropped_ids_key_is_tolerated(
+            self, tmp_path, server_url):
+        """An older `ebay-sold-comps` binary predates BUI-946 and never sets
+        this key at all — comic-fmv must not crash, and must fall back to
+        the pre-BUI-946 unfiltered merge (a ledger row just joins, exactly
+        like test_ledger_comps_join_the_pool)."""
+        ledger = [{"product_id": "L1", "price": 760, "grade": 4.5,
+                   "sold_date": "2026-08-25", "certifier": "cgc",
+                   "label": "universal", "page_quality": "unknown"}]
+        result = self._slab_result()
+        assert "graded_identity_dropped_ids" not in result
+        row, _, _ = self._run(self._book(), result, tmp_path, server_url,
+                              ledger=ledger)
+        fmv = row["fmv"]
+        assert fmv["pricing_basis"] == "direct"
+        assert fmv["exact_effective_n"] == 2.0
+        assert fmv["ledger_dropped"] == 0
 
     def test_only_the_live_slab_comps_are_archived(self, tmp_path, server_url):
         ledger = [{"product_id": "L1", "price": 760, "grade": 4.5,

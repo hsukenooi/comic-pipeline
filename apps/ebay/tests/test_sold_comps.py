@@ -5572,6 +5572,11 @@ class TestGradedIdentityGuardsInFetch:
         assert out["graded_identity_dropped"] == {
             "cross_title": 1, "store_variant": 1,
         }
+        # BUI-946: the same three drops, now also reported per-comp so a
+        # caller (fmv_runner's ledger merge) can act on the SAME listing by
+        # id rather than just seeing a count.
+        by_id = {d["product_id"]: d["code"] for d in out["graded_identity_dropped_ids"]}
+        assert by_id == {"j0": "multibook_lot", "j1": "cross_title", "j2": "store_variant"}
 
     def test_raw_mode_never_runs_the_guards(self, tmp_path, monkeypatch):
         self._wire(tmp_path, monkeypatch, self._results())
@@ -5585,6 +5590,7 @@ class TestGradedIdentityGuardsInFetch:
         assert out["graded_identity_dropped"] == {
             "cross_title": 0, "store_variant": 0,
         }
+        assert out["graded_identity_dropped_ids"] == []
         kept = {c["title"] for c in out["comps"]}
         assert AMPERSAND_LOT in kept
         assert CROSS_TITLE in kept
@@ -5598,3 +5604,39 @@ class TestGradedIdentityGuardsInFetch:
         )
         assert out["graded_identity_dropped"]["store_variant"] == 0
         assert any("Larry's" in c["title"] for c in out["slab_comps"])
+
+    def test_printing_guard_drop_is_tagged_with_product_id_in_fetch(
+        self, tmp_path, monkeypatch,
+    ):
+        # BUI-946: the printing guard's drops must ALSO land in
+        # graded_identity_dropped_ids (code "printing"). Unlike
+        # TestPrintingGuard's corpus (which pins a BUI-754 carve-out title
+        # that hard_exclude itself would reject on the way in — that test
+        # calls `_printing_guard` directly to bypass that), the outlier
+        # titles here carry NO title-level reprint marker (the printing
+        # guard's whole reason to exist, per its docstring: the tell hides
+        # in the DESCRIPTION, not the title) so they survive hard_exclude
+        # and actually reach the guard through the real fetch_book_comps
+        # pipeline.
+        results = [[
+            self._comp("a", "Ultimate Fallout 4 CGC 9.8 Marvel Comics 2011", 1200.0),
+            self._comp("b", "Ultimate Fallout #4 CGC 9.8 White Pages 1st Miles Morales Marvel Comics 2011", 1250.0),
+            self._comp("c", "Ultimate Fallout #4 (2011) Marvel Comics 1st app Miles Morales 1st Print CGC 9.8", 1150.0),
+            self._comp("d", "Ultimate Fallout 4 CGC 9.8 Marvel Comics 2011", 1225.0),
+            self._comp("e1", "Ultimate Fallout 4 CGC 9.8 Marvel Comics 2011", 215.0),
+            self._comp("e2", "Ultimate Fallout 4 CGC 9.8 Marvel Comics 2011", 215.0),
+        ]]
+        self._wire(tmp_path, monkeypatch, results)
+        monkeypatch.setattr(
+            sc, "_default_fetch_description",
+            lambda comp: "Marvel Comics 2011 Second Printing")
+        out = sc.fetch_book_comps(
+            {"title": "Ultimate Fallout", "issue": "4", "year": 2011,
+             "grade": 9.8, "certifier": "cgc"},
+            "key",
+        )
+        assert out["printing_dropped"] == 2
+        assert {c["product_id"] for c in out["slab_comps"]} == {"a", "b", "c", "d"}
+        printing_ids = {d["product_id"] for d in out["graded_identity_dropped_ids"]
+                        if d["code"] == "printing"}
+        assert printing_ids == {"e1", "e2"}
