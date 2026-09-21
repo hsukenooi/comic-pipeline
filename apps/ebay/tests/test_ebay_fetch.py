@@ -193,6 +193,19 @@ class TestExtractGrade:
         assert source == "item_specifics"
         assert desc_grade is None
 
+    def test_bare_cgc_no_longer_a_grade_token(self):
+        """BUI-923 regression: before this fix, GRADE_BARE_PATTERN's
+        alternation matched the bare 'CGC' alternative at an earlier string
+        position than the actual grade and won, so 'CGC AA SS 4.5' and
+        '2003 CGC 9.4' both wrongly returned the literal string 'CGC' as the
+        grade and silently dropped the number. Certifier-aware extraction
+        (ebay_fetch.extract_certification) now owns those titles; bare 'CGC'
+        with nothing else recognizable is simply no grade."""
+        grade, source, desc_grade = ebay_fetch.extract_grade([], "Invincible #1 CGC")
+        assert grade is None
+        assert source == "missing"
+        assert desc_grade is None
+
 
 class TestExtractVariant:
     def test_newsstand_in_title(self):
@@ -413,6 +426,196 @@ class TestParseItem:
         result = ebay_fetch.parse_item(auction_response)
         assert result["grade"] == "NM-"
         assert result["grade_from_description"] is None
+
+    def test_raw_listing_output_byte_identical_except_new_columns_blank(self, auction_response):
+        """BUI-923: a raw (uncertified) listing's existing fields are
+        untouched; the new certification fields are simply blank."""
+        result = ebay_fetch.parse_item(auction_response)
+        assert result["grade"] == "NM-"
+        assert result["grade_source"] == "title"
+        assert result["certifier"] is None
+        assert result["cert_number"] is None
+        assert result["label"] is None
+        assert result["page_quality"] is None
+        assert result["grade_mismatch_note"] is None
+
+
+# ─── BUI-923: certifier/grade/label/page-quality extraction ────────────────
+
+class TestExtractCertification:
+    """extract_certification's item-specifics-vs-title precedence and the
+    eight 2026-09-19 spike listings (docs/plans/2026-09-21-001-feat-cgc-
+    slab-support-plan.md, U1 test scenarios)."""
+
+    def test_ae1_title_only_cgc_aa_ss(self):
+        cert = ebay_fetch.extract_certification([], "Amazing Spider-Man #50 CGC AA SS 4.5 OWW 1967")
+        assert cert.certifier == "cgc"
+        assert cert.grade == 4.5
+        assert cert.label == "signature_series"
+        assert cert.page_quality == "ow_w"
+        assert cert.mismatch_note is None
+
+    def test_ae2_title_only_cgc_direct(self):
+        cert = ebay_fetch.extract_certification([], "Invincible #1 First Print 2003 CGC 9.4")
+        assert cert.certifier == "cgc"
+        assert cert.grade == 9.4
+        assert cert.label == "universal"
+
+    def test_specifics_grade_professional_grader_cert_number(self):
+        specs = [
+            {"name": "Grade", "value": "8.0 Very Fine"},
+            {"name": "Professional Grader", "value": "Certified Guaranty Company (CGC)"},
+            {"name": "Certification Number", "value": "4786366002"},
+        ]
+        cert = ebay_fetch.extract_certification(specs, "SPIDER-MAN #300")
+        assert cert.certifier == "cgc"
+        assert cert.grade == 8.0
+        assert cert.cert_number == "4786366002"
+
+    def test_specifics_vs_title_mismatch_keeps_specifics(self):
+        specs = [
+            {"name": "Grade", "value": "7.0"},
+            {"name": "Professional Grader", "value": "CGC"},
+        ]
+        cert = ebay_fetch.extract_certification(specs, "ASM #300 CGC 7.5")
+        assert cert.certifier == "cgc"
+        assert cert.grade == 7.0  # specifics wins, not the title's 7.5
+        assert cert.mismatch_note is not None
+        assert "7.0" in cert.mismatch_note and "7.5" in cert.mismatch_note
+
+    def test_cgc_ready_would_grade_is_a_bare_mention_not_a_grade(self):
+        cert = ebay_fetch.extract_certification([], "CGC ready, would grade 9.6")
+        assert cert.certifier is None
+        assert cert.grade is None
+        assert cert.title_bare_mention is True
+
+    def test_specifics_uncertified_falls_back_to_todays_source(self):
+        specs = [
+            {"name": "Certification", "value": "Uncertified"},
+            {"name": "Grade", "value": "9.4"},
+        ]
+        cert = ebay_fetch.extract_certification(specs, "SPIDER-MAN #300")
+        assert cert.certifier is None
+        assert cert.grade is None  # extract_certification itself finds nothing certified...
+        result = ebay_fetch.parse_item({
+            "itemId": "v1|1|0", "title": "SPIDER-MAN #300", "buyingOptions": ["FIXED_PRICE"],
+            "price": {"value": "10.00", "currency": "USD"},
+            "localizedAspects": [{"name": k, "value": v} for k, v in
+                                  [("Certification", "Uncertified"), ("Grade", "9.4")]],
+            "itemWebUrl": "https://x",
+        })
+        # ...so parse_item keeps today's (pre-BUI-923) item_specifics grade.
+        assert result["grade"] == "9.4"
+        assert result["grade_source"] == "item_specifics"
+        assert result["certifier"] is None
+
+    def test_specifics_not_graded_also_falls_back(self):
+        specs = [
+            {"name": "Professional Grader", "value": "Not Graded"},
+            {"name": "Grade", "value": "8.5"},
+        ]
+        cert = ebay_fetch.extract_certification(specs, "SPIDER-MAN #300")
+        assert cert.certifier is None
+
+    def test_signed_sets_signature_series_label(self):
+        cert = ebay_fetch.extract_certification([], "ASM #300 CGC 9.8 Signed Todd McFarlane")
+        assert cert.label == "signature_series"
+
+    def test_not_signed_does_not_set_label(self):
+        cert = ebay_fetch.extract_certification([], "ASM #300 CGC 9.8 not signed")
+        assert cert.label == "universal"
+
+    def test_cbcs_title_token(self):
+        cert = ebay_fetch.extract_certification([], "CBCS 9.8")
+        assert cert.certifier == "cbcs"
+        assert cert.grade == 9.8
+
+    def test_pgx_maps_to_other(self):
+        cert = ebay_fetch.extract_certification([], "PGX 9.8")
+        assert cert.certifier == "other"
+        assert cert.grade == 9.8
+
+    def test_price_adjacent_to_certifier_is_not_a_grade(self):
+        cert = ebay_fetch.extract_certification([], "CGC $9.80 shipping included")
+        assert cert.certifier is None
+        assert cert.grade is None
+
+    def test_no_certification_at_all(self):
+        cert = ebay_fetch.extract_certification([], "AMAZING SPIDER-MAN #300 NM-")
+        assert cert.certifier is None
+        assert cert.grade is None
+        assert cert.title_bare_mention is False
+
+
+class TestParseItemCertification:
+    """End-to-end parse_item() coverage for the certified-slab path."""
+
+    def _item(self, title, specs=None):
+        return ebay_fetch.parse_item({
+            "itemId": "v1|1|0", "title": title, "buyingOptions": ["FIXED_PRICE"],
+            "price": {"value": "10.00", "currency": "USD"},
+            "localizedAspects": [{"name": k, "value": v} for k, v in (specs or [])],
+            "itemWebUrl": "https://x",
+        })
+
+    def test_certified_grade_overrides_legacy_grade_and_source(self):
+        result = self._item("Amazing Spider-Man #50 CGC AA SS 4.5 OWW 1967")
+        assert result["grade"] == 4.5
+        assert result["grade_source"] == "certified"
+        assert result["certifier"] == "cgc"
+        assert result["label"] == "signature_series"
+        assert result["page_quality"] == "ow_w"
+
+    def test_ambiguous_certifier_mention_yields_missing_grade(self):
+        result = self._item("CGC ready, would grade 9.6")
+        assert result["grade"] is None
+        assert result["grade_source"] == "missing"
+        assert result["certifier"] is None
+
+    def test_grade_mismatch_note_surfaces_in_identify_row(self):
+        result = self._item("ASM #300 CGC 7.5", [("Grade", "7.0"), ("Professional Grader", "CGC")])
+        assert result["grade_mismatch_note"] is not None
+        row = ebay_fetch.identify_row(1, result, datetime(2026, 9, 21, tzinfo=timezone.utc))
+        assert result["grade_mismatch_note"] in row
+
+
+class TestIdentifyRowCertification:
+    NOW = datetime(2026, 9, 7, 12, 0, 0, tzinfo=timezone.utc)
+
+    def _cells(self, row):
+        return [c.strip() for c in row.strip().strip("|").split(" | ")]
+
+    def test_cert_and_pq_columns_render_for_a_slab(self):
+        row = ebay_fetch.identify_row(
+            1,
+            _identify_item(
+                grade=4.5, grade_source="certified", certifier="cgc",
+                label="signature_series", page_quality="ow_w",
+            ),
+            self.NOW,
+        )
+        cells = self._cells(row)
+        assert cells[-2] == "CGC SS"
+        assert cells[-1] == "OW/W"
+
+    def test_cert_column_omits_universal_label(self):
+        row = ebay_fetch.identify_row(
+            1,
+            _identify_item(
+                grade=9.4, grade_source="certified", certifier="cgc",
+                label="universal", page_quality="unknown",
+            ),
+            self.NOW,
+        )
+        cells = self._cells(row)
+        assert cells[-2] == "CGC"
+        assert cells[-1] == "—"  # "unknown" page quality renders blank
+
+    def test_raw_item_has_blank_cert_and_pq(self):
+        row = ebay_fetch.identify_row(1, _identify_item(), self.NOW)
+        cells = self._cells(row)
+        assert cells[-2] == "—"
+        assert cells[-1] == "—"
 
 
 class TestLoadConfig:
@@ -2316,11 +2519,16 @@ class TestIdentifyRow:
         return [c.strip() for c in row.strip().strip("|").split(" | ")]
 
     def test_clean_auction_row(self):
+        """BUI-923: Cert/PQ are appended at the END of the row (not inserted
+        after Grade), specifically so every other identify_row test's
+        positional cells[N] assertions keep working unchanged \u2014 a raw
+        (uncertified) item renders both new columns as a blank dash."""
         row = ebay_fetch.identify_row(1, _identify_item(), self.NOW)
         cells = self._cells(row)
         assert cells == [
             "[1](https://www.ebay.com/itm/298217294954)", "AMAZING SPIDER-MAN", "#300",
             "1988", "NM", "\u2014", "Auction", "$102.50", "12", "beatlebluecat", "2d", "\u2014",
+            "\u2014", "\u2014",
         ]
 
     def test_grade_from_title_is_noted(self):

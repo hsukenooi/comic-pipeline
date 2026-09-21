@@ -16,6 +16,7 @@ from pathlib import Path
 import requests
 from urllib.parse import quote
 
+import grade_tokens
 from comic_identity import confident_cover_year, identify_comic
 
 
@@ -51,11 +52,20 @@ SELLER_ALIASES_FILE = Path(__file__).resolve().parent / "seller_aliases.json"
 PRODUCTION_BASE = "https://api.ebay.com"
 SANDBOX_BASE = "https://api.sandbox.ebay.com"
 
+# BUI-923: "CGC" was here until it was found to be the cause of the bug this
+# ticket exists to fix — GRADE_PATTERN/GRADE_BARE_PATTERN's alternation tries
+# each alternative left-to-right, so on a title like "CGC AA SS 4.5" or
+# "2003 CGC 9.4" the bare "CGC" alternative matched at an earlier position
+# than the actual numeric grade and won, returning the literal string "CGC"
+# as the "grade" and silently dropping the number. Certifier detection (and
+# the numeric grade that goes with it) now lives in grade_tokens.py /
+# ebay_fetch.extract_certification instead — see that module's
+# extract_title_certification().
 _GRADE_ABBREVS = (
     r"NM[\-\+]?|VF[\-\+]?|FN[\-\+]?|VG[\-\+]?|GD[\-\+]?|FR[\-\+]?|PR[\-\+]?"
     r"|Near Mint[\-\+]?|Very Fine[\-\+]?|Fine[\-\+]?"
     r"|NM/M|NM/MT|FN/VF|VG/FN|GD/VG|FR/GD"
-    r"|FVF|VF/NM|Gem|CGC"
+    r"|FVF|VF/NM|Gem"
     r"|[0-9]{1,2}\.[0-9]"
 )
 
@@ -81,6 +91,12 @@ VARIANT_TITLE_KEYWORDS = [
 
 GRADE_SPECIFICS_KEYS = {"Grade", "CGC Grade", "CBCS Grade", "Condition"}
 GRADE_SPECIFICS_KEYS_LOWER = frozenset(k.lower() for k in GRADE_SPECIFICS_KEYS)
+
+# BUI-923: item specifics that name the certifier/cert number for a slab
+# listing. Distinct from GRADE_SPECIFICS_KEYS above (which names the *grade*
+# field) — a listing can carry either set independently of the other.
+CERTIFICATION_SPECIFICS_KEYS = {"Certification", "Professional Grader", "Certification Number"}
+CERTIFICATION_SPECIFICS_KEYS_LOWER = frozenset(k.lower() for k in CERTIFICATION_SPECIFICS_KEYS)
 
 _GENERIC_EBAY_CONDITIONS = frozenset({"Brand New", "Like New", "New", "Very Good", "Good", "Acceptable"})
 
@@ -623,6 +639,103 @@ def extract_grade(item_specifics, title, description=None):
     return None, "missing", None
 
 
+class CertificationResult:
+    """Result of extract_certification() — a slab's certifier, numeric grade,
+    cert number, label, and page quality, or all-None when the listing isn't
+    certified. `title_bare_mention` is True when the title names a certifier
+    (e.g. "CGC") without it being adjacent to a grade — the ambiguous "CGC
+    ready, would grade 9.6" case (BUI-923) — so parse_item knows to suppress
+    a legacy raw-title grade fallback rather than trust a stray nearby
+    number.
+    """
+
+    __slots__ = (
+        "certifier", "grade", "cert_number", "label", "page_quality",
+        "mismatch_note", "title_bare_mention",
+    )
+
+    def __init__(
+        self, certifier=None, grade=None, cert_number=None, label=None,
+        page_quality=None, mismatch_note=None, title_bare_mention=False,
+    ):
+        self.certifier = certifier
+        self.grade = grade
+        self.cert_number = cert_number
+        self.label = label
+        self.page_quality = page_quality
+        self.mismatch_note = mismatch_note
+        self.title_bare_mention = title_bare_mention
+
+
+def extract_certification(item_specifics, title):
+    """Resolve certifier, numeric grade, cert number, label, and page
+    quality for a certified (slab) listing (BUI-923).
+
+    Precedence is item specifics, then title (plan U1 KTD "Item specifics
+    win over title"). A specifics-vs-title grade disagreement keeps the
+    specifics value and records a mismatch note. Only a recognized
+    certifier value counts — "Uncertified"/"None"/"Not Graded"/"Raw"/blank
+    specifics values, and a title mentioning a certifier name with no grade
+    adjacent to it, both come back with certifier=None (see
+    CertificationResult.title_bare_mention for the latter).
+    """
+    specifics_certifier = None
+    cert_number = None
+    specifics_grade_raw = None
+    for spec in item_specifics:
+        name = spec.get("name", "").strip().lower()
+        if name not in CERTIFICATION_SPECIFICS_KEYS_LOWER and name not in GRADE_SPECIFICS_KEYS_LOWER:
+            continue
+        if name == "certification number":
+            if cert_number is None and spec.get("value"):
+                cert_number = spec.get("value")
+        elif name in CERTIFICATION_SPECIFICS_KEYS_LOWER:  # "certification" / "professional grader"
+            if specifics_certifier is None:
+                specifics_certifier = grade_tokens.resolve_certifier_from_specifics_value(spec.get("value"))
+        elif name in GRADE_SPECIFICS_KEYS_LOWER:
+            if specifics_grade_raw is None and spec.get("value"):
+                specifics_grade_raw = str(spec.get("value"))
+
+    specifics_grade = None
+    if specifics_certifier and specifics_grade_raw:
+        m = grade_tokens._NUMERIC_GRADE_RE.search(specifics_grade_raw)
+        if m:
+            specifics_grade = float(m.group(1))
+
+    title_certifier, title_grade, title_bare_mention = grade_tokens.extract_title_certification(title)
+
+    if specifics_certifier:
+        certifier = specifics_certifier
+        # A structured Certification/Professional Grader value can be
+        # present without a parseable numeric Grade specifics field
+        # alongside it; the title's adjacency-matched grade is still a
+        # legitimate source for the number in that case. No mismatch is
+        # recorded when specifics_grade is None — there's nothing to
+        # disagree with.
+        grade = specifics_grade if specifics_grade is not None else title_grade
+        mismatch_note = None
+        if title_grade is not None and specifics_grade is not None and title_grade != specifics_grade:
+            mismatch_note = f"grade mismatch: item specifics {specifics_grade} vs title {title_grade}"
+    elif title_certifier:
+        # cert_number is left as whatever the specifics loop already found —
+        # a Certification Number can be present even when the Certification/
+        # Professional Grader value itself didn't resolve, so the title
+        # supplying the certifier shouldn't discard real specifics data.
+        certifier, grade, mismatch_note = title_certifier, title_grade, None
+    else:
+        return CertificationResult(title_bare_mention=title_bare_mention)
+
+    label_text = f"{title} {specifics_grade_raw or ''}"
+    label = grade_tokens.resolve_label(label_text) or "universal"
+    page_quality = grade_tokens.resolve_page_quality(label_text) or "unknown"
+
+    return CertificationResult(
+        certifier=certifier, grade=grade, cert_number=cert_number, label=label,
+        page_quality=page_quality, mismatch_note=mismatch_note,
+        title_bare_mention=title_bare_mention,
+    )
+
+
 def extract_variant(item_specifics, title):
     """Extract variant from item specifics or title."""
     # Check item specifics
@@ -702,6 +815,23 @@ def parse_item(data):
     grade, grade_source, grade_from_description = extract_grade(
         item_specifics_raw, title, description_snippet,
     )
+    certification = extract_certification(item_specifics_raw, title)
+    if certification.certifier:
+        # BUI-923: item specifics win over title, and a slab's grade is
+        # numeric, never the raw "CGC"/"NM-"-style string extract_grade
+        # returns for a raw book.
+        grade = certification.grade
+        grade_source = "certified"
+    elif grade_source == "title" and certification.title_bare_mention:
+        # The title names a certifier (e.g. "CGC ready, would grade 9.6")
+        # without it sitting next to a grade — raw with no stated grade, not
+        # a self-reported number (BUI-923 outcome text). Only suppresses a
+        # TITLE-sourced legacy grade; a genuine item-specifics Grade field
+        # is untouched even when Certification/Professional Grader resolves
+        # to absent on the same listing.
+        grade = None
+        grade_source = "missing"
+        grade_from_description = None
     variant = extract_variant(item_specifics_raw, title)
 
     # eBay's generic condition labels (e.g. "Brand New", "Like New") are
@@ -733,6 +863,13 @@ def parse_item(data):
         "grade": grade,
         "grade_source": grade_source,
         "grade_from_description": grade_from_description,
+        # BUI-923: blank (None) on a raw listing — only ever populated when
+        # grade_source == "certified".
+        "certifier": certification.certifier,
+        "cert_number": certification.cert_number,
+        "label": certification.label,
+        "page_quality": certification.page_quality,
+        "grade_mismatch_note": certification.mismatch_note,
         "variant": variant,
         # BUI-316: a per-issue cover year to forward to /comic:collection-check,
         # but ONLY when the title's parenthesized year and item-specifics
@@ -1258,9 +1395,38 @@ def print_table(items, fields=None):
 IDENTIFY_COLUMNS = (
     "#", "Comic", "Issue", "Year", "Grade", "Variant", "Type",
     "Current Price", "Bids", "Seller", "Ends", "Notes",
+    # BUI-923: appended at the end, not inserted after Grade, so every
+    # existing positional cells[N] assertion in test_ebay_fetch.py stays
+    # valid \u2014 only test_clean_auction_row's full-row literal needed updating.
+    "Cert", "PQ",
 )
 _DASH = "\u2014"
 _WARN = "\u26a0\ufe0f"
+
+# BUI-923: identify-table display strings for the new certifier/label/
+# page-quality vocab. Deliberately terser than the raw token values (e.g.
+# "SS" not "signature_series") to keep the markdown table narrow; "universal"
+# and "unknown" render as nothing \u2014 a slab with no non-default label/page
+# quality just shows the certifier name alone / a blank PQ cell.
+_CERTIFIER_DISPLAY = {"cgc": "CGC", "cbcs": "CBCS", "other": "Other"}
+_LABEL_DISPLAY = {
+    "signature_series": "SS", "qualified": "Q", "restored": "R", "conserved": "C", "other": "Other",
+}
+_PAGE_QUALITY_DISPLAY = {
+    "white": "White", "ow_w": "OW/W", "ow": "OW", "c_ow": "C/OW", "cream": "Cream",
+}
+
+
+def _cert_cell(certifier, label):
+    """The Cert column: certifier plus label, e.g. "CGC SS"; blank for a raw
+    (uncertified) listing; just the certifier name when the label is the
+    "universal" default."""
+    if not certifier:
+        return None
+    parts = [_CERTIFIER_DISPLAY.get(certifier, certifier.upper())]
+    if label and label != "universal":
+        parts.append(_LABEL_DISPLAY.get(label, label))
+    return " ".join(parts)
 
 
 def parse_utc_timestamp(text):
@@ -1354,6 +1520,9 @@ def identify_row(index, item, now):
         grade_cell = None
         notes.append(f"{_WARN} Grade not stated")
 
+    if item.get("grade_mismatch_note"):
+        notes.append(item["grade_mismatch_note"])
+
     listing_type = item.get("listing_type")
     if listing_type == "BIN":
         notes.append(f"{_WARN} Buy It Now")
@@ -1366,11 +1535,13 @@ def identify_row(index, item, now):
 
     item_id = item.get("item_id")
     link = f"[{index}](https://www.ebay.com/itm/{item_id})"
+    cert_cell = _cert_cell(item.get("certifier"), item.get("label"))
+    pq_cell = _PAGE_QUALITY_DISPLAY.get(item.get("page_quality"))
     cells = [
         link, _cell(series), _cell(issue), _cell(item.get("cover_year")),
         _cell(grade_cell), _cell(item.get("variant")), _cell(listing_type),
         _cell(item.get("current_price")), bids_cell, _cell(item.get("seller")),
-        _cell(ends), _cell("; ".join(notes)),
+        _cell(ends), _cell("; ".join(notes)), _cell(cert_cell), _cell(pq_cell),
     ]
     return "| " + " | ".join(cells) + " |"
 
