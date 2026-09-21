@@ -1975,13 +1975,13 @@ class TestGradedPageQuality:
 
 
 class TestGradedPageQualityLadderFallback:
-    """BUI-939: page-quality scoping must not starve the ladder tier.
+    """BUI-939/937: page-quality scoping cannot starve the ladder tier.
 
     The exact tier's "prefer same-quality comps" rule (`TestGradedPageQuality`
     above) is a DIFFERENT rule from this one. That rule decides which pool
-    the EXACT bucket is read from; this one decides which pool the LADDER's
-    neighbour rungs are read from, and only once the exact tier has already
-    said no on the scoped pool.
+    the EXACT bucket is read from; this one says which pool the LADDER's
+    neighbour rungs are read from — since BUI-937, always the whole same-label
+    pool, so there is no rung count left to get wrong.
     """
 
     def test_real_invincible_1_94_white_case_widens_and_prices(self):
@@ -2052,31 +2052,40 @@ class TestGradedPageQualityLadderFallback:
         assert out["pool_n"] == 2
         assert out["fmv_low"] >= 3000
 
-    def test_scoped_pool_at_exactly_min_rungs_is_not_widened(self):
-        """Exactly `GRADED_LADDER_MIN_RUNGS` (3) anchor-eligible rungs in the
-        scoped pool is enough — the fallback triggers on FEWER than that,
-        not on the boundary itself."""
+    def test_a_scoped_ladder_row_reads_every_quality_not_just_enough_rungs(self):
+        """BUI-937 replaced BUI-939's rung count: the ladder reads the whole
+        same-label pool even when the SCOPED pool had rungs to spare.
+
+        The scoped pool here has exactly `GRADED_LADDER_MIN_RUNGS` (3) white
+        rungs — 9.0/9.6/9.8 — so the old conditional widen would have left it
+        alone and bracketed the 9.4 target across the 9.0-to-9.6 gap. A cream
+        9.2 sale sits inside that gap, and reading it TIGHTENS the bracket,
+        which is the whole argument for never scoping the ladder: a nearer rung
+        is better evidence than a same-quality one two grades away.
+        """
         white = [_slab_comp(500, 9.0, age=1, page_quality="white",
                             product_id="w1"),
-                 _slab_comp(900, 9.2, age=2, page_quality="white",
-                            product_id="w2"),
                  _slab_comp(4200, 9.6, age=3, page_quality="white",
-                            product_id="w3"),
+                            product_id="w2"),
                  _slab_comp(5000, 9.8, age=4, page_quality="white",
-                            product_id="w4")]
-        # A decoy rung of a different quality the widen must NOT need to
-        # reach for — if it leaked in, the bracket would come from 9.6/9.9-ish
-        # neighbours built from a mixed pool instead of the pure-white one.
-        other = [_slab_comp(50000, 9.4, age=5, page_quality="cream",
+                            product_id="w3")]
+        other = [_slab_comp(900, 9.2, age=5, page_quality="cream",
                             product_id="c1")]
+
+        scoped_only = _graded(white, 9.4, page_quality="white")
+        assert scoped_only["graded_ladder"]["grade_below"] == 9.0
+
         out = _graded(white + other, 9.4, page_quality="white")
         assert out["flag_reason"] is None
         assert out["pricing_basis"] == "ladder"
-        assert out["page_quality_fallback"] is False
-        assert out["page_quality_fallback_reason"] is None
+        assert out["page_quality_fallback"] is True
+        assert out["page_quality_fallback_reason"] == "ladder_starved"
         assert out["pool_n"] == 4
-        assert out["graded_ladder"]["grade_below"] == 9.2
+        assert out["graded_ladder"]["grade_below"] == 9.2  # the cream rung
         assert out["graded_ladder"]["grade_above"] == 9.6
+        # And the tighter bracket happens to lower the cap here — stated so a
+        # regression that silently restores the 9.0 anchor is visible as money.
+        assert out["max_bid"] < scoped_only["max_bid"]
 
     def test_still_refuses_when_the_full_pool_is_also_starved(self):
         """Widening can't invent rungs that don't exist: if the WHOLE pool
@@ -2125,6 +2134,176 @@ class TestGradedPageQualityLadderFallback:
         assert out["page_quality_fallback_reason"] == "ladder_starved"
         assert out["graded_ladder"]["grade_below"] == 9.2
         assert out["graded_ladder"]["grade_above"] == 9.6
+
+
+class TestGradedExactTierIsNotReRunAfterAWiden:
+    """BUI-943: a widened pool's exact-grade sales do not reopen the tier.
+
+    The pool here is a white 9.4 target over white 9.2/9.6/9.8 rungs plus TWO
+    full-weight cream 9.4 sales — enough effective n at the exact grade to
+    clear the exact tier's gate, if the gate were ever asked a second time on
+    the wider pool. It is not: the gate reads the page-quality-scoped bucket,
+    once.
+    """
+
+    _WHITE_RUNGS = [_slab_comp(610, 9.2, age=3, page_quality="white",
+                               product_id="w1"),
+                    _slab_comp(4200, 9.6, age=7, page_quality="white",
+                               product_id="w2"),
+                    _slab_comp(5000, 9.8, age=6, page_quality="white",
+                               product_id="w3")]
+    _CREAM_EXACTS = [_slab_comp(3400, 9.4, age=9, page_quality="cream",
+                                product_id="c1"),
+                     _slab_comp(3600, 9.4, age=12, page_quality="cream",
+                                product_id="c2")]
+
+    def test_two_exact_sales_of_another_quality_still_price_by_ladder(self):
+        out = _graded(self._WHITE_RUNGS + self._CREAM_EXACTS, 9.4,
+                      page_quality="white")
+        assert out["pricing_basis"] == "ladder"
+        assert out["confidence"] == "LOW"
+        assert out["bid_factor"] == 0.60
+        assert out["page_quality_fallback"] is True
+        assert out["page_quality_fallback_reason"] == "ladder_starved"
+        # The two cream sales are dropped with the rest of the target rung and
+        # the white 9.2/9.6 neighbours interpolate across the gap.
+        assert out["graded_ladder"]["grade_below"] == 9.2
+        assert out["graded_ladder"]["grade_above"] == 9.6
+        assert out["fmv_high"] == 2400
+        assert out["max_bid"] == 1450
+
+    def test_the_dropped_exact_sales_are_still_reported_as_evidence(self):
+        """`exact_effective_n` reads 2.0 on a `basis=ladder` row on purpose —
+        it is the widened pool's evidence, printed by `_build_notes` as
+        "recorded, NOT used as the price", and never an input to the tier."""
+        out = _graded(self._WHITE_RUNGS + self._CREAM_EXACTS, 9.4,
+                      page_quality="white")
+        assert out["exact_effective_n"] == 2.0
+        assert out["exact_sales"] == [3400.0, 3600.0]
+        assert [d["price"] for d in out["exact_sales_detail"]] == [3400.0, 3600.0]
+
+    def test_re_running_the_gate_would_have_raised_the_cap_not_the_band(self):
+        """Why the ladder wins the decision, measured rather than asserted.
+
+        Reading the same pool with NO page-quality reading is exactly what
+        re-running the gate on the widened pool would do — the same bucket, the
+        same envelope clamp. It lands on the identical $2,400 band and differs
+        only in the haircut, 0.80 against the ladder's 0.60. Equal evidence,
+        higher cap, paid for with the comps the preference declined.
+        """
+        pool = self._WHITE_RUNGS + self._CREAM_EXACTS
+        ladder_row = _graded(pool, 9.4, page_quality="white")
+        exact_rerun = _graded(pool, 9.4, page_quality=None)
+        assert exact_rerun["pricing_basis"] == "direct"
+        assert exact_rerun["fmv_high"] == ladder_row["fmv_high"] == 2400
+        assert exact_rerun["bid_factor"] == 0.80
+        assert exact_rerun["max_bid"] == 1925
+        assert ladder_row["max_bid"] < exact_rerun["max_bid"]
+
+
+class TestGradedPageQualityScopesTheExactBucketOnly:
+    """BUI-937: the scoped pool is the exact BAND; the envelope is the market.
+
+    Before this, a scoped pool whose only rung was the exact bucket left the
+    thin-bucket band with no envelope to bound it — the gap BUI-930's own code
+    comment named and BUI-179's dispersion guard was left holding alone. The
+    clamp now reads every same-label comp, so the bound exists whenever the
+    market has rungs either side of the target.
+    """
+
+    # Two white 9.6 sales in close agreement; the only other rungs in the pool
+    # are a cream 9.4 and a cream 9.8, which imply ~$1,200 at 9.6.
+    _WHITE_PAIR = [_slab_comp(5000, 9.6, age=3, page_quality="white",
+                              product_id="w1"),
+                   _slab_comp(5200, 9.6, age=6, page_quality="white",
+                              product_id="w2")]
+    _CREAM_RUNGS = [_slab_comp(1000, 9.4, age=9, page_quality="cream",
+                               product_id="c1"),
+                    _slab_comp(1400, 9.8, age=12, page_quality="cream",
+                               product_id="c2")]
+
+    def test_white_pair_is_clamped_by_the_unscoped_neighbour_rungs(self):
+        """The ticket's case: the band prices from the two WHITE sales, and the
+        cap is bounded by rungs the scoped pool does not contain."""
+        out = _graded(self._WHITE_PAIR + self._CREAM_RUNGS, 9.6,
+                      page_quality="white")
+        assert out["pricing_basis"] == "direct"
+        # Scoping was honoured — the band is the white pair's, not a widen.
+        assert out["page_quality_fallback"] is False
+        assert out["pool_n"] == 2
+        assert out["exact_sales"] == [5000.0, 5200.0]
+        # ... and the unscoped rungs bounded it.
+        assert out["envelope_clamped"] is True
+        assert out["fmv_low"] == out["median"] == out["fmv_high"] == 1200
+        assert out["max_bid"] == 950
+        assert sorted(out["graded_ladder"]["ladder"]) == [9.4, 9.6, 9.8]
+
+    def test_the_same_pair_is_unclamped_when_the_market_has_no_other_rung(self):
+        """The control: with nothing either side of 9.6 there is no envelope,
+        so the pair prices itself — proof the clamp above came from the comps
+        scoping had excluded and not from some new haircut."""
+        out = _graded(self._WHITE_PAIR, 9.6, page_quality="white")
+        assert out["envelope_clamped"] is False
+        assert out["fmv_high"] == 5150
+        assert out["max_bid"] == 4125
+
+    def test_a_fat_other_quality_target_rung_does_not_disable_the_clamp(self):
+        """The clamp's thin-bucket trigger reads the SCOPED bucket's effective
+        n, not the whole pool's at that grade.
+
+        Four cream 9.6 sales put the unscoped 9.6 rung past
+        `OUTLIER_ROBUST_BUCKET_N`, which would wave the two-sale white band
+        through unbounded if the trigger read the wider count. The band being
+        bounded is the white pair's, so the count that decides whether it needs
+        bounding is the white pair's too.
+        """
+        fat = [_slab_comp(900 + i, 9.6, age=10 + i, page_quality="cream",
+                          product_id=f"f{i}") for i in range(4)]
+        out = _graded(self._WHITE_PAIR + fat + self._CREAM_RUNGS, 9.6,
+                      page_quality="white")
+        assert out["exact_effective_n"] == 2.0  # the white pair, not 6.0
+        assert out["envelope_clamped"] is True
+        assert out["fmv_high"] == 1200
+
+    def test_a_divergent_scoped_pair_with_no_envelope_still_refuses(self):
+        """BUI-930's dispersion guard is not regressed: at the TOP of the
+        ladder there is still no envelope, and two sales five times apart are
+        still not one market."""
+        white = [_slab_comp(1000, 9.8, age=3, page_quality="white",
+                            product_id="w1"),
+                 _slab_comp(5000, 9.8, age=6, page_quality="white",
+                            product_id="w2")]
+        below = [_slab_comp(2000, 9.6, age=9, page_quality="cream",
+                            product_id="c1"),
+                 _slab_comp(1500, 9.4, age=12, page_quality="cream",
+                            product_id="c2")]
+        out = _graded(white + below, 9.8, page_quality="white")
+        assert out["flag_reason"] == "too_sparse"
+        assert out["max_bid"] is None
+
+    def test_a_divergent_scoped_pair_is_clamped_rather_than_refused(self):
+        """The deliberate trade this change makes, stated as a test.
+
+        The same divergent pair one rung lower IS bracketed by the whole pool,
+        so the envelope binds and the book prices instead of refusing — which
+        is what the guard's own comment always said it was for ("applied where
+        BUI-349's cannot reach"). The cap that results is the neighbours'
+        envelope, well under either sale, so nothing rises: the dispersion
+        guard stands down only when something stricter has taken over.
+        """
+        white = [_slab_comp(1000, 9.6, age=3, page_quality="white",
+                            product_id="w1"),
+                 _slab_comp(5000, 9.6, age=6, page_quality="white",
+                            product_id="w2")]
+        around = [_slab_comp(900, 9.4, age=9, page_quality="cream",
+                             product_id="c1"),
+                  _slab_comp(1500, 9.8, age=12, page_quality="cream",
+                             product_id="c2")]
+        out = _graded(white + around, 9.6, page_quality="white")
+        assert out["flag_reason"] is None
+        assert out["envelope_clamped"] is True
+        assert out["fmv_high"] == 1200
+        assert out["max_bid"] == 950
 
 
 class TestGradedRefusalShape:

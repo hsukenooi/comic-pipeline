@@ -225,7 +225,13 @@ GRADED_CASES = [
             (4000, 9.8, 8)]), 9.4, None),
 
     # Page quality: two same-quality comps are enough to scope the pool to
-    # them; one is not, and the fallback is recorded.
+    # them; one is not, and the fallback is recorded. BUI-937 moved the first
+    # row's money: the band is still the two white sales ($3,000/$3,200), but
+    # the clamp now reads the rungs scoping excluded (a $900 9.2 and a $1,500
+    # 9.6), whose envelope bounds 9.4 at $1,200 — so the cap fell from $2,525
+    # to $950. That is the point of the change, not a side effect: before it,
+    # a scoped pool one rung wide had no envelope at all and a two-sale bucket
+    # set a four-figure cap on nothing but its own two listings.
     ("page_quality_prefers_two_matching",
      _slab([(3000, 9.4, 5, "white"), (3200, 9.4, 6, "white"),
             (1000, 9.4, 7, "ow_w"), (1100, 9.4, 8, "ow_w"),
