@@ -3305,7 +3305,13 @@ def calibration_report(
 
     Returns one dict per (comic, grade) that clears either admit path above,
     each with:
-      - `comic_id`, `title`, `issue`, `year`, `grade`, `fmv_high`
+      - `comic_id`, `title`, `issue`, `year`, `grade`, `certifier`, `label`,
+        `fmv_high` — `certifier`/`label` (BUI-935) are the row's price
+        identity beyond grade (BUI-924/925): the grouping key is still `f.id`
+        (unchanged — a report row can never straddle two markets), but once a
+        slab row exists two rows can share one `grade` with nothing else in
+        the payload to tell them apart, so both ride along read-only, exactly
+        as stored on the linked `fmv` row.
       - `loss_count`, `above_fmv_loss_count`, `above_fmv_loss_rate` (0-100,
         the % of losses where `winning_bid > fmv_high`; `above_fmv_loss_rate`
         is `None` when `loss_count` is 0)
@@ -3342,6 +3348,8 @@ def calibration_report(
                c.issue AS issue,
                c.year AS year,
                f.grade AS grade,
+               f.certifier AS certifier,
+               f.label AS label,
                f.high AS fmv_high,
                b.winning_bid AS winning_bid,
                {_EFFECTIVE_STATUS_SQL} AS status
@@ -3374,6 +3382,8 @@ def calibration_report(
                 "issue": row["issue"],
                 "year": row["year"],
                 "grade": row["grade"],
+                "certifier": row["certifier"],
+                "label": row["label"],
                 "fmv_high": fmv_high,
                 "_losses": [],
                 "_wins": [],

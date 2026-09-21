@@ -507,6 +507,30 @@ def test_get_comps_by_title_issue_year(api):
     assert len(r.json()) == 1
 
 
+def test_get_comps_carries_certifier_and_label(api):
+    """BUI-935: `get_comps` reads `SELECT * FROM comps`, and `comps` has
+    carried `certifier`/`label` columns since BUI-924 — pin that a raw comp
+    reports the raw sentinel ('none'/'universal') and a slab comp reports its
+    actual certifier/label, rather than assuming `SELECT *` still covers
+    every column after a future column-list refactor."""
+    comic_id = _create_comic(api)
+    api.post("/api/comics/comps", json={
+        "comic_id": comic_id,
+        "comps": [
+            _comp(product_id="raw1", pool="raw"),
+            _comp(product_id="slab1", pool="slab", certifier="cgc",
+                  label="signature_series"),
+        ],
+    })
+    r = api.get("/api/comics/comps", params={"comic_id": comic_id})
+    assert r.status_code == 200
+    rows = {row["product_id"]: row for row in r.json()}
+    assert rows["raw1"]["certifier"] == "none"
+    assert rows["raw1"]["label"] == "universal"
+    assert rows["slab1"]["certifier"] == "cgc"
+    assert rows["slab1"]["label"] == "signature_series"
+
+
 def test_get_comps_unresolvable_comic_id_400s(api):
     r = api.get("/api/comics/comps", params={"comic_id": 999999})
     assert r.status_code == 400

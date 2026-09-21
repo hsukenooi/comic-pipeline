@@ -2418,8 +2418,16 @@ def test_comics_snipes_and_history_expose_the_same_fmv_field_set(api):
 
 
 def _create_comic_and_fmv(api, *, title, issue, year, grade, locg_id=None,
-                          locg_variant_id=None, fmv_low=None, fmv_high=None):
-    """POST /api/comics to create a comic+fmv row, return (comic_id, fmv_id)."""
+                          locg_variant_id=None, fmv_low=None, fmv_high=None,
+                          certifier=None, label=None):
+    """POST /api/comics to create a comic+fmv row, return (comic_id, fmv_id).
+
+    `certifier`/`label` (BUI-935, optional) let a caller create a second,
+    slab-market `fmv` row for the SAME (title, issue, year) identity — the
+    comic row is reused (upsert_comic dedupes on identity), while `upsert_fmv`
+    keys on (comic_id, grade, certifier, label), so two calls at the same
+    `grade` with different certifiers yield two distinct fmv rows.
+    """
     body = {"title": title, "issue": issue, "year": year, "grade": grade}
     if locg_id is not None:
         body["locg_id"] = locg_id
@@ -2429,6 +2437,10 @@ def _create_comic_and_fmv(api, *, title, issue, year, grade, locg_id=None,
         body["fmv_low"] = fmv_low
     if fmv_high is not None:
         body["fmv_high"] = fmv_high
+    if certifier is not None:
+        body["certifier"] = certifier
+    if label is not None:
+        body["label"] = label
     row = api.post("/api/comics", json=body).json()
     return row["comic_id"], row["fmv_id"]
 
@@ -3158,6 +3170,44 @@ def test_calibration_report_fields_match_skill_doc(api):
         f"calibration_report() actually returns {actual_fields} — a field "
         "was renamed/added/removed on one side without the other"
     )
+
+
+def test_calibration_report_carries_certifier_and_label(api):
+    """BUI-935: once a slab `fmv` row exists, `grade` alone no longer names a
+    row uniquely — a raw and a slab row at the SAME (comic, grade) are
+    otherwise indistinguishable in the payload. `certifier`/`label` must ride
+    along on every admitted row, sourced from the linked `fmv` row (never
+    inferred), so a raw row reports the raw sentinel ('none'/'universal')
+    and a slab row reports its actual certifier/label."""
+    db_path = os.environ["DB_PATH"]
+    _, raw_fmv_id = _create_comic_and_fmv(
+        api, title="Fantastic Four", issue="1", year=1961, grade=9.6,
+        fmv_high=100.0,
+    )
+    _, slab_fmv_id = _create_comic_and_fmv(
+        api, title="Fantastic Four", issue="1", year=1961, grade=9.6,
+        fmv_high=1000.0, certifier="cgc", label="signature_series",
+    )
+    assert raw_fmv_id != slab_fmv_id  # same comic+grade, two distinct markets
+
+    # Two above-fmv losses each clears the default min_losses=2 admit gate.
+    _add_resolved_bid(api, db_path, "400100", raw_fmv_id,
+                       status="LOST", winning_bid=120.0)
+    _add_resolved_bid(api, db_path, "400101", raw_fmv_id,
+                       status="LOST", winning_bid=130.0)
+    _add_resolved_bid(api, db_path, "400102", slab_fmv_id,
+                       status="LOST", winning_bid=1200.0)
+    _add_resolved_bid(api, db_path, "400103", slab_fmv_id,
+                       status="LOST", winning_bid=1300.0)
+
+    report = api.get("/api/comics/calibration").json()
+    assert len(report) == 2
+    raw_row = next(row for row in report if row["fmv_high"] == 100.0)
+    slab_row = next(row for row in report if row["fmv_high"] == 1000.0)
+    assert raw_row["certifier"] == "none"
+    assert raw_row["label"] == "universal"
+    assert slab_row["certifier"] == "cgc"
+    assert slab_row["label"] == "signature_series"
 
 
 def test_calibration_inherits_purge_durability(api):
