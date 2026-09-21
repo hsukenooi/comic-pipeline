@@ -1407,6 +1407,9 @@ def _make_win(
     current_bid: float = 42.00,
     end_date_iso: str = "2026-05-20T15:00:00Z",
     edition: str | None = None,
+    grade: float | None = None,
+    certifier: str | None = None,
+    cert_number: str | None = None,
 ) -> dict[str, Any]:
     identify_data: dict[str, Any] = {
         "series": series,
@@ -1420,12 +1423,22 @@ def _make_win(
     # pre-BUI-426 payload shape unchanged.
     if edition is not None:
         identify_data["edition"] = edition
-    return {
+    win: dict[str, Any] = {
         "item_id": item_id,
         "current_bid": current_bid,
         "end_date_iso": end_date_iso,
         "identify_data": identify_data,
     }
+    # BUI-927 (U5): the certified identity, top-level on the win (mirrors
+    # record_win_prep._build_win_entry's shape). Omitted by default so every
+    # existing caller of this helper keeps exercising the raw-win path.
+    if grade is not None:
+        win["grade"] = grade
+    if certifier is not None:
+        win["certifier"] = certifier
+    if cert_number is not None:
+        win["cert_number"] = cert_number
+    return win
 
 
 def _null_metron():
@@ -1509,6 +1522,130 @@ def test_record_win_series_from_index(tmp_path):
     # The index-resolved series_name is preserved (not overwritten by Metron).
     assert row["release_date"] == "1988-01-01"
     assert row["metron_id"] is None
+
+
+def test_record_win_certified_cgc_writes_slabbed_row(tmp_path):
+    """BUI-927 (U5): a certified win (grade 7.0, certifier cgc) records as
+    slabbed, with the grade formatted as an exact VALID_GRADES string and the
+    grading company mapped from the certifier."""
+    from locg.commands import cmd_collection_record_win
+    from locg.collection_cache import CollectionCache
+
+    cache = make_cache(tmp_path)
+    _seed_cache(cache, [{
+        **_agent_win_row(series="Amazing Spider-Man (1963 - 1998)", full_title="Amazing Spider-Man #1"),
+        "source": "locg_export",
+    }])
+    from locg.collection_cache import rebuild_series_name_index
+    def rebuild(payload):
+        payload["series_name_index"] = rebuild_series_name_index(payload)
+    cache.apply(rebuild, command="test-rebuild")
+
+    metron = _null_metron()
+    result = cmd_collection_record_win(
+        [_make_win(
+            series="Amazing Spider-Man (1963 - 1998)", issue="300",
+            grade=7.0, certifier="cgc", cert_number="4172733006",
+        )],
+        cache=cache,
+        metron=metron,
+    )
+
+    assert result["rows_written"] == 1
+    row = cache.load()["comics"][-1]
+    assert row["slabbing"] == 1
+    assert row["grading"] == "7.0"
+    assert row["grading_company"] == "CGC"
+
+
+def test_record_win_certified_grade_nine_serializes_with_trailing_zero(tmp_path):
+    """Grade 9.0 must serialize as "9.0", never "9" — LOCG's bulk-import form
+    matches Grading by exact VALID_GRADES string."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    _seed_cache(cache, [{
+        **_agent_win_row(series="Amazing Spider-Man (1963 - 1998)", full_title="Amazing Spider-Man #1"),
+        "source": "locg_export",
+    }])
+    from locg.collection_cache import rebuild_series_name_index
+    def rebuild(payload):
+        payload["series_name_index"] = rebuild_series_name_index(payload)
+    cache.apply(rebuild, command="test-rebuild")
+
+    metron = _null_metron()
+    cmd_collection_record_win(
+        [_make_win(
+            series="Amazing Spider-Man (1963 - 1998)", issue="301",
+            grade=9.0, certifier="cgc", cert_number="4172733007",
+        )],
+        cache=cache,
+        metron=metron,
+    )
+
+    row = cache.load()["comics"][-1]
+    assert row["grading"] == "9.0"
+
+
+def test_record_win_certifier_other_slabs_with_blank_company(tmp_path):
+    """certifier 'other' (a real third-party certifier LOCG's form has no
+    dedicated column for) still slabs and grades the book — only the
+    company stays blank, since there's no LOCG vocabulary word for it."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    _seed_cache(cache, [{
+        **_agent_win_row(series="Amazing Spider-Man (1963 - 1998)", full_title="Amazing Spider-Man #1"),
+        "source": "locg_export",
+    }])
+    from locg.collection_cache import rebuild_series_name_index
+    def rebuild(payload):
+        payload["series_name_index"] = rebuild_series_name_index(payload)
+    cache.apply(rebuild, command="test-rebuild")
+
+    metron = _null_metron()
+    cmd_collection_record_win(
+        [_make_win(
+            series="Amazing Spider-Man (1963 - 1998)", issue="302",
+            grade=8.5, certifier="other", cert_number="XYZ123",
+        )],
+        cache=cache,
+        metron=metron,
+    )
+
+    row = cache.load()["comics"][-1]
+    assert row["slabbing"] == 1
+    assert row["grading"] == "8.5"
+    assert row["grading_company"] is None
+
+
+def test_record_win_raw_win_writes_identical_defaults(tmp_path):
+    """A raw win (no certifier at all — the shape every win had before
+    BUI-927) writes slabbing 0 and blank grading/grading_company, identical
+    to today."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    _seed_cache(cache, [{
+        **_agent_win_row(series="Amazing Spider-Man (1963 - 1998)", full_title="Amazing Spider-Man #1"),
+        "source": "locg_export",
+    }])
+    from locg.collection_cache import rebuild_series_name_index
+    def rebuild(payload):
+        payload["series_name_index"] = rebuild_series_name_index(payload)
+    cache.apply(rebuild, command="test-rebuild")
+
+    metron = _null_metron()
+    cmd_collection_record_win(
+        [_make_win(series="Amazing Spider-Man (1963 - 1998)", issue="303")],
+        cache=cache,
+        metron=metron,
+    )
+
+    row = cache.load()["comics"][-1]
+    assert row["slabbing"] == 0
+    assert row["grading"] is None
+    assert row["grading_company"] is None
 
 
 def _seed_index_for(cache, series: str, full_title: str):

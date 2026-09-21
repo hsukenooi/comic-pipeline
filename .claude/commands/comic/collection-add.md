@@ -113,7 +113,10 @@ in Step 1's `wins` shape (reuse `item_id`/`current_bid`/`end_date_iso` from
 the `needs_review` row, add the user-supplied `identify_data`) and write the
 full list to `<scratch-dir>/resolved_reviews.json` as `{"wins": [...]}`.
 **Always write the file, even if empty** (`{"wins": []}`) — Step 3 expects
-it to exist.
+it to exist. **If the `needs_review` row also carries `grade`/`certifier`/
+`cert_number` (BUI-927), reuse those on the resolved entry too** — a
+certified win that needed manual series/issue resolution still records as
+slabbed, not raw, once resolved.
 
 ## Step 3: Record + mark-seen + status (one call, BUI-428)
 

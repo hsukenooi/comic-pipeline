@@ -28,8 +28,9 @@ from record_win_prep import (
 
 
 def _snipe(item_id, title="Test Comic #1", status="WON", time_to_end="ENDED",
-           current_bid="10.00 USD", end_date_iso="2026-05-24T18:14:48+00:00"):
-    return {
+           current_bid="10.00 USD", end_date_iso="2026-05-24T18:14:48+00:00",
+           grade=None, certifier=None, cert_number=None):
+    snipe = {
         "item_id": item_id,
         "title": title,
         "status": status,
@@ -37,6 +38,17 @@ def _snipe(item_id, title="Test Comic #1", status="WON", time_to_end="ENDED",
         "current_bid": current_bid,
         "end_date_iso": end_date_iso,
     }
+    # BUI-927 (U5): optional certified identity, mirroring the real
+    # /api/snipes row shape (server/main.py's _serialize_snipe_row) — omitted
+    # by default so every pre-existing call site keeps exercising the raw-win
+    # shape unchanged.
+    if grade is not None:
+        snipe["grade"] = grade
+    if certifier is not None:
+        snipe["certifier"] = certifier
+    if cert_number is not None:
+        snipe["cert_number"] = cert_number
+    return snipe
 
 
 def _identity(series="Ghost Rider", issue="1", year=1973, is_lot=False,
@@ -318,6 +330,56 @@ def test_entries_for_win_clean_parse():
             "variant_text": "Newsstand",
         },
     }]
+
+
+def test_entries_for_win_certified_win_carries_grade_certifier_cert_number():
+    """BUI-927 (U5): a certified bid row's grade/certifier/cert_number ride
+    along on the built win entry, top-level (not nested in identify_data —
+    they describe the physical book, not the series/issue match)."""
+    win = _snipe("1", grade=7.0, certifier="cgc", cert_number="4172733006")
+    identity = _identity(series="Ghost Rider", issue="1", variant_text="Newsstand")
+    entries, review = entries_for_win(win, identity)
+    assert review is None
+    assert entries == [{
+        "item_id": "1",
+        "current_bid": "10.00 USD",
+        "end_date_iso": "2026-05-24T18:14:48+00:00",
+        "identify_data": {
+            "series": "Ghost Rider",
+            "issue": "1",
+            "year": 1973,
+            "variant_text": "Newsstand",
+        },
+        "grade": 7.0,
+        "certifier": "cgc",
+        "cert_number": "4172733006",
+    }]
+
+
+def test_entries_for_win_raw_win_omits_certified_fields():
+    """A raw win (certifier absent, matching a real bids row's stored
+    default before this ticket ever ran) builds byte-identical to before
+    BUI-927 — no certifier/grade/cert_number keys leak onto the entry."""
+    win = _snipe("1", certifier="none")
+    identity = _identity(series="Ghost Rider", issue="1", variant_text="Newsstand")
+    entries, review = entries_for_win(win, identity)
+    assert review is None
+    assert "certifier" not in entries[0]
+    assert "grade" not in entries[0]
+    assert "cert_number" not in entries[0]
+
+
+def test_entries_for_win_needs_review_carries_certified_identity():
+    """The needs_review path (BUI-354) also surfaces the certified identity
+    so a human resolving it in /comic:collection-add Step 2 can carry it
+    forward into the resolved entry."""
+    win = _snipe("1", grade=9.0, certifier="cbcs", cert_number="C1")
+    identity = _identity(series=None, issue="1")
+    entries, review = entries_for_win(win, identity)
+    assert entries == []
+    assert review["grade"] == 9.0
+    assert review["certifier"] == "cbcs"
+    assert review["cert_number"] == "C1"
 
 
 def test_entries_for_win_omits_empty_variant_text():

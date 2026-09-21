@@ -2534,6 +2534,16 @@ def _serialize_snipe_row(item: dict) -> dict:
         # the dashboards render these rows as "removal pending", not as
         # ordinary live snipes with a working remove button.
         "removal_pending": item.get("removal_requested_at") is not None,
+        # BUI-927 (U5): the certified identity captured at add time (BUI-926).
+        # record_win_prep.py's _build_win_entry reads these straight off this
+        # row shape (it fetches from /api/snipes, this function's other
+        # caller) so a slab win records into the collection as slabbed
+        # instead of silently dropping back to raw. `certifier` is never NULL
+        # on the row (NOT NULL DEFAULT 'none'); `grade`/`cert_number` stay
+        # null for a raw bid.
+        "grade": item.get("grade"),
+        "certifier": item.get("certifier"),
+        "cert_number": item.get("cert_number"),
     }
 
 

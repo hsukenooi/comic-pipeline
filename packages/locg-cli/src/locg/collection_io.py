@@ -2928,9 +2928,14 @@ def _row_to_csv_dict(row: dict[str, Any], in_wish_list: bool = False) -> dict[st
         "Owner": "",
         "Purchase Store": "eBay",
         "Signature": 0,
-        "Slabbing": 0,
-        "Grading": "",
-        "Grading Company": "",
+        # BUI-927 (U5): emit the row's own values instead of the constants
+        # this always wrote — a raw row's `slabbing`/`grading`/
+        # `grading_company` are 0/None/None (set by _build_win_row), which
+        # blank exactly like the old literals, so a raw row's CSV output is
+        # unchanged.
+        "Slabbing": row.get("slabbing") or 0,
+        "Grading": row.get("grading") or "",
+        "Grading Company": row.get("grading_company") or "",
     }
 
 
