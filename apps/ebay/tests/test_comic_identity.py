@@ -6,6 +6,7 @@ genuinely new title→identity extraction logic.
 """
 
 import comic_identity as ci
+import comic_identity_year as ciy  # BUI-942: _title_cover_date_years is not re-exported
 import seller_scan
 
 
@@ -866,3 +867,264 @@ class TestConfidentCoverYear:
             )
             == 1963
         )
+
+
+# ─── confident_cover_year(certified=True) — the BUI-942 slab relaxation ─────
+# The premise in BUI-942 ("the slab path skips the year reader") was wrong:
+# there is no slab-specific bypass. confident_cover_year is ONE shared strict
+# gate, and it fails more often on slabs because a slab title spends its paren
+# budget on the cert ("CGC 8.0 (OW/W)") and writes the year bare, or writes a
+# "3/66" cover date, or — spike listing 298687063023 — carries no Publication
+# Year aspect at all. Six of the eight 2026-09-19 spike slabs state a year in
+# the title; only two of those six yielded one before this change.
+#
+# The relaxation is certified-only and keeps the invariant that made BUI-316
+# safe: a WRONG year is worse than a blank one (it false-negatives the ownership
+# check → duplicate buy), so the year RETURNED is still the item-specifics
+# Publication Year wherever one exists, with the title year only corroborating.
+# The single exception — a stand-alone "3/66" cover date — is per-issue by
+# construction and so cannot be the BUI-129 volume-start-year category error.
+
+# The eight spike titles, verbatim (apps/ebay has no cached fetch fixture for
+# them; these strings and their Publication Year aspects are the offline record.
+# Item ids are in the BUI-942 ticket / the cgc-slab-spike memory note).
+_SPIKE_SLABS = [
+    # (item_id, title, Publication Year aspect or None, expected cover_year)
+    (
+        "137753816595",
+        "Batman #227 (1970) CGC 4.5 VG+ DC Comics Bronze Age Neal Adams",
+        "1970",
+        1970,  # paren year — already worked under BUI-316
+    ),
+    (
+        "377507539790",
+        "THE SILVER SURFER #4 CGC 5.5 MARVEL THOR LOKI APPEARANCE RARE HIGH DEMAND ISSUE",
+        "1969",
+        None,  # title states NO year — one signal only, stays year-agnostic
+    ),
+    (
+        "298687063023",
+        "Fantastic Four #48   3/66   1st Appearance of SILVER SURFER & GALACTUS! CGC 7.0",
+        None,  # no Publication Year aspect at all
+        1966,  # stand-alone cover date (FF #48 is March 1966)
+    ),
+    (
+        "198651466110",
+        "Giant-Size X-Men #1 CGC 8.0 OW/W 1st New X-Men 1975 Marvel",
+        "1975",
+        1975,  # bare title year corroborates
+    ),
+    (
+        "407227274461",
+        "DC Batman #227 (1970) CGC 5.5  DC #31 Homage Cover ",
+        "1970",
+        1970,  # paren year — already worked under BUI-316
+    ),
+    (
+        "237073612766",
+        "Amazing Spider-Man #50 CGC AA SS 4.5 OWW 1967 - Signed by Stan Lee - 1st Kingpin",
+        "1967",
+        1967,  # bare title year corroborates (the grade "4.5" is not a year)
+    ),
+    (
+        "336749516844",
+        "Invincible #1 High Grade 1st App. WHITE Pages Kirkman Image Comics 2003 CGC 9.4",
+        "2003",
+        2003,  # bare title year corroborates
+    ),
+    (
+        "407184193219",
+        "Ultimate Fallout #4 CGC 9.8 1st Miles Morales - 1st print - custom label",
+        "2011",
+        None,  # title states NO year — stays year-agnostic
+    ),
+]
+
+
+class TestCertifiedCoverYearRelaxation:
+    def test_every_spike_slab_whose_title_states_a_year_now_yields_one(self):
+        """BUI-942 done-when, pinned offline against the eight spike titles."""
+        got = {}
+        for item_id, title, pub_year, _expected in _SPIKE_SLABS:
+            specifics = {} if pub_year is None else {"Publication Year": pub_year}
+            got[item_id] = ci.confident_cover_year(title, specifics, certified=True)
+        assert got == {item_id: exp for item_id, _t, _p, exp in _SPIKE_SLABS}
+        # Six of eight, and the two blanks are exactly the two titles that state
+        # no year anywhere — not a gate failure.
+        assert sum(1 for v in got.values() if v is not None) == 6
+
+    def test_bare_title_year_corroborates_only_for_a_slab(self):
+        # Same listing with the certified flag off → unchanged BUI-316
+        # behavior. The raw path is deliberately untouched by this ticket.
+        title = "Giant-Size X-Men #1 CGC 8.0 OW/W 1st New X-Men 1975 Marvel"
+        assert ci.confident_cover_year(title, {"Publication Year": "1975"}) is None
+        assert (
+            ci.confident_cover_year(title, {"Publication Year": "1975"}, certified=True)
+            == 1975
+        )
+
+    def test_bare_volume_start_year_still_suppresses_the_bui129_trap(self):
+        # THE trap: the title's bare year is the VOLUME start year while the
+        # issue shipped 20 years later. Publication Year carries the truth, the
+        # two disagree → emit nothing rather than the wrong 1963 that would hide
+        # every owned mid-run issue.
+        assert (
+            ci.confident_cover_year(
+                "Amazing Spider-Man 1963 series #238 CGC 9.0",
+                {"Publication Year": "1983"},
+                certified=True,
+            )
+            is None
+        )
+
+    def test_a_bare_year_never_stands_alone(self):
+        # With no Publication Year to corroborate, a bare 4-digit year is
+        # exactly the volume-start-year shape BUI-129 was — never emitted.
+        assert (
+            ci.confident_cover_year(
+                "Amazing Spider-Man 1963 series #238 CGC 9.0", {}, certified=True
+            )
+            is None
+        )
+
+    def test_grading_year_in_title_cannot_become_the_answer(self):
+        # A bare year that is the CERT year, not the cover year: it fails to
+        # corroborate the correct Publication Year, so the result is blank —
+        # never the 2024 that would false-negative the ownership check.
+        assert (
+            ci.confident_cover_year(
+                "Amazing Spider-Man #798 CGC 9.8 graded 2024",
+                {"Publication Year": "2018"},
+                certified=True,
+            )
+            is None
+        )
+        # And when the title states BOTH, the Publication Year is what is
+        # returned — the stray grading year only ever confirms.
+        assert (
+            ci.confident_cover_year(
+                "Amazing Spider-Man #798 2018 CGC 9.8 graded 2024",
+                {"Publication Year": "2018"},
+                certified=True,
+            )
+            == 2018
+        )
+
+    def test_reprint_and_facsimile_still_refuse_when_certified(self):
+        # A slabbed reprint is the same hazard as a raw one: its Publication
+        # Year is the ORIGINAL issue's, so forwarding it would confirm ownership
+        # of a volume the buyer does not hold.
+        assert (
+            ci.confident_cover_year(
+                "Ultimate Fallout #4 CGC 9.8 2nd Printing 2011",
+                {"Publication Year": "2011"},
+                certified=True,
+            )
+            is None
+        )
+        assert (
+            ci.confident_cover_year(
+                "Amazing Spider-Man #1 Facsimile Edition CGC 9.8 1963",
+                {"Publication Year": "1963"},
+                certified=True,
+            )
+            is None
+        )
+        # Same for the stand-alone cover-date path.
+        assert (
+            ci.confident_cover_year(
+                "Fantastic Four #48 3/66 CGC 7.0 Marvel Tales reprint",
+                {},
+                certified=True,
+            )
+            is None
+        )
+
+    def test_cover_date_stands_alone_only_when_certified(self):
+        title = "Fantastic Four #48   3/66   1st Silver Surfer! CGC 7.0"
+        assert ci.confident_cover_year(title, {}) is None
+        assert ci.confident_cover_year(title, {}, certified=True) == 1966
+
+    def test_cover_date_contradicted_by_publication_year_suppresses(self):
+        # Publication Year is authoritative and disagrees by 4 years → blank.
+        assert (
+            ci.confident_cover_year(
+                "Fantastic Four #48 3/66 CGC 7.0",
+                {"Publication Year": "1970"},
+                certified=True,
+            )
+            is None
+        )
+        # Agreeing within ±1 → the Publication Year is what is returned.
+        assert (
+            ci.confident_cover_year(
+                "Fantastic Four #48 3/66 CGC 7.0",
+                {"Publication Year": "1966"},
+                certified=True,
+            )
+            == 1966
+        )
+
+    def test_two_disagreeing_cover_dates_are_ambiguous(self):
+        assert (
+            ci.confident_cover_year(
+                "Big lot: X-Men #1 9/63 and Avengers #4 3/64 CGC", {}, certified=True
+            )
+            is None
+        )
+        # Two mentions of the SAME cover date are not ambiguous.
+        assert (
+            ci.confident_cover_year(
+                "X-Men #1 9/63 cover date 9/63 CGC 9.0", {}, certified=True
+            )
+            == 1963
+        )
+
+    def test_ratio_variant_is_not_read_as_a_cover_date(self):
+        # "1/50" would read as January 1950 and wreck a modern book's ownership
+        # check. Month 1 is excluded precisely because a ratio/incentive variant
+        # always writes numerator 1.
+        for title in (
+            "Spawn #1 CGC 9.8 1/50 retailer incentive",
+            "Something Is Killing The Children #1 CGC 9.8 1/25 variant",
+            "Sketch cover #5/50 CGC 9.6",
+        ):
+            assert ci.confident_cover_year(title, {}, certified=True) is None, title
+
+    def test_score_and_full_date_shapes_are_not_cover_dates(self):
+        # "9/10" (a self-reported score) would read as September 2010; the 30-99
+        # two-digit window drops it. "3/15/66" is a full M/D/YY date — reading
+        # its head as "3/15" would emit 2015.
+        assert (
+            ci.confident_cover_year(
+                "Batman #227 CGC 4.5 condition 9/10 nice", {}, certified=True
+            )
+            is None
+        )
+        assert (
+            ci.confident_cover_year(
+                "Batman #227 CGC 4.5 bought 3/15/66 lot", {}, certified=True
+            )
+            is None
+        )
+
+    def test_grade_digits_are_never_years(self):
+        # The grade-digit false-positive class (a CGC grade read as a number)
+        # cannot reach the year reader: "9.8"/"4.5" are neither 4-digit years
+        # nor month/2-digit-year cover dates.
+        assert ciy._title_cover_date_years("ASM #50 CGC 9.8 SS 4.5 OWW") == []
+        assert (
+            ci.confident_cover_year("ASM #50 CGC 9.8 SS 4.5 OWW", {}, certified=True)
+            is None
+        )
+
+    def test_cover_date_extractor_shapes(self):
+        assert ciy._title_cover_date_years("Fantastic Four #48 3/66") == [1966]
+        assert ciy._title_cover_date_years("Tales of Suspense #39 03/63") == [1963]
+        assert ciy._title_cover_date_years("Amazing Fantasy #15 8/62 CGC") == [1962]
+        assert ciy._title_cover_date_years("Hulk #181 11/74 CGC 9.0") == [1974]
+        assert ciy._title_cover_date_years("Batman #1 12/40 Golden Age") == [1940]
+        # Rejected shapes: month 1, a 20xx-mapped two-digit year, a longer
+        # numeric run on either side, and a "#"-prefixed numbered copy.
+        for title in ("1/66", "3/10", "3/665", "13/66", "9.8/66", "#5/50", "3/66/7"):
+            assert ciy._title_cover_date_years(title) == [], title
