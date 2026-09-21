@@ -15,6 +15,7 @@ import gzip
 import importlib.util
 import json
 import sys
+import urllib.parse
 from pathlib import Path
 
 import pytest
@@ -669,3 +670,237 @@ def test_server_url_must_be_set_rather_than_guessed(tmp_path, server, monkeypatc
     with pytest.raises(SystemExit):
         bf.main(_argv(tmp_path))
     assert server.posts == []
+
+
+# ---------------------------------------------------------------------------
+# BUI-947: --sweep-excluded
+# ---------------------------------------------------------------------------
+#
+# The live residual this mode exists to close, verbatim from BUI-947's own
+# comment: Invincible #1 CGC 9.4 priced $3,650 with `ledger_dropped=4`, but a
+# fifth stored row (comps id 15719, product 366561460527, 9.8 @ $629) stayed
+# in the pool because that listing was not in the day's fetch — so no fetch
+# reported it and BUI-946's merge-time filter could never see it. Its title
+# is a Larry's store variant, which `graded_identity_exclude` drops under
+# `store_variant` (BUI-938). These tests use that exact row.
+
+INVINCIBLE_15719 = {
+    "product_id": "366561460527",
+    "title": "Invincible #1 (Limited Edition) Larry's Wonderful World "
+             "Image Comic 2003 CGC 9.8",
+    "price": 629.0,
+    "grade": 9.8,
+    "sold_date": "2026-08-02",
+    "pool": "slab",
+    "certifier": "cgc",
+    "label": "universal",
+}
+
+INVINCIBLE_CLEAN = {
+    "product_id": "137385453611",
+    "title": "Invincible #1 1st App of Invincible Omni Man 2003 Image "
+             "CGC 9.6 Amazon Kirkman",
+    "price": 4500.0,
+    "grade": 9.6,
+    "sold_date": "2026-07-02",
+    "pool": "slab",
+    "certifier": "cgc",
+    "label": "universal",
+}
+
+
+def test_sweep_verdict_catches_the_bui947_residual_row():
+    """The ticket's first test case. Offline: the guard is a title test, so
+    this needs no server and no provider call."""
+    assert bf.sweep_verdict(
+        sc, title=INVINCIBLE_15719["title"], issue="1",
+        target_is_variant=False, certifier="cgc") == "store_variant"
+
+
+def test_sweep_verdict_keeps_a_legitimate_comp():
+    assert bf.sweep_verdict(
+        sc, title=INVINCIBLE_CLEAN["title"], issue="1",
+        target_is_variant=False, certifier="cgc") is None
+
+
+def test_sweep_verdict_honours_a_variant_target():
+    """BUI-938: when the TARGET is itself a variant the store-variant guard is
+    switched OFF, not inverted. A sweep that ignored that would stamp rows
+    today's live guards would KEEP — the one failure mode this must not have."""
+    assert bf.sweep_verdict(
+        sc, title=INVINCIBLE_15719["title"], issue="1",
+        target_is_variant=True, certifier="cgc") is None
+
+
+def test_sweep_verdict_codes_a_multibook_lot():
+    """`hard_exclude` would also drop this, but a bare bool has no code to
+    stamp — checking the lot guard first is what gives it one."""
+    title = ("Amazing Spider-Man #300 CGC 9.6 & Amazing Spider-Man #301 "
+             "CGC 9.8 Marvel 1988")
+    assert bf.sweep_verdict(
+        sc, title=title, issue="300", target_is_variant=False,
+        certifier="cgc") == "multibook_lot"
+
+
+@pytest.fixture
+def sweep_server(monkeypatch):
+    """A recording stand-in for the comics server's sweep surface."""
+
+    class Server:
+        def __init__(self):
+            self.comics = [
+                {"id": 1025, "title": "Invincible", "issue": "1",
+                 "year": 2003, "variant": None},
+            ]
+            self.comps = {1025: [dict(INVINCIBLE_15719), dict(INVINCIBLE_CLEAN)]}
+            self.posts = []
+            self.fail_posts = False
+
+        def get(self, url, timeout=60.0):
+            path, _, query = url.partition("?")
+            if path.endswith("/health"):
+                return {"status": "ok", "git_sha": "deadbeef"}
+            if path.endswith("/api/comics"):
+                return self.comics
+            if path.endswith("/api/comics/comps"):
+                params = dict(urllib.parse.parse_qsl(query))
+                assert params["pool"] == "slab"
+                # The sweep must never ask for already-stamped rows: they are
+                # what it would otherwise re-stamp on every run.
+                assert params["include_excluded"] == "false"
+                return self.comps.get(int(params["comic_id"]), [])
+            raise AssertionError(f"unexpected GET {url}")
+
+        def post(self, url, payload, timeout=60.0):
+            assert url.endswith("/api/comics/comps/exclude")
+            if self.fail_posts:
+                raise RuntimeError("boom")
+            self.posts.append(payload)
+            return {"comic_id": payload["comic_id"], "code": payload["code"],
+                    "stamped": len(payload["product_ids"]),
+                    "already_stamped": 0, "not_found": []}
+
+    stub = Server()
+    monkeypatch.setattr(bf, "_http_get_json", stub.get)
+    monkeypatch.setattr(bf, "_http_post_json", stub.post)
+    monkeypatch.setenv("COMICS_SERVER_URL", "http://server.invalid")
+    return stub
+
+
+def test_sweep_stamps_the_residual_row_and_leaves_the_clean_one(sweep_server):
+    assert bf.main(["--sweep-excluded"]) == 0
+    assert sweep_server.posts == [{
+        "comic_id": 1025,
+        "product_ids": ["366561460527"],
+        "code": "store_variant",
+    }]
+
+
+def test_sweep_dry_run_writes_nothing(sweep_server, capsys):
+    assert bf.main(["--sweep-excluded", "--dry-run"]) == 0
+    assert sweep_server.posts == []
+    out = capsys.readouterr().out
+    assert "would stamp" in out
+    assert "DRY RUN" in out
+
+
+def test_sweep_reads_no_corpus(sweep_server, tmp_path, capsys):
+    """A different mode, branched before the corpora are read: pointing it at
+    empty cache/capture dirs must not turn it into a no-op import."""
+    assert bf.main(["--sweep-excluded",
+                    "--cache-dir", str(tmp_path / "nope"),
+                    "--capture-dir", str(tmp_path / "nope")]) == 0
+    assert len(sweep_server.posts) == 1
+    assert "corpus:" not in capsys.readouterr().out
+
+
+def test_sweep_skips_a_row_whose_certifier_is_not_cgc_or_cbcs(sweep_server):
+    """The live guards only ever run under `graded_target in (cgc, cbcs)`.
+    Judging a row that never met that condition would apply a rule it was
+    never subject to."""
+    sweep_server.comps[1025] = [dict(INVINCIBLE_15719, certifier="other")]
+    assert bf.main(["--sweep-excluded"]) == 0
+    assert sweep_server.posts == []
+
+
+def test_sweep_honours_a_variant_book(sweep_server):
+    """The comic's own `variant` switches the store-variant guard off, exactly
+    as the live path does — end to end, not just in `sweep_verdict`."""
+    sweep_server.comics[0]["variant"] = "Larry's Wonderful World"
+    assert bf.main(["--sweep-excluded"]) == 0
+    assert sweep_server.posts == []
+
+
+def test_sweep_reports_an_uncoded_hard_exclude_without_stamping_it(
+        sweep_server, capsys):
+    """`hard_exclude` returns a bare bool. There is no honest code to stamp
+    such a row with, so it is reported and left alone."""
+    sweep_server.comps[1025] = [dict(
+        INVINCIBLE_15719,
+        title="Invincible #1 FACSIMILE REPRINT 2003 Image CGC 9.8")]
+    assert bf.main(["--sweep-excluded"]) == 0
+    assert sweep_server.posts == []
+    out = capsys.readouterr().out
+    assert "hard_exclude with no code" in out
+
+
+def test_sweep_groups_one_call_per_code(sweep_server):
+    sweep_server.comps[1025] = [
+        dict(INVINCIBLE_15719),
+        dict(INVINCIBLE_15719, product_id="lot-1",
+             title="Invincible #1 CGC 9.8 & Invincible #2 CGC 9.6 Image 2003"),
+    ]
+    assert bf.main(["--sweep-excluded"]) == 0
+    by_code = {p["code"]: p["product_ids"] for p in sweep_server.posts}
+    assert by_code == {"store_variant": ["366561460527"],
+                       "multibook_lot": ["lot-1"]}
+
+
+def test_sweep_collapses_the_one_row_per_fmv_grade_duplication(sweep_server):
+    """`GET /api/comics` returns one row per (comic, fmv) pair, so a book
+    priced at three grades appears three times. Sweeping it three times would
+    triple every read and post the same stamp repeatedly."""
+    sweep_server.comics = [
+        {"id": 1025, "title": "Invincible", "issue": "1", "year": 2003,
+         "variant": None, "grade": g}
+        for g in (9.4, 9.6, 9.8)
+    ]
+    assert bf.main(["--sweep-excluded"]) == 0
+    assert len(sweep_server.posts) == 1
+
+
+def test_sweep_fails_the_run_on_a_post_failure(sweep_server, capsys):
+    sweep_server.fail_posts = True
+    assert bf.main(["--sweep-excluded"]) == 1
+    assert "PARTIAL SWEEP" in capsys.readouterr().err
+
+
+def test_sweep_aborts_instead_of_erroring_once_per_book(sweep_server, capsys):
+    """A server without BUI-947's endpoint fails EVERY post. Past the same
+    five-in-a-row bar the import path uses, the next attempt is not
+    independent evidence — stop rather than print one error line per book."""
+    sweep_server.comics = [
+        {"id": 1000 + i, "title": "Invincible", "issue": "1", "year": 2003,
+         "variant": None}
+        for i in range(12)
+    ]
+    sweep_server.comps = {1000 + i: [dict(INVINCIBLE_15719)] for i in range(12)}
+    sweep_server.fail_posts = True
+
+    assert bf.main(["--sweep-excluded"]) == 1
+
+    err = capsys.readouterr().err
+    assert "ABORTING after 5 consecutive POST failures" in err
+    assert err.count("POST FAILED") == 5
+
+
+def test_sweep_and_verify_shape_are_refused_together(sweep_server):
+    with pytest.raises(SystemExit):
+        bf.main(["--sweep-excluded", "--verify-shape"])
+
+
+def test_sweep_requires_a_server_url(sweep_server, monkeypatch):
+    monkeypatch.delenv("COMICS_SERVER_URL", raising=False)
+    monkeypatch.delenv("GIXEN_SERVER_URL", raising=False)
+    with pytest.raises(SystemExit):
+        bf.main(["--sweep-excluded"])

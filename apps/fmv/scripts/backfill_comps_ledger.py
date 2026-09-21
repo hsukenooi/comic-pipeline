@@ -30,6 +30,17 @@ Both are optional; either being absent is reported, not fatal.
     ./apps/fmv/scripts/backfill_comps_ledger.py --dry-run        # read-only plan
     ./apps/fmv/scripts/backfill_comps_ledger.py                  # apply
 
+BUI-947 adds a SECOND, unrelated mode to the same file, and it is worth being
+clear that it shares only the plumbing. ``--sweep-excluded`` reads no corpus
+at all: it re-runs the live graded guards over the comps ALREADY IN THE
+LEDGER and stamps the matches excluded. It lives here because the guards are
+already path-loaded here and the server round-trip is already built here —
+see the "sweep the stored slab ledger" section below for what it can and
+cannot replay.
+
+    ./apps/fmv/scripts/backfill_comps_ledger.py --sweep-excluded --dry-run
+    ./apps/fmv/scripts/backfill_comps_ledger.py --sweep-excluded
+
 Sibling of ``fmv_high_calibration.py`` / ``bid_factor_demotion_measurement.py``
 in shape (a one-shot ops script under ``apps/fmv/scripts/``), but unlike those
 two this one WRITES. Run it only under the repo's backup → apply → diff ritual:
@@ -140,6 +151,7 @@ import os
 import re
 import sys
 import types
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -828,6 +840,244 @@ def verify_shape(sc: types.ModuleType, responses: list[RawResponse],
 
 
 # --------------------------------------------------------------------------
+# BUI-947: sweep the stored slab ledger with today's graded guards
+# --------------------------------------------------------------------------
+#
+# The archive half of BUI-946. There, the fetch reports what its guards
+# excluded and the merge honours it — which covers only a listing the live
+# fetch still SEES. Both providers serve a ~90-day sold window, so a stored
+# `pool='slab'` row older than that is never re-fetched, nothing reports it,
+# and it keeps entering the pool at 0.5 weight until it ages past 365 days.
+# Every new guard (BUI-941's autographs next) grows the same tail the day it
+# ships.
+#
+# So this re-runs the guards over the STORED rows instead of a fetch, and
+# posts the matches to `POST /api/comics/comps/exclude` (BUI-947). It imports
+# the guards from the live `sold_comps` module — the same path-load and the
+# same reasoning as the import boundary above: a copy of a rule that changes
+# weekly drifts within days, and a sweep filtered by a stale copy is exactly
+# the "which rules had run?" question the ledger exists to abolish.
+#
+# WHAT IT CANNOT SWEEP, and why each is a deliberate omission rather than an
+# oversight:
+#
+#   * The BUI-929 PRINTING guard. It is not a title test — it fetches each
+#     candidate's eBay item DESCRIPTION over the Browse API and keeps
+#     anything it cannot verify. Replaying it offline is impossible, and
+#     replaying it online would re-bill a second API for the whole archive.
+#     A `printing` stamp still reaches the ledger the ordinary way, from a
+#     live run via `fmv_runner._post_comps_exclusions`.
+#   * `hard_exclude`'s own verdict, when it is not the ampersand lot. It
+#     returns a bare bool with no code, and the exclusion vocabulary is
+#     codes; there is nothing honest to stamp such a row WITH. They are
+#     counted and reported (`uncoded_hard_exclude`) so the gap is visible
+#     rather than implied.
+#   * A slab row whose `certifier` is not cgc/cbcs. The live guards only ever
+#     run under `graded_target in ("cgc", "cbcs")`; running them on a row
+#     that never met that condition would judge it by a rule it was never
+#     subject to. Counted as `skipped_certifier`.
+#
+# Everything here is READ + one narrow POST. It never deletes, and a stamped
+# row is skipped by the read (`include_excluded=false`), so a second sweep
+# over a swept archive posts nothing.
+
+# The guard verdict for a row `hard_exclude` drops for a reason that has no
+# code. Not a member of `COMPS_EXCLUSION_CODES` and never posted — a sentinel
+# for the report only.
+UNCODED_HARD_EXCLUDE = "uncoded_hard_exclude"
+
+# Read every stored slab row per book, not the endpoint's 100-row default: a
+# sweep that silently stopped at 100 would report a clean pass over a pool it
+# never finished reading.
+SWEEP_COMPS_READ_LIMIT = 1000
+
+
+def sweep_verdict(sc: types.ModuleType, *, title: str, issue,
+                  target_is_variant: bool, certifier: str) -> str | None:
+    """Replay the live graded guards over ONE stored slab row's title.
+
+    Returns an exclusion code, `UNCODED_HARD_EXCLUDE`, or None to keep.
+
+    The ORDER is the live order in `fetch_book_comps`, and it is load-bearing
+    in one direction: `hard_exclude` folds the ampersand-lot check in
+    internally, so checking `_multibook_graded_lot` first is what lets a lot
+    be stamped with its own code instead of disappearing into the uncoded
+    bucket. Live, a title `hard_exclude` drops never reaches
+    `graded_identity_exclude` at all, and this reproduces that — so this can
+    only ever report a subset of what the live path would drop, never a
+    superset. That is the safe direction: the failure mode to avoid is
+    stamping a row today's guards would KEEP.
+
+    `certifier` is passed as the live `graded_target`. Both accepted values
+    take the identical branch of `hard_exclude`; what matters is that it is
+    one of them, which the caller has already established.
+    """
+    if not title:
+        return None
+    if sc._multibook_graded_lot(title):
+        return "multibook_lot"
+    if sc.hard_exclude(title, graded_target=certifier):
+        return UNCODED_HARD_EXCLUDE
+    return sc.graded_identity_exclude(
+        title, issue=issue, target_is_variant=target_is_variant)
+
+
+def _sweep_books(comics: list[dict]) -> dict[int, dict]:
+    """`GET /api/comics` returns one row per (comic, fmv) pair, so a book with
+    three priced grades appears three times. Collapse to one entry per id —
+    the identity fields this sweep reads (`issue`, `variant`) are the comic's,
+    identical across those rows."""
+    books: dict[int, dict] = {}
+    for row in comics:
+        comic_id = row.get("id")
+        if comic_id is None:
+            continue
+        books.setdefault(int(comic_id), row)
+    return books
+
+
+def sweep_excluded(sc: types.ModuleType, server_url: str, *,
+                   dry_run: bool = False, limit: int | None = None) -> int:
+    """Re-run the graded guards over every stored, un-stamped slab comp and
+    stamp the matches (BUI-947). Returns a process exit code."""
+    health = _http_get_json(f"{server_url}/health")
+    print(f"server: {server_url} ({health})")
+    books = _sweep_books(_http_get_json(f"{server_url}/api/comics"))
+    book_ids = sorted(books)
+    if limit:
+        book_ids = book_ids[:limit]
+    print(f"sweep: {len(book_ids)} book(s) to examine"
+          f"{' (DRY RUN — nothing will be written)' if dry_run else ''}")
+
+    totals: collections.Counter = collections.Counter()
+    post_failed = 0
+    consecutive_failures = 0
+    aborted = False
+    for comic_id in book_ids:
+        if aborted:
+            break
+        book = books[comic_id]
+        params = urllib.parse.urlencode({
+            "comic_id": comic_id,
+            "pool": "slab",
+            "include_excluded": "false",
+            "limit": SWEEP_COMPS_READ_LIMIT,
+        })
+        rows = _http_get_json(f"{server_url}/api/comics/comps?{params}")
+        if not isinstance(rows, list) or not rows:
+            continue
+        totals["rows_read"] += len(rows)
+        totals["books_with_slab_rows"] += 1
+
+        ids_by_code: dict[str, list[str]] = {}
+        for row in rows:
+            product_id = row.get("product_id")
+            if not product_id:
+                continue
+            certifier = (row.get("certifier") or "").lower()
+            if certifier not in ("cgc", "cbcs"):
+                totals["skipped_certifier"] += 1
+                continue
+            verdict = sweep_verdict(
+                sc,
+                title=row.get("title") or "",
+                issue=book.get("issue"),
+                target_is_variant=bool(book.get("variant")),
+                certifier=certifier,
+            )
+            if verdict is None:
+                totals["kept"] += 1
+                continue
+            if verdict == UNCODED_HARD_EXCLUDE:
+                totals[UNCODED_HARD_EXCLUDE] += 1
+                print(f"  comic {comic_id} {book.get('title')!r} "
+                      f"#{book.get('issue')}: comp {product_id} matches "
+                      f"hard_exclude with no code — NOT stamped: "
+                      f"{row.get('title')!r}")
+                continue
+            totals[f"match_{verdict}"] += 1
+            ids_by_code.setdefault(verdict, []).append(str(product_id))
+
+        for code, product_ids in sorted(ids_by_code.items()):
+            print(f"  comic {comic_id} {book.get('title')!r} "
+                  f"#{book.get('issue')}: "
+                  f"{'would stamp' if dry_run else 'stamping'} "
+                  f"{len(product_ids)} row(s) as {code} "
+                  f"({', '.join(product_ids)})")
+            if dry_run:
+                totals["would_stamp"] += len(product_ids)
+                continue
+            try:
+                result = _http_post_json(
+                    f"{server_url}/api/comics/comps/exclude",
+                    {"comic_id": comic_id, "product_ids": product_ids,
+                     "code": code},
+                )
+            except Exception as exc:  # noqa: BLE001 — one book never aborts the sweep
+                post_failed += 1
+                consecutive_failures += 1
+                print(f"  POST FAILED for comic {comic_id} code={code}: {exc}",
+                      file=sys.stderr)
+                if consecutive_failures >= _ABORT_AFTER_CONSECUTIVE_FAILURES:
+                    # Same bar and same reasoning as the import path above:
+                    # nothing is landing, almost always a server without
+                    # BUI-947's endpoint, and one error line per book buries
+                    # the signal. Re-running is safe — an already-stamped row
+                    # is a no-op.
+                    aborted = True
+                    print(f"  ABORTING after {consecutive_failures} "
+                          "consecutive POST failures — is the server running "
+                          "BUI-947's /api/comics/comps/exclude? Re-running is "
+                          "safe.", file=sys.stderr)
+                    break
+                continue
+            consecutive_failures = 0
+            totals["stamped"] += int(result.get("stamped") or 0)
+            totals["already_stamped"] += int(result.get("already_stamped") or 0)
+            not_found = result.get("not_found") or []
+            if not_found:
+                totals["not_found"] += len(not_found)
+                print(f"  NOT FOUND (no un-stamped slab row for this book): "
+                      f"{', '.join(str(p) for p in not_found)}",
+                      file=sys.stderr)
+
+    print("\n" + "=" * 64)
+    print(f"books examined      : {len(book_ids)} "
+          f"({totals['books_with_slab_rows']} with un-stamped slab comps)")
+    print(f"slab rows read      : {totals['rows_read']}")
+    print(f"  kept              : {totals['kept']}")
+    print(f"  skipped certifier : {totals['skipped_certifier']}  "
+          "(not cgc/cbcs — the live guards never ran on these)")
+    print(f"  uncoded exclude   : {totals[UNCODED_HARD_EXCLUDE]}  "
+          "(hard_exclude with no code to stamp — reported only)")
+    for code in sorted(k[len("match_"):] for k in totals if k.startswith("match_")):
+        print(f"  match {code:<13}: {totals['match_' + code]}")
+    if dry_run:
+        print(f"DRY RUN — would stamp {totals['would_stamp']} row(s); "
+              "nothing was written.")
+        print("=" * 64)
+        return 0
+    print(f"rows stamped        : {totals['stamped']}")
+    print(f"  already stamped   : {totals['already_stamped']}  "
+          "(a re-run lands here — the first stamp's excluded_at is kept)")
+    print(f"  not found         : {totals['not_found']}")
+    print(f"  POST failures     : {post_failed}")
+    print("=" * 64)
+    print("Verify: SELECT excluded_code, COUNT(*) FROM comps "
+          "WHERE excluded_code IS NOT NULL GROUP BY 1;")
+    if aborted:
+        print("ABORTED — nothing was landing. Fix the server and re-run; "
+              "every stamp already written is a no-op the second time.",
+              file=sys.stderr)
+        return 1
+    if post_failed:
+        print("PARTIAL SWEEP — some stamps never landed. Re-running is safe "
+              "(an already-stamped row is a no-op).", file=sys.stderr)
+        return 1
+    return 0
+
+
+# --------------------------------------------------------------------------
 # Driver
 # --------------------------------------------------------------------------
 
@@ -850,15 +1100,41 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--verify-shape", action="store_true",
                         help="replay the corpus through the live "
                              "fetch_book_comps and diff; writes nothing")
+    parser.add_argument("--sweep-excluded", action="store_true",
+                        help="BUI-947: a DIFFERENT MODE — ignore the corpora "
+                             "entirely and instead re-run the live graded "
+                             "guards over the STORED pool='slab' comps, "
+                             "stamping every match via "
+                             "POST /api/comics/comps/exclude. Combine with "
+                             "--dry-run to see what it would stamp.")
     parser.add_argument("--limit", type=int, default=None,
                         help="process at most N responses (per corpus) — for a "
-                             "smoke import before the full run")
+                             "smoke import before the full run. Under "
+                             "--sweep-excluded it caps BOOKS instead, for the "
+                             "same purpose.")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     sc = _load_live_sold_comps()
+
+    # BUI-947: a different mode, branched BEFORE the corpora are read. The
+    # sweep's input is the SERVER's stored ledger, not the on-disk responses,
+    # so reading (and reporting on) a corpus it will not touch would be
+    # misleading noise at best and a wasted several-hundred-file scan at
+    # worst.
+    if args.sweep_excluded:
+        if args.verify_shape:
+            raise SystemExit(
+                "backfill: --sweep-excluded and --verify-shape are different "
+                "modes (one reads the server's ledger, the other replays the "
+                "on-disk corpus) — run them separately."
+            )
+        return sweep_excluded(
+            sc, _resolve_server_url(args.server_url),
+            dry_run=args.dry_run, limit=args.limit,
+        )
 
     cache_dir = Path(args.cache_dir) if args.cache_dir else sc.CACHE_DIR
     capture_dir = Path(args.capture_dir) if args.capture_dir else sc.CAPTURE_DIR
