@@ -1,9 +1,22 @@
 """Pydantic models for comic overlay API endpoints."""
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel, Field, field_validator
 
-from gixen_overlay.db import COMPS_POOLS, COMPS_PROVENANCES, FMV_PROVENANCES
+from gixen_overlay.db import (
+    COMP_PAGE_QUALITIES,
+    COMP_PAGE_QUALITY_UNKNOWN,
+    COMPS_POOLS,
+    COMPS_PROVENANCES,
+    FMV_CERTIFIER_NONE,
+    FMV_CERTIFIERS,
+    FMV_LABEL_UNIVERSAL,
+    FMV_LABELS,
+    FMV_PRICING_BASES,
+    FMV_PROVENANCES,
+)
 
 # Every needs_manual reason `comic-fmv` may post as `fmv_flag_reason` (BUI-593).
 #
@@ -21,7 +34,89 @@ from gixen_overlay.db import COMPS_POOLS, COMPS_PROVENANCES, FMV_PROVENANCES
 #
 # `tests/test_flag_reason_contract.py` is the canary. Anything added to
 # `forced_flag_reason=` in fmv_runner must be added here in the same commit.
-FMV_FLAG_REASONS = ("one_sided", "too_wide", "too_sparse", "variant_dropped")
+#
+# BUI-925 adds ten more, in three groups. The first nine are the graded
+# pricing mode's own refusals (plan U3/U7): a certified book whose LABEL or
+# CERTIFIER puts it outside the priceable market
+# (`label_signature_series`/`label_qualified`/`label_restored`/
+# `label_conserved`/`certifier_other`), one with no slab comps at its
+# certifier at all (`no_certifier_pool`), and the three ladder refusals
+# (`ladder_too_thin`/`ladder_non_monotone`/`outside_ladder`) — a slab is
+# priced off neighbouring grade rungs, so too few rungs, a non-monotone
+# neighbourhood, or a target outside the observed ladder each mean "there is
+# no honest number here", exactly like `too_sparse` does on the raw path.
+# The tenth, `graded_mode_unavailable` (BUI-928), is the interim short-
+# circuit: until the graded mode ships, `comic-fmv` marks every certified row
+# needs_manual with that reason rather than pricing a slab off the raw
+# market. It is accepted here even though today's producer never POSTs it
+# (the row is short-circuited before any upsert) — the whole failure mode
+# this vocabulary guards against is a producer-side reason the validator
+# rejects, and a 422 discards the ENTIRE upsert.
+FMV_FLAG_REASONS = (
+    "one_sided", "too_wide", "too_sparse", "variant_dropped",
+    "label_signature_series", "label_qualified", "label_restored",
+    "label_conserved", "certifier_other", "no_certifier_pool",
+    "ladder_too_thin", "ladder_non_monotone", "outside_ladder",
+    "graded_mode_unavailable",
+)
+
+
+# ---------------------------------------------------------------------------
+# BUI-925: the price identity's certifier/label, shared by every request model
+# that names a grade.
+#
+# `comic_id + grade` stopped being the whole key of an `fmv` row in BUI-924 —
+# `(comic_id, grade, certifier, label)` is. Every model below that names a
+# grade therefore has to name the other two components too, or it addresses
+# "either row" once a slab price sits beside a raw one at the same grade.
+#
+# ABSENT MEANS RAW, never "any". That is the fail-closed direction and it is
+# the entire point: every client that predates the column — and every hand-
+# rolled curl — was written when `fmv` held raw prices only, so a request that
+# does not name a certifier is asking about the raw market whether it knows it
+# or not. Handing one of them a CGC slab's band would set a raw bid cap off a
+# slab market, several times the right number.
+#
+# One helper pair rather than five copied validator bodies: the failure this
+# is protecting is a vocabulary that drifts between the models, so there is
+# exactly one place to change.
+def _coerce_vocabulary(
+    value: Any, vocabulary: tuple[str, ...], default: str, field: str
+) -> str:
+    """Normalize one closed-vocabulary identity field, in `mode="before"`.
+
+    Absent, null and empty all mean the DEFAULT sentinel; anything else must
+    be in the vocabulary. A non-string is rejected as a ValueError (a 422)
+    rather than being allowed to raise `AttributeError` out of `.strip()`,
+    which pydantic would surface as a 500 — a malformed payload must never be
+    a server error on the money path.
+    """
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be one of: " + ", ".join(vocabulary))
+    if value.strip() == "":
+        return default
+    if value not in vocabulary:
+        raise ValueError(f"{field} must be one of: " + ", ".join(vocabulary))
+    return value
+
+
+def _coerce_certifier(v: Any) -> str:
+    """Normalize a request's certifier: absent/empty -> 'none', else validate."""
+    return _coerce_vocabulary(v, FMV_CERTIFIERS, FMV_CERTIFIER_NONE, "certifier")
+
+
+def _coerce_label(v: Any) -> str:
+    """Normalize a request's label: absent/empty -> 'universal', else validate."""
+    return _coerce_vocabulary(v, FMV_LABELS, FMV_LABEL_UNIVERSAL, "label")
+
+
+def _coerce_page_quality(v: Any) -> str:
+    """Normalize a comp's page quality: absent/empty -> 'unknown'."""
+    return _coerce_vocabulary(
+        v, COMP_PAGE_QUALITIES, COMP_PAGE_QUALITY_UNKNOWN, "page_quality"
+    )
 
 
 class UpsertComicRequest(BaseModel):
@@ -59,6 +154,21 @@ class UpsertComicRequest(BaseModel):
     # see CONCEPTS.md). What the closed vocabulary buys over the old prefix is
     # that a mistyped claim now 422s loudly instead of silently failing open.
     fmv_provenance: str | None = None
+    # BUI-925: the other two components of the `fmv` row identity (BUI-924),
+    # UNPREFIXED to match what `GET /api/comics` serves back. Omitted means
+    # the RAW row ('none'/'universal') — see `_coerce_certifier` above for why
+    # absent is a sentinel here and not "any".
+    certifier: str = FMV_CERTIFIER_NONE
+    label: str = FMV_LABEL_UNIVERSAL
+    # BUI-925: how the number was arrived at ('direct' | 'interpolated' |
+    # 'ladder' | 'proxy'). Optional and NOT defaulted here: omitting it means
+    # "derive it", and `upsert_fmv` derives it from the notes tokens on every
+    # upsert (`derive_pricing_basis`), which is what keeps a raw row posted by
+    # an older `comic-fmv` during the server-first deploy window carrying its
+    # haircut. Defaulting it to 'direct' here would instead assert a claim the
+    # caller never made, and 'direct' is precisely the value that means "no
+    # haircut" — the expensive direction.
+    pricing_basis: str | None = None
     locg_id: int | None = None
     locg_variant_id: int | None = None
 
@@ -101,6 +211,32 @@ class UpsertComicRequest(BaseModel):
             )
         return v
 
+    @field_validator("certifier", mode="before")
+    @classmethod
+    def validate_certifier(cls, v: Any) -> str:
+        return _coerce_certifier(v)
+
+    @field_validator("label", mode="before")
+    @classmethod
+    def validate_label(cls, v: Any) -> str:
+        return _coerce_label(v)
+
+    @field_validator("pricing_basis")
+    @classmethod
+    def validate_pricing_basis(cls, v: str | None) -> str | None:
+        # Empty string normalizes to None ("derive it"), mirroring
+        # validate_flag_reason/validate_provenance. Anything else outside the
+        # vocabulary 422s loudly rather than being stored as an unreadable
+        # claim — the same reasoning as fmv_provenance, and here it also
+        # protects a CHECK constraint from an IntegrityError five frames down.
+        if v is not None and v.strip() == "":
+            return None
+        if v is not None and v not in FMV_PRICING_BASES:
+            raise ValueError(
+                "pricing_basis must be one of: " + ", ".join(FMV_PRICING_BASES)
+            )
+        return v
+
 
 class LocgLinkRequest(BaseModel):
     locg_id: int
@@ -120,6 +256,13 @@ class LinkFmvRequest(BaseModel):
     `locg_id`, then `(series, issue, [year])`. `grade` is always required —
     each strategy narrows by grade. At least one of comic_id/locg_id/series
     must be provided.
+
+    BUI-925: every one of those three strategies narrows by
+    `(certifier, label)` too. Without it, a link-fmv for a CBCS 9.8 would
+    happily return the CGC 9.8 row sitting beside it — the bid cap would then
+    come from a different market than the book being bought. Omitted means
+    the raw row; a caller that wants a slab has to name it, and gets a 404
+    (never a neighbouring row) when that exact identity is not priced.
     """
 
     grade: float
@@ -128,14 +271,46 @@ class LinkFmvRequest(BaseModel):
     series: str | None = None
     issue: str | None = None
     year: int | None = None
+    certifier: str = FMV_CERTIFIER_NONE
+    label: str = FMV_LABEL_UNIVERSAL
+
+    @field_validator("certifier", mode="before")
+    @classmethod
+    def validate_certifier(cls, v: Any) -> str:
+        return _coerce_certifier(v)
+
+    @field_validator("label", mode="before")
+    @classmethod
+    def validate_label(cls, v: Any) -> str:
+        return _coerce_label(v)
 
 
 class VerifyItem(BaseModel):
-    """One entry of a working list, as fed to POST /api/comics/verify."""
+    """One entry of a working list, as fed to POST /api/comics/verify.
+
+    BUI-925: `certifier`/`label` make verify key on the FULL price identity.
+    Without them a raw `fmv` row wrongly linked to a CGC bid verifies
+    `fully_linked` — the one verdict that tells the buy flow "this bid's cap
+    is backed by a real price for this book", when it is backed by a price
+    for a different one. Omitted means raw, so an old client's payload
+    behaves exactly as before.
+    """
 
     item_id: str
     grade: float | None = None
     locg_id: int | None = None
+    certifier: str = FMV_CERTIFIER_NONE
+    label: str = FMV_LABEL_UNIVERSAL
+
+    @field_validator("certifier", mode="before")
+    @classmethod
+    def validate_certifier(cls, v: Any) -> str:
+        return _coerce_certifier(v)
+
+    @field_validator("label", mode="before")
+    @classmethod
+    def validate_label(cls, v: Any) -> str:
+        return _coerce_label(v)
 
 
 class VerifyRequest(BaseModel):
@@ -509,6 +684,16 @@ class CompItem(BaseModel):
     from_cache: bool | None = None
     observed_at: str | None = None
     provenance: str
+    # BUI-925: the comp's own price identity. DESCRIPTIVE here, not part of
+    # `idx_comps_identity` (BUI-924: `pool` already separates raw from slab and
+    # a provider's `product_id` is unique within a pool) — what they buy is a
+    # slab pool that can be filtered to one certifier and label, which is what
+    # the graded pricing mode prices off. Each defaults to an explicit
+    # sentinel rather than NULL so "this is a raw copy" and "nobody read the
+    # page quality" are statable facts instead of absences.
+    certifier: str = FMV_CERTIFIER_NONE
+    label: str = FMV_LABEL_UNIVERSAL
+    page_quality: str | None = COMP_PAGE_QUALITY_UNKNOWN
 
     @field_validator("pool")
     @classmethod
@@ -525,6 +710,21 @@ class CompItem(BaseModel):
                 f"provenance must be one of: {', '.join(COMPS_PROVENANCES)}"
             )
         return v
+
+    @field_validator("certifier", mode="before")
+    @classmethod
+    def _validate_certifier(cls, v: Any) -> str:
+        return _coerce_certifier(v)
+
+    @field_validator("label", mode="before")
+    @classmethod
+    def _validate_label(cls, v: Any) -> str:
+        return _coerce_label(v)
+
+    @field_validator("page_quality", mode="before")
+    @classmethod
+    def _validate_page_quality(cls, v: Any) -> str:
+        return _coerce_page_quality(v)
 
 
 class CompsIngestRequest(BaseModel):

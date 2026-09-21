@@ -17,6 +17,9 @@ from unittest.mock import patch
 
 import pytest
 
+from gixen_overlay.db import certifier_from_title
+from gixen_overlay.title_parser import parse_title
+
 _STATIC_DIR = os.path.join(
     os.path.dirname(__file__), "..", "src", "gixen_overlay", "static"
 )
@@ -3850,3 +3853,600 @@ def test_comics_snipes_exposes_removal_pending(api):
     by_id = {s["item_id"]: s for s in snipes}
     assert by_id["716000001"]["removal_pending"] is True
     assert by_id["716000002"]["removal_pending"] is False
+
+
+# ---------------------------------------------------------------------------
+# BUI-925 — every read path carries the full price identity
+# ---------------------------------------------------------------------------
+
+
+def _seed_raw_and_slab(api, *, title="AE5 Comic", issue="1", year=1964,
+                       grade=9.8, raw_high=100.0, slab_high=1000.0,
+                       raw_low=None, slab_low=None):
+    """One comic with a raw band and a CGC band at the SAME grade.
+
+    Returns `(comic_id, raw_fmv_id, slab_fmv_id)`. `raw_low=None` seeds the
+    raw side as an UNPRICED stub, which is how the nastiest shape in this
+    ticket arises: the book a caller asks about has no raw price, and the
+    only priced row on file is a slab's.
+    """
+    raw = api.post("/api/comics", json={
+        "title": title, "issue": issue, "year": year, "grade": grade,
+        "fmv_low": raw_high / 2 if raw_low is None else raw_low,
+        "fmv_high": raw_high,
+    })
+    assert raw.status_code == 200
+    comic_id = raw.json()["comic_id"]
+    slab = api.post("/api/comics", json={
+        "title": title, "issue": issue, "year": year, "grade": grade,
+        "fmv_low": slab_high / 2 if slab_low is None else slab_low,
+        "fmv_high": slab_high, "certifier": "cgc",
+    })
+    assert slab.status_code == 200
+    assert slab.json()["comic_id"] == comic_id, (
+        "a slab price must live on the SAME comics row as the raw copy — "
+        "forking `comics` identity is the shape BUI-579 had to remediate"
+    )
+    return comic_id, raw.json()["fmv_id"], slab.json()["fmv_id"]
+
+
+def test_upsert_comic_certified_row_lands_beside_the_raw_row(api):
+    """`(comic, 9.8, cgc)` is a DIFFERENT row from `(comic, 9.8, none)`."""
+    comic_id, raw_fmv_id, slab_fmv_id = _seed_raw_and_slab(api)
+    assert raw_fmv_id != slab_fmv_id
+
+    raw_rows = api.get("/api/comics", params={"title": "AE5 Comic"}).json()
+    assert [r["fmv_id"] for r in raw_rows] == [raw_fmv_id]
+    assert raw_rows[0]["fmv_high"] == 100.0
+    assert raw_rows[0]["certifier"] == "none"
+    assert raw_rows[0]["label"] == "universal"
+
+    slab_rows = api.get(
+        "/api/comics", params={"title": "AE5 Comic", "certifier": "cgc"}
+    ).json()
+    assert [r["fmv_id"] for r in slab_rows] == [slab_fmv_id]
+    assert slab_rows[0]["fmv_high"] == 1000.0
+    assert slab_rows[0]["certifier"] == "cgc"
+
+
+def test_upsert_comic_response_echoes_certifier_and_label(api):
+    r = api.post("/api/comics", json={
+        "title": "Echo Comic", "issue": "1", "year": 1970, "grade": 9.4,
+        "fmv_low": 50.0, "fmv_high": 90.0, "certifier": "cgc",
+    })
+    assert r.status_code == 200
+    assert r.json()["certifier"] == "cgc"
+    assert r.json()["label"] == "universal"
+
+
+def test_upsert_comic_response_echoes_raw_sentinels_when_omitted(api):
+    """An old client that never heard of the field still gets a defined echo,
+    and it says `none` — which is what its write actually did."""
+    r = api.post("/api/comics", json={
+        "title": "Echo Raw", "issue": "1", "year": 1970, "grade": 9.4,
+        "fmv_low": 50.0, "fmv_high": 90.0,
+    })
+    assert r.status_code == 200
+    assert r.json()["certifier"] == "none"
+    assert r.json()["label"] == "universal"
+
+
+def test_upsert_comic_unknown_certifier_returns_422(api):
+    r = api.post("/api/comics", json={
+        "title": "PSA Comic", "issue": "1", "year": 1970, "grade": 9.4,
+        "fmv_low": 50.0, "fmv_high": 90.0, "certifier": "psa",
+    })
+    assert r.status_code == 422
+    assert not api.get("/api/comics", params={"title": "PSA Comic"}).json(), (
+        "a 422 must discard the WHOLE upsert — no comics row either"
+    )
+
+
+def test_upsert_comic_unknown_label_returns_422(api):
+    r = api.post("/api/comics", json={
+        "title": "Label Comic", "issue": "1", "year": 1970, "grade": 9.4,
+        "certifier": "cgc", "label": "purple",
+    })
+    assert r.status_code == 422
+
+
+@pytest.mark.parametrize("reason", [
+    "ladder_too_thin", "ladder_non_monotone", "outside_ladder",
+    "label_signature_series", "label_qualified", "label_restored",
+    "label_conserved", "certifier_other", "no_certifier_pool",
+    "graded_mode_unavailable",
+])
+def test_upsert_comic_accepts_the_graded_needs_manual_reasons(api, reason):
+    """BUI-593's failure mode, re-armed for the graded reasons: a reason the
+    producer can emit and the validator rejects 422s the ENTIRE upsert, so
+    the book is priced nowhere."""
+    r = api.post("/api/comics", json={
+        "title": f"Flag {reason}", "issue": "1", "year": 1970, "grade": 9.4,
+        "certifier": "cgc", "fmv_flag_reason": reason,
+    })
+    assert r.status_code == 200, r.text
+
+
+def test_list_comics_unknown_certifier_returns_422_not_an_empty_list(api):
+    """An empty list reads as "this book has no price on file" — which is
+    indistinguishable from the truth and sends the caller off to fetch one."""
+    r = api.get("/api/comics", params={"certifier": "CGC"})
+    assert r.status_code == 422
+
+
+def test_list_comics_serves_the_certifier_key_on_every_row(api):
+    """The key's PRESENCE is the graded client's deploy-order probe: an old
+    server drops the query parameter silently, so the only safe gate is
+    whether `certifier` comes back at all (plan KTD "Deploy-order guard")."""
+    api.post("/api/comics", json={
+        "title": "Probe Comic", "issue": "1", "year": 1970, "grade": 9.4,
+        "fmv_low": 10.0, "fmv_high": 20.0,
+    })
+    rows = api.get("/api/comics", params={"title": "Probe Comic"}).json()
+    assert rows and all(
+        "certifier" in r and "label" in r and "pricing_basis" in r
+        for r in rows
+    )
+
+
+def test_link_fmv_404s_on_the_wrong_certifier_never_the_other_row_ae5(api):
+    """AE5: link-fmv for `{comic_id, 9.8, cbcs}` with only a CGC row at 9.8
+    returns 404 — it must never hand back the CGC row's id."""
+    comic_id, _raw, slab_fmv_id = _seed_raw_and_slab(
+        api, title="AE5 CBCS", grade=9.8,
+    )
+    api.post("/api/bids", json={"item_id": "925000001", "max_bid": 500.0})
+    r = api.post("/api/bids/925000001/link-fmv", json={
+        "comic_id": comic_id, "grade": 9.8, "certifier": "cbcs",
+    })
+    assert r.status_code == 404
+    assert "certifier=cbcs" in r.json()["detail"]
+    # And nothing was linked — a 404 that still wrote a junction row would be
+    # the same defect wearing a different status code.
+    raw = sqlite3.connect(os.environ["DB_PATH"])
+    linked = raw.execute(
+        "SELECT COUNT(*) FROM bid_fmvs bf JOIN bids b ON b.id = bf.bid_id "
+        "WHERE b.item_id = '925000001'"
+    ).fetchone()[0]
+    raw.close()
+    assert linked == 0
+    assert slab_fmv_id is not None
+
+
+def test_link_fmv_certified_request_lands_on_the_slab_row(api):
+    comic_id, raw_fmv_id, slab_fmv_id = _seed_raw_and_slab(
+        api, title="Link CGC", grade=9.8,
+    )
+    api.post("/api/bids", json={"item_id": "925000002", "max_bid": 500.0})
+    r = api.post("/api/bids/925000002/link-fmv", json={
+        "comic_id": comic_id, "grade": 9.8, "certifier": "cgc",
+    })
+    assert r.status_code == 200
+    assert r.json()["fmv_id"] == slab_fmv_id != raw_fmv_id
+
+
+def test_link_fmv_without_a_certifier_lands_on_the_raw_row(api):
+    comic_id, raw_fmv_id, slab_fmv_id = _seed_raw_and_slab(
+        api, title="Link Raw", grade=9.8,
+    )
+    api.post("/api/bids", json={"item_id": "925000003", "max_bid": 80.0})
+    r = api.post("/api/bids/925000003/link-fmv", json={
+        "comic_id": comic_id, "grade": 9.8,
+    })
+    assert r.status_code == 200
+    assert r.json()["fmv_id"] == raw_fmv_id != slab_fmv_id
+
+
+def test_link_fmv_by_series_issue_is_certifier_scoped_too(api):
+    """The title strategies are the fallback that keeps link-fmv working when
+    `locg_id` was never populated — so they carry the identity as well."""
+    _comic_id, raw_fmv_id, slab_fmv_id = _seed_raw_and_slab(
+        api, title="Link Series", issue="7", year=1975, grade=8.5,
+    )
+    api.post("/api/bids", json={"item_id": "925000004", "max_bid": 500.0})
+    r = api.post("/api/bids/925000004/link-fmv", json={
+        "series": "link series", "issue": "7", "year": 1975, "grade": 8.5,
+        "certifier": "cgc",
+    })
+    assert r.status_code == 200
+    assert r.json()["fmv_id"] == slab_fmv_id != raw_fmv_id
+
+
+def test_extract_comics_raw_title_never_auto_links_to_a_slab_price(api):
+    """The nastiest shape: the raw row is an unpriced stub and the CGC row is
+    priced. A raw-titled bid must link to NOTHING rather than inherit the
+    slab band — this path fires on every bid write, so it is the widest way a
+    bid could acquire a price it was never priced against.
+    """
+    api.post("/api/bids", json={"item_id": "925000010", "max_bid": 40.0})
+    # Priced CGC row, no raw price at all.
+    slab = api.post("/api/comics", json={
+        "title": "Autolink", "issue": "1", "year": 1980,
+        "grade": 9.0, "fmv_low": 500.0, "fmv_high": 900.0, "certifier": "cgc",
+    })
+    assert slab.status_code == 200
+    # Guard the guard: `parse_title` yields the first word as the series, so
+    # the title below must parse to exactly the seeded book. Without this the
+    # test could pass by linking to a different, unpriced comics row and
+    # prove nothing about the certifier filter.
+    assert parse_title("Autolink #1 1980 VF/NM").series == "Autolink"
+
+    raw = sqlite3.connect(os.environ["DB_PATH"])
+    raw.execute(
+        "UPDATE bids SET ebay_title=? WHERE item_id=?",
+        ("Autolink #1 1980 VF/NM", "925000010"),
+    )
+    raw.commit()
+    raw.close()
+
+    assert api.post("/api/extract-comics").status_code == 200
+    row = next(s for s in api.get("/api/comics/snipes").json()
+               if s["item_id"] == "925000010")
+    assert row["cond_grade"] == 9.0, (
+        "the auto-link did not reach the seeded book at all — the test would "
+        "then pass for the wrong reason"
+    )
+    assert row["fmv_high"] is None, (
+        "a raw-titled bid picked up the CGC band — this is the defect"
+    )
+    assert row["certifier"] == "none"
+
+
+def test_extract_comics_cgc_title_links_to_the_cgc_row(api):
+    """The other direction: a `CGC` token in the title puts the auto-link on
+    the certified row, so the dashboard band matches the book."""
+    api.post("/api/bids", json={"item_id": "925000011", "max_bid": 800.0})
+    slab = api.post("/api/comics", json={
+        "title": "Slabtest", "issue": "1", "year": 1980,
+        "grade": 9.0, "fmv_low": 500.0, "fmv_high": 900.0, "certifier": "cgc",
+    })
+    assert slab.status_code == 200
+    assert parse_title("Slabtest #1 1980 CGC 9.0").series == "Slabtest"
+
+    raw = sqlite3.connect(os.environ["DB_PATH"])
+    raw.execute(
+        "UPDATE bids SET ebay_title=? WHERE item_id=?",
+        ("Slabtest #1 1980 CGC 9.0", "925000011"),
+    )
+    raw.commit()
+    raw.close()
+
+    assert api.post("/api/extract-comics").status_code == 200
+    row = next(s for s in api.get("/api/comics/snipes").json()
+               if s["item_id"] == "925000011")
+    assert row["fmv_high"] == 900.0
+    assert row["certifier"] == "cgc"
+
+
+def test_verify_raw_row_linked_to_a_certified_item_is_no_fmv_at_certifier(api):
+    """Without this verdict the row below verifies `fully_linked` — the one
+    verdict that tells the buy flow the cap is backed by a real price for
+    this book, while the number came from the raw market."""
+    comic_id, raw_fmv_id, _slab = _seed_raw_and_slab(
+        api, title="Verify Comic", grade=9.2,
+    )
+    api.post("/api/bids", json={"item_id": "925000020", "max_bid": 800.0})
+    linked = api.post("/api/bids/925000020/link-fmv", json={
+        "comic_id": comic_id, "grade": 9.2,
+    })
+    assert linked.json()["fmv_id"] == raw_fmv_id
+
+    body = api.post("/api/comics/verify", json={"items": [
+        {"item_id": "925000020", "grade": 9.2, "certifier": "cgc"}
+    ]}).json()
+    result = body["results"][0]
+    assert result["verdict"] == "no_fmv_at_certifier"
+    assert result["found_certifier"] == "none"
+    assert "cgc" in result["guidance"] and "none" in result["guidance"]
+    assert body["summary"]["issues"] == 1
+
+
+def test_verify_certified_item_on_its_own_slab_row_is_fully_linked(api):
+    comic_id, _raw, slab_fmv_id = _seed_raw_and_slab(
+        api, title="Verify Slab", grade=9.2,
+    )
+    api.post("/api/bids", json={"item_id": "925000021", "max_bid": 800.0})
+    linked = api.post("/api/bids/925000021/link-fmv", json={
+        "comic_id": comic_id, "grade": 9.2, "certifier": "cgc",
+    })
+    assert linked.json()["fmv_id"] == slab_fmv_id
+
+    result = api.post("/api/comics/verify", json={"items": [
+        {"item_id": "925000021", "grade": 9.2, "certifier": "cgc"}
+    ]}).json()["results"][0]
+    assert result["verdict"] == "fully_linked"
+
+
+def test_verify_legacy_item_with_no_certifier_still_verifies_raw(api):
+    """Backward compatibility: every pre-BUI-924 fmv row is `none`, so a
+    payload that names no certifier verifies exactly as it did before."""
+    comic_id, raw_fmv_id, _slab = _seed_raw_and_slab(
+        api, title="Verify Legacy", grade=9.2,
+    )
+    api.post("/api/bids", json={"item_id": "925000022", "max_bid": 80.0})
+    assert api.post("/api/bids/925000022/link-fmv", json={
+        "comic_id": comic_id, "grade": 9.2,
+    }).json()["fmv_id"] == raw_fmv_id
+    result = api.post("/api/comics/verify", json={"items": [
+        {"item_id": "925000022", "grade": 9.2}
+    ]}).json()["results"][0]
+    assert result["verdict"] == "fully_linked"
+
+
+def test_verify_needs_manual_guidance_names_the_graded_reason(api):
+    """A graded refusal must not be advised "re-run /comic:fmv" or "use the
+    CGC proxy" — neither applies to a slab."""
+    api.post("/api/bids", json={"item_id": "925000023", "max_bid": 800.0})
+    flagged = api.post("/api/comics", json={
+        "title": "Ladder Comic", "issue": "1", "year": 1964, "grade": 9.2,
+        "certifier": "cgc", "fmv_flag_reason": "ladder_too_thin",
+    })
+    comic_id = flagged.json()["comic_id"]
+    api.post("/api/bids/925000023/link-fmv", json={
+        "comic_id": comic_id, "grade": 9.2, "certifier": "cgc",
+    })
+    result = api.post("/api/comics/verify", json={"items": [
+        {"item_id": "925000023", "grade": 9.2, "certifier": "cgc"}
+    ]}).json()["results"][0]
+    assert result["verdict"] == "needs_manual"
+    assert "ladder_too_thin" in result["guidance"]
+    assert "grade rungs" in result["guidance"]
+
+
+def _certified_bid_with_price(api, item_id, *, title, certifier, grade=9.2,
+                              high=1000.0, max_bid=800.0):
+    """A bid linked to an fmv row at `certifier`, with `bids.certifier` set."""
+    api.post("/api/bids", json={"item_id": item_id, "max_bid": max_bid})
+    payload = {
+        "title": title, "issue": "1", "year": 1964, "grade": grade,
+        "fmv_low": high / 2, "fmv_high": high,
+    }
+    if certifier != "none":
+        payload["certifier"] = certifier
+    comic_id = api.post("/api/comics", json=payload).json()["comic_id"]
+    link = {"comic_id": comic_id, "grade": grade}
+    if certifier != "none":
+        link["certifier"] = certifier
+    assert api.post(f"/api/bids/{item_id}/link-fmv", json=link).status_code == 200
+    raw = sqlite3.connect(os.environ["DB_PATH"])
+    raw.execute(
+        "UPDATE bids SET certifier=?, grade=? WHERE item_id=?",
+        (certifier, grade, item_id),
+    )
+    raw.commit()
+    raw.close()
+    return comic_id
+
+
+def test_snipes_and_history_rows_both_carry_the_certifier_in_parity(api):
+    """The BUI-50 parity rule applied to the new fields: a `9.2` on the
+    dashboard means two different prices depending on these, so the grade
+    must never ship without them — on either endpoint."""
+    _certified_bid_with_price(
+        api, "925000030", title="Parity Slab", certifier="cgc",
+    )
+    _certified_bid_with_price(
+        api, "925000031", title="Parity Raw", certifier="none", high=100.0,
+        max_bid=80.0,
+    )
+
+    snipes = {r["item_id"]: r for r in api.get("/api/comics/snipes").json()}
+    assert snipes["925000030"]["certifier"] == "cgc"
+    assert snipes["925000030"]["label"] == "universal"
+    assert snipes["925000031"]["certifier"] == "none"
+
+    # Resolve both so they move into the history window.
+    raw = sqlite3.connect(os.environ["DB_PATH"])
+    raw.execute(
+        "UPDATE bids SET status='WON', winning_bid=50.0, "
+        "auction_end_at=datetime('now','-1 day') "
+        "WHERE item_id IN ('925000030','925000031')"
+    )
+    raw.commit()
+    raw.close()
+
+    history = {r["item_id"]: r for r in api.get("/api/comics/history").json()}
+    assert history["925000030"]["certifier"] == "cgc"
+    assert history["925000030"]["label"] == "universal"
+    assert history["925000031"]["certifier"] == "none"
+    assert set(snipes["925000030"]) == set(history["925000030"]), (
+        "snipes and history rows must stay field-for-field identical — both "
+        "go through _build_comics_row (BUI-50)"
+    )
+
+
+def test_seller_reliability_ignores_a_certified_bid(api):
+    """A certified book carries a third party's grade, not the seller's own
+    claim, so it has no deviation to contribute."""
+    _seed_graded_bid(api, "925000040", "slabseller", 9.0, 8.0)  # +1.0, raw
+    _seed_graded_bid(api, "925000041", "slabseller", 5.0, 9.8)  # would skew
+    raw = sqlite3.connect(os.environ["DB_PATH"])
+    raw.execute(
+        "UPDATE bids SET certifier='cgc' WHERE item_id='925000041'"
+    )
+    raw.commit()
+    raw.close()
+
+    body = api.get(
+        "/api/seller-reliability", params={"seller": "slabseller"}
+    ).json()
+    assert body["sample_size"] == 1
+    assert body["avg_deviation"] == pytest.approx(1.0)
+
+
+def test_seller_reliability_still_counts_a_legacy_bid_with_no_certifier(api):
+    """`certifier` is NOT NULL DEFAULT 'none', so every pre-migration row is
+    inside the new filter rather than silently dropped out of it. Written
+    with an explicit NULL-free legacy-shaped insert to prove the default
+    does the work."""
+    api.post("/api/bids", json={"item_id": "925000042", "max_bid": 50.0})
+    raw = sqlite3.connect(os.environ["DB_PATH"])
+    raw.execute(
+        "UPDATE bids SET seller='legacyseller', seller_grade=9.0, "
+        "photo_grade=7.0 WHERE item_id='925000042'"
+    )
+    stored = raw.execute(
+        "SELECT certifier FROM bids WHERE item_id='925000042'"
+    ).fetchone()[0]
+    raw.commit()
+    raw.close()
+    assert stored == "none"
+
+    body = api.get(
+        "/api/seller-reliability", params={"seller": "legacyseller"}
+    ).json()
+    assert body["sample_size"] == 1
+    assert body["avg_deviation"] == pytest.approx(2.0)
+
+
+def test_first_party_outcomes_exclude_a_certified_win(api):
+    """A CGC 9.2 win at $900 merged into a raw 9.2 book's comp pool would
+    drag its band up by the whole slab premium."""
+    _certified_bid_with_price(
+        api, "925000050", title="Outcome Comic", certifier="none", high=100.0,
+        max_bid=80.0,
+    )
+    # A CGC win on the SAME book at the same grade.
+    api.post("/api/bids", json={"item_id": "925000051", "max_bid": 900.0})
+    slab = api.post("/api/comics", json={
+        "title": "Outcome Comic", "issue": "1", "year": 1964, "grade": 9.2,
+        "fmv_low": 500.0, "fmv_high": 1000.0, "certifier": "cgc",
+    })
+    comic_id = slab.json()["comic_id"]
+    api.post("/api/bids/925000051/link-fmv", json={
+        "comic_id": comic_id, "grade": 9.2, "certifier": "cgc",
+    })
+    raw = sqlite3.connect(os.environ["DB_PATH"])
+    raw.execute(
+        "UPDATE bids SET status='WON', winning_bid=?, certifier=?, "
+        "auction_end_at=datetime('now','-2 days') WHERE item_id=?",
+        (900.0, "cgc", "925000051"),
+    )
+    raw.execute(
+        "UPDATE bids SET status='WON', winning_bid=?, "
+        "auction_end_at=datetime('now','-3 days') WHERE item_id=?",
+        (60.0, "925000050"),
+    )
+    raw.commit()
+    raw.close()
+
+    rows = api.get("/api/comics/outcomes", params={
+        "title": "Outcome Comic", "issue": "1", "grade": 9.2,
+    }).json()
+    assert [r["price"] for r in rows] == [60.0]
+
+    slab_rows = api.get("/api/comics/outcomes", params={
+        "title": "Outcome Comic", "issue": "1", "grade": 9.2,
+        "certifier": "cgc",
+    }).json()
+    assert [r["price"] for r in slab_rows] == [900.0]
+
+
+def test_comps_ingest_carries_certifier_label_and_page_quality(api):
+    r = api.post("/api/comics/comps", json={
+        "comic_id": None,
+        "comps": [{
+            "pool": "slab", "provider": "sold-comps.com", "product_id": "p1",
+            "provenance": "live", "price": 900.0, "grade": 9.2,
+            "certifier": "cgc", "label": "signature_series",
+            "page_quality": "ow_w",
+        }],
+    })
+    assert r.status_code == 200, r.text
+    raw = sqlite3.connect(os.environ["DB_PATH"])
+    raw.row_factory = sqlite3.Row
+    row = raw.execute(
+        "SELECT certifier, label, page_quality FROM comps WHERE product_id='p1'"
+    ).fetchone()
+    raw.close()
+    assert (row["certifier"], row["label"], row["page_quality"]) == (
+        "cgc", "signature_series", "ow_w"
+    )
+
+
+def test_comps_ingest_defaults_to_the_raw_sentinels(api):
+    """An older `comic-fmv` posts none of the three; they must land as
+    statable facts ('none'/'universal'/'unknown'), never NULL."""
+    r = api.post("/api/comics/comps", json={
+        "comic_id": None,
+        "comps": [{
+            "pool": "raw", "provider": "sold-comps.com", "product_id": "p2",
+            "provenance": "live", "price": 40.0,
+        }],
+    })
+    assert r.status_code == 200, r.text
+    raw = sqlite3.connect(os.environ["DB_PATH"])
+    raw.row_factory = sqlite3.Row
+    row = raw.execute(
+        "SELECT certifier, label, page_quality FROM comps WHERE product_id='p2'"
+    ).fetchone()
+    raw.close()
+    assert (row["certifier"], row["label"], row["page_quality"]) == (
+        "none", "universal", "unknown"
+    )
+
+
+def test_comps_ingest_unknown_page_quality_422s_the_whole_batch(api):
+    r = api.post("/api/comics/comps", json={
+        "comic_id": None,
+        "comps": [{
+            "pool": "slab", "provider": "sold-comps.com", "product_id": "p3",
+            "provenance": "live", "page_quality": "off-white-ish",
+        }],
+    })
+    assert r.status_code == 422
+
+
+@pytest.mark.parametrize("bad", [123, True, ["cgc"], {"a": 1}])
+def test_upsert_comic_non_string_certifier_is_a_422_not_a_500(api, bad):
+    """A malformed payload must never be a SERVER error on the money path.
+
+    The coercion runs in `mode="before"`, so it sees the raw JSON value; a
+    naive `.strip()` there would raise AttributeError and surface as a 500,
+    which reads as "the server is broken" rather than "your payload is".
+    """
+    r = api.post("/api/comics", json={
+        "title": "Bad Certifier", "issue": "1", "year": 1970, "grade": 9.4,
+        "certifier": bad,
+    })
+    assert r.status_code == 422
+
+
+def test_upsert_comic_explicit_null_certifier_means_raw(api):
+    """An explicit `null` is not a third state — it is the raw sentinel."""
+    r = api.post("/api/comics", json={
+        "title": "Null Certifier", "issue": "1", "year": 1970, "grade": 9.4,
+        "fmv_low": 10.0, "fmv_high": 20.0,
+        "certifier": None, "label": None,
+    })
+    assert r.status_code == 200
+    assert r.json()["certifier"] == "none"
+    assert r.json()["label"] == "universal"
+
+
+def test_link_fmv_non_string_certifier_is_a_422(api):
+    api.post("/api/bids", json={"item_id": "925000060", "max_bid": 50.0})
+    r = api.post("/api/bids/925000060/link-fmv", json={
+        "comic_id": 1, "grade": 9.0, "certifier": 17,
+    })
+    assert r.status_code == 422
+
+
+def test_certifier_from_title_is_fail_closed_on_a_cgc_ready_listing():
+    """A recorded decision, not an accident (BUI-925).
+
+    "CGC ready" in a raw listing's title makes the auto-link treat the bid as
+    certified, so it links to an unpriced CGC stub instead of the book's real
+    raw band: the dashboard shows NO price. That is the fail-closed direction
+    and it is the trade this path accepts — all it has is `bids.ebay_title`,
+    and the alternative failure (a raw bid inheriting a slab band) is the
+    several-times-wrong one. The item-specifics precedence that tells "CGC
+    9.8" from "CGC ready" lives in `ebay-fetch --identify` (plan U1), which
+    this path never runs.
+    """
+    assert certifier_from_title("ASM #300 CGC ready, would grade 9.6") == "cgc"
+    assert certifier_from_title("ASM #300 VF/NM") == "none"
+    assert certifier_from_title(None) == "none"
+    # Word-bounded: a longer token that merely contains the letters is not a
+    # certifier.
+    assert certifier_from_title("CGCS Comics store lot") == "none"

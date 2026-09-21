@@ -82,7 +82,9 @@ class GixenOverlayPlugin:
         `intent.comic_identities` is `AddBidRequest.comic_identities`,
         threaded through by `api_add_bid` only — `[]` for an edit (PATCH
         never populates it) or an add with no identity, in which case this
-        is a no-op. Each entry is `{comic_id|locg_id, grade}`; resolution
+        is a no-op. Each entry is `{comic_id|locg_id, grade[, certifier,
+        label]}` (BUI-926 added the last two on the add payload, BUI-925
+        threads them through here); resolution
         reuses `/api/bids/{item_id}/link-fmv`'s own strategy
         (`_resolve_fmv_for_link`: comic_id direct lookup, then locg_id
         JOIN — no series/issue fallback, since the add payload never
@@ -97,6 +99,16 @@ class GixenOverlayPlugin:
         replacement semantics (BUI-82: `ON CONFLICT ... DO UPDATE SET
         is_primary = 1`), so hook-link + legacy link converge to one
         junction row instead of duplicating.
+
+        BUI-925: the entry's `certifier`/`label` go into the
+        `LinkFmvRequest` unchanged. They are the rest of the `fmv` row
+        identity, so omitting them here would have this hook link a certified
+        bid to whichever row at that grade SQLite reached first — and this
+        hook is what sets `bids.fmv_id`, the pointer the dashboard band and
+        every later check read. An unrecognized value raises out of
+        `LinkFmvRequest` into the per-identity `except` below and the bid is
+        left unlinked, which is the fail-closed direction: no link at all
+        beats a link to the wrong market.
 
         v1 is advisory-only (KTD1): a resolution or link failure for one
         identity is logged and skipped, never raised — the bid write
@@ -137,7 +149,11 @@ class GixenOverlayPlugin:
                 )
                 continue
             try:
-                req = LinkFmvRequest(grade=grade, comic_id=comic_id, locg_id=locg_id)
+                req = LinkFmvRequest(
+                    grade=grade, comic_id=comic_id, locg_id=locg_id,
+                    certifier=identity.get("certifier"),
+                    label=identity.get("label"),
+                )
                 fmv_row, attempted = _resolve_fmv_for_link(conn, req)
                 if fmv_row is None:
                     logger.info(

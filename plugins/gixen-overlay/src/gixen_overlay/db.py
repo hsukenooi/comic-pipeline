@@ -114,6 +114,34 @@ _CGC_PROXY_NOTE_TOKEN = "CGC proxy"
 # "this is a raw copy", which a slab row is by definition not.
 _COMPS_SLAB_CERTIFIER_RE = re.compile(r"\b(cgc|cbcs)\b", re.IGNORECASE)
 
+
+def certifier_from_title(title: str | None) -> str:
+    r"""BUI-925: the certifier an eBay listing TITLE claims, or 'none'.
+
+    The one place the `\b(cgc|cbcs)\b` token is turned into a price-identity
+    certifier for a *listing*, so the title auto-link (`_link_issue_to_bid`,
+    fired on every bid write) and any later caller cannot drift apart on what
+    counts as a slab title.
+
+    Deliberately NOT the same rule as the `pool='slab'` comps backfill above,
+    which falls back to 'other': there, the row is already known to be a slab,
+    so a title naming neither grader means "some third-party grader". Here
+    nothing is known in advance, and the overwhelming majority of listings are
+    raw — so an unmatched title is 'none', and the auto-link stays on the raw
+    row. That is also the fail-closed direction: the failure this exists to
+    stop is a raw-titled bid auto-linking to a slab price several times its
+    book's value, and 'none' can only ever match a raw row.
+
+    A title token alone never proves certification ("CGC ready", "would grade
+    9.8 CGC"), which is why `ebay-fetch --identify` (U1) prefers the eBay
+    `Certification` item specific. This function is the title-only fallback
+    the auto-link has to live with, because all it ever has is `bids.ebay_title`.
+    """
+    if not title:
+        return FMV_CERTIFIER_NONE
+    m = _COMPS_SLAB_CERTIFIER_RE.search(title)
+    return m.group(1).lower() if m is not None else FMV_CERTIFIER_NONE
+
 # The BUI-533/759 notes-prefix matcher, kept as a FALLBACK for one release
 # (BUI-769) so a row whose `provenance` is NULL because it predates the column
 # is still protected. A deliberate verbatim twin of
@@ -3056,6 +3084,7 @@ def get_first_party_outcomes(
     locg_variant_id: int | None = None,
     window: float = DEFAULT_OUTCOME_GRADE_WINDOW,
     days: float = DEFAULT_OUTCOME_RECENCY_DAYS,
+    certifier: str = FMV_CERTIFIER_NONE,
 ) -> list[sqlite3.Row]:
     """Return the user's own resolved auctions for a (comic, grade) window.
 
@@ -3089,7 +3118,18 @@ def get_first_party_outcomes(
     Recency is judged the same way /api/comics/history judges "when did this
     resolve": `COALESCE(auction_end_at, resolved_at)`, bounded to the last
     `days`.
+
+    `certifier` (BUI-925) scopes the outcomes to ONE market, via the joined
+    `fmv` row — these rows are merged straight into `apps/fmv`'s comp pool, so
+    a CGC 9.2 win at $900 landing in a raw 9.2 book's pool would drag its band
+    up by the whole slab premium. Defaulted (not optional) to the raw sentinel
+    for the same fail-closed reason `list_comics` uses: every caller that
+    exists today was written when `fmv` held raw prices only.
     """
+    if certifier not in FMV_CERTIFIERS:
+        raise ValueError(
+            f"unknown certifier {certifier!r} (expected one of {FMV_CERTIFIERS})"
+        )
     if not locg_id and not (title and issue):
         return []
 
@@ -3110,8 +3150,12 @@ def get_first_party_outcomes(
             clauses.append("c.year = ?")
             params.append(year)
 
-    clauses.append("f.grade BETWEEN ? AND ?")
-    params.extend([grade - window, grade + window])
+    # BUI-925: the grade window and the certifier are ONE clause on purpose —
+    # `tests/test_fmv_query_certifier_contract.py` reads each SQL string on its
+    # own, so keeping them together is what makes "this fmv query is scoped to
+    # one market" checkable here rather than inferred from another line.
+    clauses.append("f.grade BETWEEN ? AND ? AND f.certifier = ?")
+    params.extend([grade - window, grade + window, certifier])
     # BUI-660: admits a live WON/LOST row, or a REMOVED row purge-swept from
     # one (prior_status IN (WON, LOST)) — see _RESOLVED_STATUS_CLAUSE.
     clauses.append(_RESOLVED_STATUS_CLAUSE)

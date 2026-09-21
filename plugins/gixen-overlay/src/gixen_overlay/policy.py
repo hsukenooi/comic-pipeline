@@ -60,6 +60,7 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
+from gixen_overlay.db import FMV_CERTIFIER_NONE, FMV_LABEL_UNIVERSAL
 from gixen_overlay.models import LinkFmvRequest
 from gixen_overlay.routes import _resolve_fmv_for_link
 from server.db import TOMBSTONE_STATUSES_SQL
@@ -181,6 +182,15 @@ def _resolve_post_identities(conn: sqlite3.Connection, identities: list) -> tupl
     non-dict entry, a missing grade/comic_id/locg_id, or a value pydantic's
     `LinkFmvRequest` rejects all degrade to "this entry didn't resolve",
     never a crash.
+
+    BUI-925: an entry's `certifier`/`label` (BUI-926 puts them on the add
+    payload) are carried into the resolver, so `over_fmv` and
+    `recomputed_cap` compare a certified bid against the CERTIFIED band.
+    Absent means raw, and an UNRECOGNIZED value is not silently downgraded to
+    raw — `LinkFmvRequest` rejects it and the entry lands in `attempted`, so
+    the write is advised `unpriced_entry` rather than quietly measured against
+    the wrong market. This is the money path: these two checks are what stand
+    between a typo'd identity and a cap set off a several-times-wrong price.
     """
     if not identities:
         return [], ["no comic identity supplied in the add payload"]
@@ -198,7 +208,10 @@ def _resolve_post_identities(conn: sqlite3.Connection, identities: list) -> tupl
             attempted.append(f"identity missing grade or comic_id/locg_id: {entry!r}")
             continue
         try:
-            req = LinkFmvRequest(grade=grade, comic_id=comic_id, locg_id=locg_id)
+            req = LinkFmvRequest(
+                grade=grade, comic_id=comic_id, locg_id=locg_id,
+                certifier=entry.get("certifier"), label=entry.get("label"),
+            )
         except Exception as exc:  # noqa: BLE001  # untrusted per-entry payload input (pydantic ValidationError or any other bad-shape value) — record it in attempted and keep resolving the rest of the list, never crash the whole write
             attempted.append(f"identity failed validation ({exc.__class__.__name__}): {entry!r}")
             continue
@@ -212,20 +225,36 @@ def _resolve_post_identities(conn: sqlite3.Connection, identities: list) -> tupl
     return resolved, attempted
 
 
-def _resolve_patch_links(conn: sqlite3.Connection, bid_row_id: int | None) -> list[dict]:
-    """PATCH arm: every existing `bid_fmvs` link's fmv row for this bid.
+def _resolve_patch_links(
+    conn: sqlite3.Connection,
+    bid_row_id: int | None,
+    certifier: str = FMV_CERTIFIER_NONE,
+    label: str = FMV_LABEL_UNIVERSAL,
+) -> list[dict]:
+    """PATCH arm: every existing `bid_fmvs` link's fmv row for this bid, at
+    this bid's own price identity.
 
     `bid_row_id` is None for a genuine "no_prior_row" PATCH (an edit against
     an item never ingested locally — a web-added snipe the sync loop hasn't
     picked up yet) — returns `[]`, same as a never-linked bid; both are
     "nothing to compare the bid against" and unpriced_entry (below) is the
     single check that says so.
+
+    BUI-925: a PATCH carries no identity of its own, so the identity comes
+    from the BID ROW (`bids.certifier`, BUI-926); `label` has no column there
+    and stays `'universal'`. Filtering matters because the junction can hold a
+    link the auto-link or an older client wrote against the wrong market: an
+    edit raising the cap on a CGC bid must not be measured against a raw
+    band. A filtered-out link resolves to nothing, which `unpriced_entry`
+    reports honestly — the right failure, and strictly better than an
+    `over_fmv` verdict computed off a price for a different book.
     """
     if bid_row_id is None:
         return []
     rows = conn.execute(
-        "SELECT f.* FROM bid_fmvs bf JOIN fmv f ON f.id = bf.fmv_id WHERE bf.bid_id = ?",
-        (bid_row_id,),
+        "SELECT f.* FROM bid_fmvs bf JOIN fmv f ON f.id = bf.fmv_id "
+        "WHERE bf.bid_id = ? AND f.certifier = ? AND f.label = ?",
+        (bid_row_id, certifier, label),
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -240,13 +269,23 @@ def _resolve_identities(conn: sqlite3.Connection, intent: Any) -> tuple[list[dic
     """
     if intent.trigger == "edit":
         bid_row_id = None
+        certifier = FMV_CERTIFIER_NONE
         prior = getattr(intent, "prior_row", None)
         if prior is not None:
             try:
                 bid_row_id = prior["id"]
             except (KeyError, IndexError, TypeError):
                 bid_row_id = None
-        resolved = _resolve_patch_links(conn, bid_row_id)
+            try:
+                # BUI-925/926. Guarded the same way `id` is: `prior_row` is a
+                # sqlite3.Row from the host, and a pre-BUI-926 row (or a
+                # hand-built stub in a test) has no such column — an IndexError
+                # there must degrade to "raw", which is what every legacy bid
+                # genuinely is, not take the whole check down.
+                certifier = prior["certifier"] or FMV_CERTIFIER_NONE
+            except (KeyError, IndexError, TypeError):
+                certifier = FMV_CERTIFIER_NONE
+        resolved = _resolve_patch_links(conn, bid_row_id, certifier)
         attempted = [] if resolved else ["no existing FMV link for this bid (PATCH arm)"]
         return resolved, attempted
     identities = getattr(intent, "comic_identities", None) or []
@@ -479,9 +518,18 @@ def _check_duplicate_comic(conn: sqlite3.Connection, intent: Any) -> dict | None
             continue
         checked_comic_ids.append(comic_id)
         new_grade = entry.get("grade") if isinstance(entry, dict) else None
+        new_certifier = (
+            (entry.get("certifier") or FMV_CERTIFIER_NONE)
+            if isinstance(entry, dict) else FMV_CERTIFIER_NONE
+        )
+        # BUI-925: `f.certifier` rides along so the message can NAME the two
+        # markets. The check itself stays `comic_id`-keyed on purpose — a
+        # raw copy and a slab of one book are the same collectible, so two
+        # live snipes on them are still two snipes on one book, which is
+        # exactly what this check exists to surface.
         rows = conn.execute(
             f"""
-            SELECT b.item_id, b.snipe_group, f.grade
+            SELECT b.item_id, b.snipe_group, f.grade, f.certifier
             FROM bids b
             JOIN bid_fmvs bf ON bf.bid_id = b.id
             JOIN fmv f ON f.id = bf.fmv_id
@@ -498,9 +546,11 @@ def _check_duplicate_comic(conn: sqlite3.Connection, intent: Any) -> dict | None
             duplicates.append({
                 "comic_id": comic_id,
                 "new_grade": new_grade,
+                "new_certifier": new_certifier,
                 "existing_item_id": row["item_id"],
                 "existing_snipe_group": row["snipe_group"],
                 "existing_grade": row["grade"],
+                "existing_certifier": row["certifier"],
             })
 
     if not checked_comic_ids:
@@ -517,8 +567,10 @@ def _check_duplicate_comic(conn: sqlite3.Connection, intent: Any) -> dict | None
     message = (
         f"This comic already has a live PENDING snipe on item "
         f"{first['existing_item_id']} (group {first['existing_snipe_group']}, "
-        f"grade {first['existing_grade']}) outside this bid's group "
-        f"(new grade {first['new_grade']})."
+        f"grade {first['existing_grade']}, certifier "
+        f"{first['existing_certifier']}) outside this bid's group "
+        f"(new grade {first['new_grade']}, certifier "
+        f"{first['new_certifier']})."
     )
     if len(duplicates) > 1:
         message += f" {len(duplicates) - 1} more duplicate(s) found."
