@@ -135,6 +135,31 @@ class TestCompToLedgerItem:
         item = fmv_runner._comp_to_ledger_item(_make_comp(1200.0, 6.5), pool="slab")
         assert item["pool"] == "slab"
 
+    def test_slab_identity_fields_ride_along(self):
+        """BUI-930: a slab comp's own identity. Without these the ledger
+        stores a `pool='slab'` row whose certifier is unknown, which the
+        graded mode must then DROP when it reads them back — an archive that
+        cannot be used as a pricing input is not the archive this ticket
+        needs."""
+        comp = _make_comp(1200.0, 9.8)
+        comp.update({"certifier": "cgc", "label": "signature_series",
+                     "page_quality": "ow_w"})
+        item = fmv_runner._comp_to_ledger_item(comp, pool="slab")
+        assert item["certifier"] == "cgc"
+        assert item["label"] == "signature_series"
+        assert item["page_quality"] == "ow_w"
+
+    def test_a_raw_comp_sends_the_three_as_none(self):
+        """`CompItem`'s `mode="before"` validators normalize None to the raw
+        sentinels ('none'/'universal'/'unknown'), so the fields can be listed
+        unconditionally instead of per-pool — and a raw comp's ledger row is
+        unchanged in meaning."""
+        item = fmv_runner._comp_to_ledger_item(_make_comp(100.0, 9.0),
+                                               pool="raw")
+        assert item["certifier"] is None
+        assert item["label"] is None
+        assert item["page_quality"] is None
+
     def test_ignores_extraneous_fields_not_in_the_ledger_contract(self):
         """A future field added to the parsed-comp shape upstream must not
         silently ride along into the ledger POST unreviewed (the exact

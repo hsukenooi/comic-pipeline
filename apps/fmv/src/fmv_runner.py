@@ -27,6 +27,7 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TypeGuard
 
 import click
 import requests
@@ -192,6 +193,160 @@ def _fail_mapping(detail: str) -> None:
     sys.exit(1)
 
 
+# ─── Graded (slab) identity + deploy-order probe (BUI-930) ───────────────────
+
+# The raw sentinels. `certifier`/`label` are NOT NULL columns with these
+# defaults server-side (plan KTD "Raw is an explicit sentinel"), so absent,
+# empty and the literal string all mean the same raw market here too.
+_RAW_CERTIFIER = "none"
+_RAW_LABEL = "universal"
+
+# The `source` a certified row carries when the comics server cannot describe
+# a price's certifier. Its own value, like SOURCE_LEDGER_ADVISORY: this book
+# was not priced, not skipped for provenance, and not rejected — it was never
+# looked up at all, because the server this run is talking to predates the
+# column that tells a slab price apart from a raw one.
+SOURCE_SCHEMA_MISMATCH = "skipped_schema_mismatch"
+
+# The certifiers the graded pricing mode can actually price from. `other`
+# (PGX and friends) is a real value in the vocabulary and an unpriceable one:
+# its sales are too few and too idiosyncratic to build a ladder from, and
+# pooling them with CGC's would mix two markets.
+_PRICEABLE_CERTIFIERS = ("cgc", "cbcs")
+
+# A non-universal label puts the book outside the pool its own certifier's
+# universal sales describe — a Signature Series slab trades on the signature,
+# a Restored one against the restoration. Each gets its OWN reason so
+# `/comic:verify`'s guidance can name it. Written as literal dicts rather than
+# a name→name mapping because `test_flag_reason_contract.py` scans this
+# module's SOURCE for `"flag_reason": "<literal>"` and asserts the server's
+# validator accepts every one — a reason that validator rejects 422s and the
+# server discards the WHOLE upsert (the BUI-588 failure mode).
+_GRADED_LABEL_PUNTS: dict[str, dict] = {
+    "signature_series": {"flag_reason": "label_signature_series"},
+    "qualified": {"flag_reason": "label_qualified"},
+    "restored": {"flag_reason": "label_restored"},
+    "conserved": {"flag_reason": "label_conserved"},
+}
+_GRADED_CERTIFIER_PUNT: dict = {"flag_reason": "certifier_other"}
+# `label: other` is in the vocabulary but has no producer today
+# (`grade_tokens.resolve_label` returns one of the four above or None), and it
+# has no reason of its own. It lands on `no_certifier_pool`, which is the
+# literal truth for it: there is no pool of same-label slab sales to price
+# from. The note names the label so the punt is never mistaken for "this book
+# just has no comps".
+_GRADED_UNKNOWN_LABEL_PUNT: dict = {"flag_reason": "no_certifier_pool"}
+
+
+def _identity_token(value: object, default: str) -> str:
+    """Normalize one closed-vocabulary identity field off a batch row.
+
+    Mirrors the server's `_coerce_vocabulary` for the two fields this module
+    reads: absent, None and blank all mean the raw sentinel, and the value is
+    lower-cased because a hand-written batch (or `/comic:identify`'s own
+    output, historically) can carry `"CGC"`. Unrecognized values are passed
+    through rather than corrected — `_graded_punt_reason` decides what to do
+    with them, and silently rewriting an unknown certifier to `none` would
+    route a slab onto the RAW pricing path, which is the one outcome this
+    whole project exists to prevent.
+    """
+    if value is None:
+        return default
+    text = value if isinstance(value, str) else str(value)
+    return text.strip().lower() or default
+
+
+def _book_certifier(book: dict) -> str:
+    return _identity_token(book.get("certifier"), _RAW_CERTIFIER)
+
+
+def _book_label(book: dict) -> str:
+    return _identity_token(book.get("label"), _RAW_LABEL)
+
+
+def _book_page_quality(book: dict) -> str | None:
+    """The target slab's page quality, or None when it was never read.
+
+    `"unknown"` is normalized to None here so every downstream test is a
+    single `if page_quality:` — see `fmv_math._graded_page_quality_filter`
+    for why the absence of a reading must not become a filter.
+    """
+    value = _identity_token(book.get("page_quality"), "unknown")
+    return None if value == "unknown" else value
+
+
+def _is_certified(book: dict) -> bool:
+    """True for a book whose SUBJECT is a slab, i.e. one the graded pricing
+    mode owns. Absent/blank/`none` is the raw path, byte-for-byte unchanged."""
+    return _book_certifier(book) != _RAW_CERTIFIER
+
+
+def _graded_punt_reason(book: dict) -> str | None:
+    """The `fmv_flag_reason` that refuses this certified book BEFORE any
+    provider query, or None when the graded mode can try to price it.
+
+    Returns None for every raw book, so the caller can ask this of the whole
+    batch without first splitting it.
+    """
+    if not _is_certified(book):
+        return None
+    if _book_certifier(book) not in _PRICEABLE_CERTIFIERS:
+        return _GRADED_CERTIFIER_PUNT["flag_reason"]
+    label = _book_label(book)
+    if label == _RAW_LABEL:
+        return None
+    punt = _GRADED_LABEL_PUNTS.get(label)
+    return (punt or _GRADED_UNKNOWN_LABEL_PUNT)["flag_reason"]
+
+
+def _probe_certifier_support(server_url: str, *, grade: float | None = None) -> bool:
+    """One run-level read that decides whether this server can tell a slab
+    price apart from a raw one. THE deploy-order gate (plan R29/KTD
+    "Deploy-order guard is a read-side probe before any write").
+
+    Why a READ and not the write's own response echo: an old comics server
+    drops the unknown `certifier` key (pydantic ignores extras) and upserts on
+    `(comic_id, grade)`, so by the time a response came back without it, the
+    slab's price would already have overwritten the raw row. The echo stays as
+    a SECOND assertion in `_upsert_fmv`; this is the gate.
+
+    The discriminator is the mere PRESENCE of the `certifier` key on a
+    returned row — the same `"variant" in r` pattern BUI-777 established in
+    `_db_lookup_by_identity`, and for the same reason: on a value test, an old
+    server's silence is indistinguishable from a genuine raw `'none'`. Note
+    the key is present even on a comic with no `fmv` row at all (`list_comics`
+    LEFT-JOINs and selects `f.certifier` unconditionally), so a NULL value
+    still proves the column is served.
+
+    Fails CLOSED on anything else — a failed GET, a non-list body, or an EMPTY
+    list. An empty list is genuinely inconclusive (a server with no comics on
+    file cannot demonstrate its own schema), and "don't know" is not "yes" on
+    the one check standing between a slab price and the raw row it would
+    overwrite. The cost of the false refusal is a hand-priced book; the cost
+    of a false pass is a wrong four-figure bid cap on a book we then have to
+    find and repair.
+
+    `grade` narrows the probe to comics holding an `fmv` row at that grade
+    (the first certified book's own grade), which is a few dozen rows instead
+    of the whole table; a miss falls back to the unfiltered read, which is the
+    only query guaranteed to return a row if the table holds any.
+    """
+    for params in ({"grade": grade} if grade is not None else None, {}):
+        if params is None:
+            continue
+        rows = _get_json_or_warn(
+            f"{server_url}/api/comics",
+            params=params,
+            warn=("certifier-support probe failed — every certified row in "
+                  "this batch will be refused"),
+            default=_LOOKUP_FAILED,
+        )
+        if rows is _LOOKUP_FAILED or not isinstance(rows, list) or not rows:
+            continue
+        return all(isinstance(r, dict) and "certifier" in r for r in rows)
+    return False
+
+
 def run(*, batch_path: str | None, out_path: str | None,
         max_age_days: float, force: bool,
         quiet: bool, server_url: str | None,
@@ -227,31 +382,36 @@ def run(*, batch_path: str | None, out_path: str | None,
         _normalize_book_title(book)
         _normalize_book_year(book)
 
-    # 0. BUI-928 (plan U11, R35): punt every CERTIFIED row to needs_manual
-    #    before ANY of the three things below ever see it — the DB-cache split
-    #    (whose no-locg_id path always issues a real hand-priced-provenance
-    #    GET, BUI-775), the comp fetch, and the upsert. A slab priced off the
-    #    raw market at its numeric grade is exactly the bug the whole CGC slab
-    #    project exists to remove, and the graded pricing mode that CAN price
-    #    one (U6/U7) doesn't exist yet. `certifier` absent, None, empty, or the
-    #    literal raw sentinel `"none"` (R21's vocabulary: `none|cgc|cbcs|other`)
-    #    stays on the raw path unchanged; anything else short-circuits here.
-    #    `raw_idx` records, for each surviving book's position in `raw_books`,
-    #    its ORIGINAL position in `books` — every index-keyed bucket
-    #    `_split_by_db_cache` hands back is relative to `raw_books` (its own
-    #    internal `enumerate`), and `_stitch` below walks the ORIGINAL `books`
-    #    list, so those indices are translated back immediately after the call
-    #    rather than threading two index spaces through the rest of `run`.
-    certified_needs_manual: dict[int, dict] = {}
-    raw_books: list[dict] = []
-    raw_idx: list[int] = []
+    # 0. BUI-930 (plan U7, R29): the deploy-order gate. ONE read decides
+    #    whether this comics server can describe a price's certifier at all;
+    #    if it cannot, every CERTIFIED row is refused before ANY of the three
+    #    things below sees it — the DB-cache split (whose no-locg_id path
+    #    always issues a real hand-priced-provenance GET, BUI-775), the comp
+    #    fetch, and the upsert. On such a server the certifier query parameter
+    #    is silently dropped, so the cache path would hand a slab target the
+    #    RAW row's band and the write would land on that same raw row. Raw
+    #    books in the same batch are untouched by all of this.
+    #    (This replaces BUI-928's unconditional `graded_mode_unavailable`
+    #    punt, which existed only until the graded mode shipped.)
+    #    `eligible_idx` records, for each surviving book's position in
+    #    `eligible_books`, its ORIGINAL position in `books` — every index-keyed
+    #    bucket `_split_by_db_cache` hands back is relative to `eligible_books`
+    #    (its own internal `enumerate`), and `_stitch` below walks the ORIGINAL
+    #    `books` list, so those indices are translated back immediately after
+    #    the call rather than threading two index spaces through the rest of
+    #    `run`.
+    schema_mismatch: dict[int, dict] = {}
+    certified_idx = [i for i, b in enumerate(books) if _is_certified(b)]
+    if certified_idx and not _probe_certifier_support(
+            server_url, grade=_coerce_grade(books[certified_idx[0]].get("grade"))):
+        schema_mismatch = {i: books[i] for i in certified_idx}
+    eligible_books: list[dict] = []
+    eligible_idx: list[int] = []
     for i, book in enumerate(books):
-        certifier = book.get("certifier")
-        if certifier is not None and str(certifier).strip().lower() not in ("", "none"):
-            certified_needs_manual[i] = book
-        else:
-            raw_idx.append(i)
-            raw_books.append(book)
+        if i in schema_mismatch:
+            continue
+        eligible_idx.append(i)
+        eligible_books.append(book)
 
     # 1. DB cache reuse (skipped if --force). Also separates out hand-priced
     #    rows (BUI-533): a default run must skip them entirely (skipped_hand),
@@ -263,26 +423,50 @@ def run(*, batch_path: str | None, out_path: str | None,
     #    (skipped_lookup_error), never folded into the hand-priced count.
     (cached, needs_compute, skipped_hand, force_overwrite_notes,
      skipped_lookup_error) = _split_by_db_cache(
-        raw_books, server_url=server_url, max_age_days=max_age_days, force=force,
+        eligible_books, server_url=server_url, max_age_days=max_age_days,
+        force=force,
     )
-    # BUI-928: translate raw_books-relative indices back to books-relative
-    # ones — see the comment on `raw_idx` above.
-    cached = {raw_idx[k]: v for k, v in cached.items()}
-    skipped_hand = {raw_idx[k]: v for k, v in skipped_hand.items()}
-    force_overwrite_notes = {raw_idx[k]: v for k, v in force_overwrite_notes.items()}
-    skipped_lookup_error = {raw_idx[k]: v for k, v in skipped_lookup_error.items()}
+    # BUI-928/930: translate eligible_books-relative indices back to
+    # books-relative ones — see the comment on `eligible_idx` above.
+    cached = {eligible_idx[k]: v for k, v in cached.items()}
+    skipped_hand = {eligible_idx[k]: v for k, v in skipped_hand.items()}
+    force_overwrite_notes = {eligible_idx[k]: v
+                             for k, v in force_overwrite_notes.items()}
+    skipped_lookup_error = {eligible_idx[k]: v
+                            for k, v in skipped_lookup_error.items()}
     for b in needs_compute:
-        b["_idx"] = raw_idx[b["_idx"]]
+        b["_idx"] = eligible_idx[b["_idx"]]
     if force_overwrite_notes:
         _echo_hand_override_notes(force_overwrite_notes, books)
 
-    # 2. Fetch comps for the books that need fresh compute
+    # 2. Fetch comps for the books that need fresh compute.
+    #    BUI-930: a certified book whose LABEL or CERTIFIER puts it outside the
+    #    priceable market is refused HERE, before the payload is built, so it
+    #    costs zero provider requests (plan U7: "short-circuit to needs_manual
+    #    BEFORE any fetch"). It is still upserted below, exactly like any other
+    #    needs-manual book, so it gets a comic_id and `/comic:verify` reports
+    #    `needs_manual` rather than the more severe `no_comic`.
+    #
+    #    Certified books that CAN be priced stay in this same payload and the
+    #    same subprocess call: `_fetch_comps` forwards every input field but
+    #    `_idx`, so `certifier` rides along and ebay-sold-comps switches itself
+    #    into BUI-929's graded mode per book. Splitting the fetch would spend a
+    #    second subprocess for nothing.
+    graded_punts: dict[int, str] = {}
+    fetch_books: list[dict] = []
+    for b in needs_compute:
+        reason = _graded_punt_reason(b)
+        if reason is None:
+            fetch_books.append(b)
+        else:
+            graded_punts[b["_idx"]] = reason
+
     fresh_results: list[dict] = []
-    if needs_compute:
+    if fetch_books:
         # Default hard_fail=True: any fetch failure sys.exits inside _fetch_comps,
         # so a return here is always a real list (the None branch is soft-fail
         # only, used by the BUI-348 proxy rescue).
-        fresh_results = _fetch_comps(needs_compute, force=force) or []
+        fresh_results = _fetch_comps(fetch_books, force=force) or []
 
     # 3. Run FMV math + DB upsert for fresh books, mapped back to inputs by an
     #    explicit id — never by list position (BUI-174/187). The subprocess fans
@@ -296,8 +480,8 @@ def run(*, batch_path: str | None, out_path: str | None,
     # multi-issue lot listing BUI-625 refuses to mint as its first issue).
     # original input index → the server's rejection detail.
     skipped_rejected: dict[int, str] = {}
-    if needs_compute:
-        sent_ids = [b["_idx"] for b in needs_compute]
+    if fetch_books:
+        sent_ids = [b["_idx"] for b in fetch_books]
         results_by_id: dict[int, dict] = {}
         for result in fresh_results:
             rid = (result.get("input") or {}).get("_req_id")
@@ -309,10 +493,10 @@ def run(*, batch_path: str | None, out_path: str | None,
         sent_set = set(sent_ids)
         missing = [i for i in sent_ids if i not in results_by_id]
         unexpected = [k for k in results_by_id if k not in sent_set]
-        if len(fresh_results) != len(needs_compute) or missing or unexpected:
+        if len(fresh_results) != len(fetch_books) or missing or unexpected:
             _fail_mapping(
                 f"ebay-sold-comps result/identity mismatch: sent "
-                f"{len(needs_compute)} books, got {len(fresh_results)} results; "
+                f"{len(fetch_books)} books, got {len(fresh_results)} results; "
                 f"missing ids={missing}, unexpected ids={unexpected}. Refusing to "
                 "map comps positionally (would price the wrong comic)."
             )
@@ -323,10 +507,20 @@ def run(*, batch_path: str | None, out_path: str | None,
             # it can be caught HERE, per book, instead of anywhere further up
             # the call stack (which would still take the whole run down).
             try:
-                fresh_fmvs[idx] = _compute_and_upsert_one(
-                    results_by_id[idx], books[idx],
-                    server_url=server_url, grade_window=grade_window,
-                )
+                if _is_certified(books[idx]):
+                    # BUI-930: the graded branch. It never calls build_pool,
+                    # the proxy rescue, the cross check, the ungraded anchor,
+                    # or the first-party merge — each of those would price a
+                    # slab off the raw market (the rescue would price it at
+                    # 0.5x itself).
+                    fresh_fmvs[idx] = _compute_graded_one(
+                        results_by_id[idx], books[idx], server_url=server_url,
+                    )
+                else:
+                    fresh_fmvs[idx] = _compute_and_upsert_one(
+                        results_by_id[idx], books[idx],
+                        server_url=server_url, grade_window=grade_window,
+                    )
             except _UpsertRejected as exc:
                 skipped_rejected[idx] = str(exc)
 
@@ -350,11 +544,23 @@ def run(*, batch_path: str | None, out_path: str | None,
             fresh_fmvs, books, server_url=server_url, force=force,
         )
 
+    # 3d. BUI-930: the pre-fetch graded punts. Written AFTER the two rescue
+    # tiers above so they can never see a graded row (both already refuse one
+    # via `_is_unpriced_raw`/`_is_thin_or_low_confidence_priced`; ordering
+    # makes it structural as well as conditional).
+    for idx, reason in graded_punts.items():
+        try:
+            fresh_fmvs[idx] = _compute_graded_one(
+                None, books[idx], server_url=server_url, punt_reason=reason,
+            )
+        except _UpsertRejected as exc:
+            skipped_rejected[idx] = str(exc)
+
     # 4. Stitch cached + fresh + hand-priced-skipped + lookup-error-skipped +
-    #    write-rejected-skipped + certified-punted (BUI-928)
+    #    write-rejected-skipped + schema-mismatch-skipped (BUI-930)
     final = _stitch(books, cached, fresh_fmvs, skipped_hand,
                     skipped_lookup_error, skipped_rejected,
-                    certified_needs_manual)
+                    schema_mismatch)
 
     if not quiet:
         _print_table(final)
@@ -445,19 +651,21 @@ def run(*, batch_path: str | None, out_path: str | None,
             err=True,
         )
 
-    # BUI-928: a FOURTH skip class, reported separately from the three above.
-    # Unlike every other bucket, this book never reached the server at all —
-    # no hand-priced lookup, no comp fetch, no upsert — because a certifier
-    # was present and the graded pricing mode (plan U6/U7) doesn't exist yet.
-    # Loud for the same reason as the others: a certified row must never
-    # silently price off the raw market, which is the exact bug this project
-    # exists to remove (R35).
-    if certified_needs_manual:
+    # BUI-930: a FOURTH skip class, reported separately from the three above.
+    # Unlike every other bucket, this book never reached the server for its own
+    # sake at all — no hand-priced lookup, no comp fetch, no upsert — because
+    # the one run-level probe found a comics server that cannot describe a
+    # price's certifier. Loud for the same reason as the others, and with the
+    # remedy named: this is a DEPLOY-ORDER problem, not a pricing one.
+    if schema_mismatch:
         click.echo(
-            f"⚠️  {len(certified_needs_manual)} book(s) need MANUAL pricing: "
-            "certified (CGC/CBCS) row(s) — the graded pricing mode isn't "
-            "shipped yet, so comic-fmv refuses to price them from the raw "
-            "market. Hand-price these (flag_reason=graded_mode_unavailable).",
+            f"⚠️  skipped {len(schema_mismatch)} certified (CGC/CBCS) book(s): "
+            "this comics server does not report a price's `certifier`, so it "
+            "predates the graded pricing schema (BUI-924/925). Nothing was "
+            "fetched or written for them — a slab price written to such a "
+            "server would land on the RAW row and set a raw bid cap off a "
+            "slab market. Deploy the server (./scripts/deploy.sh) and re-run; "
+            "raw books in this batch priced normally.",
             err=True,
         )
 
@@ -895,11 +1103,20 @@ def _split_by_db_cache(books: list[dict], *, server_url: str,
             needs.append({"_idx": i, **book})
             continue
         locg_id = book.get("locg_id")
+        # BUI-930: `(comic_id, grade)` stopped being the whole key of an `fmv`
+        # row — `(comic_id, grade, certifier, label)` is. Both lookups below
+        # therefore have to name the certifier and label, or a cgc 9.6 target
+        # would reuse (and a default run would protect, or overwrite) the RAW
+        # 9.6 row sitting beside it. Passed only for a CERTIFIED book so every
+        # raw call stays byte-for-byte what it was: the server's own contract
+        # is that an absent certifier MEANS `none`, so adding the parameter to
+        # a raw lookup would change nothing but the request bytes.
+        identity = _price_identity_kwargs(book)
 
         if locg_id and not force:
             row = _db_lookup(server_url, locg_id=locg_id, grade=grade,
                              locg_variant_id=book.get("locg_variant_id"),
-                             max_age_days=max_age_days)
+                             max_age_days=max_age_days, **identity)
             if row:
                 cached[i] = row
                 continue
@@ -968,10 +1185,11 @@ def _hand_price_candidates(server_url: str, book: dict, *,
     because a clean `locg_id` row is no evidence at all about the row
     `(title, issue, variant)` actually resolves onto.
     """
+    price_identity = _price_identity_kwargs(book)
     if book.get("locg_id"):
         row = _db_lookup(server_url, locg_id=book["locg_id"], grade=grade,
                          locg_variant_id=book.get("locg_variant_id"),
-                         max_age_days=None, strict=True)
+                         max_age_days=None, strict=True, **price_identity)
         if row is not None and _row_is_hand_priced(row):
             return [row]
 
@@ -983,8 +1201,14 @@ def _hand_price_candidates(server_url: str, book: dict, *,
             f"title={book.get('title')!r} issue={book.get('issue')!r}"
         )
     title, issue, variant = identity
+    # BUI-930: `certifier`/`label` are the last two components of the write's
+    # key. Without them a hand-priced RAW 9.6 would make a cgc 9.6 target skip
+    # (a missing price where one was computable) and — the expensive
+    # direction — a hand-priced cgc row would not protect itself from a raw
+    # recompute, because the two are now genuinely different rows.
     return _db_lookup_by_identity(server_url, title=title, issue=issue,
-                                  grade=grade, variant=variant)
+                                  grade=grade, variant=variant,
+                                  **price_identity)
 
 
 def _variant_key(value: object) -> str | None:
@@ -1094,7 +1318,9 @@ def _grade_key(value: object) -> object:
 
 
 def _db_lookup_by_identity(server_url: str, *, title: str, issue: str,
-                           grade: float, variant: str | None) -> list[dict]:
+                           grade: float, variant: str | None,
+                           certifier: str = _RAW_CERTIFIER,
+                           label: str = _RAW_LABEL) -> list[dict]:
     """Every stored FMV row a write at `(title, issue, variant)` + `grade`
     could land on — ALL of them, not the freshest one. Raises `_DbLookupFailed`
     if the GET fails.
@@ -1141,9 +1367,17 @@ def _db_lookup_by_identity(server_url: str, *, title: str, issue: str,
     the server matched `title` with SQL `LOWER()`, any row it returned is
     already ASCII-case-equal here.
     """
+    params: dict = {"title": title, "issue": issue, "grade": grade}
+    # BUI-930: unlike `variant`, this one IS a query parameter, and it has to
+    # be — the server reads an ABSENT certifier as `'none'`, so without it a
+    # certified book's provenance question would be answered with the raw
+    # row's provenance. `label` has no parameter and is filtered client-side
+    # below, like `variant`.
+    if certifier != _RAW_CERTIFIER:
+        params["certifier"] = certifier
     rows = _get_json_or_warn(
         f"{server_url}/api/comics",
-        params={"title": title, "issue": issue, "grade": grade},
+        params=params,
         warn=(f"hand-priced provenance lookup failed "
               f"(title={title!r} issue={issue!r})"),
         default=_LOOKUP_FAILED,
@@ -1168,7 +1402,8 @@ def _db_lookup_by_identity(server_url: str, *, title: str, issue: str,
                if isinstance(r, dict)
                and str(r.get("title") or "").lower() == title.lower()
                and str(r.get("issue")) == issue
-               and _grade_key(r.get("grade")) == _grade_key(grade)]
+               and _grade_key(r.get("grade")) == _grade_key(grade)
+               and _row_price_identity_matches(r, certifier, label)]
     # BUI-777: narrow to the write's own variant, but ONLY over rows that
     # actually carry the field. `"variant" in r` — never `r.get("variant")` —
     # is the discriminator; see the docstring for why conflating "absent" with
@@ -1221,9 +1456,48 @@ class _DbLookupFailed(Exception):
     """
 
 
+def _price_identity_kwargs(book: dict) -> dict:
+    """`{"certifier": ..., "label": ...}` for a certified book, `{}` for a raw
+    one (BUI-930).
+
+    An empty dict, not the explicit raw sentinels, so every lookup a raw batch
+    makes is byte-for-byte the pre-BUI-930 request. That is not cosmetic: the
+    raw path is the one this change must not be able to move, and a call that
+    sends no new bytes cannot move it.
+    """
+    if not _is_certified(book):
+        return {}
+    return {"certifier": _book_certifier(book), "label": _book_label(book)}
+
+
+def _row_price_identity_matches(row: dict, certifier: str, label: str) -> bool:
+    """True when a returned `/api/comics` row describes the SAME price market
+    as `(certifier, label)` (BUI-930).
+
+    Deploy-skew rule, copied deliberately from BUI-777's `variant` handling: a
+    row that does not CARRY the key came from a server that cannot answer the
+    question, and is matched rather than dropped. Reading an old server's
+    silence as `'none'` would make a certified book match nothing — and a book
+    whose candidate set is empty RECOMPUTES, i.e. a hand-priced row would go
+    from protected to overwritten by a version skew alone. The certified path
+    never actually relies on this (the run-level probe refuses every certified
+    row on such a server before this code is reached); it exists so the RAW
+    path's behaviour against an old server is provably unchanged.
+    """
+    if "certifier" in row and _identity_token(row.get("certifier"),
+                                              _RAW_CERTIFIER) != certifier:
+        return False
+    if "label" in row and _identity_token(row.get("label"),
+                                          _RAW_LABEL) != label:
+        return False
+    return True
+
+
 def _db_lookup(server_url: str, *, locg_id: int, grade: float,
                locg_variant_id: int | None = None,
                max_age_days: float | None,
+               certifier: str = _RAW_CERTIFIER,
+               label: str = _RAW_LABEL,
                strict: bool = False) -> dict | None:
     """Return the freshest matching FMV row, or None if not cached/stale.
 
@@ -1248,11 +1522,24 @@ def _db_lookup(server_url: str, *, locg_id: int, grade: float,
     BUI-544: `strict=True` raises `_DbLookupFailed` when the GET itself fails,
     instead of returning the None a genuine miss also returns. Only the
     hand-priced provenance check uses it — see `_split_by_db_cache`.
+
+    BUI-930: `certifier`/`label` complete the `fmv` row's identity. They
+    default to the RAW sentinels because that is exactly what the server
+    itself does with an absent `certifier` parameter (plan KTD "Raw is an
+    explicit sentinel"), so a caller that omits them asks the raw question and
+    gets the raw answer — unlike `variant` in `_db_lookup_by_identity`, where
+    an absent parameter means "no filter" and a default would silently widen
+    the key. The parameter is sent only when non-raw so a raw lookup's request
+    bytes are unchanged; the returned row is re-verified either way, by the
+    same defensive reasoning as `locg_id`/`grade` above (FastAPI silently
+    ignores query params an older build doesn't know).
     """
     params: dict = {"locg_id": locg_id, "grade": grade,
                     "max_age_days": max_age_days}
     if locg_variant_id is not None:
         params["locg_variant_id"] = locg_variant_id
+    if certifier != _RAW_CERTIFIER:
+        params["certifier"] = certifier
     rows = _get_json_or_warn(
         f"{server_url}/api/comics", params=params,
         warn=f"DB cache lookup failed (locg_id={locg_id})",
@@ -1275,7 +1562,8 @@ def _db_lookup(server_url: str, *, locg_id: int, grade: float,
     rows = [r for r in rows
             if r.get("locg_id") == locg_id and r.get("grade") == grade
             and r.get("locg_variant_id") == locg_variant_id
-            and r.get("fmv_low") is not None]
+            and r.get("fmv_low") is not None
+            and _row_price_identity_matches(r, certifier, label)]
     if not rows:
         return None
     rows.sort(key=lambda r: r.get("fmv_updated_at") or "", reverse=True)
@@ -1612,7 +1900,10 @@ LEDGER_ADVISORY_TIMEOUT_SECONDS = 5
 
 
 def _fetch_ledger_comps(server_url: str, *, title: str | None,
-                        issue: object, year: int | None) -> list[dict] | None:
+                        issue: object, year: int | None,
+                        pool: str = "raw",
+                        certifier: str | None = None,
+                        label: str | None = None) -> list[dict] | None:
     """The ONE sanctioned read of `GET /api/comics/comps` from the pricing path.
 
     `plugins/gixen-overlay/tests/test_fmv_history.py` enforces that by parsing
@@ -1656,12 +1947,25 @@ def _fetch_ledger_comps(server_url: str, *, title: str | None,
     nowhere, and the resolved `comic_id` is echoed back onto the row (see
     `_ledger_advisory`) so a human can check which book answered.
 
-    `pool="raw"` is not optional. The ledger also stores the graded/slab pool
-    (BUI-658 posts both), and slab prices are multiples of raw ones — pricing a
-    raw book off an unfiltered ledger read would be a silent order-of-magnitude
-    overstatement. No `grade` filter: `build_pool` does its own progressive
-    ±window widening around the target grade and needs the neighbouring grades
-    to do it. No `days` filter — see the staleness note above.
+    `pool` is never left unfiltered. The ledger stores BOTH pools (BUI-658
+    posts raw and slab), and slab prices are multiples of raw ones — reading
+    an unfiltered ledger would be a silent order-of-magnitude error in
+    whichever direction the caller was not expecting. `"raw"` is the default
+    because the BUI-663 degraded-mode read is still the majority caller; the
+    BUI-930 graded mode passes `"slab"`.
+
+    BUI-930 — `certifier`/`label` are applied CLIENT-SIDE, after the read, for
+    the same reason `_db_lookup_by_identity` filters `variant` client-side: the
+    endpoint has no parameter for either, and a row that does not CARRY the
+    key came from a server that cannot answer about it. For a slab pool that
+    is fail-closed in the expensive direction, so an unkeyed row is DROPPED
+    here rather than kept: a `pool='slab'` row of unknown certifier could be a
+    CBCS sale priced into a CGC ladder. (The raw caller passes neither and
+    filters nothing, so its behaviour is unchanged.)
+
+    No `grade` filter either way: both pricing paths need the neighbouring
+    grades — `build_pool` to widen its window, the slab ladder to interpolate.
+    No `days` filter — see the staleness note above.
     """
     if not title or issue in (None, ""):
         return None
@@ -1671,7 +1975,7 @@ def _fetch_ledger_comps(server_url: str, *, title: str | None,
             "title": title,
             "issue": str(issue),
             "year": year,
-            "pool": "raw",
+            "pool": pool,
             "limit": LEDGER_ADVISORY_READ_LIMIT,
         },
         warn=(f"comps-ledger advisory read failed for {title!r} #{issue} "
@@ -1686,13 +1990,24 @@ def _fetch_ledger_comps(server_url: str, *, title: str | None,
     )
     if not isinstance(rows, list):
         return None
-    return [r for r in rows if isinstance(r, dict)]
+    out = [r for r in rows if isinstance(r, dict)]
+    if certifier is not None:
+        out = [r for r in out
+               if _identity_token(r.get("certifier"), "") == certifier]
+    if label is not None:
+        out = [r for r in out
+               if _identity_token(r.get("label"), "") == label]
+    return out
 
 
-def _is_priceable_number(value: object) -> bool:
+def _is_priceable_number(value: object) -> TypeGuard[float]:
     """True for a JSON number usable as a price/grade. `bool` is excluded
     explicitly — it is an `int` subclass, so a stray `true` would otherwise
-    sail into the pool as the price 1.0."""
+    sail into the pool as the price 1.0.
+
+    A `TypeGuard` rather than a plain `bool` so the `float(...)` calls that
+    follow it are checkable: the guard IS the narrowing, and a caller that
+    skips it should not type-check."""
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
@@ -2067,6 +2382,298 @@ def _compute_and_upsert_one(result: dict, original_book: dict, *,
     }
 
 
+# ─── Step 3a — the GRADED branch (BUI-930) ────────────────────────────────────
+
+# Comp fields the slab pool needs beyond `price`/`grade`. `first_seen_at` is
+# ledger-only (a live comp always has `sold_date`); `page_quality` rides both.
+_SLAB_POOL_FIELDS = ("product_id", "title", "price", "grade", "sold_date",
+                     "first_seen_at", "page_quality", "certifier", "label",
+                     "link", "buying_format")
+
+# eBay's own listing-type token, as `ebay_fetch.parse_item` emits it on the
+# `listing_type` key (the other values are "Auction" and, rarely, a
+# comma-joined list of buying options). A Buy It Now listing has no auction to
+# snipe, so R34 renders its band and confidence with NO bid cap — the price is
+# still computed, written, and its comps archived.
+_BIN_LISTING_TYPE = "BIN"
+
+
+def _slab_pool_comp(comp: dict) -> dict | None:
+    """Project one live-or-ledger comp onto the slab pool's shape, or None.
+
+    Explicit field selection rather than passing the dict through: the pool is
+    handed to `fmv_math.graded_fmv`, and a ledger row carries ledger-only
+    bookkeeping (`seen_count`, `conflict_count`, `provenance`) that has no
+    business inside a pricing pool. Returns None when price or grade is
+    missing or unusable — `_is_priceable_number` excludes `bool`, which is an
+    `int` subclass and would otherwise enter the pool as $1.00.
+    """
+    price, grade = comp.get("price"), comp.get("grade")
+    if not _is_priceable_number(price) or not _is_priceable_number(grade):
+        return None
+    out = {k: comp.get(k) for k in _SLAB_POOL_FIELDS}
+    out["price"] = float(price)
+    out["grade"] = float(grade)
+    return out
+
+
+def _merge_slab_pool(live: list[dict], ledger: list[dict]) -> list[dict]:
+    """Live slab comps plus ledger slab comps, deduped on `product_id`.
+
+    LIVE WINS on a collision, and the direction matters: the live row is
+    today's observation of that listing, while the ledger row is a snapshot of
+    an earlier one (`upsert_comps` never rewrites a stored price, KTD4), so
+    preferring the ledger copy would age the pool for no gain. A comp with no
+    `product_id` cannot be deduped and is kept as its own entry — dropping it
+    would silently thin a pool that is already one sale per rung, and the only
+    cost of keeping it is a double-count of a comp that no source identified.
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+    for comp in [*live, *ledger]:
+        projected = _slab_pool_comp(comp)
+        if projected is None:
+            continue
+        pid = projected.get("product_id")
+        key = str(pid) if pid not in (None, "") else None
+        if key is not None:
+            if key in seen:
+                continue
+            seen.add(key)
+        out.append(projected)
+    return out
+
+
+def _graded_identity(inp: dict) -> tuple[str, str, str | None]:
+    return _book_certifier(inp), _book_label(inp), _book_page_quality(inp)
+
+
+def _graded_error_row(inp: dict, comps_n: int, result: dict, *,
+                      error: str, fetch_error: bool = False) -> dict:
+    """The graded twin of `_compute_and_upsert_one`'s `source: "error"` rows:
+    nothing priced, nothing written, `comic_id` null."""
+    row = {
+        "input": inp, "fmv": None, "comp_count_total": comps_n,
+        "queries_used": result.get("queries_used", []),
+        "db_row": None, "comic_id": None, "fmv_id": None,
+        "source": "error", "breaker_tripped": bool(result.get("breaker_tripped")),
+        "error": error,
+    }
+    if fetch_error:
+        row["fetch_error"] = True
+    return row
+
+
+def _compute_graded_one(result: dict | None, original_book: dict, *,
+                        server_url: str,
+                        punt_reason: str | None = None) -> dict:
+    """Price ONE certified slab and persist it (BUI-930, plan U7).
+
+    The graded counterpart of `_compute_and_upsert_one`, and deliberately a
+    separate function rather than a branch inside it. What it must NEVER do is
+    most of what that one does: no `build_pool` grade-window widening, no
+    first-party merge, no ungraded anchor, no CGC-proxy rescue, no cross
+    check. Each of those reads the RAW market, and the subject here is the
+    slab — the rescue in particular would price a slab at ~0.5x itself.
+
+    `result` is `ebay-sold-comps`' per-book result (BUI-929 graded mode), or
+    None for a book refused before any fetch, in which case `punt_reason`
+    names the refusal. Both paths end in the same upsert, so a Signature
+    Series slab still gets a `comic_id` and `/comic:verify` reports
+    `needs_manual` rather than `no_comic`.
+    """
+    inp = dict(original_book)
+    inp.pop("_idx", None)
+    if result is not None:
+        fetched = result.get("input") or {}
+        fetched.pop("_req_id", None)
+        overrides = {k: v for k, v in original_book.items()
+                     if k not in ("_idx",) and v is not None}
+        if (isinstance(fetched.get("grade"), (int, float))
+                and isinstance(overrides.get("grade"), str)):
+            overrides.pop("grade", None)
+        inp = {**fetched, **overrides}
+    certifier, label, page_quality = _graded_identity(inp)
+    # Coerced HERE, above the punt branch, not just on the pricing path: a
+    # wish-list batch can carry a letter grade (`"VF+"`), and the punt path
+    # upserts too. `POST /api/comics` types `grade` as a float, so posting the
+    # string would 422 the whole write and lose the punt's own record of WHY
+    # the book is unpriceable.
+    target_grade = _coerce_grade(inp.get("grade"))
+    if target_grade is not None:
+        inp["grade"] = target_grade
+
+    if punt_reason is not None:
+        fmv = fmv_math.graded_punt(punt_reason, certifier=certifier,
+                                   label=label, page_quality=page_quality)
+        return _graded_upsert_row(server_url, inp, fmv, result={},
+                                  live_slab=[], comps_n=0)
+
+    assert result is not None  # a book with no punt reason was fetched
+    comps = result.get("comps", [])
+    slab_comps = result.get("slab_comps") or []
+    breaker_tripped = bool(result.get("breaker_tripped"))
+
+    # BUI-565's per-book raise, verbatim in intent: a fetch that RAISED leaves
+    # a truncated pool of unknown size, and pricing off it is the same wrong
+    # answer, just quieter. `is not None`, not truthiness — an exception with
+    # no message stringifies to "".
+    if result.get("error") is not None:
+        return _graded_error_row(
+            inp, len(comps), result, fetch_error=True,
+            error=("fetch-err: ebay-sold-comps failed for this book: "
+                   f"{result.get('error') or '<no message>'}"))
+
+    if target_grade is None:
+        return _graded_error_row(
+            inp, len(comps), result,
+            error=f"no usable target grade in input: {inp.get('grade')!r}")
+
+    if _is_fetch_error({"comp_count_total": len(comps) + len(slab_comps),
+                        "queries_used": result.get("queries_used", [])}):
+        fetch_err_row = _graded_error_row(
+            inp, len(comps), result,
+            error=("fetch-err: all tiers failed; fmv DB row left untouched "
+                   "(BUI-536)"))
+        advisory = _graded_ledger_advisory(
+            server_url, inp=inp, target_grade=target_grade,
+            certifier=certifier, label=label, page_quality=page_quality)
+        if advisory is None:
+            return fetch_err_row
+        click.echo(
+            f"Note: {inp.get('title')} #{inp.get('issue')} — slab comp fetch "
+            f"FAILED; emitting a BUI-663-style ADVISORY band from "
+            f"{advisory['ledger_rows']} stored {certifier.upper()} slab "
+            f"comp(s). Not live, not written to the DB, NO bid cap — do not "
+            "bid this number without hand-checking it.",
+            err=True,
+        )
+        return {
+            **fetch_err_row,
+            "fmv": advisory["fmv"],
+            "source": SOURCE_LEDGER_ADVISORY,
+            "ledger_comic_id": advisory["comic_id"],
+            "ledger_rows": advisory["ledger_rows"],
+            "error": ("fetch-err: all tiers failed; fmv DB row left untouched "
+                      "(BUI-536). ADVISORY band priced from the SLAB comps "
+                      "ledger instead (BUI-663/930): NOT a live price, NOT "
+                      "persisted, and it carries NO max_bid."),
+        }
+
+    live_slab = [c for c in slab_comps
+                 if _identity_token(c.get("certifier"), "") == certifier
+                 and _identity_token(c.get("label"), "") == label]
+    ledger_slab = _fetch_ledger_comps(
+        server_url, title=inp.get("title"), issue=inp.get("issue"),
+        year=inp.get("year"), pool="slab", certifier=certifier, label=label,
+    ) or []
+    pool = _merge_slab_pool(live_slab, ledger_slab)
+
+    fmv = fmv_math.graded_fmv(pool, target_grade, certifier=certifier,
+                              label=label, page_quality=page_quality)
+    fmv["live_slab_count"] = len(live_slab)
+    fmv["ledger_slab_count"] = len(ledger_slab)
+    # BUI-929's printing guard already DROPPED the confirmed later printings
+    # from `slab_comps`; these two counts are how many, and how many it could
+    # not verify. Carried onto the notes so a thinner-than-expected pool is
+    # explained rather than merely observed.
+    fmv["printing_dropped"] = result.get("printing_dropped") or 0
+    fmv["printing_unverified"] = result.get("printing_unverified") or 0
+    row = _graded_upsert_row(server_url, inp, fmv, result=result,
+                             live_slab=live_slab, comps_n=len(comps))
+    row["breaker_tripped"] = breaker_tripped
+    return row
+
+
+def _apply_bin_rule(book: dict, fmv: dict | None) -> dict | None:
+    """R34: a Buy It Now listing has no auction to snipe, so there is no bid
+    cap to propose. The BAND is still computed, still written, and its comps
+    still archived — only `max_bid` is withheld, and the notes say why, so a
+    blank cap can never read as "we could not price this".
+
+    Applied on EVERY path that hands a graded row back, the freshly-priced one
+    and the cache hit alike. A cache hit recomputes `max_bid` from the stored
+    `fmv_high`, so without this the second run of the same BIN listing would
+    quietly grow the cap the first run withheld.
+
+    Scoped to graded rows, which is where R34 lives; a raw BIN row is left
+    exactly as it was so this ticket cannot move the raw path.
+    """
+    if not fmv or not fmv.get("graded") or fmv.get("max_bid") is None:
+        return fmv
+    if _identity_token(book.get("listing_type"), "") != _BIN_LISTING_TYPE.lower():
+        return fmv
+    fmv["max_bid"] = None
+    fmv["bin_listing"] = True
+    return fmv
+
+
+def _graded_upsert_row(server_url: str, inp: dict, fmv: dict, *,
+                       result: dict, live_slab: list[dict],
+                       comps_n: int) -> dict:
+    """Apply R34's BIN rule, upsert, archive the slab comps, and assemble the
+    result row — the one place a graded row is written, so the punt path and
+    the priced path cannot diverge."""
+    _apply_bin_rule(inp, fmv)
+    upserted = _upsert_fmv(server_url, inp, fmv)
+    comic_id, fmv_id = _extract_ids(upserted)
+    # Only the SLAB comps are archived. The `comps` list a graded fetch also
+    # returns holds the non-slab listings the certifier-positive query happened
+    # to surface; they are not the raw market's own query result, and posting
+    # them as `pool='raw'` would seed the raw ledger from a slab query.
+    comps_posted = _post_comps(server_url, comic_id, [], live_slab)
+    return {
+        "input": inp, "fmv": fmv, "comp_count_total": comps_n,
+        "queries_used": result.get("queries_used", []),
+        "db_row": upserted, "comic_id": comic_id, "fmv_id": fmv_id,
+        "source": "fresh", "breaker_tripped": bool(result.get("breaker_tripped")),
+        "slab_comps": live_slab,
+        "comps_posted": comps_posted,
+    }
+
+
+def _graded_ledger_advisory(server_url: str, *, inp: dict,
+                            target_grade: float, certifier: str, label: str,
+                            page_quality: str | None) -> dict | None:
+    """A degraded-mode ADVISORY band for a SLAB target, or None to keep the
+    plain fetch-err (BUI-663's posture, BUI-930's pool).
+
+    Same contract as `_ledger_advisory`: `max_bid` nulled, nothing written,
+    and None for every failure — so a book that fails here is left in the
+    honest fetch-err state rather than given a number nobody can stand behind.
+    What differs is the pool (`pool='slab'`, filtered to this certifier and
+    label) and the math (`graded_fmv`, so the exact/ladder decision and every
+    refusal are identical to a live run's).
+    """
+    rows = _fetch_ledger_comps(
+        server_url, title=inp.get("title"), issue=inp.get("issue"),
+        year=inp.get("year"), pool="slab", certifier=certifier, label=label,
+    )
+    if not rows:
+        return None
+    pool = _merge_slab_pool([], rows)
+    if len(pool) < LEDGER_ADVISORY_MIN_POOL:
+        return None
+    fmv = fmv_math.graded_fmv(pool, target_grade, certifier=certifier,
+                             label=label, page_quality=page_quality)
+    if fmv.get("flag_reason") is not None or fmv.get("fmv_high") is None:
+        return None
+    fmv["max_bid"] = None
+    fmv["ledger_advisory"] = True
+    fmv["live_slab_count"] = 0
+    fmv["ledger_slab_count"] = len(rows)
+    fmv["first_party_count"] = 0
+    fmv["variant_dropped"] = None
+    fmv["masthead_swapped_to"] = None
+    fmv["non_usd_dropped"] = 0
+    comic_ids = {r.get("comic_id") for r in rows if r.get("comic_id") is not None}
+    return {
+        "fmv": fmv,
+        "comic_id": comic_ids.pop() if len(comic_ids) == 1 else None,
+        "ledger_rows": len(rows),
+    }
+
+
 # ─── Step 3b — CGC-proxy rescue (BUI-348) ─────────────────────────────────────
 
 # The literal notes marker for a CGC-proxy band. Shared by `_build_notes`
@@ -2174,6 +2781,12 @@ def _is_unpriced_raw(result: dict) -> bool:
     if result.get("source") == "error" or _is_ledger_advisory(result):
         return False
     fmv = result.get("fmv") or {}
+    # BUI-930: and never a GRADED row. The rescue prices a RAW copy at ~0.5x
+    # the slab ladder; handed a slab target it would price the slab at half of
+    # itself. Stated here rather than relied on at the call site so every
+    # future caller of this predicate inherits the exclusion.
+    if fmv.get("graded"):
+        return False
     grade = (result.get("input") or {}).get("grade")
     return (fmv.get("fmv_high") is None
             and not fmv.get("interpolated")
@@ -2328,6 +2941,11 @@ def _is_thin_or_low_confidence_priced(result: dict) -> bool:
     if fmv.get("fmv_high") is None:
         return False
     if fmv.get("interpolated"):
+        return False
+    # BUI-930: a GRADED row IS the slab-derived price, so comparing it against
+    # the slab ladder is comparing a number with itself. Same exclusion, same
+    # reasoning as `cgc_proxy_fmv`'s own `cgc_cross_check: None`.
+    if fmv.get("graded"):
         return False
     n = fmv.get("n")
     confidence = fmv.get("confidence")
@@ -2618,6 +3236,19 @@ def _upsert_fmv(server_url: str, inp: dict, fmv: dict,
         # rather than 422-ing the whole upsert.
         "fmv_provenance": _PROVENANCE_MACHINE,
     }
+    # BUI-930: the rest of the row IDENTITY, plus the basis the number was
+    # arrived at on. Sent only for a GRADED row, for two reasons. (1) A raw
+    # row's values are exactly the server-side defaults, so posting them would
+    # change request bytes without changing a stored value. (2) `pricing_basis`
+    # is DERIVED server-side from the notes tokens when the field is omitted
+    # (plan KTD "Pricing basis is a column"), which is what keeps a raw row
+    # written by an older client during the deploy window from losing its
+    # haircut — sending our own guess would override that derivation with a
+    # duplicate of it.
+    if fmv.get("graded"):
+        body["certifier"] = fmv.get("certifier") or _RAW_CERTIFIER
+        body["label"] = fmv.get("label") or _RAW_LABEL
+        body["pricing_basis"] = fmv.get("pricing_basis")
     if inp.get("locg_id"):
         body["locg_id"] = inp["locg_id"]
     if inp.get("locg_variant_id"):
@@ -2627,12 +3258,32 @@ def _upsert_fmv(server_url: str, inp: dict, fmv: dict,
         # (etc.) get distinct comic_ids instead of being conflated.
         body["variant"] = inp["variant"]
 
-    return _post_json(
+    row = _post_json(
         f"{server_url}/api/comics",
         body,
         what=f"FMV upsert for {inp.get('title')} #{inp.get('issue')}",
         hard_fail=hard_fail,
     )
+    # BUI-930: the response echo, as the SECOND check and never the gate. The
+    # gate is `_probe_certifier_support`, which runs before any lookup — by the
+    # time a response could tell us the server dropped `certifier`, the slab's
+    # price would already have been written onto the RAW row. So reaching this
+    # branch means the probe passed and the server then failed to echo, which
+    # is not a state this code can reason about; it refuses to hand back a
+    # comic_id/fmv_id a slab bid could be linked to.
+    if fmv.get("graded") and row is not None:
+        echoed = (_identity_token(row.get("certifier"), "")
+                  if "certifier" in row else None)
+        if echoed != body["certifier"]:
+            raise _UpsertRejected(
+                "the comics server did not echo the certifier this price was "
+                f"written at (sent {body['certifier']!r}, got {echoed!r}) "
+                "even though the run-level certifier probe passed. This price "
+                "may have landed on the RAW row for this book and grade. Not "
+                "linking it: re-check the server build "
+                "(./scripts/deploy.sh) and the row at this grade by hand."
+            )
+    return row
 
 
 # ─── Step 3d — comps ledger POST (BUI-658) ────────────────────────────────────
@@ -2644,9 +3295,16 @@ def _upsert_fmv(server_url: str, inp: dict, fmv: dict,
 # `pool`/`provenance` are NOT in here — this function adds those itself, since
 # they depend on which list (`comps` vs `slab_comps`) a given comp came from,
 # not on anything the comp carries.
+# BUI-930 adds the slab comp's own identity (`certifier`/`label`/
+# `page_quality`), parsed by `sold_comps.parse_slab_fields` at fetch time.
+# A RAW comp carries none of them, so `.get()` yields None and `CompItem`'s
+# `mode="before"` validators normalize that to the raw sentinels
+# ('none'/'universal'/'unknown') — which is why they can be listed
+# unconditionally instead of per-pool.
 _COMP_LEDGER_FIELDS = (
     "product_id", "title", "price", "sold_date", "grade", "buying_format",
     "link", "query", "tier", "from_cache", "observed_at", "provider",
+    "certifier", "label", "page_quality",
 )
 
 
@@ -2783,6 +3441,72 @@ def _confidence_to_db_label(label: str) -> str:
     return "low"  # MEDIUM-LOW and LOW
 
 
+def _graded_note_parts(fmv: dict) -> list[str]:
+    """The `fmv_notes` tokens unique to a graded (slab) row (BUI-930).
+
+    Everything a human needs to audit a four-figure slab cap without the
+    pool: which market it was priced in, how (`basis=`), what the ladder
+    looked like, and — the one that matters most — that a lone sale at the
+    exact grade was SEEN and deliberately not used as the price.
+    """
+    parts = [f"certifier={fmv.get('certifier')}",
+             f"label={fmv.get('label')}"]
+    basis = fmv.get("pricing_basis")
+    if basis:
+        parts.append(f"basis={basis}")
+    pq = fmv.get("page_quality")
+    if pq:
+        parts.append(
+            f"page_quality={pq}"
+            + (" (no 2+ same-quality comps; pooled all qualities)"
+               if fmv.get("page_quality_fallback") else ""))
+    pool_n = fmv.get("pool_n")
+    if pool_n is not None:
+        parts.append(
+            f"slab_pool={pool_n} (live={fmv.get('live_slab_count', 0)} "
+            f"ledger={fmv.get('ledger_slab_count', 0)})")
+    for key, token in (("pool_undated_dropped", "undated_dropped"),
+                       ("pool_stale_dropped", "stale_dropped"),
+                       ("printing_dropped", "printing_dropped"),
+                       ("printing_unverified", "printing_unverified")):
+        if fmv.get(key):
+            parts.append(f"{token}={fmv[key]}")
+    ladder = fmv.get("graded_ladder") or {}
+    if basis == "ladder" and ladder:
+        parts.append(
+            f"slab_ladder=grade {ladder['grade_below']:g}"
+            f"→{ladder['grade_above']:g} "
+            f"(median ${ladder['median_below']:g}→${ladder['median_above']:g}); "
+            f"target rung {ladder['target_grade']:g} REMOVED before "
+            "interpolating; confidence LOW")
+        # THE money sentence. `_cgc_ladder_price_and_clamp` would have handed
+        # back this exact sale (merely bounded from above) had the rung been
+        # left in place, so saying it out loud is how an auditor can tell the
+        # guard ran rather than assume it.
+        exact = fmv.get("exact_sales") or []
+        if exact:
+            parts.append(
+                "exact_grade_sales="
+                + ",".join(f"${p:g}" for p in exact)
+                + " (effective n "
+                + f"{fmv.get('exact_effective_n', 0):g}"
+                + " — recorded, NOT used as the price)")
+        parts.append(
+            f"n={fmv.get('n')} is slab-ladder comps, not depth at the target "
+            "grade")
+    if basis == "direct" and fmv.get("envelope_clamped"):
+        parts.append(
+            "envelope_clamped=exact-grade band bounded from above by the "
+            f"neighbouring rungs (BUI-349/355) at ${ladder.get('envelope_price', 0):g}; "
+            "do not raise it to match the raw sales")
+    if fmv.get("bin_listing"):
+        # R34: rendered and written, but with no cap. Named so a blank max_bid
+        # can never read as "we could not price this".
+        parts.append("BIN: Buy It Now listing — band and confidence stand, "
+                     "no max_bid (there is no auction to snipe)")
+    return parts
+
+
 def _build_notes(fmv: dict) -> str:
     # A CGC-proxy band has no grade window (it's priced off the slab ladder, not
     # a raw ±window pool), so render "window=n/a" rather than "window=±None".
@@ -2861,6 +3585,13 @@ def _build_notes(fmv: dict) -> str:
     swapped = fmv.get("masthead_swapped_to")
     if swapped:
         parts.append(f"masthead={swapped}")
+    # BUI-930: the graded (slab) block. Stated before the flag/haircut tokens
+    # so a reader hits WHICH MARKET this number describes before the number's
+    # caveats — a $1,200 band means two completely different things for a raw
+    # copy and a CGC 9.8 slab, and `fmv_notes` is the only place a human (or
+    # `/comic:calibration-report`) sees the difference on a cached row.
+    if fmv.get("graded"):
+        parts.extend(_graded_note_parts(fmv))
     flag = fmv.get("flag_reason")
     if flag:
         parts.append(f"manual_review={flag}")
@@ -2931,6 +3662,11 @@ def _build_notes(fmv: dict) -> str:
             cause = "cgc_proxy"
         elif fmv.get("interpolated"):
             cause = "interpolated"
+        elif fmv.get("graded"):
+            # BUI-930: a slab ladder price is a single point off a bracket, so
+            # its cap comes from its own tier (0.60), never from a photo
+            # grade_confidence — which is pinned None for a certified row.
+            cause = f"graded_{fmv.get('pricing_basis')}"
         else:
             cause = f"grade_conf={fmv.get('grade_confidence')}"
         parts.append(f"bid_haircut={factor:.2f} ({cause})")
@@ -2944,7 +3680,7 @@ def _stitch(books: list[dict], cached: dict[int, dict],
             skipped_hand: dict[int, dict] | None = None,
             skipped_lookup_error: dict[int, str] | None = None,
             skipped_rejected: dict[int, str] | None = None,
-            certified_needs_manual: dict[int, dict] | None = None) -> list[dict]:
+            schema_mismatch: dict[int, dict] | None = None) -> list[dict]:
     """Combine cached, fresh, and all four kinds of skipped result back into
     the input order. `skipped_hand` (BUI-533) reuses the existing DB row
     exactly like `cached` does (never recomputed), tagged with a distinct
@@ -2968,42 +3704,45 @@ def _stitch(books: list[dict], cached: dict[int, dict],
     `source`, so a non-null fmv here would render as an ordinary priced row
     and defeat the whole point of a loud, unmistakable skip.
 
-    `certified_needs_manual` (BUI-928, plan U11) is a fourth, and the only one
-    that never reached `run`'s DB-cache split, fetch, or upsert at all — the
-    book carries a `certifier` other than `none`/empty/None and the graded
-    pricing mode doesn't exist yet, so `run` short-circuits it before any of
-    the three. Unlike the other three skips, its `fmv` is NOT null — it carries
-    `flag_reason: "graded_mode_unavailable"` so it renders exactly like any
-    other needs-manual row (`_print_table`'s `fmv.get("flag_reason")` branch,
-    `manual:<reason>`), while `max_bid`/`comic_id`/`fmv_id` still project null
-    (no top-level `comic_id` key, `db_row: None` — see `_brief_row`) because,
-    unlike a normal needs-manual row, nothing was ever upserted for it."""
+    `schema_mismatch` (BUI-930, plan R29) is a fourth, and the only one that
+    never reached `run`'s DB-cache split, fetch, or upsert at all: the
+    run-level certifier probe found a comics server that cannot describe a
+    price's certifier, so every certified book was refused before anything
+    could be read or written for it. Like `skipped_lookup_error` it carries
+    `fmv: None` — deliberately, because `_print_table` reads `fmv` before it
+    ever looks at `source`, so a non-null fmv here would render as an ordinary
+    row and bury the one fact that matters. This is a DEPLOY-ORDER state, not
+    a pricing verdict: nothing is known about this book's price, and nothing
+    should be inferred from the blank."""
     skipped_hand = skipped_hand or {}
     skipped_lookup_error = skipped_lookup_error or {}
     skipped_rejected = skipped_rejected or {}
-    certified_needs_manual = certified_needs_manual or {}
+    schema_mismatch = schema_mismatch or {}
     out: list[dict] = []
     for i, book in enumerate(books):
-        if i in certified_needs_manual:
+        if i in schema_mismatch:
             out.append({
                 "input": _input_summary(book),
-                "fmv": {
-                    "flag_reason": "graded_mode_unavailable",
-                    "max_bid": None,
-                    "n": 0,
-                    "confidence": None,
-                },
+                "fmv": None,
                 "comp_count_total": 0,
                 "queries_used": [],
                 "db_row": None,
-                "source": "needs_manual_certified",
+                "source": SOURCE_SCHEMA_MISMATCH,
                 "breaker_tripped": False,
+                "error": (
+                    "BUI-930: skipped, this comics server does not report a "
+                    "price's `certifier` (it predates BUI-924/925), so a slab "
+                    "price written to it would land on the RAW row. Nothing "
+                    "was fetched, computed, or written. Deploy the server and "
+                    "re-run."
+                ),
             })
         elif i in cached:
             row = cached[i]
             out.append({
                 "input": _input_summary(book),
-                "fmv": _fmv_from_db_row(row, book.get("grade_confidence")),
+                "fmv": _apply_bin_rule(
+                    book, _fmv_from_db_row(row, book.get("grade_confidence"))),
                 "comp_count_total": row.get("fmv_comps") or 0,
                 "queries_used": [],
                 "db_row": row,
@@ -3014,7 +3753,8 @@ def _stitch(books: list[dict], cached: dict[int, dict],
             row = skipped_hand[i]
             out.append({
                 "input": _input_summary(book),
-                "fmv": _fmv_from_db_row(row, book.get("grade_confidence")),
+                "fmv": _apply_bin_rule(
+                    book, _fmv_from_db_row(row, book.get("grade_confidence"))),
                 "comp_count_total": row.get("fmv_comps") or 0,
                 "queries_used": [],
                 "db_row": row,
@@ -3069,9 +3809,13 @@ def _stitch(books: list[dict], cached: dict[int, dict],
 
 
 def _input_summary(book: dict) -> dict:
+    # BUI-930 adds the slab identity fields. They are projected the same
+    # way every other key here is — only when present — so a raw book's
+    # summary is byte-for-byte unchanged.
     return {k: book.get(k) for k in
             ("item_id", "title", "issue", "year", "publisher", "grade",
-             "grade_confidence", "locg_id", "locg_variant_id", "notes")
+             "grade_confidence", "locg_id", "locg_variant_id", "notes",
+             "certifier", "label", "page_quality", "listing_type")
             if book.get(k) is not None}
 
 
@@ -3127,6 +3871,24 @@ def _window_from_notes(notes: str | None) -> float | None:
         return None
 
 
+# BUI-930: the `fmv.pricing_basis` vocabulary, as the server stores it. The
+# two that carry a bid haircut are listed with the factor they restore; the
+# other two restore nothing (a `direct` band is a plain priced row, and
+# `proxy` is the BUI-348 tier, whose own notes token already caps it — both
+# are listed so a reader can see the vocabulary is closed).
+_PRICING_BASIS_BID_FACTORS: dict[str, float] = {
+    "ladder": fmv_math.GRADED_LADDER_BID_FACTOR,          # 0.60 (BUI-930)
+    "interpolated": fmv_math.INTERPOLATED_BID_FACTOR,     # 0.60 (BUI-318 §7)
+    "proxy": fmv_math.CGC_PROXY_BID_FACTOR,               # 0.70 (BUI-348)
+}
+# The two bases whose confidence is forced to LOW by the tier itself, not
+# earned by the pool. Re-asserted on a cache hit because `fmv_confidence` is
+# STORED collapsed — `_confidence_to_db_label` writes LOW and MEDIUM-LOW alike
+# as 'low' — so the stored label cannot be trusted to carry the distinction
+# back, which is exactly the trap this column was added to replace.
+_PRICING_BASIS_FORCES_LOW = ("ladder", "interpolated")
+
+
 def _fmv_from_db_row(row: dict, grade_confidence: str | None = None) -> dict:
     """Project a gixen-overlay `comics` row back into the fmv dict shape.
 
@@ -3165,6 +3927,25 @@ def _fmv_from_db_row(row: dict, grade_confidence: str | None = None) -> dict:
     cgc_proxy = _cgc_proxy_from_notes(row.get("fmv_notes"))
     if cgc_proxy:
         factor = min(factor, fmv_math.CGC_PROXY_BID_FACTOR)
+    # BUI-930: the COLUMN is read first and the notes token only as a
+    # fallback. `pricing_basis` exists precisely because neither of the two
+    # recoveries above can be trusted on its own: the stored confidence
+    # collapses LOW and MEDIUM-LOW onto 'low', and a notes prefix fails OPEN
+    # on a reword (BUI-769) — a rewritten note silently restores the full
+    # 0.80x cap on a book the tier said must bid 0.60x. A row written by an
+    # older client has no column at all, so the notes path above stays and
+    # this only ever tightens: `min()` in both directions.
+    basis = row.get("pricing_basis")
+    if basis in _PRICING_BASIS_FORCES_LOW:
+        fmv_conf = "LOW"
+        factor = min(fmv_math.bid_factor(fmv_conf, grade_confidence),
+                     _PRICING_BASIS_BID_FACTORS[basis])
+    elif basis in _PRICING_BASIS_BID_FACTORS:
+        factor = min(factor, _PRICING_BASIS_BID_FACTORS[basis])
+    if basis == "interpolated":
+        interpolated = True
+    certifier = _identity_token(row.get("certifier"), _RAW_CERTIFIER)
+    label = _identity_token(row.get("label"), _RAW_LABEL)
     return {
         "n": row.get("fmv_comps") or 0,
         # Shape parity with compute_fmv (effective_n exists there for the
@@ -3217,6 +3998,21 @@ def _fmv_from_db_row(row: dict, grade_confidence: str | None = None) -> dict:
         # so a cache-reused row always reads as "not cross-checked" here; the
         # key must still exist for downstream readers that iterate uniformly.
         "cgc_cross_check": None,
+        # BUI-930: the price identity and the basis, recovered from the
+        # columns the server now serves on every row. `graded` is derived
+        # rather than stored — a certified row IS a graded row — so a cached
+        # slab renders and reports as one without a second column.
+        "graded": certifier != _RAW_CERTIFIER,
+        "certifier": certifier,
+        "label": label,
+        "pricing_basis": basis,
+        "graded_ladder": None,
+        "page_quality": None,
+        "page_quality_fallback": False,
+        "exact_effective_n": 0.0,
+        "exact_sales": [],
+        "pool_n": None,
+        "envelope_clamped": False,
     }
 
 
@@ -3275,8 +4071,8 @@ def _brief_row(r: dict) -> dict:
       - source (BUI-549) → the row's own `source` verbatim (`"fresh"`,
         `"cached"`, `"cgc-proxy"`, `"skipped_hand_priced"`,
         `"skipped_lookup_error"`, `"skipped_rejected"` (BUI-639),
-        `"needs_manual_certified"` (BUI-928), `"ledger-advisory"` (BUI-663),
-        or `"error"`). Without this, a
+        `"skipped_schema_mismatch"` (BUI-930), `"ledger-advisory"`
+        (BUI-663), or `"error"`). Without this, a
         `skipped_lookup_error` row (hand-priced provenance unverifiable —
         the lookup FAILED or answered ambiguously, row left
         completely untouched) projects identically to an ordinary
@@ -3310,6 +4106,15 @@ def _brief_row(r: dict) -> dict:
         "fmv_low": fmv.get("fmv_low"),
         "fmv_high": fmv.get("fmv_high"),
         "fmv_notes": fmv_notes,
+        # BUI-930: the price identity and basis an orchestrator threads into
+        # `gixen build-batch` / `POST /api/bids` and, later, `/comic:verify`.
+        # Null on a raw row rather than the `none`/`universal` sentinels: a
+        # raw row's `--brief` line is unchanged for every consumer that
+        # predates this, and the sentinels are the server's contract for what
+        # an ABSENT value means, so null says exactly the same thing.
+        "certifier": fmv.get("certifier"),
+        "label": fmv.get("label"),
+        "pricing_basis": fmv.get("pricing_basis"),
         "source": r.get("source"),
     }
 
@@ -3379,6 +4184,24 @@ def _print_table(rows: list[dict]) -> None:
             fmv_str = f"${fmv['fmv_low']}–${fmv['fmv_high']} LEDGER"
             med_str = f"${fmv.get('median') or '?'}"
             mb_str = "advisory"
+        elif fmv.get("graded") and fmv.get("fmv_low") is not None:
+            # BUI-930: the slab itself was priced. Checked ABOVE every other
+            # priced branch because a graded band must never render in the
+            # same shape as a raw one — the two are different markets at
+            # different orders of magnitude, and the certifier token is the
+            # only thing on this line that says which.
+            basis = fmv.get("pricing_basis")
+            certifier = fmv.get("certifier") or "?"
+            if basis == "ladder":
+                fmv_str = f"${fmv['fmv_high']} {certifier}-ldr"
+            else:
+                fmv_str = f"${fmv['fmv_low']}–${fmv['fmv_high']} {certifier}"
+            med_str = f"${fmv.get('median') or '?'}"
+            # R34: a BIN listing has no auction, so there is no cap to show.
+            # A distinct token, never a number and never "manual": the band
+            # beside it is real and the operator must not read a cap into the
+            # blank.
+            mb_str = "BIN" if fmv.get("bin_listing") else f"${fmv.get('max_bid') or '?'}"
         elif fmv.get("cgc_proxy"):
             # BUI-348: CGC-proxy band (raw priced off the slab ladder) — mark it
             # so it's never conflated with a real raw-comp range.
@@ -3404,6 +4227,15 @@ def _print_table(rows: list[dict]) -> None:
             # hand-priced skip. Distinct token, distinct source column; the
             # per-book reason is in the summary and the row's `error`.
             fmv_str = "skip:unverified"
+            med_str = "—"
+            mb_str = "—"
+        elif r.get("source") == SOURCE_SCHEMA_MISMATCH:
+            # BUI-930: never priced this run — the comics server cannot
+            # describe a price's certifier, so every certified row was
+            # refused before any read or write. Distinct token so it can't be
+            # read as a thin pool, a fetch-err, or either of the two skips
+            # below: nothing was attempted for this book at all.
+            fmv_str = "skip:schema"
             med_str = "—"
             mb_str = "—"
         elif r.get("source") == "skipped_rejected":

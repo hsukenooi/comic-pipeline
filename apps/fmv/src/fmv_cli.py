@@ -123,6 +123,20 @@ def cli(batch_path: str | None, out_path: str | None,
       [{"item_id": "...", "title": "...", "issue": "...", "year": 1984,
         "grade": 8.0, "locg_id": 1081721, "locg_variant_id": null,
         "publisher": "dark horse", "notes": "..."}, ...]
+
+    \b
+    BUI-930 — a CERTIFIED (slab) row adds four keys, all emitted by
+    `ebay-fetch --identify`:
+      certifier     "cgc" | "cbcs" | "other"  (absent/"none" == a raw book,
+                    which is every existing batch, unchanged)
+      label         "universal" | "signature_series" | "qualified" |
+                    "restored" | "conserved"  (default "universal")
+      page_quality  "white" | "ow_w" | "ow" | "c_ow" | "cream" | "unknown"
+      listing_type  "Auction" | "BIN"  — the key `ebay_fetch.parse_item`
+                    emits; "BIN" renders the band with NO max bid (R34).
+    A row with a certifier is priced from that certifier's own slab sales at
+    that label, never from the raw market, and `grade_confidence` is ignored
+    for it (a certified grade is not a photo judgement).
     """
     # BUI-220: warn when the server URL was supplied only via the deprecated
     # GIXEN_SERVER_URL env (the canonical name is COMICS_SERVER_URL).

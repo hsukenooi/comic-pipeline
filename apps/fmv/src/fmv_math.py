@@ -17,7 +17,7 @@ import math
 import re
 import statistics
 from datetime import date, datetime
-from typing import Iterable
+from typing import Iterable, Mapping
 
 
 # ─── Pool building ────────────────────────────────────────────────────────────
@@ -307,9 +307,9 @@ def cross_grade_inversions(
 
 
 def _bracket_interpolate(
-    medians: dict[float, float], target_grade: float,
-    counts: dict[float, int] | None = None,
-    min_bucket_n: int = MIN_BRACKET_COMPS,
+    medians: Mapping[float, float], target_grade: float,
+    counts: Mapping[float, float] | None = None,
+    min_bucket_n: float = MIN_BRACKET_COMPS,
 ) -> dict | None:
     """Linear-interpolate a price at ``target_grade`` between the nearest
     BRACKETING buckets (one strictly below, one strictly above), or None if the
@@ -352,9 +352,9 @@ def _bracket_interpolate(
 
 
 def interpolate_grade_curve(
-    medians: dict[float, float], target_grade: float,
-    counts: dict[float, int] | None = None,
-    min_bucket_n: int = MIN_BRACKET_COMPS,
+    medians: Mapping[float, float], target_grade: float,
+    counts: Mapping[float, float] | None = None,
+    min_bucket_n: float = MIN_BRACKET_COMPS,
 ) -> dict | None:
     """§7 linear interpolation between the nearest BRACKETING bucket medians.
 
@@ -763,9 +763,9 @@ OUTLIER_ROBUST_BUCKET_N = 3
 
 
 def _cgc_ladder_price_and_clamp(
-    ladder: dict[float, float], target_grade: float,
-    counts: dict[float, int] | None = None,
-    min_bucket_n: int = MIN_BRACKET_COMPS,
+    ladder: Mapping[float, float], target_grade: float,
+    counts: Mapping[float, float] | None = None,
+    min_bucket_n: float = MIN_BRACKET_COMPS,
 ) -> tuple[float | None, bool]:
     """Shared core of ``cgc_ladder_price``: returns ``(price, envelope_clamped)``.
 
@@ -803,9 +803,9 @@ def _cgc_ladder_price_and_clamp(
     return (bracket["target_price"], False) if bracket else (None, False)
 
 
-def cgc_ladder_price(ladder: dict[float, float], target_grade: float,
-                     counts: dict[float, int] | None = None,
-                     min_bucket_n: int = MIN_BRACKET_COMPS) -> float | None:
+def cgc_ladder_price(ladder: Mapping[float, float], target_grade: float,
+                     counts: Mapping[float, float] | None = None,
+                     min_bucket_n: float = MIN_BRACKET_COMPS) -> float | None:
     """Slab price at ``target_grade`` from a CGC/CBCS grade→price ladder.
 
     ``ladder`` is grade → median slab price (build it with ``bucket_medians``
@@ -1394,3 +1394,515 @@ def compute_fmv(comps: list[dict], target_grade: float,
         # whether or not the cross-check ran.
         "cgc_cross_check": None,
     }
+
+
+# ─── Graded (slab) pricing mode (BUI-930) ─────────────────────────────────────
+#
+# Everything above prices a RAW copy. This section prices the slab ITSELF —
+# the certified book in the listing is the thing being bought, so its comps
+# are that certifier's own sales at that label, and none of the raw machinery
+# applies: no `build_pool` grade-window widening (R30 — the exact tier is
+# strictly exact, a 9.6 target never pools 9.8 sales), no CGC-proxy discount
+# (it would price a slab at 0.5x itself), no ungraded anchor, no first-party
+# merge. What IS reused is the ladder: `bucket_medians`' weighted twin below,
+# `_bracket_interpolate` via `_cgc_ladder_price_and_clamp`, the BUI-349/355
+# envelope clamp, and `monotonicity_violations`. One interpolation formula,
+# two callers — the money-critical invariant this module has held since
+# BUI-318.
+#
+# THE ONE RULE THIS SECTION EXISTS TO ENFORCE: a lone exact sale is never the
+# price. The 2026-09-19 spike measured vintage slabs at ONE eBay sale per
+# grade in 90 days, so the exact bucket is routinely n=1. Handing that single
+# listing back as the FMV would make one seller's ask the bid cap on a
+# four-figure book. Instead the target rung is REMOVED from the ladder and the
+# neighbours interpolate across the gap (see `graded_fmv`).
+
+# Age weighting (plan KTD "The ledger becomes a pricing input for slab targets
+# only"). Live provider comps span eBay's ~90-day sold window; the comps
+# ledger reaches further back, and those older observations are worth having
+# on a market this thin — at half weight, and never past a year.
+GRADED_FRESH_MAX_AGE_DAYS = 90     # weight 1.0 up to here
+GRADED_STALE_MAX_AGE_DAYS = 365    # weight GRADED_STALE_WEIGHT up to here
+GRADED_STALE_WEIGHT = 0.5          # 91–365 days
+# Undated comps are EXCLUDED, not weighted 1.0 (the raw path's neutral
+# default). The two paths differ because the raw pool is all live, ~90-day
+# data where "no date" means the parser missed a field; the slab pool merges a
+# ledger that genuinely reaches back years, so an undated ledger comp could be
+# any age at all and a neutral weight would silently make the oldest rows the
+# strongest evidence.
+
+# The exact tier's gate, on EFFECTIVE n (the weight sum), not raw count. Two
+# full-weight sales, or one full plus two stale, price directly; anything less
+# goes to the ladder.
+GRADED_EXACT_MIN_EFFECTIVE_N = 2.0
+
+# Below this many remaining rungs the ladder is refused (plan R10 /
+# `ladder_too_thin`). Counted over ANCHOR-ELIGIBLE rungs — see `_graded_ladder`.
+GRADED_LADDER_MIN_RUNGS = 3
+
+# A slab priced off its neighbours is a single point estimate off a bracket,
+# exactly like the §7 raw interpolation, so it carries the same LOW label and
+# the same 0.60 cap. Aliased rather than reused by name so the two can be
+# tuned apart without one silently dragging the other.
+GRADED_LADDER_CONFIDENCE = "LOW"
+GRADED_LADDER_BID_FACTOR = INTERPOLATED_BID_FACTOR  # 0.60
+
+# `min_bucket_n` for every slab ladder call. The raw path keeps
+# MIN_BRACKET_COMPS (2) because a lone RAW listing is one mistag away from
+# smearing a wild over-bid; a lone CERTIFIED sale is a graded, authenticated
+# observation of the exact thing being bought, and requiring two would refuse
+# essentially every vintage key (the spike measured one sale per rung). The
+# money guard that replaces it is that the TARGET rung is dropped before the
+# interpolation runs, so no single sale can ever be the answer.
+GRADED_LADDER_MIN_BUCKET_N = 1
+
+# The graded mode's own `fmv_flag_reason` vocabulary. Must stay a subset of
+# `gixen_overlay.models.FMV_FLAG_REASONS` — a value that validator rejects
+# 422s and the server discards the WHOLE upsert (the BUI-588 failure mode).
+# The label/certifier punts live in fmv_runner (they fire before any fetch);
+# these four are the ones this module can reach.
+GRADED_FLAG_REASONS = (
+    "no_certifier_pool", "ladder_too_thin", "ladder_non_monotone",
+    "outside_ladder", "too_sparse",
+)
+
+
+def _is_graded_price(value: object) -> bool:
+    """True for a usable price. `bool` excluded explicitly (it is an `int`
+    subclass, so a stray `true` would otherwise enter the pool as $1.00)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def graded_comp_weight(age_days: float | None) -> float | None:
+    """Age weight for one slab comp, or None when the comp is EXCLUDED.
+
+    `age_days` is measured against the pool's own newest comp (see
+    `graded_pool`), never a wall clock — the same determinism rule
+    `_recency_weights` follows, so a fixture pool weighs the same today and
+    next year. None (undated) is excluded; see GRADED_STALE_WEIGHT's comment.
+    """
+    if age_days is None:
+        return None
+    if age_days <= GRADED_FRESH_MAX_AGE_DAYS:
+        return 1.0
+    if age_days <= GRADED_STALE_MAX_AGE_DAYS:
+        return GRADED_STALE_WEIGHT
+    return None
+
+
+def _graded_comp_date(comp: dict) -> date | None:
+    """A slab comp's age basis: `sold_date`, else the ledger's `first_seen_at`.
+
+    A live provider comp always carries `sold_date`. A ledger row may not (the
+    provider did not report one), and for those `first_seen_at` — when this
+    ledger first observed the listing — is a strict UPPER bound on the sale's
+    recency, i.e. the conservative direction: it can only make a comp look
+    NEWER than it is by the lag between sale and first observation, which is
+    days, and it can never resurrect a comp older than the 365-day cutoff.
+    """
+    return (_parse_sold_date(comp.get("sold_date"))
+            or _parse_sold_date(comp.get("first_seen_at")))
+
+
+def graded_pool(comps: Iterable[dict]) -> tuple[list[dict], int, int]:
+    """Weight and filter a slab comp pool.
+
+    Returns `(kept, undated_dropped, stale_dropped)`. Each kept comp is a
+    SHALLOW COPY carrying a `weight` key — copies so the caller's own list
+    (which it also posts to the comps ledger) is never mutated with a field
+    that is not part of the `CompItem` contract.
+
+    The reference date is the pool's newest parseable comp date, matching
+    `_recency_weights` (deterministic, no clock). A pool whose comps are ALL
+    old therefore weighs them all 1.0 relative to each other — correct, and
+    the same property the raw path has: recency weighting answers "which of
+    these is the freshest evidence", never "is this market stale".
+    """
+    usable = [c for c in comps
+              if _is_graded_price(c.get("price")) and c.get("grade") is not None]
+    dated = [(c, _graded_comp_date(c)) for c in usable]
+    known = [d for _, d in dated if d is not None]
+    if not known:
+        return [], len(usable), 0
+    reference = max(known)
+    kept: list[dict] = []
+    undated = stale = 0
+    for comp, when in dated:
+        if when is None:
+            undated += 1
+            continue
+        weight = graded_comp_weight(max((reference - when).days, 0))
+        if weight is None:
+            stale += 1
+            continue
+        kept.append({**comp, "weight": weight})
+    return kept, undated, stale
+
+
+def bucket_weighted_medians(comps: Iterable[dict]) -> dict[float, float]:
+    """Grade → WEIGHT-AWARE median price, the slab ladder's rung values.
+
+    The weighted twin of `bucket_medians`: same bucketing (one bucket per
+    distinct parsed grade, comps missing grade or price ignored), but the
+    rung value is `weighted_median`, so a 200-day-old ledger sale counts half
+    as much as a live one inside its own rung. A comp with no `weight` key
+    counts 1.0, which makes this reduce EXACTLY to `bucket_medians` on an
+    unweighted pool (`weighted_median` delegates to `statistics.median` when
+    every weight is equal) — so a test may pass bare comps.
+    """
+    buckets: dict[float, list[tuple[float, float]]] = {}
+    for c in comps:
+        g = c.get("grade")
+        p = c.get("price")
+        if g is None or p is None:
+            continue
+        buckets.setdefault(float(g), []).append(
+            (float(p), float(c.get("weight", 1.0))))
+    out: dict[float, float] = {}
+    for g, pairs in buckets.items():
+        out[g] = weighted_median([p for p, _ in pairs], [w for _, w in pairs])
+    return out
+
+
+def bucket_effective_n(comps: Iterable[dict]) -> dict[float, float]:
+    """Grade → EFFECTIVE sample size (the weight sum) in that bucket.
+
+    The weighted twin of `bucket_counts`, and the dict every slab-ladder call
+    passes as `counts`. One consequence is deliberate and worth stating: with
+    `GRADED_LADDER_MIN_BUCKET_N == 1`, a rung whose only sale is 91–365 days
+    old sums to 0.5 and is NOT eligible to anchor an interpolation. That is
+    the conservative direction — it can only refuse a price, never raise one —
+    and it keeps a single stale observation from defining a bracket end on a
+    four-figure book.
+    """
+    out: dict[float, float] = {}
+    for c in comps:
+        g = c.get("grade")
+        p = c.get("price")
+        if g is None or p is None:
+            continue
+        out[float(g)] = out.get(float(g), 0.0) + float(c.get("weight", 1.0))
+    return out
+
+
+def _graded_result(**over) -> dict:
+    """The graded mode's output dict, shaped like `compute_fmv`'s.
+
+    Every key `compute_fmv`/`cgc_proxy_fmv` emit is present so a graded row
+    can flow through `_build_notes`, `_print_table`, `_brief_row` and the
+    upsert without a single `.get` special case, plus the graded-only keys the
+    persistence path needs (`certifier`/`label`/`pricing_basis`).
+    """
+    base: dict = {
+        "n": 0,
+        "effective_n": 0.0,
+        "window": None,
+        "flag_reason": None,
+        "grade_span": None,
+        "fmv_low": None,
+        "fmv_high": None,
+        "median": None,
+        "max_bid": None,
+        "cv": None,
+        "cv_pct": "n/a",
+        "confidence": "LOW",
+        # R20/KTD: a certified grade is not a photo judgement, so the BUI-51
+        # photo-coverage haircut has nothing to say about it. Pinned None here
+        # (not merely ignored by the caller) so `_build_notes`' haircut
+        # attribution and `bid_factor` both see the same absence.
+        "grade_confidence": None,
+        "bid_factor": BASE_BID_FACTOR,
+        "trimmed_pool": [],
+        # Shape parity with compute_fmv. `interpolated` stays False even on a
+        # `ladder` row: `pricing_basis` is the carrier now (plan KTD "Pricing
+        # basis is a column"), and setting both would make `_build_notes` and
+        # `_print_table` announce the same fact twice in two vocabularies.
+        "interpolated": False,
+        "interpolation": None,
+        "suspect_buckets": [],
+        "cgc_proxy": False,
+        "cgc_ladder": None,
+        "ungraded_anchor": None,
+        "anchor_diverges": False,
+        "cgc_cross_check": None,
+        # ── graded-only ──────────────────────────────────────────────────
+        "graded": True,
+        "certifier": None,
+        "label": None,
+        # 'direct' | 'ladder' | None (nothing was priced). Never
+        # 'interpolated'/'proxy' — those are the raw path's bases.
+        "pricing_basis": None,
+        "graded_ladder": None,
+        "page_quality": None,
+        "page_quality_fallback": False,
+        "exact_effective_n": 0.0,
+        "exact_sales": [],
+        "pool_n": 0,
+        "pool_undated_dropped": 0,
+        "pool_stale_dropped": 0,
+        "envelope_clamped": False,
+    }
+    base.update(over)
+    return base
+
+
+def _graded_page_quality_filter(
+    pool: list[dict], page_quality: str | None,
+) -> tuple[list[dict], bool]:
+    """Prefer comps whose page quality matches the target's.
+
+    Returns `(pool, fell_back)`. Applied ONLY when the target's page quality
+    is a real reading — `None`/`"unknown"` is the ABSENCE of one, and "prefer
+    the comps whose page quality we also failed to read" is not a quality
+    match, it is a filter on parser coverage (on the spike corpus it would
+    have thrown away the single graded-white rung of half the books). Falls
+    back to the whole pool, with `fell_back=True` so the caller can say so in
+    the notes, whenever fewer than two comps match — one match is a single
+    listing, not a market.
+    """
+    if not page_quality or page_quality == "unknown":
+        return pool, False
+    matched = [c for c in pool if c.get("page_quality") == page_quality]
+    if len(matched) >= 2:
+        return matched, False
+    return pool, True
+
+
+def graded_punt(reason: str, *, certifier: str, label: str,
+                page_quality: str | None = None) -> dict:
+    """A graded needs-manual result for a book refused BEFORE any fetch.
+
+    The label/certifier refusals (plan R31) are decided from the listing
+    alone — a Signature Series slab does not need its comps queried to be
+    known unpriceable — so they never reach `graded_fmv`. This keeps their
+    output dict identical in shape to one that did, so `_build_notes`,
+    `_print_table`, `_brief_row` and the upsert have exactly one graded shape
+    to handle.
+    """
+    return _graded_result(flag_reason=reason, certifier=certifier, label=label,
+                          page_quality=page_quality,
+                          # None, not 0: nothing was ever fetched, and
+                          # `slab_pool=0` in the notes would read as "we
+                          # looked at this certifier's sales and found none",
+                          # which is a different (and wrong) claim.
+                          pool_n=None)
+
+
+def graded_fmv(comps: list[dict], target_grade: float, *,
+               certifier: str, label: str,
+               page_quality: str | None = None) -> dict:
+    """Price a CERTIFIED slab from same-certifier, same-label slab sales.
+
+    `comps` is the already-identity-filtered pool (live provider slab comps
+    plus ledger `pool='slab'` rows for the same comic/certifier/label, deduped
+    on `product_id` — the caller does that merge; this function does the
+    math). Each comp needs `price` and `grade`, plus `sold_date` or
+    `first_seen_at` for its age weight and optionally `page_quality`.
+
+    Returns a `compute_fmv`-shaped dict. A refusal is the ordinary needs-manual
+    shape (`flag_reason` set, every price None, confidence LOW) — the graded
+    mode never returns None, so the caller has exactly one result shape.
+
+    The decision, per the plan's diagram:
+
+      * EXACT tier — effective n >= 2 at EXACTLY `target_grade` prices
+        directly: weighted Q25/median/Q75 of that one bucket, the standard
+        `confidence_label` rubric on its effective n and CV, and — below
+        `OUTLIER_ROBUST_BUCKET_N` — the BUI-349/355 envelope clamp bounding
+        the whole band from above by what the neighbours imply. R30 is why the
+        bucket is strictly exact: a 9.6 and a 9.8 slab are two different
+        products at two different prices, and pooling them is precisely the
+        error the raw ±window exists to make (usefully) for raw copies.
+      * LADDER tier — otherwise the target rung is DROPPED and the neighbours
+        interpolate across the gap, at LOW/0.60. Dropping it is the whole
+        mechanism: `_cgc_ladder_price_and_clamp` returns an exact bucket
+        directly when one is present, so calling it with the rung in place
+        would hand back the lone sale (merely bounded from above) rather than
+        an interpolation.
+      * REFUSALS — `no_certifier_pool` (nothing survived the identity + age
+        filters), `ladder_too_thin` (< 3 anchor-eligible rungs left),
+        `outside_ladder` (no rung on one side — the proxy's never-extrapolate
+        rule), `ladder_non_monotone` (the two rungs the interpolation would
+        actually use invert).
+
+    The `ladder_non_monotone` check is scoped to the NEIGHBOURS, not the whole
+    ladder, and that scope is measured rather than assumed. `cgc_proxy_fmv`
+    refuses on ANY violation anywhere in its ladder, which is right for a
+    ladder built from a 3+-comp raw-market query; on the 2026-09-21 spike
+    corpus, where every rung is one sale, all 4 ladder-tier books carried a
+    violation SOMEWHERE and a whole-ladder rule refused all 4 — while the
+    neighbour rule refused exactly the 2 whose own bracket inverted (Batman
+    #227 at 4.5, whose 4.0 rung sold for $1,400 against a $899 5.5; and
+    Invincible #1 at 9.4). A guard that refuses everything is not a guard, and
+    the rungs a straight line is drawn between are the ones whose order
+    decides whether that line means anything.
+    """
+    pool, undated_dropped, stale_dropped = graded_pool(comps)
+    pool, pq_fallback = _graded_page_quality_filter(pool, page_quality)
+    identity: dict = {
+        "certifier": certifier,
+        "label": label,
+        "page_quality": page_quality,
+        "page_quality_fallback": pq_fallback,
+        "pool_n": len(pool),
+        "pool_undated_dropped": undated_dropped,
+        "pool_stale_dropped": stale_dropped,
+    }
+    if not pool:
+        return _graded_result(flag_reason="no_certifier_pool", **identity)
+
+    ladder = bucket_weighted_medians(pool)
+    eff_n = bucket_effective_n(pool)
+    target_grade = float(target_grade)
+    exact_comps = [c for c in pool if float(c["grade"]) == target_grade]
+    identity["exact_effective_n"] = eff_n.get(target_grade, 0.0)
+    identity["exact_sales"] = sorted(float(c["price"]) for c in exact_comps)
+
+    if identity["exact_effective_n"] >= GRADED_EXACT_MIN_EFFECTIVE_N:
+        return _graded_direct(exact_comps, ladder, eff_n, target_grade, identity)
+    return _graded_ladder(pool, ladder, eff_n, target_grade, identity)
+
+
+def _graded_direct(exact_comps: list[dict], ladder: dict[float, float],
+                   eff_n: dict[float, float], target_grade: float,
+                   identity: dict) -> dict:
+    """The EXACT tier: price the band off the target-grade bucket alone."""
+    prices = [float(c["price"]) for c in exact_comps]
+    weights = [float(c["weight"]) for c in exact_comps]
+    effective_n = sum(weights)
+    cv_val = cv(prices)
+
+    fmv_low = weighted_quartile(prices, weights, 0.25)
+    fmv_high = weighted_quartile(prices, weights, 0.75)
+    med = weighted_median(prices, weights)
+
+    # BUI-349/355 envelope clamp, reused verbatim: with `eff_n` as `counts`,
+    # the helper's own `counts[target] < max(min_bucket_n, 3)` trigger fires
+    # exactly on an exact bucket below OUTLIER_ROBUST_BUCKET_N effective
+    # sales, and bounds it by the linear envelope its neighbours imply. The
+    # cap is applied to the WHOLE band (low/median/high alike) rather than to
+    # the midpoint only: `max_bid` rides `fmv_high`, so clamping the median
+    # and leaving the high would leave the bid cap exactly where the guard
+    # says it must not be. `min()` everywhere means this can only LOWER a
+    # number, never raise one.
+    capped, envelope_clamped = _cgc_ladder_price_and_clamp(
+        ladder, target_grade, counts=eff_n,
+        min_bucket_n=GRADED_LADDER_MIN_BUCKET_N,
+    )
+    if envelope_clamped and capped is not None:
+        fmv_low = min(fmv_low, capped)
+        fmv_high = min(fmv_high, capped)
+        med = min(med, capped)
+    elif effective_n < OUTLIER_ROBUST_BUCKET_N:
+        # The gap the clamp above cannot cover, and the ONE place a thin exact
+        # bucket can still set a four-figure cap unbounded. `capped` comes
+        # back unclamped whenever no eligible rung BRACKETS the target — the
+        # target sits at an end of the ladder, or the page-quality preference
+        # scoped the pool down to the exact bucket alone — so there is no
+        # envelope to bound it with. A 2-sale bucket is never IQR-trimmable
+        # and its median-of-2 is just a midpoint, so one mistagged or premium
+        # listing sets `fmv_high` and, at 0.80x, the bid. This is BUI-179's
+        # guard, applied where BUI-349's cannot reach: refuse rather than
+        # price a pair that disagree implausibly. Same `too_sparse` reason
+        # BUI-179 uses, and for the same reason — what is wrong is not the
+        # count but that two observations this far apart are not one market.
+        lo, hi = min(prices), max(prices)
+        if lo <= 0 or hi / lo > SMALL_POOL_MAX_RATIO:
+            return _graded_result(flag_reason="too_sparse", **identity)
+
+    conf = confidence_label(effective_n, cv_val)
+    # `grade_confidence` is pinned None for a certified row (see
+    # `_graded_result`), so this is BASE_BID_FACTOR today. Routed through
+    # `bid_factor` anyway so the graded path cannot drift from the one
+    # function that owns the haircut ladder.
+    factor = bid_factor(conf, None)
+    low_i, high_i, med_i = (clean_round(fmv_low), clean_round(fmv_high),
+                            clean_round(med))
+    return _graded_result(
+        n=len(exact_comps),
+        effective_n=effective_n,
+        fmv_low=low_i,
+        fmv_high=high_i,
+        median=med_i,
+        max_bid=clean_round(high_i * factor),
+        cv=cv_val,
+        cv_pct=f"{cv_val * 100:.0f}%" if cv_val is not None else "n/a",
+        confidence=conf,
+        bid_factor=factor,
+        trimmed_pool=sorted(prices),
+        pricing_basis="direct",
+        envelope_clamped=envelope_clamped,
+        graded_ladder={
+            "ladder": dict(sorted(ladder.items())),
+            "effective_n": dict(sorted(eff_n.items())),
+            "target_grade": target_grade,
+            "envelope_price": capped if envelope_clamped else None,
+        },
+        **identity,
+    )
+
+
+def _graded_ladder(pool: list[dict], ladder: dict[float, float],
+                   eff_n: dict[float, float], target_grade: float,
+                   identity: dict) -> dict:
+    """The LADDER tier: drop the target rung and interpolate its neighbours."""
+    ladder_ex = {g: v for g, v in ladder.items() if g != target_grade}
+    eff_ex = {g: v for g, v in eff_n.items() if g != target_grade}
+    # Counted over ANCHOR-ELIGIBLE rungs (effective n >= min_bucket_n) rather
+    # than over every surviving key: a rung that cannot anchor cannot hold up
+    # a bracket either, so counting it would only swap this honest
+    # `ladder_too_thin` for a misleading `outside_ladder` one branch later.
+    eligible = [g for g in ladder_ex
+                if eff_ex.get(g, 0.0) >= GRADED_LADDER_MIN_BUCKET_N]
+    if len(eligible) < GRADED_LADDER_MIN_RUNGS:
+        return _graded_result(flag_reason="ladder_too_thin", **identity)
+
+    bracket = _bracket_interpolate(
+        ladder_ex, target_grade, eff_ex, GRADED_LADDER_MIN_BUCKET_N)
+    if bracket is None:
+        # No eligible rung on one side. The proxy's never-extrapolate rule,
+        # for the same reason: a straight line run off the end of the observed
+        # ladder is a guess, and on a slab that guess is four figures.
+        return _graded_result(flag_reason="outside_ladder", **identity)
+
+    pair = (bracket["grade_below"], bracket["grade_above"])
+    if pair in monotonicity_violations(ladder_ex):
+        return _graded_result(flag_reason="ladder_non_monotone", **identity)
+
+    price, _clamped = _cgc_ladder_price_and_clamp(
+        ladder_ex, target_grade, counts=eff_ex,
+        min_bucket_n=GRADED_LADDER_MIN_BUCKET_N,
+    )
+    if price is None:  # pragma: no cover — `bracket` above already proved one
+        return _graded_result(flag_reason="outside_ladder", **identity)
+
+    point = clean_round(price)
+    factor = min(bid_factor(GRADED_LADDER_CONFIDENCE, None),
+                 GRADED_LADDER_BID_FACTOR)
+    return _graded_result(
+        # `n` is LADDER depth, not exact-grade depth — the same caveat
+        # `cgc_proxy_fmv` carries, and `_build_notes` states it in words so a
+        # machine reading `fmv_comps` in isolation cannot mistake it for
+        # liquidity at the target grade.
+        n=len(pool),
+        effective_n=sum(eff_n.values()),
+        fmv_low=point,
+        fmv_high=point,
+        median=point,
+        max_bid=clean_round(point * factor),
+        confidence=GRADED_LADDER_CONFIDENCE,
+        bid_factor=factor,
+        pricing_basis="ladder",
+        graded_ladder={
+            "ladder": dict(sorted(ladder_ex.items())),
+            "effective_n": dict(sorted(eff_ex.items())),
+            "target_grade": target_grade,
+            "grade_below": bracket["grade_below"],
+            "grade_above": bracket["grade_above"],
+            "median_below": bracket["median_below"],
+            "median_above": bracket["median_above"],
+            "target_price": bracket["target_price"],
+            "envelope_price": None,
+        },
+        **identity,
+    )
