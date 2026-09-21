@@ -3345,6 +3345,13 @@ def _is_fetch_error(r: dict) -> bool:
     return all(q.get("error") for q in queries)
 
 
+def _cell(value) -> str:
+    """Render a table cell None-safe. A row that never reached pricing — the
+    BUI-928 certified punt carries `confidence: None` — must not crash the
+    renderer's `:<12` format spec (`None.__format__` rejects any spec)."""
+    return "?" if value is None else str(value)
+
+
 def _print_table(rows: list[dict]) -> None:
     click.echo(f"{'#':>3}  {'Comic':<30} {'Grade':>5}  "
                f"{'FMV':<14} {'Med':>5}  {'n':>3}  {'CV':>5}  "
@@ -3430,9 +3437,9 @@ def _print_table(rows: list[dict]) -> None:
             mb_str = "n/a"
         click.echo(
             f"{i:>3}  {label[:30]:<30} {str(grade):>5}  "
-            f"{fmv_str:<14} {med_str:>5}  {fmv.get('n','?'):>3}  "
-            f"{fmv.get('cv_pct','?'):>5}  "
-            f"{fmv.get('confidence','?'):<12} {mb_str:>7}  {r['source']}"
+            f"{fmv_str:<14} {med_str:>5}  {_cell(fmv.get('n')):>3}  "
+            f"{_cell(fmv.get('cv_pct')):>5}  "
+            f"{_cell(fmv.get('confidence')):<12} {mb_str:>7}  {r['source']}"
         )
 
     # BUI-143: a whole batch run during a SerpApi outage/quota-exhaustion would

@@ -5615,3 +5615,22 @@ class TestModernCgcProxyStaysRefused:
         slab, _ = fmv_math._cgc_ladder_price_and_clamp(ladder, 9.2, counts=counts)
         assert slab == 261.0
         assert slab < fmv_math.CGC_PROXY_MIN_SLAB_PRICE
+
+
+class TestPrintTableCertifiedPunt:
+    """BUI-928 follow-up: the certified punt row carries `confidence: None`
+    (nothing was priced), and `_print_table`'s `:<12` format spec crashed on
+    it during the live spike-batch probe, before any --brief line was emitted."""
+
+    def test_print_table_renders_certified_punt_row(self, capsys):
+        row = {
+            "input": {"title": "Batman", "issue": "227", "grade": 4.5},
+            "fmv": {"flag_reason": "graded_mode_unavailable", "max_bid": None,
+                    "n": 0, "confidence": None},
+            "comp_count_total": 0, "queries_used": [], "db_row": None,
+            "source": "needs_manual_certified", "breaker_tripped": False,
+        }
+        fmv_runner._print_table([row])
+        out = capsys.readouterr().out
+        assert "graded_mode_unavailable" in out
+        assert "needs_manual_certified" in out
