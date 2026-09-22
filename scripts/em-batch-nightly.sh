@@ -239,9 +239,10 @@ try:
 except Exception:
     sys.exit(0)
 print(doc.get("result", "").strip())
-# total_cost_usd in a resumed segment is cumulative for the session (checked
-# 2026-09-22: modelUsage lines carried over unchanged), so the last file is the
-# run total; only the turn counts add up. No apostrophes in here: bash 3.2 cannot
+# modelUsage in a resumed segment is cumulative for the session (checked
+# 2026-09-22: the first segment lines carried over unchanged), so the last file
+# is the run total; only the turn counts add up. Tokens, not dollars: the runs
+# draw on a subscription, so a dollar figure is not money spent. No apostrophes in here: bash 3.2 cannot
 # parse a quote inside a heredoc inside a command substitution.
 turns = 0
 for f in sorted(glob.glob(sys.argv[2] + "/result*.json")):
@@ -249,7 +250,12 @@ for f in sorted(glob.glob(sys.argv[2] + "/result*.json")):
         turns += json.load(open(f)).get("num_turns", 0)
     except Exception:
         pass
-print("\nCost: $%.2f, %s turns." % (doc.get("total_cost_usd", 0.0), turns))
+mu = doc.get("modelUsage", {}) or {}
+out = sum(v.get("outputTokens", 0) for v in mu.values())
+rd = sum(v.get("cacheReadInputTokens", 0) for v in mu.values())
+wr = sum(v.get("cacheCreationInputTokens", 0) + v.get("inputTokens", 0) for v in mu.values())
+per = ", ".join("%s %dk out / %.1fM read" % (m.split("-")[1], v.get("outputTokens", 0) / 1000, v.get("cacheReadInputTokens", 0) / 1e6) for m, v in mu.items())
+print("\nUsage: %dk output, %.1fM cache read, %.2fM cache write tokens, %s turns (%s)." % (out / 1000, rd / 1e6, wr / 1e6, turns, per))
 EOPY
 )"
 if [ -z "$SUMMARY" ]; then
