@@ -115,15 +115,20 @@ reachable *only* this way, the other 4 also appearing in a carrier URL and so
 reported as `carrier_url`. Prose after a label ("all tracking numbers are
 forwarded at time of shipping") is rejected before validation by requiring at
 least 8 digits in the candidate, so it does not even become a warning. A
-labelled number for a carrier with no rule here (Shopee's `SPXSG…`) is reported
-as `unknown_carrier` rather than emitted unvalidated. And a number shaped like a
+labelled number for a carrier with no rule here at all is reported as
+`unknown_carrier` rather than emitted unvalidated. And a number shaped like a
 check-digit carrier's is that carrier's to accept or refuse — no looser,
 shape-only rule may rescue it (see `classify_tracking`).
 
 UPS 1Z and USPS impb check digits are both verified against this account's real
-ledger (5/5 and 11/11 respectively). FedEx and DHL are validated on shape only
-and have not been seen in this account's mail — they are wired up but
-unverified, which the `--json` output states per row via `carrier_verified`.
+ledger (5/5 and 11/11 respectively). FedEx, DHL, and Shopee Xpress (`SPX…`,
+BUI-967) are validated on shape only and have not been seen in this account's
+mail — they are wired up but unverified, which the `--json` output states per
+row via `carrier_verified`. SPX is recognized only through the label path
+(source 2): no carrier tracking URL for it has ever turned up here, so unlike
+FedEx and DHL it carries no entry in `_CARRIER_RULES` (source 1) — inventing a
+host/query-param shape with nothing to verify it against would be exactly the
+kind of guess this module refuses to make.
 """
 
 from __future__ import annotations
@@ -246,6 +251,15 @@ def dhl_shape_ok(tracking: str) -> bool:
     return bool(re.fullmatch(r"\d{10,11}|[A-Z]{2}\d{9}[A-Z]{2}", tracking))
 
 
+def spx_shape_ok(tracking: str) -> bool:
+    """Shopee Xpress (SPX): `SPX` + a 2-letter country code + 8-15 digits
+    (`SPXSG065899567827` is the shape seen so far). Shape only, like FedEx and
+    DHL — Shopee documents no public check-digit algorithm, and no SPX number
+    has appeared in this account's real mail to verify one against (BUI-967).
+    """
+    return bool(re.fullmatch(r"SPX[A-Z]{2}\d{8,15}", tracking))
+
+
 # (carrier, verified-against-ground-truth, validator, url pattern)
 # The pattern must anchor on the carrier's own host and read a
 # tracking-named query parameter — never a bare digit run in body text.
@@ -317,6 +331,16 @@ _CHECKED_FORMATS = [
     ("USPS", re.compile(r"\d{20}|\d{22}|\d{26}"), usps_check_digit_ok),
 ]
 
+# Carriers recognized only through the label path (source 2, BUI-967): no
+# carrier tracking URL for them has ever appeared in this account's mail, so
+# there is no host/query-param shape to add to _CARRIER_RULES (extract_tracking,
+# source 1) — inventing one would be exactly the kind of guess this module
+# refuses to make (see "Never guess a tracking number"). classify_tracking
+# tries these last, so a candidate _CARRIER_RULES already claims is unaffected.
+_LABEL_ONLY_CARRIERS = [
+    ("SHOPEE", False, spx_shape_ok),
+]
+
 
 def classify_tracking(candidate: str):
     """Return (carrier, carrier_verified), or None if nothing may claim it.
@@ -328,6 +352,9 @@ def classify_tracking(candidate: str):
         if shape.fullmatch(candidate):
             return (carrier, True) if validator(candidate) else None
     for carrier, verified, validator, _pattern in _CARRIER_RULES:
+        if validator(candidate):
+            return carrier, verified
+    for carrier, verified, validator in _LABEL_ONLY_CARRIERS:
         if validator(candidate):
             return carrier, verified
     return None
@@ -361,7 +388,8 @@ def extract_labeled_tracking(text: str):
     `found` is a list of (carrier, tracking, carrier_verified) in the same shape
     as `extract_tracking`; `rejected` is a list of candidates that looked like a
     tracking number and were labelled as one, but matched no carrier rule here
-    (a real Shopee `SPXSG…` number, for instance). Those become a visible
+    at all (Shopee's `SPX…` used to be this module's standing example, until
+    BUI-967 gave it a shape rule — see `spx_shape_ok`). Those become a visible
     `unknown_carrier` warning rather than an unvalidated row.
 
     Takes rendered text, not raw HTML, because the label and the number are
@@ -510,8 +538,16 @@ _EBAY_TXN_ID = re.compile(r"[?&](?:amp;)?transactionId=(\d{9,18})", re.I)
 # "delivery update" was added in BUI-916: it is eBay's own class, it carries a
 # labelled tracking number, and the old pattern classified it `ignore` — the
 # whole message was dropped before extraction ever ran.
+#
+# BUI-967: bare `package` used to be one of the alternatives here, and it
+# matched the word anywhere in the subject — including a GitHub CI
+# notification with "package" in it, which is not a shipping mail. Every real
+# subject observed with "package" in it is eBay's own "Your package …"
+# phrasing, and each one also matches a more specific alternative below
+# ("with its carrier", "delivered", "estimated to arrive"), so narrowing to
+# `your package` drops no measured coverage.
 _SHIPPING_SUBJECT = re.compile(
-    r"package|shipped|shipment|shipping confirmation|out for delivery|delivered|"
+    r"your package|shipped|shipment|shipping confirmation|out for delivery|delivered|"
     r"with its carrier|order is being prepared|estimated to arrive|"
     r"an update on your order|delivery update|on the way",
     re.I,
