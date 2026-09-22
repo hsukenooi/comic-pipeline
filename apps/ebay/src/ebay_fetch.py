@@ -1290,6 +1290,106 @@ def search_by_keyword(keyword, token, base_url, *, max_results=500, buying_optio
     return all_items[:max_results]
 
 
+# ─── Active-ask ceiling (BUI-954) ──────────────────────────────────────────
+#
+# `comic-fmv` shells out to this mode (`--active-asks`) for a REFUSED
+# (needs_manual) row: it never imports eBay code, so the search itself, and
+# the identity filtering that keeps a mismatched listing from being counted,
+# both have to live here. Display only on the caller's side — see
+# fmv_runner._maybe_attach_active_ask_ceiling — but the filtering below is
+# what makes the number trustworthy enough to show at all: a search by
+# title+issue alone returns every grade and every certifier, and an
+# unfiltered lowest price would as often be a wrong-grade or wrong-certifier
+# listing as the row's own identity.
+
+
+def _parse_active_ask_price(item: dict) -> "float | None":
+    """The numeric USD price of a parsed itemSummary (BUI-954), or None.
+
+    `parse_item_summary` already formats `current_price` as a currency-symbol
+    string (`"$25.00"` for USD, `"GBP 25.00"` otherwise — see its docstring).
+    Only a `$`-prefixed price is accepted: a display-only ceiling must not
+    blend currencies (the same posture BUI-675's raw-comp currency gate
+    takes), and there is no FX conversion here to make a non-USD number
+    comparable.
+    """
+    raw = item.get("current_price")
+    if not isinstance(raw, str) or not raw.startswith("$"):
+        return None
+    try:
+        return float(raw[1:].replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _title_matches_ask_identity(title: str, *, grade: float,
+                                certifier: "str | None",
+                                label: "str | None") -> bool:
+    """True if `title` (an active BIN listing) names the SAME identity as the
+    refused row it's a ceiling candidate for (BUI-954).
+
+    Conservative by design — a display-only ceiling that mislabels an
+    unrelated book's ask as this one's is worse than a ceiling that misses a
+    real match, so every ambiguous case (no readable grade, a slab title on
+    a raw target, a raw title on a slab target, a certifier/label mismatch)
+    is dropped rather than guessed at.
+
+    ``certifier``/``label`` are None for a RAW target: a slab ask (any
+    certifier named in the title) is a different market and is dropped
+    outright, mirroring `_SLAB_TITLE_RE`'s role on the sold-comps side. For a
+    CERTIFIED target both must match exactly — a CGC 4.5 row never counts a
+    CGC 6.0 ask (wrong grade) or a CBCS 4.5 ask (wrong certifier).
+    """
+    ask_certifier = grade_tokens.resolve_certifier_token(title)
+    if certifier:
+        if ask_certifier != certifier:
+            return False
+        ask_label = grade_tokens.resolve_label(title) or "universal"
+        if ask_label != label:
+            return False
+    elif ask_certifier is not None:
+        return False
+
+    m = grade_tokens._NUMERIC_GRADE_RE.search(title)
+    if not m:
+        return False
+    try:
+        ask_grade = float(m.group(1))
+    except ValueError:
+        return False
+    return abs(ask_grade - grade) < 0.05
+
+
+def search_active_asks(keyword, token, base_url, *, grade, certifier=None,
+                       label=None, max_results=50):
+    """Search active (Buy It Now) listings and return the lowest ask + count
+    for the same title/issue/grade[/certifier/label] identity (BUI-954).
+
+    Wraps `search_by_keyword` with `buying_options="FIXED_PRICE"` — the same
+    Browse API path `seller-scan` already uses — then filters to listings
+    `_title_matches_ask_identity` confirms share this book's identity.
+    Returns ``{"low": float | None, "n": int}``; ``n == 0`` (and
+    ``low is None``) when nothing survived the search or the filter, never
+    an exception — a caller (this module's own `main`) prints it as-is and
+    lets the SUBPROCESS caller (`comic-fmv`) decide how to fail soft.
+    """
+    items = search_by_keyword(keyword, token, base_url,
+                              max_results=max_results,
+                              buying_options="FIXED_PRICE")
+    prices = []
+    for item in items:
+        title = item.get("title") or ""
+        if not _title_matches_ask_identity(title, grade=grade,
+                                           certifier=certifier, label=label):
+            continue
+        price = _parse_active_ask_price(item)
+        if price is not None:
+            prices.append(price)
+    if not prices:
+        return {"low": None, "n": 0}
+    return {"low": min(prices), "n": len(prices)}
+
+
 # ─── Aspects disk cache (BUI-229) ─────────────────────────────────────────────
 # Per-item disk cache for localizedAspects (get_item_by_legacy_id responses).
 # Keyed by numeric item_id; 7-day TTL matches the search-cache default — aspects
@@ -1686,8 +1786,67 @@ def main(argv=None):
         default=None,
         help="eBay environment (overrides config)",
     )
+    parser.add_argument(
+        "--active-asks",
+        type=str,
+        default=None,
+        metavar="KEYWORD",
+        help="BUI-954: search active Buy-It-Now listings for KEYWORD "
+             "(typically '<title> #<issue>') and print the lowest ask + "
+             "count for the same identity as JSON ({\"low\": ..., \"n\": "
+             "...}), instead of fetching the positional item ids. Requires "
+             "--grade; --certifier/--label narrow the match to a certified "
+             "target (omit both for a raw target, which excludes any "
+             "listing naming a certifier). Used by comic-fmv to show a "
+             "display-only ceiling on refused rows — see "
+             "docs/conventions/fmv-math-spec.md §7.",
+    )
+    parser.add_argument(
+        "--grade",
+        type=float,
+        default=None,
+        help="Target CGC-scale grade to match for --active-asks (required "
+             "with --active-asks).",
+    )
+    parser.add_argument(
+        "--certifier",
+        choices=["cgc", "cbcs", "other"],
+        default=None,
+        help="Certifier to match for --active-asks on a CERTIFIED target "
+             "(omit for a raw target).",
+    )
+    parser.add_argument(
+        "--label",
+        type=str,
+        default=None,
+        help="Slab label to match for --active-asks on a CERTIFIED target "
+             "(e.g. 'universal', 'signature_series'); ignored for a raw "
+             "target.",
+    )
+    parser.add_argument(
+        "--max-results",
+        type=int,
+        default=50,
+        help="Max active listings to fetch for --active-asks (default 50).",
+    )
 
     args = parser.parse_args(argv)
+
+    if args.active_asks is not None:
+        if args.grade is None:
+            print("Error: --active-asks requires --grade.", file=sys.stderr)
+            sys.exit(2)
+        client_id, client_secret, base_url = load_config()
+        if args.env:
+            base_url = PRODUCTION_BASE if args.env == "production" else SANDBOX_BASE
+        token = get_token(client_id, client_secret, base_url)
+        result = search_active_asks(
+            args.active_asks, token, base_url, grade=args.grade,
+            certifier=args.certifier, label=args.label,
+            max_results=args.max_results,
+        )
+        print(json.dumps(result))
+        return
 
     # Collect item args from CLI, falling back to stdin only when none were
     # given (BUI-538). Reading stdin whenever it merely isn't a TTY hung
