@@ -469,6 +469,14 @@ _REPRINT_MARKERS: frozenset[str] = frozenset({
     "retold",  # BUI-253 PR-review fix (S1): sold_comps.py's manual-fallback
     # lexicon already flagged "retold" as a reprint marker; comic_identity's
     # lexicon was missing it entirely.
+    "anniversary edition",  # BUI-959: kept in sync with
+    # comic_identity_year._PROMO_REPRINT_MARKERS (same "retold" convention)
+    # so should_reject's deterministic path rejects an "Nth Anniversary
+    # Edition" reprint too, not just identify_comic's edition classification.
+    # Deliberately NOT bare "anniversary" — see the measurement note next to
+    # _PROMO_REPRINT_MARKERS in comic_identity_year.py: a genuine original
+    # issue is routinely sold as an "Nth Anniversary Issue"/"Variant", and
+    # those must keep matching.
 })
 
 

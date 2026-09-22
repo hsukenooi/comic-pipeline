@@ -225,6 +225,27 @@ _PROMO_REPRINT_MARKERS: frozenset[str] = frozenset({
     # above so should_reject's deterministic path and identify_comic's
     # edition classification both recognize it — one lexicon addition,
     # kept in both places since they're intentionally split by kind.
+    "anniversary edition",  # BUI-959: "Nth Anniversary Edition" reprints
+    # (e.g. "Giant Size X-Men 40th Anniversary Edition" hardcover) were
+    # falling through to whatever edition-word regex matched next — giant-
+    # size in that example — carrying forward the ORIGINAL issue's
+    # Publication Year via confident_cover_year instead of the reprint's.
+    # Also added to _REPRINT_MARKERS in comic_identity.py, same convention
+    # as "retold" above. Deliberately just "anniversary edition", NOT bare
+    # "anniversary" — a genuine ORIGINAL issue routinely advertises itself
+    # as an "Nth Anniversary Issue" or "Nth Anniversary Variant" (e.g.
+    # "Fantastic Four #100 100th Anniversary Issue", "Amazing Spider-Man
+    # #300 25th Anniversary Issue", "All-New X-Men #20 50th Anniversary
+    # Variant") — matching bare "anniversary" would misclassify those as
+    # reprints. Measured over the offline corpus at ~/.cache/ebay-sold-comps
+    # (1,171 cached responses, 16,688 distinct titles): 20 titles contain
+    # "anniversary issue" or "anniversary variant" and correctly classify as
+    # single-issue/other (0 false positives); exactly 1 title contains
+    # "anniversary edition" verbatim ("Marvel Giant Size X-Men 40th
+    # Anniversary Edition 2015 HARD COVER VHTF") and flips giant-size ->
+    # reprint, a genuine correction (it's a 2015 HC reprint, not the
+    # original single issue). _classify_edition_kind changes class for
+    # exactly that 1 of 16,688 titles.
 })
 
 
