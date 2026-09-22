@@ -5636,9 +5636,13 @@ class TestGradedIdentityGuardsInFetch:
             {"title": "Batman", "issue": "227", "year": 1970, "grade": 4.5},
             "key",
         )
-        # No certifier ⇒ no graded_target ⇒ every guard is bypassed and the
-        # raw pool keeps exactly what LOCAL_EXCLUDE_RE/is_comp_excluded let
-        # through, including the ampersand lot.
+        # BUI-961: no certifier and no include_graded ⇒ `admits_graded` is
+        # False on every tier this book's thin/vintage pool reaches (the
+        # BUI-524 inclusive tier does fire here, but `_wire` serves it an
+        # empty page, so it contributes no comps for the guard to touch
+        # either way) ⇒ every guard is bypassed and the raw pool keeps
+        # exactly what LOCAL_EXCLUDE_RE/is_comp_excluded let through,
+        # including the ampersand lot — byte-identical to pre-BUI-961.
         assert out["graded_identity_dropped"] == {
             "cross_title": 0, "store_variant": 0,
         }
@@ -5646,6 +5650,36 @@ class TestGradedIdentityGuardsInFetch:
         kept = {c["title"] for c in out["comps"]}
         assert AMPERSAND_LOT in kept
         assert CROSS_TITLE in kept
+
+    def test_include_graded_raw_target_drops_lot_and_cross_title(
+            self, tmp_path, monkeypatch):
+        """BUI-961: comic-fmv's CGC-proxy/cross-check rescue runs
+        `fetch_book_comps` with `include_graded: True` on a RAW target (no
+        `certifier`) — before this ticket the lot/cross-title/store-variant
+        guards were gated on `graded_target` alone, so this exact pass
+        admitted the House of Secrets #88 "Batman 227 Inspo" listing
+        (CROSS_TITLE, a real corpus title/price — $525 sold 2026-09-11,
+        BUI-921's own live trace) and the ampersand two-book lot straight
+        into `comps`. Both must now be dropped, with codes, the same as a
+        certified-target pass."""
+        self._wire(tmp_path, monkeypatch, self._results())
+        out = sc.fetch_book_comps(
+            {"title": "Batman", "issue": "227", "year": 1970, "grade": 4.5,
+             "include_graded": True},
+            "key",
+        )
+        # route_slabs is False for this pass (no graded_target, so the base
+        # tier never routes to slab_comps) — the surviving comps land in the
+        # ordinary raw `comps` pool, same shape as comic-fmv's real
+        # cross-check fetch.
+        assert out["slab_comps"] == []
+        kept = {c["title"] for c in out["comps"]}
+        assert AMPERSAND_LOT not in kept
+        assert CROSS_TITLE not in kept
+        assert self.JUNK[2][0] not in kept  # the Larry's store-variant title
+        assert self.GENUINE[0] in kept
+        by_id = {d["product_id"]: d["code"] for d in out["graded_identity_dropped_ids"]}
+        assert by_id == {"j0": "multibook_lot", "j1": "cross_title", "j2": "store_variant"}
 
     def test_a_variant_target_keeps_its_own_variant_comps(self, tmp_path, monkeypatch):
         self._wire(tmp_path, monkeypatch, self._results())

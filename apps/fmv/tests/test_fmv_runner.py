@@ -4834,36 +4834,18 @@ _BATMAN227_BOOKS = [{"item_id": "1", "title": "Batman", "issue": "227",
                      "year": 1970, "grade": 6.0, "publisher": "dc"}]
 
 
-class TestMultibookGradedLotDetector:
-    def test_fires_on_the_real_two_book_lot(self):
-        assert fmv_runner._is_multibook_graded_lot(_BATMAN227_LOT_TITLE) is True
-
-    @pytest.mark.parametrize("title", [
-        # One issue that merely name-drops two things — the shape BUI-922's
-        # "a grade on BOTH sides" requirement exists to protect.
-        "Amazing Spider-Man #129 CGC 6.0 1st Punisher & Jackal",
-        "Batman #227 CGC 6.0 Neal Adams and Robin backup",
-        "Batman #227 (1970) CGC 6.0 - Classic cover by Neal Adams",
-        "Batman #227 CGC 8.5 1970 4744708001",
-        "",
-    ])
-    def test_leaves_single_book_titles_alone(self, title):
-        assert fmv_runner._is_multibook_graded_lot(title) is False
-
-    def test_none_title_is_not_a_lot(self):
-        assert fmv_runner._is_multibook_graded_lot(None) is False
-
-    def test_slab_comps_only_drops_the_lot(self):
-        kept = fmv_runner._slab_comps_only(_BATMAN227_SLABS)
-        assert len(kept) == len(_BATMAN227_SLABS) - 1 == 10
-        assert all(c["title"] != _BATMAN227_LOT_TITLE for c in kept)
-
-
 class TestCgcLadderIgnoresMultibookLot:
-    """BUI-921 regression. Each test here FAILS on the unfixed code: the
-    graded second fetch fired and returned this exact 11-comp pool, and the
-    one two-book lot in it inverted the ladder so every verdict downstream
-    was thrown away (`cgc_cross_check: None`, no proxy rescue)."""
+    """BUI-921/961 regression. `_slab_comps_only` no longer drops the lot
+    itself (BUI-961 removed the runner-side duplicate detector — see the
+    block comment above `_slab_comps_only`); ebay-sold-comps' own
+    `admits_graded`-gated guards drop it before a graded-only fetch ever
+    returns it (pinned in apps/ebay's own
+    `TestMultibookGradedLot`/`TestGradedIdentityGuardsInFetch`). These tests
+    now mock `_fetch_comps`/`fresh_fmvs[idx]["slab_comps"]` with the
+    ALREADY-CLEAN pool a fixed fetch would actually return, and pin that the
+    runner still folds the pass into `queries_used`/`slab_comps`
+    (`_record_graded_pass`, BUI-921's surviving lesson) and prices off it
+    correctly."""
 
     def test_the_lot_is_what_inverts_the_raw_ladder(self):
         # Pins the mechanism, not just the symptom: with the lot in, the
@@ -4875,8 +4857,11 @@ class TestCgcLadderIgnoresMultibookLot:
 
     def test_cross_check_flags_divergence_after_a_dedicated_fetch(self, server_url):
         fresh = _batman227_thin_priced_row()
+        # BUI-961: the mocked fetch returns _BATMAN227_CLEAN, not the dirty
+        # _BATMAN227_SLABS — a real ebay-sold-comps graded-only fetch would
+        # already have dropped the lot before this function ever saw it.
         with patch("fmv_runner._fetch_comps",
-                   return_value=[_graded_result(0, _BATMAN227_SLABS)]) as fetch_mock, \
+                   return_value=[_graded_result(0, _BATMAN227_CLEAN)]) as fetch_mock, \
              patch("fmv_runner._upsert_fmv",
                    return_value={"comic_id": 1021, "fmv_id": 9}), \
              patch("fmv_runner._post_comps", return_value=True):
@@ -4896,16 +4881,18 @@ class TestCgcLadderIgnoresMultibookLot:
         assert fresh[0]["fmv"]["fmv_high"] == 1200
 
     def test_lot_is_not_posted_to_the_comps_ledger(self, server_url):
+        # BUI-961: a lot is not an observation of THIS comic at that grade —
+        # ebay-sold-comps now excludes it from the fetch itself (rather than
+        # the runner filtering it before posting), so the mocked fetch
+        # already returns the clean pool.
         fresh = _batman227_thin_priced_row()
         with patch("fmv_runner._fetch_comps",
-                   return_value=[_graded_result(0, _BATMAN227_SLABS)]), \
+                   return_value=[_graded_result(0, _BATMAN227_CLEAN)]), \
              patch("fmv_runner._upsert_fmv",
                    return_value={"comic_id": 1021, "fmv_id": 9}), \
              patch("fmv_runner._post_comps", return_value=True) as post_mock:
             fmv_runner._apply_cgc_cross_check(
                 fresh, _BATMAN227_BOOKS, server_url=server_url, force=False)
-        # A lot is not an observation of THIS comic at that grade, so it is
-        # excluded from the BUI-676 second-fetch post as well as the ladder.
         post_mock.assert_called_once_with(server_url, 1021, [], _BATMAN227_CLEAN)
         assert fresh[0]["comps_posted"] is True
 
@@ -4915,7 +4902,7 @@ class TestCgcLadderIgnoresMultibookLot:
         `slab_comps` still 0 — which is why the bug was filed as "the graded
         fetch never fires"."""
         fresh = _batman227_thin_priced_row()
-        graded = {"input": {"_req_id": 0}, "comps": _BATMAN227_SLABS,
+        graded = {"input": {"_req_id": 0}, "comps": _BATMAN227_CLEAN,
                   "queries_used": [{"tier": "base", "nkw": "graded-only"}]}
         with patch("fmv_runner._fetch_comps", return_value=[graded]), \
              patch("fmv_runner._upsert_fmv",
@@ -4952,7 +4939,7 @@ class TestCgcLadderIgnoresMultibookLot:
         (one tier failed, another succeeded) must still be recorded."""
         fresh = _batman227_thin_priced_row()
         fresh[0]["queries_used"] = []
-        graded = {"input": {"_req_id": 0}, "comps": _BATMAN227_SLABS,
+        graded = {"input": {"_req_id": 0}, "comps": _BATMAN227_CLEAN,
                   "queries_used": [{"tier": "base", "nkw": "g1",
                                     "error": "timeout"},
                                    {"tier": "broader", "nkw": "g2"}]}
@@ -4964,14 +4951,15 @@ class TestCgcLadderIgnoresMultibookLot:
                 fresh, _BATMAN227_BOOKS, server_url=server_url, force=False)
         assert [q["nkw"] for q in fresh[0]["queries_used"]] == ["g1", "g2"]
 
-    def test_reused_bui524_ladder_drops_the_lot_before_the_trust_floor(
+    def test_reused_bui524_ladder_needs_no_runner_side_refilter(
             self, server_url):
         """The zero-extra-spend path: BUI-524's inclusive tier already
-        supplied the ladder. The lot must come off it too — and be removed
-        BEFORE the >= CGC_PROXY_MIN_LADDER_COMPS count, so a contaminated
-        pool can never pass the trust floor on a rung that is not one."""
+        supplied the ladder. BUI-961: that tier's own fetch is now
+        `admits_graded`-gated in ebay-sold-comps (`route_slabs=True` is part
+        of the OR), so `slab_comps` arrives here already lot-free — this
+        pins that the runner trusts it as-is rather than re-filtering."""
         fresh = _batman227_thin_priced_row()
-        fresh[0]["slab_comps"] = list(_BATMAN227_SLABS)
+        fresh[0]["slab_comps"] = list(_BATMAN227_CLEAN)
         with patch("fmv_runner._fetch_comps") as fetch_mock, \
              patch("fmv_runner._upsert_fmv",
                    return_value={"comic_id": 1021, "fmv_id": 9}), \
@@ -4983,31 +4971,13 @@ class TestCgcLadderIgnoresMultibookLot:
         check = fresh[0]["fmv"]["cgc_cross_check"]
         assert check is not None and 4.0 not in check["ladder"]
 
-    def test_a_contaminated_two_rung_ladder_falls_through_to_the_fetch(
-            self, server_url):
-        """Exactly CGC_PROXY_MIN_LADDER_COMPS reused slabs, one of them the
-        lot: filtering AFTER the count would have kept the book on a 2-rung
-        ladder. It must fall through to the dedicated fetch instead."""
-        fresh = _batman227_thin_priced_row()
-        fresh[0]["slab_comps"] = [_BATMAN227_SLABS[1],   # the lot
-                                  _BATMAN227_SLABS[4],   # 6.0 $900
-                                  _BATMAN227_SLABS[7]]   # 8.0 $2372
-        assert len(fresh[0]["slab_comps"]) == fmv_math.CGC_PROXY_MIN_LADDER_COMPS
-        with patch("fmv_runner._fetch_comps",
-                   return_value=[_graded_result(0, _BATMAN227_SLABS)]) as fetch_mock, \
-             patch("fmv_runner._upsert_fmv",
-                   return_value={"comic_id": 1021, "fmv_id": 9}), \
-             patch("fmv_runner._post_comps", return_value=True):
-            fmv_runner._apply_cgc_cross_check(
-                fresh, _BATMAN227_BOOKS, server_url=server_url, force=False)
-        fetch_mock.assert_called_once()
-        assert fresh[0]["fmv"]["cgc_cross_check"] is not None
-
     def test_rescue_prices_an_unpriced_book_off_the_cleaned_ladder(
             self, server_url):
         """Run 2 of the BUI-921 trace: grade 6.0 at the auto ±2.0 window came
         back `too_wide`/unpriced, so the BUI-348 rescue — not the cross-check
-        — owned the book, and the same inverted ladder left it needs_manual."""
+        — owned the book, and the same inverted ladder left it needs_manual.
+        BUI-961: the mocked fetch now returns the already-clean pool, since a
+        real graded-only fetch would never return the lot."""
         fresh = {0: {"input": {"title": "Batman", "issue": "227", "year": 1970,
                               "grade": 6.0, "publisher": "dc"},
                      "fmv": {"fmv_high": None, "interpolated": False,
@@ -5015,7 +4985,7 @@ class TestCgcLadderIgnoresMultibookLot:
                      "source": "fresh", "comic_id": 1021,
                      "queries_used": [{"tier": "base", "nkw": "raw -cgc -cbcs"}]}}
         with patch("fmv_runner._fetch_comps",
-                   return_value=[_graded_result(0, _BATMAN227_SLABS)]), \
+                   return_value=[_graded_result(0, _BATMAN227_CLEAN)]), \
              patch("fmv_runner._upsert_fmv",
                    return_value={"comic_id": 1021, "fmv_id": 9}), \
              patch("fmv_runner._post_comps", return_value=True):
@@ -5055,7 +5025,10 @@ class TestRunCrossChecksAThinPricedVintageBook:
                 out.append({
                     "input": {k: v for k, v in b.items() if k != "_idx"}
                              | {"_req_id": b["_idx"]},
-                    "comps": _BATMAN227_SLABS if graded else raw_comps,
+                    # BUI-961: a real include_graded fetch already excludes
+                    # the multi-book lot at the source, so the fake serves
+                    # the clean pool rather than _BATMAN227_SLABS.
+                    "comps": _BATMAN227_CLEAN if graded else raw_comps,
                     "slab_comps": [],
                     "queries_used": [{
                         "tier": "base",

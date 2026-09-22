@@ -3086,7 +3086,7 @@ _CGC_PROXY_VINTAGE_YEAR_CUTOFF = 2000
 # "ungraded"/"not graded", which would false-positive on a bare substring).
 _SLAB_TITLE_RE = re.compile(r"\b(?:cgc|cbcs)\b", re.IGNORECASE)
 
-# ─── BUI-921: the ampersand-joined multi-book graded lot ───────────────────
+# ─── BUI-921/961: the ampersand-joined multi-book graded lot ───────────────
 #
 # `Batman #227 CGC 4.0 OW Pages (1970) & Batman #232 CGC 6.0 White Pages
 # (1971)` — two books, one price, one parsed grade. Every gate in front of it
@@ -3101,70 +3101,29 @@ _SLAB_TITLE_RE = re.compile(r"\b(?:cgc|cbcs)\b", re.IGNORECASE)
 # graded-only second fetch fired and returned 12 slab comps, and every
 # verdict was thrown away by one contaminated rung.
 #
-# The check is BUI-922's, re-stated here rather than imported: ebay-sold-comps
-# runs it only in BUI-929 GRADED mode (`graded_target` set — a certified
-# TARGET), and the CGC-proxy/cross-check second pass is an `include_graded`
-# pass on a RAW target, which never reaches it. `comic-fmv` does not import
-# eBay code (it shells out to the console script), so the duplication is the
-# same deliberate trade `_SLAB_TITLE_RE` above already makes against
-# `sold_comps._is_slab_comp` — keep the two in sync by hand. The rule is "two
-# `#NNN` tokens joined by &/+/and, EACH carrying its own numeric grade";
-# requiring a grade on BOTH sides is what keeps it off the ordinary
-# single-issue title that merely mentions two things ("… #129 CGC 6.0 1st
-# Punisher & Jackal"). BUI-922 measured it over the offline corpus's 23,488
-# comps: it fires on 2 (the same listing, cached twice) and nothing else.
-# Re-measured for BUI-921 against this copy, over the 16,033 DISTINCT titles
-# in ~/.cache/ebay-sold-comps: 0 disagreements with `sold_comps`'s own
-# implementation, and it fires on exactly 1 title — the Batman #227 lot above.
-_MULTIBOOK_JOINER_RE = re.compile(r"\s(?:&|\+|and)\s", re.IGNORECASE)
-# One lot "member": `#NNN`, bounded so it can bind neither to a longer run
-# (a year, a cert number) nor to half of a decimal grade.
-_MULTIBOOK_ISSUE_RE = re.compile(r"#\s*\d{1,3}(?!\d)(?!\.\d)")
-# Copied verbatim from apps/ebay's `grade_tokens._NUMERIC_GRADE_RE` — a
-# LOOSER pattern here would drop real comps off a money-path ladder, so this
-# is a literal copy rather than a simplification.
-_NUMERIC_GRADE_RE = re.compile(
-    r'(?<!\$)(?<!x )(?<!X )'
-    r'\b([0-9]\.[02-9])'
-    r'(?!\w)'
-    r'(?!\s*(?:in(?:ch(?:es?)?)?\b|cm\b|mm\b|lbs?\b|oz\b|x\b|ship(?:ping)?\b|["\']))'
-)
-
-
-def _is_multibook_graded_lot(title: str | None) -> bool:
-    """True when `title` names two or more separately GRADED books joined by
-    "&" / "+" / "and" — see the block comment above (BUI-921/BUI-922)."""
-    if not title:
-        return False
-    graded_members = 0
-    for part in _MULTIBOOK_JOINER_RE.split(title):
-        if _MULTIBOOK_ISSUE_RE.search(part) and _NUMERIC_GRADE_RE.search(part):
-            graded_members += 1
-            if graded_members >= 2:
-                return True
-    return False
-
-
-def _drop_multibook_graded_lots(slabs: list[dict]) -> list[dict]:
-    """Drop the ampersand multi-book graded lots from an already-slab-filtered
-    pool (BUI-921). Applied to BOTH ladder sources — the graded-only second
-    fetch (via `_slab_comps_only`) and the BUI-524 inclusive tier's
-    pre-routed `slab_comps` — since the contaminant is a property of the
-    listing, not of which pass found it."""
-    return [c for c in slabs if not _is_multibook_graded_lot(c.get("title"))]
+# BUI-921 re-stated the check here rather than importing it, because
+# ebay-sold-comps at the time ran it only when `graded_target` was set (a
+# certified TARGET), and the CGC-proxy/cross-check second pass is an
+# `include_graded` pass on a RAW target, which never reached it. BUI-961
+# closed that gap at the SOURCE — `sold_comps._run`'s `admits_graded` now
+# covers an `include_graded` pass regardless of `graded_target`, and the
+# BUI-524 inclusive tier's `route_slabs` pass too — so every comp this
+# module ever sees under `"comps"`/`"slab_comps"` already had the lot (and
+# the cross-title/store-variant guards) applied before it left
+# ebay-sold-comps. The runner-side duplicate detector is removed; only the
+# reporting fold (`_record_graded_pass`, below) remains — a graded pass that
+# ran and found nothing usable must still say so in `queries_used`.
 
 
 def _slab_comps_only(comps: list[dict]) -> list[dict]:
     """Keep only genuine CGC/CBCS slab comps of THIS book (grade + price +
-    certifier in title), dropping the BUI-921 multi-book graded lot — which
-    carries a certifier and a parsed grade but prices two books at once, so
-    it is neither a comp of this book nor a rung of its ladder. Also excluded
-    from what the caller posts to the comps ledger: a lot is not an
-    observation of this comic at that grade."""
-    return _drop_multibook_graded_lots(
-        [c for c in comps
-         if c.get("grade") is not None and c.get("price") is not None
-         and _SLAB_TITLE_RE.search(c.get("title") or "")])
+    certifier in title). ebay-sold-comps' own `admits_graded`-gated guards
+    (BUI-922/938/961) already dropped the ampersand multi-book lot and any
+    cross-title/store-variant contamination before returning these comps —
+    see the block comment above."""
+    return [c for c in comps
+            if c.get("grade") is not None and c.get("price") is not None
+            and _SLAB_TITLE_RE.search(c.get("title") or "")]
 
 
 def _record_graded_pass(row: dict, result: dict, ladder: list[dict]) -> None:
@@ -3505,17 +3464,16 @@ def _apply_cgc_cross_check(fresh_fmvs: dict[int, dict], books: list[dict], *,
     have_ladder: dict[int, list[dict]] = {}
     need_fetch: list[int] = []
     for idx in candidates:
-        # BUI-921: drop the multi-book graded lots BEFORE the ladder-trust
-        # count, not after — a lot is not a rung, so counting it would let a
-        # 2-rung ladder pass the >= CGC_PROXY_MIN_LADDER_COMPS floor and then
-        # be refused downstream (or, worse, priced off an inverted curve). A
-        # candidate whose BUI-524 slabs fall below the floor once the lots are
-        # gone correctly falls through to the dedicated fetch below, exactly
-        # as it would have had that tier found too few slab comps to begin
-        # with; the lot shape is rare enough (2 in 23,488 corpus comps) that
-        # this adds no measurable provider spend.
-        slabs = _drop_multibook_graded_lots(
-            fresh_fmvs[idx].get("slab_comps") or [])
+        # BUI-921/961: no runner-side lot-drop needed here — `slab_comps`
+        # came off the primary pass's BUI-524 inclusive tier, whose
+        # `route_slabs=True` fetch is now `admits_graded`-gated in
+        # ebay-sold-comps itself (BUI-961), so a lot (or a cross-title/
+        # store-variant comp) was already excluded before it was ever
+        # stored on `fresh_fmvs[idx]["slab_comps"]`. A candidate whose
+        # BUI-524 slabs fall below the trust floor still correctly falls
+        # through to the dedicated fetch below, exactly as it would have
+        # had that tier found too few slab comps to begin with.
+        slabs = fresh_fmvs[idx].get("slab_comps") or []
         if len(slabs) >= fmv_math.CGC_PROXY_MIN_LADDER_COMPS:
             have_ladder[idx] = slabs
         else:
