@@ -2159,6 +2159,73 @@ class TestSearchByKeyword:
         assert results == []
         assert "Network error" in capsys.readouterr().err
 
+    # ── on_error hook (BUI-971) ──────────────────────────────────────────
+
+    def test_on_error_called_once_with_the_http_message(self, capsys):
+        """A non-200 status invokes `on_error` with the same one-line message
+        it prints — the hook a caller that only sees a COUNT needs to tell a
+        failed search from an empty one."""
+        err_resp = MagicMock()
+        err_resp.status_code = 401
+        err_resp.text = "Invalid access token"
+        seen = []
+        with patch("ebay_fetch.requests.get", return_value=err_resp):
+            with patch("ebay_fetch.time.sleep"):
+                results = ebay_fetch.search_by_keyword(
+                    "spider-man", "tok", ebay_fetch.PRODUCTION_BASE,
+                    on_error=seen.append,
+                )
+        assert results == []
+        assert len(seen) == 1
+        assert "HTTP 401" in seen[0]
+        assert "Invalid access token" in seen[0]
+        # Still printed to stderr as before — the hook adds a channel, it
+        # does not replace the existing one.
+        assert "HTTP 401" in capsys.readouterr().err
+
+    def test_on_error_called_once_on_a_transport_error(self):
+        seen = []
+        with patch(
+            "ebay_fetch.requests.get",
+            side_effect=requests.exceptions.ConnectionError("no route to host"),
+        ):
+            with patch("ebay_fetch.time.sleep"):
+                ebay_fetch.search_by_keyword(
+                    "spider-man", "tok", ebay_fetch.PRODUCTION_BASE,
+                    on_error=seen.append,
+                )
+        assert len(seen) == 1
+        assert "Network error" in seen[0]
+
+    def test_on_error_called_once_when_the_rate_limit_outlasts_retries(self):
+        """A 429 that never lets up ends as RetryExhausted → the non-200
+        branch → exactly one `on_error` call, not one per attempt."""
+        rate_limited = MagicMock()
+        rate_limited.status_code = 429
+        rate_limited.text = "Too Many Requests"
+        seen = []
+        with patch("ebay_fetch.requests.get", return_value=rate_limited):
+            with patch("ebay_fetch.time.sleep"):
+                ebay_fetch.search_by_keyword(
+                    "spider-man", "tok", ebay_fetch.PRODUCTION_BASE,
+                    retries=2, on_error=seen.append,
+                )
+        assert len(seen) == 1
+        assert "HTTP 429" in seen[0]
+
+    def test_on_error_not_called_on_a_clean_empty_search(self):
+        """A search that runs fine and matches nothing is not an error —
+        this is the distinction the whole hook exists to draw."""
+        seen = []
+        with patch("ebay_fetch.requests.get", return_value=self._make_resp([])):
+            with patch("ebay_fetch.time.sleep"):
+                results = ebay_fetch.search_by_keyword(
+                    "spider-man", "tok", ebay_fetch.PRODUCTION_BASE,
+                    on_error=seen.append,
+                )
+        assert results == []
+        assert seen == []
+
 
 class TestActiveAsks:
     """BUI-954: the active-ask ceiling — `search_active_asks` and its
@@ -2299,6 +2366,80 @@ class TestActiveAsks:
         assert kwargs["buying_options"] == "FIXED_PRICE"
         assert kwargs["max_results"] == 25
 
+    # ── errored search vs genuine zero (BUI-971) ────────────────────────
+
+    def test_browse_http_error_returns_an_error_key_and_never_n_zero(
+            self, capsys):
+        """The ticket's core invariant: a Browse HTTP failure must NOT come
+        back looking like a book with no live asks. `n` is null (not 0) so
+        even a consumer that ignores the `error` key cannot misread it."""
+        err_resp = MagicMock()
+        err_resp.status_code = 401
+        err_resp.text = "Invalid access token"
+        with patch("ebay_fetch.requests.get", return_value=err_resp):
+            with patch("ebay_fetch.time.sleep"):
+                result = ebay_fetch.search_active_asks(
+                    "Amazing Spider-Man #50", "bad-token",
+                    ebay_fetch.PRODUCTION_BASE, grade=4.5,
+                )
+        assert result["n"] is None
+        assert result["low"] is None
+        assert "HTTP 401" in result["error"]
+        assert result != {"low": None, "n": 0}
+        assert "HTTP 401" in capsys.readouterr().err
+
+    def test_transport_error_returns_an_error_key(self):
+        with patch(
+            "ebay_fetch.requests.get",
+            side_effect=requests.exceptions.ConnectionError("no route to host"),
+        ):
+            with patch("ebay_fetch.time.sleep"):
+                result = ebay_fetch.search_active_asks(
+                    "Amazing Spider-Man #50", "tok",
+                    ebay_fetch.PRODUCTION_BASE, grade=4.5,
+                )
+        assert result["n"] is None
+        assert "Network error" in result["error"]
+
+    def test_a_genuine_zero_carries_no_error_key(self):
+        """A search that ran fine and matched nothing keeps the pre-BUI-971
+        shape exactly — `{"low": None, "n": 0}`, no `error` key — so it
+        still reads as 'nothing to show' and stays silent downstream."""
+        with patch("ebay_fetch.search_by_keyword", return_value=[]):
+            result = ebay_fetch.search_active_asks(
+                "Amazing Spider-Man #50", "tok", ebay_fetch.PRODUCTION_BASE,
+                grade=4.5,
+            )
+        assert result == {"low": None, "n": 0}
+        assert "error" not in result
+
+    def test_a_partial_page_before_an_error_still_reports_the_error(self):
+        """An error on page 2 leaves page 1's items in hand. Reporting their
+        count as if the search completed would understate the market — the
+        count is the whole output, so any failure invalidates it."""
+        page1_items = [
+            {"itemId": "v1|1|0", "title": "Amazing Spider-Man #50 4.5 Kingpin",
+             "buyingOptions": ["FIXED_PRICE"],
+             "price": {"value": "650.00", "currency": "USD"},
+             "itemWebUrl": "https://www.ebay.com/itm/1",
+             "seller": {"username": "s"}},
+        ]
+        page1 = MagicMock()
+        page1.status_code = 200
+        page1.json.return_value = {"itemSummaries": page1_items, "total": 400}
+        page2_err = MagicMock()
+        page2_err.status_code = 500
+        page2_err.text = "Internal Server Error"
+        with patch("ebay_fetch.requests.get", side_effect=[page1, page2_err]):
+            with patch("ebay_fetch.time.sleep"):
+                result = ebay_fetch.search_active_asks(
+                    "Amazing Spider-Man #50", "tok",
+                    ebay_fetch.PRODUCTION_BASE, grade=4.5, max_results=400,
+                )
+        assert result["n"] is None
+        assert result["low"] is None
+        assert "HTTP 500" in result["error"]
+
     # ── main()'s --active-asks wiring ────────────────────────────────────
 
     def test_main_default_cap_is_one_full_browse_page(self):
@@ -2339,6 +2480,26 @@ class TestActiveAsks:
         assert kwargs["grade"] == 4.5
         assert kwargs["certifier"] == "cgc"
         assert kwargs["label"] == "signature_series"
+
+    def test_main_prints_the_error_json_and_still_exits_zero(self, capsys):
+        """The JSON is the whole contract (BUI-971): the error travels in the
+        payload, not the exit code, so `_fetch_active_asks` can name WHICH
+        failure it was instead of collapsing it into its generic 'exit N'
+        branch."""
+        with patch("ebay_fetch.load_config",
+                   return_value=("id", "secret", ebay_fetch.PRODUCTION_BASE)):
+            with patch("ebay_fetch.get_token", return_value="tok"):
+                with patch(
+                    "ebay_fetch.search_active_asks",
+                    return_value={"low": None, "n": None,
+                                  "error": "Error searching by keyword: "
+                                           "HTTP 401: Invalid access token"},
+                ):
+                    ebay_fetch.main(["--active-asks", "Amazing Spider-Man #50",
+                                     "--grade", "4.5"])
+        out = json.loads(capsys.readouterr().out)
+        assert out["n"] is None
+        assert "HTTP 401" in out["error"]
 
 
 # ============================================================

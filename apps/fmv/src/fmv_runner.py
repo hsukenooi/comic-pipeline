@@ -1732,12 +1732,20 @@ def _fetch_active_asks(title: str, issue: str, grade: float, *,
     Now ask matching a refused row's identity, or None on ANY failure.
 
     Fails SOFT and LOUD-ONCE: a missing binary, a timeout, a non-zero exit,
-    or unparseable output each print one stderr warning and return None —
-    never raise, never sys.exit. This is a display-only extra on a row that
-    is already fully decided (see `_maybe_attach_active_ask_ceiling`), so a
-    failure here must never touch the price or block the run, unlike
-    `_fetch_comps`'s hard-fail-by-default posture on the primary pricing
-    fetch.
+    unparseable output, or an `error` key in the JSON each print one stderr
+    warning and return None — never raise, never sys.exit. This is a
+    display-only extra on a row that is already fully decided (see
+    `_maybe_attach_active_ask_ceiling`), so a failure here must never touch
+    the price or block the run, unlike `_fetch_comps`'s hard-fail-by-default
+    posture on the primary pricing fetch.
+
+    The `error` key (BUI-971) is the one failure that is NOT visible in the
+    exit code: `ebay-fetch --active-asks` exits 0 when the Browse search
+    itself fails, because the JSON carries the diagnosis. Before that key
+    existed the subprocess reported `n: 0` on an outage — identical to a book
+    with genuinely no live asks — so the refused row showed no ceiling and
+    printed no warning either way. A genuine `n: 0` still returns None
+    SILENTLY (nothing to show is not a failure); only the `error` key warns.
 
     ``certifier``/``label`` are passed only for a CERTIFIED row — `None` for
     a raw one, which tells `ebay-fetch` to exclude any slab ask (see
@@ -1778,10 +1786,30 @@ def _fetch_active_asks(title: str, issue: str, grade: float, *,
     try:
         data = json.loads(result.stdout)
     except json.JSONDecodeError:
+        data = None
+    # A non-dict payload (a bare list/string/number) is as unusable as
+    # unparseable text, and reaching `.get` on one would raise out of a
+    # helper whose whole contract is to fail soft.
+    if not isinstance(data, dict):
         click.echo(
             f"Warning: {EBAY_FETCH_BIN} --active-asks produced unparseable "
             f"output for {title} #{issue}; skipping the active-ask "
             "ceiling.",
+            err=True,
+        )
+        return None
+    search_error = data.get("error")
+    if search_error:
+        # eBay's error bodies are pretty-printed JSON, so the message the
+        # subprocess hands back spans several lines. Collapse it: this is
+        # ONE warning line per refused row, and a run with several of them
+        # has to stay scannable.
+        detail = " ".join(str(search_error).split())
+        if len(detail) > 160:
+            detail = detail[:157] + "..."
+        click.echo(
+            f"Warning: {EBAY_FETCH_BIN} --active-asks search failed for "
+            f"{title} #{issue}: {detail}; skipping the active-ask ceiling.",
             err=True,
         )
         return None

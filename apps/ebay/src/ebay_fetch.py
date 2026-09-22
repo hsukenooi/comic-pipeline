@@ -1266,7 +1266,7 @@ def search_seller_listings(seller, token, base_url, *, max_results=1000, retries
     return kept
 
 
-def search_by_keyword(keyword, token, base_url, *, max_results=500, buying_options="AUCTION|FIXED_PRICE", retries=3):
+def search_by_keyword(keyword, token, base_url, *, max_results=500, buying_options="AUCTION|FIXED_PRICE", retries=3, on_error=None):
     """Search eBay Browse API by keyword, returning parsed item summaries.
 
     The item→sellers counterpart to search_seller_listings(): instead of
@@ -1285,6 +1285,16 @@ def search_by_keyword(keyword, token, base_url, *, max_results=500, buying_optio
     Paginates in pages of up to 200 until results exhausted or max_results
     reached. Sleeps 2 s after each successful page to respect eBay's ~1 call/2 s
     recommendation across potentially hundreds of keyword searches.
+
+    `on_error(message)` (BUI-971; optional, default None leaves every
+    pre-existing caller byte-for-byte unchanged) is called exactly once, with
+    the same one-line message already printed to stderr, when the search bails
+    out early on a Browse failure — a transport error, or a non-200 status
+    (which includes a 429 that outlasted the retry budget). The return value
+    stays what it has always been (whatever items were collected before the
+    failure, possibly []), because the two existing callers want partial
+    results; the hook exists so a caller that CANNOT tell a failed search from
+    an empty one — `search_active_asks`, whose whole output is a count — can.
     """
     url = f"{base_url}/buy/browse/v1/item_summary/search"
     headers = {
@@ -1310,19 +1320,20 @@ def search_by_keyword(keyword, token, base_url, *, max_results=500, buying_optio
                 status_retry_message=lambda code: "Rate limited",
             )
         except requests.exceptions.RequestException as exc:
-            print(
-                f"Network error searching by keyword '{keyword}': {exc}",
-                file=sys.stderr,
-            )
+            msg = f"Network error searching by keyword '{keyword}': {exc}"
+            print(msg, file=sys.stderr)
+            if on_error is not None:
+                on_error(msg)
             return all_items[:max_results]
         except RetryExhausted as exc:
             resp = exc.response
 
         if resp.status_code != 200:
-            print(
-                f"Error searching by keyword: HTTP {resp.status_code}: {resp.text[:200]}",
-                file=sys.stderr,
-            )
+            msg = (f"Error searching by keyword: HTTP {resp.status_code}: "
+                   f"{resp.text[:200]}")
+            print(msg, file=sys.stderr)
+            if on_error is not None:
+                on_error(msg)
             return all_items[:max_results]
 
         data = resp.json()
@@ -1421,10 +1432,34 @@ def search_active_asks(keyword, token, base_url, *, grade, certifier=None,
     ``low is None``) when nothing survived the search or the filter, never
     an exception — a caller (this module's own `main`) prints it as-is and
     lets the SUBPROCESS caller (`comic-fmv`) decide how to fail soft.
+
+    BUI-971 — the errored-search case. `search_by_keyword` fails soft: a
+    Browse HTTP status, an exhausted rate-limit budget, or a transport error
+    prints to stderr and returns whatever it had, which for the usual
+    single-page search is ``[]``. Filtering that produced ``{"low": None,
+    "n": 0}`` — byte-for-byte what a book with no live asks produces — and
+    the process still exited 0, so `comic-fmv` could not tell an outage from
+    a genuine zero and the refused row showed no ceiling either way, with no
+    warning. That is the BUI-565 shape (an errored fetch reading as a clean
+    zero), here on a display-only path where it costs no money but hides an
+    outage. So an errored search now returns ``{"low": None, "n": None,
+    "error": "<the same one-line message>"}``: the `error` key is the signal
+    `_fetch_active_asks` branches on, and ``n`` is **null rather than 0** so
+    that a consumer that ignores the key still cannot read an outage as a
+    genuine zero. A genuine zero is unchanged, and stays silent.
+
+    The exit code stays 0 in both cases (see `main`) — the JSON is the whole
+    contract, and a non-zero exit would collapse the error back into
+    `_fetch_active_asks`'s generic "exit N" branch, losing which failure it
+    was.
     """
+    errors: list[str] = []
     items = search_by_keyword(keyword, token, base_url,
                               max_results=max_results,
-                              buying_options="FIXED_PRICE")
+                              buying_options="FIXED_PRICE",
+                              on_error=errors.append)
+    if errors:
+        return {"low": None, "n": None, "error": errors[0]}
     prices = []
     for item in items:
         title = item.get("title") or ""
@@ -1846,7 +1881,10 @@ def main(argv=None):
              "...}), instead of fetching the positional item ids. Requires "
              "--grade; --certifier/--label narrow the match to a certified "
              "target (omit both for a raw target, which excludes any "
-             "listing naming a certifier). Used by comic-fmv to show a "
+             "listing naming a certifier). If the Browse search itself "
+             "fails, the JSON instead carries {\"low\": null, \"n\": null, "
+             "\"error\": \"...\"} (BUI-971) — never a zero count that would "
+             "read as 'no live asks'. Used by comic-fmv to show a "
              "display-only ceiling on refused rows — see "
              "docs/conventions/fmv-math-spec.md §7.",
     )
