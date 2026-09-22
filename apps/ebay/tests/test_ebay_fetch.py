@@ -2979,6 +2979,122 @@ class TestGetItemAspects:
         assert cached == {"Publication Year": "1975"}
 
 
+# ─── BUI-968: get_condition_description ────────────────────────────────────────
+
+
+class TestGetConditionDescription:
+    """get_condition_description fetches the raw conditionDescription text
+    (BUI-968) — the seller-scan/wishlist-sellers counterpart to
+    /comic:buy Step 1.5's ebay-fetch --json field, sourced from the same
+    getItem endpoint get_item_aspects() uses."""
+
+    def _mock_200(self, condition_description):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"conditionDescription": condition_description}
+        return mock_resp
+
+    def test_parses_condition_description(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(ebay_fetch, "_CONDITION_CACHE_DIR", tmp_path / "condition")
+        with patch("requests.get", return_value=self._mock_200("rusty staple")):
+            result = ebay_fetch.get_condition_description("123456", "tok", "https://api.ebay.com")
+        assert result == "rusty staple"
+
+    def test_returns_none_on_non_200(self, tmp_path, monkeypatch):
+        """Non-200 response → None (fail-open)."""
+        monkeypatch.setattr(ebay_fetch, "_CONDITION_CACHE_DIR", tmp_path / "condition")
+        mock_resp = MagicMock()
+        mock_resp.status_code = 404
+        with patch("requests.get", return_value=mock_resp):
+            result = ebay_fetch.get_condition_description("999", "tok", "https://api.ebay.com")
+        assert result is None
+
+    def test_returns_none_on_network_error(self, tmp_path, monkeypatch):
+        """Network error → None (fail-open), failing fast (no retry budget
+        spent — retry_network_errors=False, mirrors get_item_aspects())."""
+        import requests as req
+        monkeypatch.setattr(ebay_fetch, "_CONDITION_CACHE_DIR", tmp_path / "condition")
+        with patch(
+            "requests.get", side_effect=req.exceptions.ConnectionError("down")
+        ) as mock_get:
+            with patch("ebay_fetch.time.sleep") as mock_sleep:
+                result = ebay_fetch.get_condition_description("999", "tok", "https://api.ebay.com")
+        assert result is None
+        assert mock_get.call_count == 1
+        mock_sleep.assert_not_called()
+
+    def test_returns_none_when_no_condition_description(self, tmp_path, monkeypatch):
+        """200 response with no conditionDescription key → None (the common
+        case — most listings carry no seller note at all)."""
+        monkeypatch.setattr(ebay_fetch, "_CONDITION_CACHE_DIR", tmp_path / "condition")
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"title": "Amazing Spider-Man #7"}
+        with patch("requests.get", return_value=mock_resp):
+            result = ebay_fetch.get_condition_description("888", "tok", "https://api.ebay.com")
+        assert result is None
+
+    def test_disk_cache_hit_skips_network(self, tmp_path, monkeypatch):
+        """A fresh cache file is returned without making an HTTP request."""
+        monkeypatch.setattr(ebay_fetch, "_CONDITION_CACHE_DIR", tmp_path / "condition")
+        path = ebay_fetch._condition_cache_path("777")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"condition_description": "water damage to cover"}))
+
+        with patch("requests.get") as mock_get:
+            result = ebay_fetch.get_condition_description("777", "tok", "https://api.ebay.com")
+
+        mock_get.assert_not_called()
+        assert result == "water damage to cover"
+
+    def test_disk_cache_hit_on_no_note_skips_network(self, tmp_path, monkeypatch):
+        """A cached 'no note' outcome (None) is itself a cache HIT — unlike
+        the aspects cache, which never caches a None result — so a listing
+        with no conditionDescription is not re-fetched on every scan."""
+        monkeypatch.setattr(ebay_fetch, "_CONDITION_CACHE_DIR", tmp_path / "condition")
+        path = ebay_fetch._condition_cache_path("778")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"condition_description": None}))
+
+        with patch("requests.get") as mock_get:
+            result = ebay_fetch.get_condition_description("778", "tok", "https://api.ebay.com")
+
+        mock_get.assert_not_called()
+        assert result is None
+
+    def test_result_written_to_disk_cache(self, tmp_path, monkeypatch):
+        """A successful fetch writes the condition description to the disk
+        cache, wrapped in {"condition_description": ...} (not a bare value —
+        see the module comment on why a bare None would be ambiguous with a
+        cache miss)."""
+        monkeypatch.setattr(ebay_fetch, "_CONDITION_CACHE_DIR", tmp_path / "condition")
+        with patch("requests.get", return_value=self._mock_200("mildew smell")):
+            ebay_fetch.get_condition_description("42", "tok", "https://api.ebay.com")
+
+        cached = ebay_fetch._condition_cache_get("42")
+        assert cached == {"condition_description": "mildew smell"}
+
+    def test_no_note_result_also_written_to_disk_cache(self, tmp_path, monkeypatch):
+        """A successful fetch with NO conditionDescription still writes a
+        cache entry (payload {"condition_description": None}), distinct from
+        no cache file at all — this is what makes the "no note" outcome a
+        cache hit on the next call (see test_disk_cache_hit_on_no_note_skips_network)."""
+        monkeypatch.setattr(ebay_fetch, "_CONDITION_CACHE_DIR", tmp_path / "condition")
+        with patch("requests.get", return_value=self._mock_200(None)):
+            ebay_fetch.get_condition_description("43", "tok", "https://api.ebay.com")
+
+        cached = ebay_fetch._condition_cache_get("43")
+        assert cached == {"condition_description": None}
+        assert ebay_fetch._condition_cache_path("43").exists()
+
+    def test_uses_separate_cache_namespace_from_aspects(self, tmp_path, monkeypatch):
+        """The condition-description cache and the aspects cache never
+        collide, even for the same item_id — separate directories."""
+        monkeypatch.setattr(ebay_fetch, "_CONDITION_CACHE_DIR", tmp_path / "condition")
+        monkeypatch.setattr(ebay_fetch, "_ASPECTS_CACHE_DIR", tmp_path / "aspects")
+        assert ebay_fetch._condition_cache_path("1") != ebay_fetch._aspects_cache_path("1")
+        assert ebay_fetch._CONDITION_CACHE_DIR != ebay_fetch._ASPECTS_CACHE_DIR
+
 
 # --- BUI-900: the identification table, built by the CLI ---------------------
 

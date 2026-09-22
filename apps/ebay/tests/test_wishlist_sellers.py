@@ -82,6 +82,7 @@ def _run_main(
     dropped_return: list | None = None,
     json_output: bool = False,
     extra_args: list | None = None,
+    condition_description_by_item_id: dict | None = None,
 ) -> tuple[str, int, MagicMock, MagicMock]:
     """Run main() with standard mocks; return (stdout, exit_code, mock_verify,
     mock_record).
@@ -94,6 +95,13 @@ def _run_main(
     BUI-309: `exit_code` is main()'s return value — non-zero (_EXIT_INCOMPLETE)
     when `dropped_return` produced any never-verified candidates in the final
     survivors set, 0 on a clean run.
+
+    BUI-968: `condition_description_by_item_id`, when given, feeds the
+    Step 11.5 condition-defect gate — `apply_condition_defect_gate()` calls
+    `seller_scan.get_condition_description(item_id, ...)` once per survivor,
+    which this maps by item_id (default None: no note, matching the tests/
+    conftest.py autouse fixture that already pins that call to a no-op for
+    every other test in this suite).
     """
     if wish_list is None or wish_items is None:
         wish_list, wish_items = _two_wish_items()
@@ -104,6 +112,7 @@ def _run_main(
         verify_return = [m for ms in matches_by_wish for m in ms]
     if dropped_return is None:
         dropped_return = []
+    condition_description_by_item_id = condition_description_by_item_id or {}
 
     mock_verify = MagicMock(return_value=(verify_return, dropped_return, []))
     mock_record = MagicMock()
@@ -124,6 +133,10 @@ def _run_main(
         patch.object(ws, "verdict_db_path", return_value=db_path),
         patch.object(ws, "verify_with_claude", mock_verify),
         patch.object(ws, "record_items_seen", mock_record),
+        patch(
+            "seller_scan.get_condition_description",
+            side_effect=lambda item_id, *a, **k: condition_description_by_item_id.get(item_id),
+        ),
     ):
         buf = io.StringIO()
         argv = ["--json"] if json_output else []
@@ -1033,6 +1046,120 @@ class TestPostVerifyReGate:
         # sellerX falls below 2 after verify → not in output
         assert "sellerX" not in output
         assert "No sellers found" in output
+
+
+# ─── Condition-defect gate (BUI-968) ───────────────────────────────────────────
+
+class TestConditionDefectGate:
+    """BUI-968: extends BUI-919's standing moisture/rust/loose-staple rule
+    from /comic:buy Step 1.5 to wishlist-sellers, via seller_scan's shared
+    apply_condition_defect_gate()."""
+
+    def test_defective_listing_dropped_and_reported(self, tmp_path):
+        """A survivor whose conditionDescription names rust is dropped from
+        the table/JSON output and surfaced in `defect_dropped`, even though
+        its seller still clears the ≥2 gate on its other two (clean)
+        matches — three DISTINCT wish books so dedup_matches's per-(seller,
+        wish-book) collapse can't merge the defective one into a clean one."""
+        db_path = tmp_path / "v.db"
+        wish_list = [
+            {"id": "w1", "name": "Amazing Spider-Man #129"},
+            {"id": "w2", "name": "X-Men #94"},
+            {"id": "w3", "name": "Detective Comics #27"},
+        ]
+        wish_items = [
+            {"id": "w1", "name": "Amazing Spider-Man #129",
+             "series": "Amazing Spider-Man", "issue": "129",
+             "_tokens": ["amazing", "spider", "man"]},
+            {"id": "w2", "name": "X-Men #94", "series": "X-Men", "issue": "94",
+             "_tokens": ["xmen"]},
+            {"id": "w3", "name": "Detective Comics #27",
+             "series": "Detective Comics", "issue": "27",
+             "_tokens": ["detective", "comics"]},
+        ]
+        m1 = make_match(seller="sellerX", item_id="1",
+                         wish_name="Amazing Spider-Man #129")
+        m2 = make_match(seller="sellerX", item_id="2", wish_name="X-Men #94")
+        m3 = make_match(seller="sellerX", item_id="3",
+                         wish_name="Detective Comics #27",
+                         title="Detective Comics #27 VF")
+
+        output, exit_code, _, mock_record = _run_main(
+            [[m1], [m2], [m3]],
+            db_path=db_path,
+            wish_list=wish_list,
+            wish_items=wish_items,
+            verify_return=[m1, m2, m3],
+            condition_description_by_item_id={"2": "VG condition, rusty staple"},
+            json_output=True,
+        )
+
+        data = json.loads(output)
+        # Never counted toward incomplete/exit code — it's a completed verdict.
+        assert data["incomplete"] is False
+        assert exit_code == 0
+        dropped_ids = {d["item_id"] for d in data["defect_dropped"]}
+        assert dropped_ids == {"2"}
+        [defect] = [d for d in data["defect_dropped"] if d["item_id"] == "2"]
+        assert defect["condition_defects"][0]["code"] == "rust"
+        assert "rusty staple" in defect["reason"]
+        # sellerX still has 2 clean matches (m1, m3) → still surfaces.
+        assert len(data["sellers"]) == 1
+        surfaced_ids = {m["item_id"] for m in data["sellers"][0]["matches"]}
+        assert surfaced_ids == {"1", "3"}
+        # A defect-dropped item is never marked seen — buy.md Step 1.5's
+        # "re-add a row the user clears" override needs it to resurface.
+        mock_record.assert_called_once()
+        assert "2" not in set(mock_record.call_args[0][0])
+
+    def test_seller_falls_below_two_after_defect_drop(self, tmp_path):
+        """A seller with exactly 2 matches, one defective, drops entirely —
+        the ≥2 gate is re-applied after the condition-defect gate."""
+        db_path = tmp_path / "v.db"
+        m1 = make_match(seller="sellerY", item_id="10",
+                         wish_name="Amazing Spider-Man #129")
+        m2 = make_match(seller="sellerY", item_id="11", wish_name="X-Men #94")
+        wish_list, wish_items = _two_wish_items()
+
+        output, exit_code, _, mock_record = _run_main(
+            [[m1], [m2]],
+            db_path=db_path,
+            wish_list=wish_list,
+            wish_items=wish_items,
+            verify_return=[m1, m2],
+            condition_description_by_item_id={"11": "cover detached both staples"},
+        )
+
+        assert "sellerY" not in output
+        assert "No sellers found" in output
+        assert "Dropped 1 listing(s) on the condition-defect rule (BUI-919)" in output
+        assert "loose/detached staple" in output
+        assert exit_code == 0  # a completed drop, not an incomplete run
+        mock_record.assert_not_called()
+
+    def test_clean_listings_unaffected(self, tmp_path):
+        """No conditionDescription anywhere (the common case) → nothing dropped."""
+        db_path = tmp_path / "v.db"
+        m1 = make_match(seller="sellerZ", item_id="20",
+                         wish_name="Amazing Spider-Man #129")
+        m2 = make_match(seller="sellerZ", item_id="21", wish_name="X-Men #94")
+        wish_list, wish_items = _two_wish_items()
+
+        output, exit_code, _, mock_record = _run_main(
+            [[m1], [m2]],
+            db_path=db_path,
+            wish_list=wish_list,
+            wish_items=wish_items,
+            verify_return=[m1, m2],
+            json_output=True,
+        )
+
+        data = json.loads(output)
+        assert data["defect_dropped"] == []
+        assert len(data["sellers"][0]["matches"]) == 2
+        assert exit_code == 0
+        mock_record.assert_called_once()
+        assert set(mock_record.call_args[0][0]) == {"20", "21"}
 
 
 # ─── End-to-end happy path ────────────────────────────────────────────────────

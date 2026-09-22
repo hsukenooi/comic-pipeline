@@ -167,6 +167,7 @@ seller-scan <seller> 2>/dev/null
       "matches": [ { "title": "...", "wish_name": "...", "item_id": "...", "...": "..." } ],
       "dropped_candidates": [],
       "filtered": [ { "item_id": "...", "title": "...", "wish_name": "...", "reason": "..." } ],
+      "defect_dropped": [ { "item_id": "...", "title": "...", "wish_name": "...", "seller": "comics4less", "condition_defects": [ { "code": "...", "phrase": "...", "source": "..." } ], "reason": "..." } ],
       "skipped_cached_candidates": 0,
       "incomplete": false,
       "error": null,
@@ -177,6 +178,8 @@ seller-scan <seller> 2>/dev/null
 ```
 
 `sellers[*].skipped_cached_candidates` (BUI-317) counts candidates skipped entirely — no Claude CLI call — because that exact (listing, wish) pair was already rejected within the last 14 days. Always `0` when `--no-reject-cache` or `--all` is passed (either bypasses the cache; `--show-seen` alone does NOT zero this out). See `docs/solutions/workflow-issues/seller-scan-verification-batching-seen-tracking-rationale.md` for why a nonzero count here is expected/healthy rather than a problem.
+
+`sellers[*].defect_dropped` carries the condition-defect rule's drops inline (BUI-968) — see § Condition-defect gate below for the shape and why it never affects `incomplete`/exit code.
 
 **Parse exit-code-first, then drill in:**
 
@@ -211,6 +214,18 @@ inline (BUI-298) — no need to scrape stderr for them under `--json`.
 A candidate that was **never verified** (timeout/transport failure) is not the same as a model rejection — see exit code `3` in the Output section above. Every surfaced match clears the `match_score ≥ 0.65` floor (see *Matching algorithm* below); the 0.65–0.69 band is borderline and worth a user's eyeball even though Claude already passed it.
 
 Full rationale for why a second verifier is redundant, and why false positives leak at this specific seam: `docs/solutions/workflow-issues/seller-scan-verification-batching-seen-tracking-rationale.md`.
+
+## Condition-defect gate (BUI-919/BUI-968)
+
+Hsu Ken's standing buy rule (2026-09-16): never carry a comic to purchase whose seller-disclosed condition text names **moisture damage**, **rust**, or a **loose/detached staple** — at any price and any stated grade. `/comic:buy` Step 1.5 already enforces this on the identify table; BUI-968 extends the same rule here so a defective listing never reaches `/comic:buy` in the first place.
+
+The gate runs on the **final verified matches only** (after the Claude pass above) — one extra eBay call per match to fetch the seller's condition text (disk-cached 7 days, so a repeat scan of the same listing costs nothing), scanned along with the title by the same classifier Step 1.5 uses (`apps/ebay/src/condition_defects.py`). A match naming a defect never reaches `matches`.
+
+**No silent drops here either:** every drop prints to stderr as `Dropped N listing(s) on the condition-defect rule (BUI-919):`, one line per drop naming the listing, the wish item, and the seller's own phrase — and is returned inline per-seller in `--json` as `sellers[*].defect_dropped`. Present it to the user alongside the match table, the same way `filtered` is presented above. **The rule itself is not negotiable, but a misread of the text is** — a title-sourced `rust` hit on a character or story name reads very differently from a `condition_description` note reading "rusty staple" (each entry's `condition_defects[*].source` says which).
+
+A dropped listing is **never marked seen** — like a never-verified candidate, it resurfaces on every re-scan so it stays visible if the seller edits the listing or the drop turns out to be a misread. It does **not** count toward `incomplete` or the exit code: it's a completed verdict, not a failed verification.
+
+Plain "staining", "foxing", and "tanning" are **not** triggers, and neither are spine tape, a spine split, or a missing piece of cover — those are `/comic:grade` calls. Most listings carry no seller-written condition note at all, so a blank/absent `defect_dropped` entry is not proof a listing is clean; the classifier also scans the title, but structural damage visible only in photos is still a job for `/comic:grade`.
 
 ## Feed matches into /comic:buy
 

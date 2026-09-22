@@ -45,9 +45,14 @@ from comic_identity import (  # noqa: F401 — BUI-253 Step 1: re-exported for c
     series_year_range,
     should_reject,
 )
+from condition_defects import (  # BUI-968: extends BUI-919's standing rule here
+    format_defect_cell,
+    listing_defect_findings,
+)
 from ebay_fetch import (
     UnknownSellerError,
     atomic_write_json,
+    get_condition_description,
     get_token,
     load_config,
     load_seller_aliases,
@@ -1088,6 +1093,105 @@ def verify_with_claude(matches, *, use_rejected_cache=False, stats=None):
     return kept, dropped, filtered
 
 
+# ─── Condition-defect gate (BUI-968) ───────────────────────────────────────────
+
+def apply_condition_defect_gate(matches, token, base_url):
+    """Drop any match whose seller-disclosed condition text names moisture
+    damage, rust, or a loose/detached staple — Hsu Ken's standing buy rule
+    (2026-09-16, BUI-919), extended here from /comic:buy Step 1.5 to
+    seller-scan and wishlist-sellers (BUI-968), which is the single shared
+    entry point both CLIs call so the rule can't drift between them.
+
+    Callers pass only their FINAL, already-verified match list (post fuzzy
+    match, post Claude/Haiku verify) — this function pays one extra getItem
+    call per candidate (disk-cached 7 days via
+    ebay_fetch.get_condition_description(), so a repeat scan of the same
+    listing is free), so it runs on the smallest possible set, the same
+    reasoning wishlist_sellers.py's item-specifics era gate already applies
+    ("avoids paying getItem calls for singleton-seller or already-owned
+    listings" — see its Step 7.5 comment) — here narrowed further to
+    genuinely-verified matches, since a Claude/Haiku rejection can only
+    shrink the set the era gate already sees.
+
+    Unlike /comic:buy Step 1.5 (which reads `condition_defects` off a table
+    `ebay-fetch --json` already populated per-listing via a full getItem
+    detail fetch — see ebay_fetch.py's parse_item()), seller-scan and
+    wishlist-sellers fetch listings via the Browse *search* API
+    (item_summary/search / search_by_keyword), whose itemSummary shape never
+    carries `conditionDescription` at all (see parse_item_summary()'s
+    docstring) — that's why this needs its own per-candidate fetch rather
+    than reading a field already on `matches`.
+
+    Returns `(clean, dropped)`. `clean` is the surviving matches, in their
+    original order. `dropped` is a list of `{item_id, title, wish_name,
+    condition_defects, reason}` dicts, one per drop — `condition_defects` is
+    the same `[{code, phrase, source}, ...]` shape /comic:buy's `Defects`
+    column reads, and `reason` is the human-readable
+    `format_defect_cell()` string. Every drop is printed to stderr as it's
+    found (mirrors `_parse_verification_response`'s "Filtered N ..." block),
+    so both callers get "no silent drops" for free without duplicating the
+    printing.
+
+    A fetch failure (network error, non-200, or the seller simply wrote no
+    condition note — by far the common case) is NOT a drop: `get_condition_
+    description()` fail-opens to None, `listing_defect_findings()` then finds
+    nothing in an absent note, and the match passes through to `clean`. This
+    mirrors Step 1.5's own warning that a blank Defects cell means "nothing
+    to read", never "verified clean" — the classifier still separately scans
+    each match's `title`, so a defect named only in the title (rather than a
+    conditionDescription) is still caught even when the note itself is
+    unreadable or absent.
+
+    Dropped matches are deliberately excluded from whatever the caller marks
+    "seen" next (both callers already build their seen-list from the
+    survivors this function returns) — like a never-verified BUI-297
+    candidate, a defect drop should keep resurfacing on every re-scan rather
+    than silently vanishing after one report, in case the seller edits the
+    listing or the drop turns out to be a misread the user wants to clear
+    (buy.md Step 1.5: "Re-add a row the user clears and carry on").
+    """
+    clean = []
+    dropped = []
+    for cand in matches:
+        item_id = cand.get("item_id")
+        condition_description = get_condition_description(item_id, token, base_url)
+        findings = listing_defect_findings(
+            condition_description=condition_description, title=cand.get("title"),
+        )
+        if not findings:
+            clean.append(cand)
+            continue
+        dropped.append({
+            "item_id": item_id,
+            "title": cand.get("title"),
+            "wish_name": cand.get("wish_name"),
+            # BUI-968: both callers' candidates carry "seller" already
+            # (parse_item_summary()'s field / match_results_for_wish()'s
+            # field) — carried through here so wishlist_sellers.py's FLAT
+            # (not per-seller-nested) `defect_dropped` list can still
+            # attribute each drop to a seller, the same reason its existing
+            # `dropped_candidates` list already carries one per entry.
+            "seller": cand.get("seller"),
+            "condition_defects": findings,
+            "reason": format_defect_cell(findings),
+        })
+
+    if dropped:
+        print(
+            f"Dropped {len(dropped)} listing(s) on the condition-defect rule "
+            "(BUI-919):",
+            file=sys.stderr,
+        )
+        for d in dropped:
+            print(
+                f"  - {d.get('title', '?')}  ↮  {d.get('wish_name', '?')}"
+                f"  — {d['reason']}",
+                file=sys.stderr,
+            )
+
+    return clean, dropped
+
+
 # ─── Output ───────────────────────────────────────────────────────────────────
 
 def _strip_private(rows):
@@ -1141,15 +1245,16 @@ def print_matches(matches, seller_label=None):
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 
 def _seller_result(seller, username, *, matches=None, dropped=None,
-                   filtered=None, skipped=0, error=None, crashed=False):
+                   filtered=None, defect_dropped=None, skipped=0, error=None,
+                   crashed=False):
     """Build one seller's result slot for the --json `sellers` array.
 
     BUI-298: a single factory for the per-seller shape so its keys are defined
     in one place — the fetch-error, unknown-seller, and success paths all go
     through here rather than hand-building three drift-prone literals.
     `incomplete` is derived (true iff there are dropped/never-verified
-    candidates); `matches`/`dropped`/`filtered` already have their private
-    pipeline fields stripped by the caller.
+    candidates); `matches`/`dropped`/`filtered`/`defect_dropped` already have
+    their private pipeline fields stripped by the caller.
 
     BUI-317: `skipped` is the count of candidates the BUI-301 rejected cache
     skipped entirely (no CLI call) — surfaced as `skipped_cached_candidates`
@@ -1163,6 +1268,12 @@ def _seller_result(seller, username, *, matches=None, dropped=None,
     too (not just via the exit code) so a `--json` caller inspecting a
     specific seller's slot doesn't have to pattern-match its `error` string
     to tell the two apart.
+
+    BUI-968: `defect_dropped` is apply_condition_defect_gate()'s output — a
+    genuine, definitive verdict ("this listing names a disqualifying
+    defect"), unlike `dropped` (a candidate the verifier never reached a
+    verdict on at all). It deliberately does NOT feed `incomplete` — a
+    defect drop is a completed classification, not a failed one.
     """
     dropped = dropped or []
     return {
@@ -1171,6 +1282,7 @@ def _seller_result(seller, username, *, matches=None, dropped=None,
         "matches": matches or [],
         "dropped_candidates": dropped,
         "filtered": filtered or [],
+        "defect_dropped": defect_dropped or [],
         "skipped_cached_candidates": skipped,
         "incomplete": bool(dropped),
         "error": error,
@@ -1236,7 +1348,7 @@ def _scan_one_seller_impl(seller_arg, username, token, base_url, wish_items,
     list and verify candidates with Claude. Returns a per-seller result dict:
 
         {"seller", "username", "matches", "dropped_candidates", "filtered",
-         "skipped_cached_candidates", "incomplete", "error"}
+         "defect_dropped", "skipped_cached_candidates", "incomplete", "error"}
 
     BUI-298: this is the per-seller body of what used to be all of main() —
     extracted so main() can fetch the wish list + OAuth token ONCE and loop
@@ -1371,6 +1483,17 @@ def _scan_one_seller_impl(seller_arg, username, token, base_url, wish_items,
         )
     print(f"  {len(matches)} genuine match(es) verified", file=sys.stderr)
 
+    # BUI-968: condition-defect gate (Hsu Ken's standing buy rule, BUI-919),
+    # extended here from /comic:buy Step 1.5. Runs on the FINAL verified
+    # matches only — the smallest possible set — since it pays one extra
+    # getItem call per candidate; apply_condition_defect_gate() prints its
+    # own "Dropped N ..." block, so nothing further is needed here for
+    # visibility.
+    if matches:
+        matches, defect_dropped = apply_condition_defect_gate(matches, token, base_url)
+    else:
+        defect_dropped = []
+
     # BUI-319: build the result slot BEFORE recording the seen-set, then return
     # the already-built object after. record_items_seen commits an irreversible
     # server-side "these item_ids were surfaced" mark; if the result-building
@@ -1385,6 +1508,7 @@ def _scan_one_seller_impl(seller_arg, username, token, base_url, wish_items,
         matches=_strip_private(matches),
         dropped=_strip_private(dropped),
         filtered=filtered,
+        defect_dropped=defect_dropped,
         skipped=skipped,
     )
 

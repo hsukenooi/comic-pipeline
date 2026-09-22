@@ -18,10 +18,15 @@ Pipeline (per the plan's diagram):
   9.5 Item-specifics era gate for bare-title ≥2 candidates; re-apply ≥2 gate (BUI-229).
   10. Split by verdict cache; run Haiku verify on uncached survivors (R8/R9).
   11. Write new verdicts; re-apply ≥2 gate.
+  11.5 Condition-defect gate on the verified survivors (moisture/rust/loose-
+       staple, BUI-919's standing rule, shared with seller_scan.py via
+       apply_condition_defect_gate() — BUI-968); re-apply ≥2 gate.
   12. Record all final item_ids as seen (global, seller=None — R11).
   13. Emit compact table (default) or --json (R15; BUI-309: --json is always
       an object with `sellers` + `dropped_candidates`, and the process exits
-      non-zero when any candidate was never verified).
+      non-zero when any candidate was never verified; BUI-968 adds a third
+      field, `defect_dropped`, for condition-defect drops — a completed
+      verdict, not a failed one, so it does NOT affect exit code/`incomplete`).
 
 Coverage note (plan N3): wish items whose name contains no '#N' issue number
 (GNs, HCs, TPBs like "Secret Wars HC") are silently skipped by
@@ -63,6 +68,7 @@ from seller_scan import (
     _title_paren_years,
     _title_volume,
     _trunc,
+    apply_condition_defect_gate,  # BUI-968: shared condition-defect gate
     fetch_seen_item_ids,
     fetch_wish_list,
     hard_reject,
@@ -575,7 +581,8 @@ def format_table(grouped: dict) -> str:
     return "\n".join(lines)
 
 
-def _emit(*, grouped: dict, dropped_candidates: list, json_output: bool) -> None:
+def _emit(*, grouped: dict, dropped_candidates: list, defect_dropped: list,
+          json_output: bool) -> None:
     """Emit the final result to stdout.
 
     CRITICAL (R15): only the final result ever reaches stdout. Private
@@ -598,6 +605,16 @@ def _emit(*, grouped: dict, dropped_candidates: list, json_output: bool) -> None
     Those candidates are never part of `grouped` (they were never verified as
     genuine) and — per the existing BUI-297 data-safety invariant, unchanged
     here — stay uncached and unseen so they resurface on the next run.
+
+    `defect_dropped` (BUI-968: apply_condition_defect_gate()'s output — the
+    standing moisture/rust/loose-staple rule, BUI-919) is a THIRD, distinct
+    field: unlike `dropped_candidates`, these listings DID get a definitive
+    verdict (a named defect), so they're never counted toward `incomplete` or
+    the process exit code — only a failed *verification*, not a completed
+    drop, means "re-run me". apply_condition_defect_gate() already prints
+    each drop to stderr as it's found; this also surfaces them on stdout/in
+    `--json` so a table-only or --json-only reader still sees them (mirrors
+    the belt-and-suspenders `dropped_candidates` banner below).
     """
     if json_output:
         # Strip private pipeline fields only on the path that consumes them —
@@ -617,6 +634,7 @@ def _emit(*, grouped: dict, dropped_candidates: list, json_output: bool) -> None
             "incomplete": bool(dropped_candidates),
             "sellers": stripped_sellers,
             "dropped_candidates": _strip_private(dropped_candidates),
+            "defect_dropped": _strip_private(defect_dropped),
         }))
         return
 
@@ -634,6 +652,21 @@ def _emit(*, grouped: dict, dropped_candidates: list, json_output: bool) -> None
             "verified (claude CLI timeout/transport failure). They are NOT "
             "recorded as seen and WILL resurface on the next scheduled run."
         )
+
+    if defect_dropped:
+        # BUI-968: same belt-and-suspenders reasoning as the INCOMPLETE banner
+        # above — apply_condition_defect_gate() already printed these to
+        # stderr as they were found; this repeats them on stdout so a
+        # --json-off, stderr-discarded reader still sees every drop.
+        print(
+            f"Dropped {len(defect_dropped)} listing(s) on the condition-defect "
+            "rule (BUI-919):"
+        )
+        for d in defect_dropped:
+            print(
+                f"  - {d.get('title', '?')}  ↮  {d.get('wish_name', '?')}"
+                f"  — {d.get('reason', '')}"
+            )
 
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
@@ -782,9 +815,10 @@ def main(argv=None):  # noqa: C901 — the pipeline is inherently linear/long
         action="store_true",
         dest="json_output",
         help="Emit JSON instead of a human table (BUI-309: always a top-level "
-             "object — never a bare array — with `incomplete`, `sellers`, and "
-             "`dropped_candidates`; the process exits 3 when any candidate was "
-             "never verified. See main()'s docstring / the skill doc for the shape)",
+             "object — never a bare array — with `incomplete`, `sellers`, "
+             "`dropped_candidates`, and `defect_dropped` (BUI-968); the process "
+             "exits 3 when any candidate was never verified (a defect drop does "
+             "NOT count). See main()'s docstring / the skill doc for the shape)",
     )
     parser.add_argument(
         "--env",
@@ -939,7 +973,7 @@ def main(argv=None):  # noqa: C901 — the pipeline is inherently linear/long
 
     if not all_matches:
         print("No wish-list matches found on eBay.", file=sys.stderr)
-        _emit(grouped={}, dropped_candidates=[], json_output=args.json_output)
+        _emit(grouped={}, dropped_candidates=[], defect_dropped=[], json_output=args.json_output)
         return 0
 
     # ── Step 7: drop already-seen (global seen set, seller=None — R11) ───────
@@ -985,7 +1019,7 @@ def main(argv=None):  # noqa: C901 — the pipeline is inherently linear/long
 
     if not grouped:
         print("No sellers with ≥2 matches found.", file=sys.stderr)
-        _emit(grouped={}, dropped_candidates=[], json_output=args.json_output)
+        _emit(grouped={}, dropped_candidates=[], defect_dropped=[], json_output=args.json_output)
         return 0
 
     # ── Step 7.5 (moved): item-specifics era gate — runs only on ≥2 candidates ──
@@ -1019,7 +1053,7 @@ def main(argv=None):  # noqa: C901 — the pipeline is inherently linear/long
         grouped = group_and_gate(candidates)
         if not grouped:
             print("No sellers with ≥2 matches found.", file=sys.stderr)
-            _emit(grouped={}, dropped_candidates=[], json_output=args.json_output)
+            _emit(grouped={}, dropped_candidates=[], defect_dropped=[], json_output=args.json_output)
             return 0
         candidates = [m for ms in grouped.values() for m in ms]
 
@@ -1045,6 +1079,27 @@ def main(argv=None):  # noqa: C901 — the pipeline is inherently linear/long
         file=sys.stderr,
     )
 
+    # ── Step 11.5: condition-defect gate (BUI-968) ────────────────────────────
+    # Hsu Ken's standing buy rule (BUI-919: moisture/rust/loose-staple, any
+    # price, any grade), extended here from /comic:buy Step 1.5 via the same
+    # apply_condition_defect_gate() seller_scan.py uses. Runs on the flattened
+    # POST-VERIFY survivors — the smallest possible set — since it pays one
+    # extra getItem call per candidate (disk-cached 7 days). A seller can fall
+    # below 2 again here (mirrors Step 9.5's own re-gate above), so the ≥2
+    # gate is re-applied once more.
+    survivors = [m for ms in grouped.values() for m in ms]
+    if survivors:
+        survivors, defect_dropped = apply_condition_defect_gate(survivors, token, base_url)
+    else:
+        defect_dropped = []
+    grouped = group_and_gate(survivors)
+    if defect_dropped:
+        print(
+            f"  {len(grouped)} seller(s) with ≥2 genuine matches after the "
+            "condition-defect gate",
+            file=sys.stderr,
+        )
+
     # ── Step 12: record seen (global, seller=None — R11) ─────────────────────
     final_item_ids = [m["item_id"] for ms in grouped.values() for m in ms]
     if final_item_ids and not args.no_record_seen:
@@ -1056,7 +1111,10 @@ def main(argv=None):  # noqa: C901 — the pipeline is inherently linear/long
         )
 
     # ── Step 13: emit ─────────────────────────────────────────────────────────
-    _emit(grouped=grouped, dropped_candidates=dropped_candidates, json_output=args.json_output)
+    _emit(
+        grouped=grouped, dropped_candidates=dropped_candidates,
+        defect_dropped=defect_dropped, json_output=args.json_output,
+    )
 
     # BUI-309: an unattended scheduled run needs a machine-readable "this run
     # was partial" signal, not just a stderr WARNING nobody reads. Reuses
