@@ -8,6 +8,11 @@
 # run does the engineering (implement, review, CI, merge, deploy, close); this
 # file only frames it and reports.
 #
+# If the EM's last message is not the summary (it ended its turn waiting on a
+# background command; headless claude resumes it only for subagent completions),
+# the wrapper resumes the same session with a nudge, up to MAX_RESUMES times.
+# To finish a run by hand later: scripts/em-batch-nightly.sh --resume-run <run id>
+#
 # Run it now (does not wait for 01:00):
 #   launchctl kickstart -k "gui/$(id -u)/com.comics.em-batch-nightly"
 # Or by hand:
@@ -56,8 +61,11 @@ export CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=86400000
 
 DRY_RUN=0
 TICKETS_OVERRIDE=""
+RESUME_RUN=""   # --resume-run YYYY-MM-DD_HHMM: pick up an earlier run whose EM stopped early
+MAX_RESUMES=2
 while [ $# -gt 0 ]; do
   case "$1" in
+    --resume-run) RESUME_RUN="$2"; shift 2 ;;
     --dry-run) DRY_RUN=1 ;;
     --tickets) shift; TICKETS_OVERRIDE="${1:-}" ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -138,7 +146,12 @@ fi
 # --- Select tickets -------------------------------------------------------------
 RUN_DIR="$STATE_DIR/runs/$(date '+%Y-%m-%d_%H%M')"
 mkdir -p "$RUN_DIR"
-if [ -n "$TICKETS_OVERRIDE" ]; then
+if [ -n "$RESUME_RUN" ]; then
+  RUN_DIR="$STATE_DIR/runs/$RESUME_RUN"
+  [ -f "$RUN_DIR/tickets.txt" ] || fatal "no run to resume at $RUN_DIR"
+  TICKETS="$(cat "$RUN_DIR/tickets.txt")"
+  echo "resuming run $RESUME_RUN"
+elif [ -n "$TICKETS_OVERRIDE" ]; then
   TICKETS="$TICKETS_OVERRIDE"
 else
   TICKETS="$(python3 "$REPO/scripts/em-batch-nightly-select.py" --cap "$CAP" | tr '\n' ' ' | sed 's/ *$//')" \
@@ -164,6 +177,7 @@ Run context from scripts/em-batch-nightly.sh (BUI-972):
 - Shared checkout, for deploy only: $REPO (see the profile's Deploy model for the on-main-and-clean rule).
 - Run dir for wave-plan.md and handoff.md: $RUN_DIR
 - Budget: about \$$BUDGET and $TIMEOUT of wall clock. Prefer finishing fewer tickets cleanly over starting all of them.
+- Headless: only a subagent's completion resumes you. A background Bash command, a Monitor, or a CI watch never wakes you, so never end your turn while waiting on one. Wait in the foreground: a normal Bash call such as \`gh pr checks N --watch\` with a long tool timeout, repeated as needed.
 - Your FINAL message is the user summary defined in the skill's mode:autonomous section (20 lines max, written for the person who uses the pipeline, not a code reader). It is posted to Telegram as-is."
 printf '%s\n' "$PROMPT" > "$RUN_DIR/prompt.md"
 
@@ -173,31 +187,86 @@ if [ "$DRY_RUN" -eq 1 ]; then
 fi
 
 # --- Model run -----------------------------------------------------------------------
-model_cmd=(gtimeout "$TIMEOUT" "$CLAUDE" -p "$PROMPT"
-  --permission-mode auto
+base_flags=(--permission-mode auto
   --permission-prompts none
   --settings "$REPO/.claude/settings.local.json"
   --add-dir "$REPO" --add-dir "$STATE_DIR"
   --autocompact auto
   --output-format json
   --max-budget-usd "$BUDGET")
-[ -n "$MODEL" ] && model_cmd+=(--model "$MODEL")
+[ -n "$MODEL" ] && base_flags+=(--model "$MODEL")
+
+case "$TIMEOUT" in
+  *h) TIMEOUT_SECS=$(( ${TIMEOUT%h} * 3600 )) ;;
+  *m) TIMEOUT_SECS=$(( ${TIMEOUT%m} * 60 )) ;;
+  *)  TIMEOUT_SECS=$(( ${TIMEOUT%s} )) ;;
+esac
+
+# run_model OUT [claude args...]: one headless segment, bounded by what is left of TIMEOUT.
+run_model() {
+  local out="$1"; shift
+  local left=$(( TIMEOUT_SECS - ($(date +%s) - started) ))
+  [ "$left" -gt 60 ] || return 124
+  ( cd "$RUN_WT" && gtimeout "$left" "$CLAUDE" "$@" "${base_flags[@]}" ) > "$out" 2>> "$RUN_DIR/stderr.log"
+}
+
+# The contract for "finished": the result starts with the summary's first line.
+summary_done() {
+  python3 - "$1" <<'EOPY'
+import json, re, sys
+try:
+    doc = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+sys.exit(0 if re.match(r"\s*\d+ tickets? picked", doc.get("result", "")) else 1)
+EOPY
+}
+
+session_of() {
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("session_id",""))' "$1" 2>/dev/null
+}
+
+NUDGE="Resumed by scripts/em-batch-nightly.sh: your last message was not the final user summary. In headless mode only a subagent's completion resumes you; a background Bash command, a Monitor, or a CI watch never does, so never end your turn while waiting on one. Wait in the foreground (a normal Bash \`gh pr checks N --watch\` call with a long timeout, repeated). Re-read $RUN_DIR/handoff.md and wave-plan.md, verify every PR and ticket's current state with gh and linear rather than trusting the notes, then finish the batch: merge what is green, close, deploy, compound if warranted, and end with the FINAL summary in the required shape (first line: <n> tickets picked, <d> done, <h> held, <s> skipped)."
 
 started=$(date +%s)
-( cd "$RUN_WT" && "${model_cmd[@]}" ) > "$RUN_DIR/result.json" 2> "$RUN_DIR/stderr.log"
-mstatus=$?
+attempt=0
+if [ -n "$RESUME_RUN" ]; then
+  RESULT_FILE="$(ls -t "$RUN_DIR"/result*.json 2>/dev/null | head -1)"
+  [ -n "$RESULT_FILE" ] || fatal "no result json in $RUN_DIR to resume from"
+  mstatus=0
+else
+  RESULT_FILE="$RUN_DIR/result.json"
+  run_model "$RESULT_FILE" -p "$PROMPT"
+  mstatus=$?
+fi
+while [ "$mstatus" -eq 0 ] && [ "$attempt" -lt "$MAX_RESUMES" ] && ! summary_done "$RESULT_FILE"; do
+  SESSION="$(session_of "$RESULT_FILE")"
+  [ -n "$SESSION" ] || break
+  attempt=$(( attempt + 1 ))
+  echo "EM stopped without the summary; resuming session $SESSION (attempt $attempt of $MAX_RESUMES)"
+  RESULT_FILE="$RUN_DIR/result.resume$attempt.json"
+  run_model "$RESULT_FILE" --resume "$SESSION" -p "$NUDGE"
+  mstatus=$?
+done
 mins=$(( ($(date +%s) - started) / 60 ))
-echo "model run exited $mstatus after ${mins}m"
+echo "model run exited $mstatus after ${mins}m ($attempt resumes)"
 
-SUMMARY="$(python3 - "$RUN_DIR/result.json" <<'PY'
-import json, sys
+SUMMARY="$(python3 - "$RESULT_FILE" "$RUN_DIR" <<'EOPY'
+import glob, json, sys
 try:
     doc = json.load(open(sys.argv[1]))
 except Exception:
     sys.exit(0)
 print(doc.get("result", "").strip())
-print("\nCost: $%.2f, %s turns." % (doc.get("total_cost_usd", 0.0), doc.get("num_turns", "?")))
-PY
+segs = []
+for f in sorted(glob.glob(sys.argv[2] + "/result*.json")):
+    try:
+        d = json.load(open(f)); segs.append((d.get("total_cost_usd", 0.0), d.get("num_turns", 0)))
+    except Exception:
+        pass
+cost = " + ".join("$%.2f" % c for c, _ in segs) if len(segs) > 1 else "$%.2f" % (segs[0][0] if segs else 0.0)
+print("\nCost: %s, %s turns." % (cost, sum(t for _, t in segs)))
+EOPY
 )"
 if [ -z "$SUMMARY" ]; then
   if [ "$mstatus" -eq 124 ]; then
