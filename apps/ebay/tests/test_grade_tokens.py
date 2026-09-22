@@ -112,6 +112,16 @@ class TestResolveLabel:
         read as a signature at all."""
         assert gt.resolve_label("CGC 9.8 not signed") is None
 
+    @pytest.mark.parametrize("text", [
+        "CGC 9.8 not  signed",
+        "CGC 9.8 NOT   Signed",
+        "CGC 9.8 not \t signed",
+    ])
+    def test_not_signed_guard_is_whitespace_width_agnostic(self, text):
+        """BUI-969: the fixed-width `(?<!not\\s)` let a multi-space
+        'not  signed' through as a signature."""
+        assert gt.resolve_label(text) is None
+
     def test_no_label(self):
         assert gt.resolve_label("Invincible #1 2003 CGC 9.4") is None
 
@@ -284,3 +294,18 @@ class TestExtractTitleCertification:
     def test_blank_title(self):
         assert gt.extract_title_certification("") == (None, None, False)
         assert gt.extract_title_certification(None) == (None, None, False)
+
+
+class TestStripCertificationTokens:
+    def test_strips_cert_ss_and_page_quality(self):
+        out = gt.strip_certification_tokens("Ultimate Fallout #4 CGC 9.8 SS OW/W")
+        assert out.split() == ["Ultimate", "Fallout", "#4", "9.8"]
+
+    @pytest.mark.parametrize("text,kept", [
+        # BUI-969: the loose `\bss\b` stripped the "SS" half of these seller
+        # stock numbers, leaving a dangling "-254" / "-12" in the title key.
+        ("Batman #439 Vol. 1 1989 DC Comics 7.0+ Comic Book SS-254", "SS-254"),
+        ("Uncanny X-Men #300 Vol. 1 1993 Marvel Comics 1st App 7.0+ Comic Book SS-12", "SS-12"),
+    ])
+    def test_stock_number_ss_left_whole(self, text, kept):
+        assert kept in gt.strip_certification_tokens(text)

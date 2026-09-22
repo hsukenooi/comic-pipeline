@@ -394,6 +394,10 @@ class TestHardExclude:
         # branch carries a negative lookbehind: the seller is advertising that
         # the book is NOT signed, which makes it a GOOD raw comp at $174.50.
         "Batman #251 - Neal Adams & Denny O'Neil - 1973 - NOT signed - KEY - FREE SHIP",
+        # BUI-969: the guard is no longer fixed-width, so a multi-space
+        # "NOT  signed" is guarded too (0 corpus titles carry one).
+        "Batman #251 - Neal Adams & Denny O'Neil - 1973 - NOT  signed - KEY - FREE SHIP",
+        "Batman #251 1973 not \t signed",
     ])
     def test_signed_lookalikes_are_kept(self, title):
         """BUI-668: precision guard on the signature branch.
