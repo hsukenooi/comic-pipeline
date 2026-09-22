@@ -1801,11 +1801,18 @@ def hard_exclude(title: str, *, graded_target: str | None = None) -> bool:
 # `hard_exclude` takes a bare title, which is enough for a lot (BUI-922's
 # half above) and not enough for these two: one needs the target's issue
 # number, the other needs to know whether the target is itself a variant.
-# Both are GRADED MODE ONLY — the call site in `fetch_book_comps` runs them
-# only when `graded_target` is set, so the raw pool is unchanged, and a
-# graded run's non-slab `comps` are never archived either
-# (`fmv_runner._graded_upsert_row` posts `[]` for them), so nothing here can
-# reach a raw pool through the ledger later.
+# Both fire only on a pass that ADMITS GRADED COMPS — see `_run`'s
+# `admits_graded` (BUI-961): a certified target (`graded_target` set), an
+# `include_graded` raw-target pass (comic-fmv's CGC-proxy/cross-check
+# rescue), or a tier whose own query admits graded comps regardless of the
+# book-level flag (`route_slabs`, e.g. the BUI-524 vintage-inclusive tier).
+# Before BUI-961 this was `graded_target` alone, which left the
+# `include_graded` raw pass and the BUI-524 inclusive tier ungated. A call
+# that admits no graded comps at all (route_slabs never True with real
+# data) never reaches these guards, so its pool is unchanged — and for a
+# genuinely certified `graded_target` run, a graded run's non-slab `comps`
+# are never archived either (`fmv_runner._graded_upsert_row` posts `[]` for
+# them), so nothing here can reach a raw pool through the ledger later.
 
 # --- Cross-title contamination (BUI-922) -----------------------------------
 #
@@ -2505,21 +2512,25 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
     # return at the bottom must carry the same keys as the success return.
     printing_dropped = 0
     printing_unverified = 0
-    # BUI-922/938: per-code counts of the comps the graded-only identity
+    # BUI-922/938/961: per-code counts of the comps the graded-identity
     # guards dropped. Bound here, beside printing_dropped, for the same
     # reason — both returns carry the same keys. Every code is always
     # present so a caller reads "0" rather than a missing key; all zero for
-    # every raw call, which never runs the guards at all.
+    # a call whose pool never admits a graded comp (see `_run`'s
+    # `admits_graded`), which never runs the guards at all.
     graded_identity_dropped = dict.fromkeys(GRADED_IDENTITY_CODES, 0)
-    # BUI-946/962: per-comp record of every graded-only guard drop this call
-    # makes — the ampersand-lot guard (`multibook_lot`), the two
+    # BUI-946/961/962: per-comp record of every graded-identity guard drop
+    # this call makes — the ampersand-lot guard (`multibook_lot`), the two
     # `graded_identity_exclude` codes, `hard_exclude`'s own verdict
     # (`HARD_EXCLUDE_CODE`), and the printing guard (`printing`) — so a
     # downstream caller (fmv_runner's ledger merge) can drop the SAME
     # listing out of a stored ledger comp by product_id, not just see a
     # count. Only comps with a product_id can be listed here (every slab/
     # comp candidate that reaches these checks already passed the
-    # `comp["product_id"]` truthiness gate above); empty for every raw call.
+    # `comp["product_id"]` truthiness gate above); empty for a call whose
+    # pool never admits a graded comp (an ordinary raw call with no
+    # include_graded, where no tier's route_slabs ever fires with real
+    # data — see `_run`'s `admits_graded`).
     graded_identity_dropped_ids: list[dict] = []
     # BUI-678: comps the BUI-675 currency gate rejected (title present, price
     # object present, currency proven non-USD) — summed across every tier's
@@ -2636,6 +2647,22 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
             # `continue` as every other reason `parse()` can return None.
             non_usd_dropped = 0
             nonlocal non_usd_dropped_total
+            # BUI-961: whether THIS PASS admits graded comps into its pool —
+            # either because the book-level call means to (include_graded or
+            # graded_target: `not exclude_graded`), or because this specific
+            # tier's own query does regardless of the book-level flag
+            # (route_slabs=True — the BUI-524 vintage-inclusive tier builds
+            # its query with exclude_graded=False even for an ordinary raw
+            # book). Before BUI-961 the three guards below fired only when
+            # `graded_target` was set, so a raw target's `include_graded`
+            # cross-check/proxy pass (comic-fmv's CGC-proxy rescue, BUI-348)
+            # admitted cross-title and multi-book-lot comps straight into
+            # `comps` ungated, and the BUI-524 inclusive tier admitted the
+            # same into `slab_comps` ungated for a plain raw book. A call
+            # that is neither (ordinary raw, no include_graded, route_slabs
+            # never True with real data) still never runs these guards, so
+            # its pool stays byte-for-byte unchanged.
+            admits_graded = (not exclude_graded) or route_slabs
             for r in raw_results:
                 comp = parse(r)
                 if comp is None:
@@ -2646,37 +2673,37 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
                     continue
                 if comp["product_id"] in seen_ids:
                     continue
-                # BUI-946: check the ampersand-lot guard BEFORE hard_exclude
-                # so a graded-mode multi-book-lot drop gets its own
+                # BUI-946/961: check the ampersand-lot guard BEFORE
+                # hard_exclude so a multi-book-lot drop gets its own
                 # product_id-tagged code. hard_exclude folds this same check
                 # in internally (BUI-922, see its docstring) and would also
                 # return True here, but a bare bool can't say WHICH reason —
                 # or which comp — to report to the ledger merge below.
-                if graded_target and _multibook_graded_lot(comp["title"]):
+                if admits_graded and _multibook_graded_lot(comp["title"]):
                     graded_identity_dropped_ids.append(
                         {"product_id": comp["product_id"], "code": "multibook_lot"})
                     continue
                 if hard_exclude(comp["title"], graded_target=graded_target):
-                    # BUI-962: previously a bare `continue` — a hard_exclude
-                    # drop that wasn't the ampersand lot (handled above,
-                    # before this call) carried no code at all, so a
-                    # downstream sweep of the stored ledger
+                    # BUI-962/961: previously a bare `continue` — a
+                    # hard_exclude drop that wasn't the ampersand lot
+                    # (handled above, before this call) carried no code at
+                    # all, so a downstream sweep of the stored ledger
                     # (backfill_comps_ledger.sweep_verdict) could only
                     # report it as `uncoded_hard_exclude` and never stamp
-                    # it. Graded mode only, mirroring
-                    # `graded_identity_dropped_ids`'s "empty on every raw
-                    # call" contract (see its declaration) — a raw call's
-                    # pool is unaffected either way, since both branches
-                    # `continue`.
-                    if graded_target:
+                    # it. Gated on admits_graded (not graded_target) so the
+                    # same reporting applies whenever this pass's pool can
+                    # admit a graded comp — a plain raw call's pool is
+                    # unaffected either way, since both branches `continue`.
+                    if admits_graded:
                         graded_identity_dropped_ids.append(
                             {"product_id": comp["product_id"],
                              "code": HARD_EXCLUDE_CODE})
                     continue
-                # BUI-922/938: the two guards that need the TARGET's identity
-                # rather than just the comp's title. Graded mode only — a raw
-                # call never reaches this branch, so its pool is unchanged.
-                if graded_target:
+                # BUI-922/938/961: the two guards that need the TARGET's
+                # identity rather than just the comp's title. Gated on
+                # admits_graded — a call whose pool never admits a graded
+                # comp doesn't reach this branch, so its pool is unchanged.
+                if admits_graded:
                     code = graded_identity_exclude(
                         comp["title"], issue=issue,
                         target_is_variant=bool(variant))
