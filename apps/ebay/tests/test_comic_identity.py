@@ -299,6 +299,41 @@ class TestIdentifyComicFacsimileAndReprint:
             "Amazing Spider-Man #300 Retold Edition", "Amazing Spider-Man", "300"
         ) is True
 
+    def test_anniversary_edition_classified_as_reprint(self):
+        """BUI-959: an "Nth Anniversary Edition" reprint (e.g. the corpus's
+        "Giant Size X-Men 40th Anniversary Edition" hardcover) was falling
+        through to whatever other edition-word regex matched — giant-size in
+        that example — instead of being recognized as a reprint."""
+        ident = ci.identify_comic(
+            "Giant Size X-Men 40th Anniversary Edition 2015 HARD COVER"
+        )
+        assert ident.edition == "reprint"
+        assert any("later printing" in r for r in ident.reject_reasons)
+
+    def test_anniversary_edition_rejected_by_should_reject(self):
+        assert ci.should_reject(
+            "X-Men #1 40th Anniversary Edition", "X-Men", "1"
+        ) is True
+
+    def test_anniversary_issue_is_not_a_reprint(self):
+        """BUI-959: the false-positive boundary the widened lexicon must not
+        cross — a genuine ORIGINAL issue is routinely sold as an "Nth
+        Anniversary Issue" (e.g. "Fantastic Four #100 100th Anniversary
+        Issue", a real corpus title). "anniversary edition" must not match
+        "anniversary issue"."""
+        ident = ci.identify_comic("Fantastic Four #100 100th Anniversary Issue")
+        assert ident.edition == "single-issue"
+        assert ident.reject_reasons == []
+
+    def test_anniversary_variant_is_not_a_reprint(self):
+        """BUI-959: same false-positive boundary for "Anniversary Variant"
+        (e.g. corpus title "All-New X-Men #20 50th Anniversary Variant")."""
+        ident = ci.identify_comic(
+            "All-New X-Men #20 50th Anniversary Variant"
+        )
+        assert ident.edition == "single-issue"
+        assert ident.reject_reasons == []
+
 
 # ─── Lot detection + expansion (every BUI-261 format) ─────────────────────
 
