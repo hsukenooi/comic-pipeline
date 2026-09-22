@@ -161,8 +161,10 @@ class UpsertComicRequest(BaseModel):
     # absent is a sentinel here and not "any".
     certifier: str = FMV_CERTIFIER_NONE
     label: str = FMV_LABEL_UNIVERSAL
-    # BUI-925: how the number was arrived at ('direct' | 'interpolated' |
-    # 'ladder' | 'proxy'). Optional and NOT defaulted here: omitting it means
+    # BUI-925: how the number was arrived at. The vocabulary is
+    # FMV_PRICING_BASES and only FMV_PRICING_BASES — naming the values a
+    # second time here is how the two lists drift, and BUI-952 added one.
+    # Optional and NOT defaulted here: omitting it means
     # "derive it", and `upsert_fmv` derives it from the notes tokens on every
     # upsert (`derive_pricing_basis`), which is what keeps a raw row posted by
     # an older `comic-fmv` during the server-first deploy window carrying its

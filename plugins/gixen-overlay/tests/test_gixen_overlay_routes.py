@@ -4278,6 +4278,35 @@ def test_upsert_comic_accepts_the_graded_needs_manual_reasons(api, reason):
     assert r.status_code == 200, r.text
 
 
+@pytest.mark.parametrize("basis", [
+    "direct", "interpolated", "ladder", "proxy", "lone_sale",
+])
+def test_upsert_comic_accepts_every_pricing_basis(api, basis):
+    """BUI-593's failure mode again, on the basis column (BUI-952 added
+    `lone_sale`). Two gates can reject it and both discard the WHOLE upsert:
+    the pydantic vocabulary, and the CHECK constraint under it — so a priced
+    four-figure slab would be stored nowhere. Parametrized over the whole
+    vocabulary, not just the new value, so adding the next one without its
+    migration fails here rather than in production."""
+    r = api.post("/api/comics", json={
+        "title": f"Basis {basis}", "issue": "1", "year": 1970, "grade": 4.5,
+        "certifier": "cgc", "fmv_low": 1000.0, "fmv_high": 1000.0,
+        "pricing_basis": basis,
+    })
+    assert r.status_code == 200, r.text
+    rows = api.get("/api/comics", params={"title": f"Basis {basis}",
+                                          "certifier": "cgc"}).json()
+    assert rows and rows[0]["pricing_basis"] == basis
+
+
+def test_upsert_comic_unknown_pricing_basis_returns_422(api):
+    r = api.post("/api/comics", json={
+        "title": "Basis vibes", "issue": "1", "year": 1970, "grade": 4.5,
+        "certifier": "cgc", "pricing_basis": "vibes",
+    })
+    assert r.status_code == 422
+
+
 def test_list_comics_unknown_certifier_returns_422_not_an_empty_list(api):
     """An empty list reads as "this book has no price on file" — which is
     indistinguishable from the truth and sends the caller off to fetch one."""

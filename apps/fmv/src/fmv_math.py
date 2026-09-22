@@ -29,7 +29,11 @@ MAX_GRADE_WINDOW = 2.0       # widen ceiling (BUI-86)
 MIN_NARROW_POOL = 5          # widen-stop target: keep widening until this many comps
 MIN_PRICEABLE_POOL = 2       # sparse-flag floor: fewer trimmed comps → flag too_sparse
 MAX_GRADE_SPAN = 2.0         # too-wide guard: pool grade-span above this → flag
-SMALL_POOL_MAX_RATIO = 3.0   # 2-comp dispersion guard: hi/lo above this → flag (BUI-179)
+SMALL_POOL_MAX_RATIO = 3.0   # 2-comp dispersion guard: hi/lo above this → flag (BUI-179).
+                             #   Also the §7 lone-sale tier's bracket width
+                             #   (BUI-952): two numbers further apart than this
+                             #   are not one market, whether they are two comps
+                             #   in a bucket or two rungs around a target.
 MIN_BRACKET_COMPS = 2        # §7 thin-bracket guard: a bracket bucket with fewer
                              #   than this many comps is too thin to anchor an
                              #   interpolation (a lone mistagged comp → wild
@@ -1459,6 +1463,28 @@ GRADED_LADDER_MIN_RUNGS = 3
 GRADED_LADDER_CONFIDENCE = "LOW"
 GRADED_LADDER_BID_FACTOR = INTERPOLATED_BID_FACTOR  # 0.60
 
+# The LONE-SALE tier (BUI-952), between the exact tier and the ladder. A single
+# fresh sale at exactly the target grade is one observation, not a market, so it
+# cannot earn the exact tier's rubric confidence — but when the nearest
+# anchor-eligible rungs either side BRACKET it and sit within
+# SMALL_POOL_MAX_RATIO of each other, the ladder the row would otherwise fall to
+# has already vouched for the neighbourhood the sale sits in. Pricing the row AT
+# that sale is then a shorter step than interpolating a line across it, so it
+# carries a haircut between the exact tier's 0.80 and the ladder's 0.60.
+#
+# Confidence is LOW for the same reason the ladder's is — forced by the tier,
+# never earned by the pool — so `_PRICING_BASIS_FORCES_LOW` in fmv_runner must
+# list this basis too, or a cache hit reads a collapsed 'low' label and restores
+# the wrong factor.
+GRADED_LONE_SALE_CONFIDENCE = "LOW"
+GRADED_LONE_SALE_BID_FACTOR = 0.70
+# The lone sale must be a FRESH one (`graded_comp_weight` 1.0, i.e. within
+# GRADED_FRESH_MAX_AGE_DAYS). A half-weight 91–365-day sale stays a ladder row:
+# `bucket_effective_n`'s own docstring already refuses a 0.5 rung the right to
+# anchor a bracket, and a rule that let one BE the price while refusing to let
+# it bound one would contradict itself.
+GRADED_LONE_SALE_MIN_WEIGHT = 1.0
+
 # `min_bucket_n` for every slab ladder call. The raw path keeps
 # MIN_BRACKET_COMPS (2) because a lone RAW listing is one mistag away from
 # smearing a wild over-bid; a lone CERTIFIED sale is a graded, authenticated
@@ -1659,6 +1685,26 @@ def _nearest_rungs(
     return {"below": _side(below), "above": _side(above)}
 
 
+def _anchor_eligible_rungs(
+    ladder: Mapping[float, float], eff_n: Mapping[float, float],
+    target_grade: float,
+) -> list[float]:
+    """The rungs allowed to anchor a bracket: every grade but the target's
+    whose effective n clears GRADED_LADDER_MIN_BUCKET_N.
+
+    Shared by `_graded_ladder` (which counts them against
+    GRADED_LADDER_MIN_RUNGS) and `_graded_lone_sale` (which applies the SAME
+    count, so that tier cannot price a market the ladder calls too thin). One
+    function rather than two copies of one comprehension: the two tiers must
+    agree on what a usable rung is, and a silent disagreement would show up as
+    a book the thin-ladder guard refuses at 0.60 and the lone-sale tier prices
+    at 0.70.
+    """
+    return [g for g in ladder
+            if g != target_grade
+            and eff_n.get(g, 0.0) >= GRADED_LADDER_MIN_BUCKET_N]
+
+
 def _graded_result(**over) -> dict:
     """The graded mode's output dict, shaped like `compute_fmv`'s.
 
@@ -1703,10 +1749,16 @@ def _graded_result(**over) -> dict:
         "graded": True,
         "certifier": None,
         "label": None,
-        # 'direct' | 'ladder' | None (nothing was priced). Never
-        # 'interpolated'/'proxy' — those are the raw path's bases.
+        # 'direct' | 'lone_sale' | 'ladder' | None (nothing was priced).
+        # Never 'interpolated'/'proxy' — those are the raw path's bases.
         "pricing_basis": None,
         "graded_ladder": None,
+        # BUI-952: on a `lone_sale` row, the bracket that admitted the sale —
+        # `{"lo", "hi", "lo_grade", "hi_grade"}`, the two nearest
+        # anchor-eligible rung medians and their grades. None on every other
+        # basis. The notes and provenance tokens render it; nothing reads it
+        # back as an input to the math.
+        "lone_sale_bracket": None,
         "page_quality": None,
         "page_quality_fallback": False,
         # None while `page_quality_fallback` is False; otherwise
@@ -1818,6 +1870,20 @@ def graded_fmv(comps: list[dict], target_grade: float, *,
         bucket is strictly exact: a 9.6 and a 9.8 slab are two different
         products at two different prices, and pooling them is precisely the
         error the raw ±window exists to make (usefully) for raw copies.
+      * LONE-SALE tier (BUI-952) — otherwise, if the exact bucket holds
+        EXACTLY ONE fresh sale (weight 1.0) and the nearest anchor-eligible
+        rungs below and above BRACKET that sale while sitting within
+        SMALL_POOL_MAX_RATIO of each other, the row is priced AT the sale
+        (`fmv_low == fmv_high == median`), at LOW/0.70. The bracket is the
+        whole warrant: the two rungs that would otherwise have a straight line
+        drawn between them instead vouch for the neighbourhood the observed
+        sale already sits in, so the tier prints an observation rather than an
+        estimate. Everything it declines — more than one sale at the grade, a
+        stale lone sale, a ladder below GRADED_LADDER_MIN_RUNGS, a missing
+        side, an inverted pair, a sale outside its bracket, a bracket wider
+        than 3x — falls through to the ladder EXACTLY as before, so this tier
+        can only move rows off the ladder, never off a refusal and never onto
+        one. See `_graded_lone_sale` for why that holds by construction.
       * LADDER tier — otherwise the target rung is DROPPED and the neighbours
         interpolate across the gap, at LOW/0.60. Dropping it is the whole
         mechanism: `_cgc_ladder_price_and_clamp` returns an exact bucket
@@ -1925,6 +1991,16 @@ def graded_fmv(comps: list[dict], target_grade: float, *,
 
     if exact_effective_n >= GRADED_EXACT_MIN_EFFECTIVE_N:
         return _graded_direct(exact_comps, ladder, eff_n, target_grade, identity)
+
+    # BUI-952. Reads the SCOPED exact bucket, like the tier above it and for
+    # the same reason (BUI-937: the exact bucket is the one thing page quality
+    # scopes), while its bracket rungs come from the WHOLE same-label pool,
+    # like the exact tier's envelope clamp and the ladder's own neighbours.
+    # Returns None — not a refusal — whenever any condition fails, so the
+    # fall-through below is byte-for-byte the pre-BUI-952 path.
+    lone = _graded_lone_sale(exact_comps, ladder, eff_n, target_grade, identity)
+    if lone is not None:
+        return lone
 
     if len(pool) < len(full_pool):
         # Scoping was applied and the book is priced off the ladder, which
@@ -2057,6 +2133,125 @@ def _graded_direct(exact_comps: list[dict], ladder: dict[float, float],
     )
 
 
+def _graded_lone_sale(exact_comps: list[dict], ladder: dict[float, float],
+                      eff_n: dict[float, float], target_grade: float,
+                      identity: dict) -> dict | None:
+    """The LONE-SALE tier: price a single fresh exact sale its rungs bracket.
+
+    Returns the result dict, or **None** meaning "not this tier" — never a
+    refusal. That is deliberate: every condition below is a reason to fall
+    through to the ladder, which is what the row already did before this tier
+    existed, so the tier can only ever move a row from `ladder` to `lone_sale`.
+    It cannot rescue a refusal (a row whose rungs do not bracket the target
+    fails here for the same reason it fails there) and it cannot create one.
+
+    Conditions 3-5 together are what make "this tier never rescues a
+    refusal" exactly true rather than merely observed: it needs the ladder's
+    own rung count, both of the ladder's bracket sides, and a non-inverted
+    pair — i.e. every precondition each of `ladder_too_thin`, `outside_ladder`
+    and `ladder_non_monotone` refuses on. So the only rows it can take are
+    rows that were going to be priced `ladder`.
+
+    The conditions, cheapest first:
+
+    1. **Exactly one sale** at the target grade. Two sales are a band, and a
+       band belongs to the exact tier's weighted quartiles or to nothing — the
+       basis is called `lone_sale` because the number IS one observed price,
+       and a weighted median of two prices under that name would be a lie.
+    2. That sale is **fresh** (weight >= GRADED_LONE_SALE_MIN_WEIGHT).
+    3. At least GRADED_LADDER_MIN_RUNGS anchor-eligible rungs remain once the
+       target's own is set aside — the ladder's `ladder_too_thin` floor,
+       counted by the same shared `_anchor_eligible_rungs`.
+    4. The nearest **anchor-eligible** rungs strictly below and strictly above
+       the target both exist. Eligibility is `_nearest_rungs`', which is
+       `_graded_ladder`'s and `_bracket_interpolate`'s — the same
+       `eff_n >= GRADED_LADDER_MIN_BUCKET_N` bar, on rungs read the same way —
+       so this tier can never anchor on a rung the ladder would have refused,
+       and it never recomputes the rung selection itself. (`_nearest_rungs`
+       filters on `g < target` / `g > target` strictly, so passing the full
+       `ladder` here selects exactly what passing the ladder's own
+       target-dropped `ladder_ex` would.)
+    5. The two rung medians **bracket** the sale (`lo <= sale <= hi`) and sit
+       within SMALL_POOL_MAX_RATIO of each other. `lo` is the BELOW-grade
+       rung and `hi` the ABOVE-grade one, not `min`/`max` of the pair — so an
+       inverted bracket (the pair `ladder_non_monotone` refuses) can never
+       satisfy `lo <= sale <= hi` and falls through to the ladder, which
+       refuses it by name.
+
+    The price is the sale, clean-rounded like every other tier. Rounding can
+    carry the printed point up to half a clean step past `hi` (at most $12.50
+    above $200) — the same rounding the ladder applies to its own interpolated
+    point, and `hi` is a neighbouring rung's median, not a cap. Nothing here
+    clamps: the number is an observed sale, and the bracket is the evidence
+    that admitted it, not a bound on it.
+    """
+    if len(exact_comps) != 1:
+        return None
+    sale_comp = exact_comps[0]
+    weight = float(sale_comp.get("weight", 0.0))
+    if weight < GRADED_LONE_SALE_MIN_WEIGHT:
+        return None
+    sale = float(sale_comp["price"])
+
+    # The SAME thin-ladder floor `_graded_ladder` applies, and the reason this
+    # tier can never turn a refusal into a price: a market with only two
+    # anchor-eligible rungs refuses `ladder_too_thin` today, and pricing it
+    # here — at a HIGHER factor than the ladder it is too thin for — would
+    # settle BUI-953's two-rung question as a side effect of this one instead
+    # of on its own evidence. Two rungs that happen to sit either side of a
+    # sale are not more evidence than two rungs that do not.
+    if len(_anchor_eligible_rungs(ladder, eff_n, target_grade)) < GRADED_LADDER_MIN_RUNGS:
+        return None
+
+    rungs = _nearest_rungs(ladder, eff_n, target_grade, GRADED_LADDER_MIN_BUCKET_N)
+    below, above = rungs["below"], rungs["above"]
+    if below is None or above is None:
+        return None
+    lo, hi = float(below["median"]), float(above["median"])
+    # `lo <= 0` guards the ratio's division, exactly as the exact tier's own
+    # SMALL_POOL_MAX_RATIO check does; a non-positive rung median is not a
+    # market either way.
+    if lo <= 0 or hi / lo > SMALL_POOL_MAX_RATIO:
+        return None
+    if not lo <= sale <= hi:
+        return None
+
+    point = clean_round(sale)
+    factor = min(bid_factor(GRADED_LONE_SALE_CONFIDENCE, None),
+                 GRADED_LONE_SALE_BID_FACTOR)
+    return _graded_result(
+        # `n`/`effective_n` are the EXACT bucket's, not the pool's: this band
+        # rests on one sale and says so. (`_graded_ladder` reports the whole
+        # pool there because a ladder point rests on the whole ladder.)
+        n=1,
+        effective_n=weight,
+        fmv_low=point,
+        fmv_high=point,
+        median=point,
+        max_bid=clean_round(point * factor),
+        confidence=GRADED_LONE_SALE_CONFIDENCE,
+        bid_factor=factor,
+        trimmed_pool=[sale],
+        pricing_basis="lone_sale",
+        lone_sale_bracket={
+            "lo": lo, "hi": hi,
+            "lo_grade": below["grade"], "hi_grade": above["grade"],
+        },
+        graded_ladder={
+            # The rungs as the bracket test read them, for an auditor
+            # comparing the price against its neighbourhood. No
+            # `grade_below`/`target_price` keys — nothing was interpolated,
+            # and `_graded_note_parts` keys its ladder sentence off
+            # `basis == "ladder"`, so those keys would never be read here.
+            "ladder": dict(sorted(ladder.items())),
+            "effective_n": dict(sorted(eff_n.items())),
+            "target_grade": target_grade,
+            "envelope_price": None,
+        },
+        **identity,
+    )
+
+
 def _graded_ladder(pool: list[dict], ladder: dict[float, float],
                    eff_n: dict[float, float], target_grade: float,
                    identity: dict) -> dict:
@@ -2073,8 +2268,7 @@ def _graded_ladder(pool: list[dict], ladder: dict[float, float],
     # than over every surviving key: a rung that cannot anchor cannot hold up
     # a bracket either, so counting it would only swap this honest
     # `ladder_too_thin` for a misleading `outside_ladder` one branch later.
-    eligible = [g for g in ladder_ex
-                if eff_ex.get(g, 0.0) >= GRADED_LADDER_MIN_BUCKET_N]
+    eligible = _anchor_eligible_rungs(ladder_ex, eff_ex, target_grade)
     if len(eligible) < GRADED_LADDER_MIN_RUNGS:
         return _graded_result(flag_reason="ladder_too_thin", **identity)
 

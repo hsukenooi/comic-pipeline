@@ -6804,6 +6804,57 @@ class TestGradedRunEndToEnd:
         assert "basis=ladder" in persisted
         assert "certifier=cgc" in persisted
 
+    def _bracketed_slab_result(self):
+        """BUI-952: the base fixture with ONE number moved — the 4.5 sale at
+        $1,000 instead of $700, i.e. inside the $900 (4.0) / $1,400 (5.5)
+        bracket instead of below it. Everything else is identical, so a diff
+        between this test and `test_the_lone_exact_sale_is_not_the_price`
+        above is exactly the rule."""
+        return self._slab_result(slab_comps=[
+            _make_slab_comp(1000, 4.5, "e0", sold_date="2026-09-01"),
+            _make_slab_comp(900, 4.0, "e1", sold_date="2026-08-20"),
+            _make_slab_comp(1400, 5.5, "e2", sold_date="2026-08-10"),
+            _make_slab_comp(1500, 6.0, "e3", sold_date="2026-08-05"),
+        ])
+
+    def test_a_bracketed_lone_sale_prices_at_the_sale(
+            self, tmp_path, server_url):
+        row, upsert, _ = self._run(self._book(), self._bracketed_slab_result(),
+                                   tmp_path, server_url)
+        fmv = row["fmv"]
+        assert fmv["pricing_basis"] == "lone_sale"
+        assert fmv["fmv_low"] == fmv["fmv_high"] == 1000
+        assert fmv["bid_factor"] == 0.70
+        assert fmv["max_bid"] == fmv_math.clean_round(1000 * 0.70)
+        # The basis rides the brief line, which is what Step 4/5 of
+        # /comic:buy read and what a cache hit reproduces the haircut from.
+        assert fmv_runner._brief_row(row)["pricing_basis"] == "lone_sale"
+        # ...and the basis is POSTED, not left to the server's notes-token
+        # derivation, which knows nothing about this tier.
+        assert upsert.call_args.args[2]["pricing_basis"] == "lone_sale"
+
+        persisted = fmv_runner._build_notes(upsert.call_args.args[2])
+        assert "basis=lone_sale" in persisted
+        assert "lone_sale=$1000 bracket $900-$1400" in persisted
+        assert "rungs 4→5.5" in persisted
+        assert "IS the price" in persisted
+
+    def test_a_cached_lone_sale_row_keeps_its_seventy_percent_cap(self):
+        """The stored-label collapse trap (BUI-930's reason for the column):
+        `fmv_confidence` persists as a bare 'low', so a cache hit must read
+        `pricing_basis` to know this row is capped at 0.70 and its confidence
+        is LOW by the tier rather than earned."""
+        cached = fmv_runner._fmv_from_db_row(
+            {"fmv_low": 1000, "fmv_high": 1000, "fmv_comps": 1,
+             "fmv_confidence": "low",
+             "fmv_notes": "window=n/a | certifier=cgc | label=universal "
+                          "| basis=lone_sale",
+             "pricing_basis": "lone_sale", "certifier": "cgc",
+             "label": "universal"})
+        assert cached["confidence"] == "LOW"
+        assert cached["bid_factor"] == 0.70
+        assert cached["max_bid"] == fmv_math.clean_round(1000 * 0.70)
+
     def test_ledger_comps_join_the_pool(self, tmp_path, server_url):
         """A second 4.5 sale from the ledger lifts the exact bucket to
         effective n 2 and flips the book from `ladder` to `direct`."""
@@ -7420,6 +7471,29 @@ class TestProvenanceCell:
         assert fmv["pricing_basis"] == "ladder"
         assert fmv_runner._provenance(row) == "ladder 3 rungs"
         assert fmv_runner._brief_row(row)["provenance"] == "ladder 3 rungs"
+
+    def test_lone_sale_certified_row_names_the_sale(
+            self, tmp_path, server_url):
+        """BUI-952: the cell names the one price the row rests on, so an
+        operator reading it at the approval gate knows not to expect a band
+        behind the number."""
+        h = _graded_harness()
+        row, _, _ = h._run(h._book(), h._bracketed_slab_result(), tmp_path,
+                           server_url)
+        assert row["fmv"]["pricing_basis"] == "lone_sale"
+        assert fmv_runner._provenance(row) == "lone sale $1000"
+        assert fmv_runner._brief_row(row)["provenance"] == "lone sale $1000"
+        assert len(fmv_runner._provenance(row)) <= 24
+
+    def test_lone_sale_cell_survives_a_cache_hit(self):
+        """Built from `fmv_high`, not `lone_sale_bracket` — a cached row does
+        not carry the bracket, and the cell must degrade to the same string
+        rather than to a bare basis name (the gap the `ladder` cell has)."""
+        fmv = {"graded": True, "pricing_basis": "lone_sale", "fmv_low": 1000,
+               "fmv_high": 1000, "max_bid": 700, "flag_reason": None, "n": 0}
+        row = {"input": {"item_id": "1", "title": "X", "issue": "1"},
+               "fmv": fmv, "comic_id": 1, "fmv_id": 1, "source": "cache"}
+        assert fmv_runner._provenance(row) == "lone sale $1000"
 
     def test_refused_ladder_row_names_the_refusal(self, tmp_path, server_url):
         """Drop one of the three neighbour rungs (keep only 4.0 and 5.5) so

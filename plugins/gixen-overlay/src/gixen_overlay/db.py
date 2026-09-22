@@ -104,7 +104,13 @@ COMP_PAGE_QUALITY_UNKNOWN = "unknown"
 # And it cannot stay a notes token: BUI-769 is the standing evidence that a
 # prefix in a freetext field fails OPEN on a reword, in the expensive
 # direction (a haircut silently not applied).
-FMV_PRICING_BASES = ("direct", "interpolated", "ladder", "proxy")
+# BUI-952 added 'lone_sale' (the slab tier that prices a single fresh
+# exact-grade sale its neighbouring rungs bracket, at 0.70). Adding a value
+# here is NOT enough on its own: the CHECK below is baked into the stored
+# schema of every DB that already ran, so `_migrate_fmv_pricing_basis_check`
+# has to widen it or the first `lone_sale` upsert dies on an IntegrityError
+# five frames down and the whole row is discarded (the BUI-593 class).
+FMV_PRICING_BASES = ("direct", "interpolated", "ladder", "proxy", "lone_sale")
 FMV_PRICING_BASIS_DIRECT = "direct"
 
 _fmv_certifiers_sql = ", ".join(f"'{c}'" for c in FMV_CERTIFIERS)
@@ -459,6 +465,13 @@ def create_tables(conn: sqlite3.Connection) -> None:
     # `pricing_basis` — an ALTER is additive and cannot hurt.
     _migrate_add_fmv_pricing_basis_column(conn)
     _migrate_backfill_fmv_pricing_basis(conn)
+    # BUI-952: widen the `pricing_basis` CHECK to today's vocabulary. Ordered
+    # after the two above for both of their reasons — it needs the column to
+    # exist to have a CHECK to inspect, and it rebuilds the table, so running
+    # it before the backfill would mean backfilling a table that had just been
+    # replaced underneath. Gated on the STORED constraint, so it is a no-op on
+    # every DB whose CHECK already lists every basis (including a fresh one).
+    _migrate_fmv_pricing_basis_check(conn)
     # BUI-924: comps' columns are purely additive (its unique index is
     # unchanged), so they need none of the rebuild machinery — the same
     # PRAGMA-guarded ALTER pattern as `flag_reason`/`provenance` above.
@@ -853,7 +866,32 @@ def _migrate_fmv_certifier_rebuild(conn: sqlite3.Connection) -> None:
     if "certifier" in cols:
         return
 
-    logger.info("fmv-certifier rebuild: starting")
+    _rebuild_fmv_table(conn, marker="fmv_certifier_rebuild",
+                       what="fmv-certifier rebuild")
+
+
+def _rebuild_fmv_table(conn: sqlite3.Connection, *, marker: str,
+                       what: str) -> None:
+    """Recreate `fmv` + `bid_fmvs` from the CURRENT DDL literal, losing nothing.
+
+    The dangerous half of every `fmv` schema change, in ONE place. SQLite can
+    neither drop a CHECK constraint nor widen a UNIQUE key in place, so both
+    reasons this repo has had to reshape `fmv` — BUI-924's unique key, BUI-952's
+    `pricing_basis` CHECK — end in the same save/DROP/recreate/restore, and a
+    second hand-rolled copy of it is exactly how one of the three things below
+    gets forgotten on the third occasion.
+
+    `marker` is the caller's OWN crash-marker name (it is set before the first
+    DROP and cleared after the last restore, so a crash in that window is
+    detectable by the caller's `_assert_no_migration_marker`); `what` names the
+    migration in the log line. The GATE stays with the caller — only the caller
+    knows what "already done" looks like for its own change.
+
+    IMPORTANT: raw conn.execute() only — no conn.commit(). Runs inside the
+    host's per-plugin SAVEPOINT (same constraint as every _migrate_* here).
+    """
+    logger.info("%s: starting", what)
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(fmv)")]
 
     # Only carry rows that survive a JOIN against the live parent, exactly as
     # _migrate_year_nullable does: a sqlite3 CLI session that never opted into
@@ -888,7 +926,7 @@ def _migrate_fmv_certifier_rebuild(conn: sqlite3.Connection) -> None:
 
     # Marker before the first DROP: from here on the schema alone can no
     # longer tell a finished migration from a crashed one.
-    _set_migration_marker(conn, "fmv_certifier_rebuild")
+    _set_migration_marker(conn, marker)
 
     conn.execute("DROP TABLE bid_fmvs")
     conn.execute("DROP TABLE fmv")
@@ -956,11 +994,11 @@ def _migrate_fmv_certifier_rebuild(conn: sqlite3.Connection) -> None:
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_bid_fmvs_bid ON bid_fmvs(bid_id)")
 
-    _clear_migration_marker(conn, "fmv_certifier_rebuild")
+    _clear_migration_marker(conn, marker)
 
     logger.info(
-        "fmv-certifier rebuild complete: %d fmv, %d bid_fmvs, %d bids.fmv_id restored",
-        len(saved_fmv), len(saved_bid_fmvs), len(saved_bid_fmv_id),
+        "%s complete: %d fmv, %d bid_fmvs, %d bids.fmv_id restored",
+        what, len(saved_fmv), len(saved_bid_fmvs), len(saved_bid_fmv_id),
     )
 
 
@@ -1015,6 +1053,57 @@ def _migrate_backfill_fmv_pricing_basis(conn: sqlite3.Connection) -> None:
     if counts:
         logger.info("_migrate_backfill_fmv_pricing_basis: %s", counts)
     _set_migration_marker(conn, "backfill_fmv_pricing_basis")
+
+
+_FMV_PRICING_BASIS_CHECK_RE = re.compile(
+    r"CHECK\s*\(\s*pricing_basis\s+IN\s*\(([^)]*)\)", re.IGNORECASE)
+
+
+def _migrate_fmv_pricing_basis_check(conn: sqlite3.Connection) -> None:
+    """Widen `fmv.pricing_basis`'s CHECK to the current vocabulary (BUI-952).
+
+    A CHECK constraint is frozen into the stored schema at CREATE time, and
+    SQLite cannot alter one in place. So adding a value to FMV_PRICING_BASES
+    changes what `create_tables` writes on a FRESH database and changes nothing
+    at all on the Mac Mini's — where the constraint still reads the four values
+    it was created with. The first `lone_sale` upsert against that DB raises
+    IntegrityError several frames below `upsert_fmv`'s own vocabulary check,
+    and the server discards the whole row: a priced four-figure slab stored
+    nowhere, which is the BUI-593 failure mode (the fetch succeeded and the
+    WRITE failed) with a schema constraint in place of a validator.
+
+    The gate reads the CONSTRAINT, not a migration marker or a column list,
+    because the constraint is the thing that has to be true. A DB whose CHECK
+    already names every current basis — a fresh one, or one this has already
+    run on — is left alone, so this stays idempotent across restarts without
+    needing a "done" marker of its own.
+
+    IMPORTANT: raw conn.execute() only — no conn.commit(). Runs inside the
+    host's per-plugin SAVEPOINT.
+    """
+    _assert_no_migration_marker(conn, "fmv_pricing_basis_check")
+
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='fmv'"
+    ).fetchone()
+    if row is None or not row["sql"]:
+        return
+    m = _FMV_PRICING_BASIS_CHECK_RE.search(row["sql"])
+    if m is None:
+        # No column, or a column carrying no CHECK at all. Either way there is
+        # no constraint to widen and nothing can reject a new basis value, so
+        # a rebuild would buy nothing and cost a DROP of the money table.
+        return
+    stored = {v.strip().strip("'\"") for v in m.group(1).split(",") if v.strip()}
+    if stored == set(FMV_PRICING_BASES):
+        return
+
+    logger.info(
+        "fmv pricing_basis CHECK widen: stored=%s current=%s",
+        sorted(stored), sorted(FMV_PRICING_BASES),
+    )
+    _rebuild_fmv_table(conn, marker="fmv_pricing_basis_check",
+                       what="fmv pricing_basis CHECK widen")
 
 
 def _migrate_add_comps_certifier_columns(conn: sqlite3.Connection) -> None:
