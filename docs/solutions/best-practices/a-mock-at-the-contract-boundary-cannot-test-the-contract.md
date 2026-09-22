@@ -6,6 +6,7 @@ module: "apps/fmv (fmv_runner.py — producer of POST /api/comics/comps) + gixen
 problem_type: best_practice
 component: testing_framework
 severity: high
+last_refreshed: 2026-09-22
 mechanized_by: test
 enforced_by_test: plugins/gixen-overlay/tests/test_comps_contract.py
 related_components:
@@ -209,3 +210,8 @@ declared fields, covers every required one, and cannot send a raw epoch.
 - [HTTP-only contracts need a source-parsing canary](../architecture-patterns/http-only-contracts-need-a-source-parsing-canary.md) — the same boundary, the vocabulary-drift half; this doc is the type-drift half and supplies the AST improvement to that doc's regex caveat
 - [Cross-package regressions escape per-package test runs](../developer-experience/cross-package-regressions-escape-per-package-test-runs.md) — a test that existed and was not run, versus this one, which ran and proved nothing
 - [A probe of a write endpoint is a write](a-probe-of-a-write-endpoint-is-a-write.md) — the deploy-verification counterpart; BUI-673's live check used the refused-shape probe it prescribes
+- [A quiet feature needs a positive-path test](../integration-issues/subprocess-boundary-between-comic-fmv-and-ebay-fetch-untested.md)
+  (BUI-954) — the other way a mocked boundary lies: there the caller never sent the
+  payload at all (a silent type gate and a truncated page), where here the receiver
+  rejected one that was sent. Read that doc when a feature's success looks like silence;
+  read this one when the payload shape is the question
