@@ -30,7 +30,14 @@ USPS_GOOD = "9405511899223197428490"
 LABEL_FEDEX = "770012340000"                    # generic_delivery_update_labeled
 LABEL_USPS_HUMAN = "9400111111111111111114"     # human_seller_labeled
 LABEL_USPS_MERCHANT = "92020190000000000000001237"  # merchant_shipping_confirmation
-LABEL_UNKNOWN = "SPXSG065899567827"             # merchant_unknown_carrier
+# An invented carrier no rule here will ever claim — used to pin the
+# `unknown_carrier` path itself, independent of which real-world carriers
+# happen to have a rule. merchant_unknown_carrier used to carry the Shopee
+# SPX number below before BUI-967 gave SPX a shape rule; it was repointed at
+# this value so the two cases (recognized vs. genuinely unmodelled) stay
+# distinguishable.
+LABEL_UNKNOWN = "QXPRESS1234567890123"          # merchant_unknown_carrier
+LABEL_SPX = "SPXSG065899567827"                 # merchant_shopee_labeled (BUI-967)
 
 
 def load(name):
@@ -253,9 +260,20 @@ class TestExtractLabeledTracking:
     def test_a_genuine_shape_only_carrier_still_classifies(self):
         assert shipped_orders.classify_tracking(LABEL_FEDEX) == ("FEDEX", False)
 
+    def test_a_shopee_spx_number_now_classifies(self):
+        """BUI-967: SPX used to be this module's standing unmodelled-carrier
+        example (see LABEL_UNKNOWN); it now gets its own shape rule."""
+        assert shipped_orders.classify_tracking(LABEL_SPX) == ("SHOPEE", False)
+
+    def test_a_shopee_spx_label_is_read_as_a_row_not_a_warning(self):
+        found, rejected = shipped_orders.extract_labeled_tracking(
+            f"SPX Express tracking number: {LABEL_SPX}\n")
+        assert found == [("SHOPEE", LABEL_SPX, False)]
+        assert rejected == []
+
     def test_an_unmodelled_carrier_is_reported_not_trusted(self):
         found, rejected = shipped_orders.extract_labeled_tracking(
-            f"SPX Express tracking number: {LABEL_UNKNOWN}\n")
+            f"QXpress tracking number: {LABEL_UNKNOWN}\n")
         assert found == []
         assert rejected == [LABEL_UNKNOWN]
 
@@ -263,9 +281,9 @@ class TestExtractLabeledTracking:
         """decode_body concatenates every part, so a multipart message renders
         the same label twice. Two warnings for one number reads as two problems.
         """
-        text = (f"SPX Express tracking number: {LABEL_UNKNOWN}\n"
+        text = (f"QXpress tracking number: {LABEL_UNKNOWN}\n"
                 f"Items in this shipment\n"
-                f"SPX Express tracking number: {LABEL_UNKNOWN} Items in this\n")
+                f"QXpress tracking number: {LABEL_UNKNOWN} Items in this\n")
         _found, rejected = shipped_orders.extract_labeled_tracking(text)
         assert rejected == [LABEL_UNKNOWN]
 
@@ -320,6 +338,31 @@ class TestExtractShipments:
             "Tracking Number:" + "\n" * 20 + f"{USPS_GOOD}\n")
         assert found == []
         assert rejected == []
+
+
+# ─── Shipping-subject heuristic ────────────────────────────────────────────────
+
+class TestIsShippingMail:
+    """BUI-967: bare `package` anywhere in a subject used to qualify a message
+    as a shipping notice — including mail that has nothing to do with a
+    physical shipment."""
+
+    @pytest.mark.parametrize("subject", [
+        "Run failed: build and package",
+        "[my-org/my-repo] Package published to npm",
+        "Security alert: 1 vulnerable package in your repo",
+    ])
+    def test_bare_package_in_an_unrelated_subject_does_not_qualify(self, subject):
+        assert not shipped_orders.is_shipping_mail(subject, "")
+
+    @pytest.mark.parametrize("subject", [
+        "Your package is now with its carrier!",
+        "Your package has been delivered",
+        "Your package is estimated to arrive Wednesday, August 19",
+        "Your package has movement",  # matches only via "your package" itself
+    ])
+    def test_your_package_still_qualifies(self, subject):
+        assert shipped_orders.is_shipping_mail(subject, "")
 
 
 # ─── Seller / message parsing ─────────────────────────────────────────────────
@@ -440,6 +483,18 @@ class TestParseMessageLabeledSource:
         assert record["unparsed_class"] == shipped_orders.UNPARSED_UNKNOWN_CARRIER
         assert "tracking" not in record
         assert record["candidates"] == [LABEL_UNKNOWN]
+
+    def test_shopee_spx_label_yields_a_row_not_an_unknown_carrier_warning(self):
+        """BUI-967: this used to be the unmodelled-carrier fixture's own
+        number (see merchant_unknown_carrier, now repointed at an invented
+        carrier) — SPX now has a shape rule, so it must read as a shipment."""
+        record = shipped_orders.parse_message(load("merchant_shopee_labeled"))
+        assert record["kind"] == "rows"
+        assert record["tracking"] == [{
+            "tracking_number": LABEL_SPX, "carrier": "SHOPEE",
+            "carrier_verified": False, "source": shipped_orders.SOURCE_LABEL,
+        }]
+        assert record["seller"] == "Shopee"
 
     def test_prose_after_a_label_is_ignored_not_warned_about(self):
         record = shipped_orders.parse_message(load("label_prose_not_a_number"))

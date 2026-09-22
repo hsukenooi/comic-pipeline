@@ -1,0 +1,21 @@
+{
+  "id": "fixture-shopee-spx",
+  "threadId": "fixture-shopee-spx",
+  "internalDate": "1751600000000",
+  "payload": {
+    "mimeType": "text/plain",
+    "headers": [
+      {
+        "name": "From",
+        "value": "Shopee <noreply@shopee.test>"
+      },
+      {
+        "name": "Subject",
+        "value": "Your order has shipped"
+      }
+    ],
+    "body": {
+      "data": "WW91ciBvcmRlciBoYXMgc2hpcHBlZCEKClNQWCBFeHByZXNzIHRyYWNraW5nIG51bWJlcjogU1BYU0cwNjU4OTk1Njc4MjcKKCBodHRwczovL3NweC5leGFtcGxlL3RyYWNrP1NQWFNHMDY1ODk5NTY3ODI3ICkKCkl0ZW1zIGluIHRoaXMgc2hpcG1lbnQKLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KCkFtYXppbmcgU3BpZGVyLU1hbiAjNTAgVmFyaWFudAo="
+    }
+  }
+}
