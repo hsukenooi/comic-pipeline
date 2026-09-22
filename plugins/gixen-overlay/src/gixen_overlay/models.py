@@ -801,6 +801,38 @@ class CompsExcludeRequest(BaseModel):
         return v
 
 
+class CompsUnstampRequest(BaseModel):
+    """POST /api/comics/comps/unstamp — correct an exclusion stamp (BUI-962).
+
+    The correction counterpart to `CompsExcludeRequest` above — see
+    `unstamp_comps_excluded`'s docstring in `gixen_overlay.db` for the full
+    reasoning. `ids` are the `comps` table's own primary keys (as returned by
+    `GET /api/comics/comps`, including on an `include_excluded=true` audit
+    read), never `product_ids`: a row an operator has already found on an
+    audit is already uniquely identified by that id, and asking for a
+    `comic_id` besides would just be a second way to name the same row wrong.
+
+    `dry_run` defaults to `True` (mirrors `/api/sweep-orphans`): the safe
+    default previews which of `ids` are currently stamped and so WOULD be
+    cleared, without writing. Pass `dry_run: false` to commit.
+
+    There is no "clear everything stamped" shape, on purpose — same posture
+    as the BUI-130 wish-list conflict removal's `names` scoping: a correction
+    is a considered act on rows an operator has already reviewed, never a
+    bulk sweep.
+    """
+
+    ids: list[int]
+    dry_run: bool = True
+
+    @field_validator("ids")
+    @classmethod
+    def _non_empty_ids(cls, v: list[int]) -> list[int]:
+        if not v:
+            raise ValueError("ids must be a non-empty list")
+        return v
+
+
 class SlabWatchRequest(BaseModel):
     """POST /api/comics/{comic_id}/slab-watch — hand override (BUI-950).
 

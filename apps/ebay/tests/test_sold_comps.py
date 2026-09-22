@@ -5692,3 +5692,42 @@ class TestGradedIdentityGuardsInFetch:
         printing_ids = {d["product_id"] for d in out["graded_identity_dropped_ids"]
                         if d["code"] == "printing"}
         assert printing_ids == {"e1", "e2"}
+
+    def test_hard_exclude_drop_is_tagged_with_product_id_in_fetch(
+        self, tmp_path, monkeypatch,
+    ):
+        # BUI-962: a hard_exclude drop that is NOT the ampersand lot (that
+        # one is tagged separately, before hard_exclude even runs — see
+        # test_graded_mode_drops_all_three_and_counts_them) used to vanish
+        # into a bare `continue` with no code at all. "PSA 8" is a
+        # third-party certifier hard_exclude's `_GRADED_MODE_EXCLUDE_RE`
+        # rejects outright — not the ampersand lot, not cross_title, not
+        # store_variant.
+        psa_title = "Batman #227 PSA 8 1970 DC Comics"
+        genuine_title = "Batman #227 1970 CGC 4.5 3975479007 Neal Adams Cover Robin"
+        results = [[
+            self._comp("psa", psa_title, 500.0),
+            self._comp("good", genuine_title, 700.0),
+        ]]
+        self._wire(tmp_path, monkeypatch, results)
+        out = sc.fetch_book_comps(
+            {"title": "Batman", "issue": "227", "year": 1970, "grade": 4.5,
+             "certifier": "cgc"},
+            "key",
+        )
+        assert [c["title"] for c in out["slab_comps"]] == [genuine_title]
+        assert out["comps"] == []
+        by_id = {d["product_id"]: d["code"] for d in out["graded_identity_dropped_ids"]}
+        assert by_id == {"psa": "hard_exclude"}
+
+        # Raw mode: the same title is still dropped (LOCAL_EXCLUDE_RE also
+        # matches `\bpsa\b`, byte-for-byte unchanged), but no guard ever
+        # runs, so graded_identity_dropped_ids stays empty — the same
+        # invariant test_raw_mode_never_runs_the_guards pins.
+        self._wire(tmp_path, monkeypatch, results)
+        out_raw = sc.fetch_book_comps(
+            {"title": "Batman", "issue": "227", "year": 1970, "grade": 4.5},
+            "key",
+        )
+        assert out_raw["graded_identity_dropped_ids"] == []
+        assert psa_title not in {c["title"] for c in out_raw["comps"]}

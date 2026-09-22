@@ -733,13 +733,25 @@ def test_sweep_verdict_honours_a_variant_target():
 
 
 def test_sweep_verdict_codes_a_multibook_lot():
-    """`hard_exclude` would also drop this, but a bare bool has no code to
-    stamp — checking the lot guard first is what gives it one."""
+    """`hard_exclude` would also drop this (now under its own coarser
+    `hard_exclude` code, BUI-962) — checking the lot guard first is what
+    gives it the more specific `multibook_lot` code instead."""
     title = ("Amazing Spider-Man #300 CGC 9.6 & Amazing Spider-Man #301 "
              "CGC 9.8 Marvel 1988")
     assert bf.sweep_verdict(
         sc, title=title, issue="300", target_is_variant=False,
         certifier="cgc") == "multibook_lot"
+
+
+def test_sweep_verdict_codes_a_hard_exclude_drop(tmp_path, monkeypatch):
+    """BUI-962: `hard_exclude`'s own bare-bool verdict, when it is not the
+    ampersand lot, used to have no code at all (`UNCODED_HARD_EXCLUDE`). It
+    is now `sc.HARD_EXCLUDE_CODE` — a real, stampable member of
+    `COMPS_EXCLUSION_CODES`."""
+    assert bf.sweep_verdict(
+        sc, title="Invincible #1 FACSIMILE REPRINT 2003 Image CGC 9.8",
+        issue="1", target_is_variant=False,
+        certifier="cgc") == sc.HARD_EXCLUDE_CODE == "hard_exclude"
 
 
 @pytest.fixture
@@ -831,17 +843,41 @@ def test_sweep_honours_a_variant_book(sweep_server):
     assert sweep_server.posts == []
 
 
-def test_sweep_reports_an_uncoded_hard_exclude_without_stamping_it(
-        sweep_server, capsys):
-    """`hard_exclude` returns a bare bool. There is no honest code to stamp
-    such a row with, so it is reported and left alone."""
+def test_sweep_stamps_a_hard_exclude_drop_end_to_end(sweep_server, capsys):
+    """BUI-962: a `hard_exclude` drop that isn't the ampersand lot used to
+    have no code and could only be reported (`uncoded_hard_exclude`), never
+    stamped. It is now `sc.HARD_EXCLUDE_CODE`, a real code the sweep posts
+    exactly like any other."""
     sweep_server.comps[1025] = [dict(
         INVINCIBLE_15719,
         title="Invincible #1 FACSIMILE REPRINT 2003 Image CGC 9.8")]
     assert bf.main(["--sweep-excluded"]) == 0
-    assert sweep_server.posts == []
+    assert sweep_server.posts == [{
+        "comic_id": 1025,
+        "product_ids": ["366561460527"],
+        "code": "hard_exclude",
+    }]
     out = capsys.readouterr().out
-    assert "hard_exclude with no code" in out
+    # The per-row "matches hard_exclude with no code — NOT stamped" line only
+    # fires on the (now unreachable) UNCODED_HARD_EXCLUDE branch — distinct
+    # from the summary's "uncoded exclude : 0 (hard_exclude with no code to
+    # stamp — reported only)" line, which is always printed.
+    assert "matches hard_exclude with no code" not in out
+    assert "NOT stamped" not in out
+
+
+def test_sweep_never_reports_the_uncoded_hard_exclude_canary(sweep_server, capsys):
+    """The BUI-947 `uncoded exclude` summary line (kept as a canary — see the
+    module comment above `UNCODED_HARD_EXCLUDE`) is unreachable through
+    `sweep_verdict` since BUI-962 coded `hard_exclude`'s own verdict, so it
+    should always read 0 now — even on a run that DOES match hard_exclude,
+    since that match is coded and stamped, not reported here."""
+    sweep_server.comps[1025] = [dict(
+        INVINCIBLE_15719,
+        title="Invincible #1 FACSIMILE REPRINT 2003 Image CGC 9.8")]
+    assert bf.main(["--sweep-excluded"]) == 0
+    out = capsys.readouterr().out
+    assert "uncoded exclude   : 0" in out
 
 
 def test_sweep_groups_one_call_per_code(sweep_server):

@@ -20,12 +20,15 @@ COMPS_PROVENANCES = ("live", "backfill-cache", "backfill-capture")
 _comps_pools_sql = ", ".join(f"'{p}'" for p in COMPS_POOLS)
 _comps_provenances_sql = ", ".join(f"'{p}'" for p in COMPS_PROVENANCES)
 
-# BUI-947: why a stored comp is barred from re-entering a slab pool. The first
-# four are `ebay-sold-comps`' own graded-guard codes, spelled exactly as
+# BUI-947/962: why a stored comp is barred from re-entering a slab pool. The
+# first five are `ebay-sold-comps`' own graded-guard codes, spelled exactly as
 # `fetch_book_comps` emits them in `graded_identity_dropped_ids` (BUI-946) —
 # `multibook_lot` (BUI-922's ampersand lot), `cross_title` / `store_variant`
-# (`graded_identity_exclude`, BUI-922/938) and `printing` (BUI-929). `manual`
-# is the operator's own stamp, for a row no automated guard names.
+# (`graded_identity_exclude`, BUI-922/938), `hard_exclude` (BUI-962: the
+# rest of `hard_exclude`'s own bare-bool verdict — previously an un-coded,
+# un-stampable drop the BUI-947 sweep could only report as
+# `uncoded_hard_exclude`) and `printing` (BUI-929). `manual` is the
+# operator's own stamp, for a row no automated guard names.
 #
 # Deliberately NOT a DDL CHECK, unlike `pool`/`provenance` above and exactly
 # like `fmv.flag_reason`: BUI-947's premise is that EVERY future guard grows
@@ -35,7 +38,8 @@ _comps_provenances_sql = ", ".join(f"'{p}'" for p in COMPS_PROVENANCES)
 # this tuple, plus `stamp_comps_excluded` below, which re-checks it so a
 # direct-Python caller cannot write a code the API would refuse.
 COMPS_EXCLUSION_CODES = (
-    "multibook_lot", "cross_title", "store_variant", "printing", "manual",
+    "multibook_lot", "cross_title", "store_variant", "hard_exclude",
+    "printing", "manual",
 )
 COMPS_EXCLUSION_CODE_MANUAL = "manual"
 
@@ -4016,11 +4020,17 @@ def stamp_comps_excluded(
     touches only `last_seen_at`/`seen_count`/`conflict_count`, so a later
     fetch that sees the listing again bumps the bookkeeping and leaves the
     stamp standing. That is the intended direction — a guard's verdict is
-    about the listing's identity, which re-seeing it does not change — and it
-    means UN-stamping is deliberately not an API: it is a rare, considered
-    correction, made with a direct `UPDATE comps SET excluded_code = NULL`.
+    about the listing's identity, which re-seeing it does not change.
     (A live comp of the same listing still prices normally; only the stored
     copy is held out, so a wrong stamp costs pool depth, never a price.)
+
+    A wrong stamp IS correctable — see `unstamp_comps_excluded` below (BUI-962,
+    `POST /api/comics/comps/unstamp`). That replaces this docstring's earlier
+    claim that un-stamping was "deliberately not an API, made with a direct
+    `UPDATE comps SET excluded_code = NULL`": a direct SQL write is not a
+    correction path an autonomous operator can take (only `comics-api POST`
+    is a sanctioned mutation of this DB), so the only honest fix was to build
+    the API rather than keep pointing at one.
     """
     if conn.execute(
         "SELECT 1 FROM comics WHERE id = ?", (comic_id,)
@@ -4070,6 +4080,89 @@ def stamp_comps_excluded(
         "code": code,
         "stamped": stamped,
         "already_stamped": already,
+        "not_found": not_found,
+    }
+
+
+def unstamp_comps_excluded(
+    conn: sqlite3.Connection,
+    ids: list[int],
+    *,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Clear a previously-stamped comp's `excluded_code`/`excluded_at` (BUI-962).
+
+    The correction path for `stamp_comps_excluded` above. Write path for
+    `POST /api/comics/comps/unstamp` — see that endpoint's docstring for why
+    this exists: an autonomous operator may mutate the comics server's data
+    only through `comics-api POST`, never a file-level `UPDATE`, so a
+    correction reachable only by hand-editing SQL was no correction path at
+    all for that operator.
+
+    Scoped by the comps table's own primary key `id` — the same `id` every
+    row already carries in `GET /api/comics/comps` (`SELECT *`), including on
+    an `include_excluded=true` audit read, which is how an operator finds the
+    row to correct in the first place. Deliberately NOT `(comic_id,
+    product_id)` like `stamp_comps_excluded`: that pair exists there because
+    the STAMP is a judgement about one book's pool and the caller supplies
+    the book; the CORRECTION targets one already-written row an operator has
+    already identified, and `id` is the one identity nothing else about that
+    row (which book, which product_id, which pool) can get wrong.
+
+    `dry_run=True` (mirrors `sweep_orphan_yearless_comics`'s own `dry_run`
+    parameter, and `/api/sweep-orphans`'s default) computes and returns the
+    exact same three-way partition below WITHOUT writing — so a caller can
+    preview precisely what an apply call would do before committing to it.
+
+    Every id in `ids` is independently classified into exactly one of three
+    disjoint buckets, because "I would clear 2 of the 3 you gave me" is a
+    different fact from "I would clear 2":
+
+    * `unstamped` — currently stamped (`excluded_code IS NOT NULL`); cleared
+      by this call (or, under `dry_run`, WOULD be).
+    * `not_stamped` — a real `comps` row, but already un-stamped. Left alone;
+      re-running a correction over the same ids is therefore a genuine no-op,
+      the same idempotence `stamp_comps_excluded` guarantees in the other
+      direction.
+    * `not_found` — no `comps` row has that id at all (a typo, or a row a
+      prior remediation already deleted).
+    """
+    unstamped: list[int] = []
+    not_stamped: list[int] = []
+    not_found: list[int] = []
+    # De-duplicated, order preserved: a caller repeating an id in `ids` must
+    # still see it classified into exactly ONE bucket, not counted twice —
+    # `stamp_comps_excluded`'s interleaved read-then-write gets this for
+    # free (a re-seen id reads back as already-stamped on its second pass);
+    # this function reads everything up front, so it needs the dedup itself.
+    for raw_id in dict.fromkeys(ids):
+        row = conn.execute(
+            "SELECT id, excluded_code FROM comps WHERE id = ?", (raw_id,)
+        ).fetchone()
+        if row is None:
+            not_found.append(raw_id)
+        elif row["excluded_code"] is None:
+            not_stamped.append(raw_id)
+        else:
+            unstamped.append(raw_id)
+
+    if not dry_run and unstamped:
+        placeholders = ",".join("?" * len(unstamped))
+        conn.execute(
+            f"UPDATE comps SET excluded_code = NULL, excluded_at = NULL "
+            f"WHERE id IN ({placeholders})",
+            unstamped,
+        )
+        conn.commit()
+        logger.info(
+            "unstamp_comps_excluded: unstamped=%d not_stamped=%d not_found=%d",
+            len(unstamped), len(not_stamped), len(not_found),
+        )
+
+    return {
+        "dry_run": dry_run,
+        "unstamped": unstamped,
+        "not_stamped": not_stamped,
         "not_found": not_found,
     }
 

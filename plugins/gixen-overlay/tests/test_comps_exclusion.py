@@ -30,6 +30,7 @@ from gixen_overlay.db import (
     create_tables,
     get_comps,
     stamp_comps_excluded,
+    unstamp_comps_excluded,
     upsert_comic,
     upsert_comps,
 )
@@ -410,13 +411,145 @@ def test_stamp_refuses_an_unknown_code(db):
 
 
 def test_the_code_vocabulary_covers_every_live_guard_code():
-    """The four codes `ebay-sold-comps` emits in `graded_identity_dropped_ids`
-    (BUI-946), plus the operator's own. `comic-fmv` forwards those codes
+    """The five codes `ebay-sold-comps` emits in `graded_identity_dropped_ids`
+    (BUI-946/962), plus the operator's own. `comic-fmv` forwards those codes
     verbatim across an HTTP-only package boundary, so a code missing here is
     a 422 that discards the whole stamp at runtime."""
     assert set(COMPS_EXCLUSION_CODES) == {
-        "multibook_lot", "cross_title", "store_variant", "printing", "manual",
+        "multibook_lot", "cross_title", "store_variant", "hard_exclude",
+        "printing", "manual",
     }
+
+
+# ---------------------------------------------------------------------------
+# 4. unstamp_comps_excluded / POST /api/comics/comps/unstamp (BUI-962)
+# ---------------------------------------------------------------------------
+
+
+def test_unstamp_clears_the_stamp(db):
+    comic_id = upsert_comic(db, "Invincible", "1", 2003)
+    upsert_comps(db, comic_id, [_comp(product_id="15719")])
+    stamp_comps_excluded(db, comic_id, ["15719"], "store_variant")
+    row_id = db.execute(
+        "SELECT id FROM comps WHERE product_id='15719'"
+    ).fetchone()[0]
+
+    result = unstamp_comps_excluded(db, [row_id])
+
+    assert result == {"dry_run": False, "unstamped": [row_id],
+                      "not_stamped": [], "not_found": []}
+    row = db.execute(
+        "SELECT excluded_code, excluded_at FROM comps WHERE id=?", (row_id,)
+    ).fetchone()
+    assert row["excluded_code"] is None
+    assert row["excluded_at"] is None
+    # The corrected row re-enters the default (un-audited) read.
+    assert [r["product_id"] for r in get_comps(db, comic_id=comic_id)] == ["15719"]
+
+
+def test_unstamp_dry_run_writes_nothing(db):
+    comic_id = upsert_comic(db, "Invincible", "1", 2003)
+    upsert_comps(db, comic_id, [_comp(product_id="15719")])
+    stamp_comps_excluded(db, comic_id, ["15719"], "store_variant")
+    row_id = db.execute(
+        "SELECT id FROM comps WHERE product_id='15719'"
+    ).fetchone()[0]
+
+    result = unstamp_comps_excluded(db, [row_id], dry_run=True)
+
+    assert result == {"dry_run": True, "unstamped": [row_id],
+                      "not_stamped": [], "not_found": []}
+    # Nothing was written: the row is still stamped, same code and time.
+    row = db.execute(
+        "SELECT excluded_code, excluded_at FROM comps WHERE id=?", (row_id,)
+    ).fetchone()
+    assert row["excluded_code"] == "store_variant"
+    assert row["excluded_at"] is not None
+    assert get_comps(db, comic_id=comic_id) == []
+
+
+def test_unstamp_leaves_other_stamped_rows_alone(db):
+    """Only the listed ids are touched — a correction must never widen into a
+    bulk un-stamp of rows the caller never named."""
+    comic_id = upsert_comic(db, "Invincible", "1", 2003)
+    upsert_comps(db, comic_id, [
+        _comp(product_id="15719"),
+        _comp(product_id="15712", price=786.0),
+    ])
+    stamp_comps_excluded(db, comic_id, ["15719"], "store_variant")
+    stamp_comps_excluded(db, comic_id, ["15712"], "hard_exclude")
+    target_id = db.execute(
+        "SELECT id FROM comps WHERE product_id='15719'"
+    ).fetchone()[0]
+    other_id = db.execute(
+        "SELECT id FROM comps WHERE product_id='15712'"
+    ).fetchone()[0]
+
+    result = unstamp_comps_excluded(db, [target_id])
+
+    assert result["unstamped"] == [target_id]
+    rows = {r["product_id"]: r["excluded_code"]
+           for r in get_comps(db, comic_id=comic_id, include_excluded=True)}
+    assert rows == {"15719": None, "15712": "hard_exclude"}
+    other_row = db.execute(
+        "SELECT excluded_code FROM comps WHERE id=?", (other_id,)
+    ).fetchone()
+    assert other_row["excluded_code"] == "hard_exclude"
+
+
+def test_unstamp_reports_a_never_stamped_id_without_touching_it(db):
+    comic_id = upsert_comic(db, "Invincible", "1", 2003)
+    upsert_comps(db, comic_id, [_comp(product_id="15719")])
+    row_id = db.execute(
+        "SELECT id FROM comps WHERE product_id='15719'"
+    ).fetchone()[0]
+
+    result = unstamp_comps_excluded(db, [row_id])
+
+    assert result == {"dry_run": False, "unstamped": [],
+                      "not_stamped": [row_id], "not_found": []}
+
+
+def test_unstamp_reports_an_unknown_id(db):
+    result = unstamp_comps_excluded(db, [999999])
+    assert result == {"dry_run": False, "unstamped": [],
+                      "not_stamped": [], "not_found": [999999]}
+
+
+def test_unstamp_deduplicates_a_repeated_id(db):
+    """A caller repeating an id in the list must see it classified once, not
+    once per repetition."""
+    comic_id = upsert_comic(db, "Invincible", "1", 2003)
+    upsert_comps(db, comic_id, [_comp(product_id="15719")])
+    stamp_comps_excluded(db, comic_id, ["15719"], "store_variant")
+    row_id = db.execute(
+        "SELECT id FROM comps WHERE product_id='15719'"
+    ).fetchone()[0]
+
+    result = unstamp_comps_excluded(db, [row_id, row_id])
+
+    assert result == {"dry_run": False, "unstamped": [row_id],
+                      "not_stamped": [], "not_found": []}
+
+
+def test_unstamp_is_idempotent(db):
+    """Re-running a correction over the same id is a genuine no-op the
+    second time — the same idempotence `stamp_comps_excluded` guarantees in
+    the other direction."""
+    comic_id = upsert_comic(db, "Invincible", "1", 2003)
+    upsert_comps(db, comic_id, [_comp(product_id="15719")])
+    stamp_comps_excluded(db, comic_id, ["15719"], "store_variant")
+    row_id = db.execute(
+        "SELECT id FROM comps WHERE product_id='15719'"
+    ).fetchone()[0]
+
+    first = unstamp_comps_excluded(db, [row_id])
+    second = unstamp_comps_excluded(db, [row_id])
+
+    assert first == {"dry_run": False, "unstamped": [row_id],
+                     "not_stamped": [], "not_found": []}
+    assert second == {"dry_run": False, "unstamped": [],
+                      "not_stamped": [row_id], "not_found": []}
 
 
 # ---------------------------------------------------------------------------
@@ -531,4 +664,77 @@ def test_exclude_endpoint_422s_a_missing_comic_id(api):
     r = api.post("/api/comics/comps/exclude", json={
         "product_ids": ["15719"], "code": "manual",
     })
+    assert r.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# POST /api/comics/comps/unstamp (BUI-962)
+# ---------------------------------------------------------------------------
+
+
+def _stamped_row_id(api, comic_id, product_id, code="store_variant") -> int:
+    r = api.post("/api/comics/comps/exclude", json={
+        "comic_id": comic_id, "product_ids": [product_id], "code": code,
+    })
+    assert r.status_code == 200, r.text
+    rows = api.get("/api/comics/comps", params={
+        "comic_id": comic_id, "include_excluded": "true",
+    }).json()
+    return next(row["id"] for row in rows if row["product_id"] == product_id)
+
+
+def test_unstamp_endpoint_dry_run_default_writes_nothing(api):
+    comic_id = _create_comic(api)
+    _ingest(api, comic_id, _comp(product_id="15719"))
+    row_id = _stamped_row_id(api, comic_id, "15719")
+
+    r = api.post("/api/comics/comps/unstamp", json={"ids": [row_id]})
+
+    assert r.status_code == 200, r.text
+    assert r.json() == {"dry_run": True, "unstamped": [row_id],
+                        "not_stamped": [], "not_found": []}
+    # Still stamped — the audit read still shows it, and the default read
+    # still skips it.
+    served = api.get("/api/comics/comps", params={"comic_id": comic_id}).json()
+    assert served == []
+    audited = api.get("/api/comics/comps", params={
+        "comic_id": comic_id, "include_excluded": "true",
+    }).json()
+    assert audited[0]["excluded_code"] == "store_variant"
+
+
+def test_unstamp_endpoint_apply_clears_exactly_the_listed_ids(api):
+    comic_id = _create_comic(api)
+    _ingest(api, comic_id, _comp(product_id="15719"), _comp(product_id="15712"))
+    target_id = _stamped_row_id(api, comic_id, "15719", code="store_variant")
+    other_id = _stamped_row_id(api, comic_id, "15712", code="hard_exclude")
+
+    r = api.post("/api/comics/comps/unstamp",
+                 json={"ids": [target_id], "dry_run": False})
+
+    assert r.status_code == 200, r.text
+    assert r.json() == {"dry_run": False, "unstamped": [target_id],
+                        "not_stamped": [], "not_found": []}
+    served = {row["product_id"]: row["excluded_code"]
+             for row in api.get("/api/comics/comps", params={
+                 "comic_id": comic_id, "include_excluded": "true",
+             }).json()}
+    assert served == {"15719": None, "15712": "hard_exclude"}
+    # The corrected row is back in the default (un-audited) read; the other
+    # stamped row is still held out.
+    assert [row["product_id"] for row in api.get(
+        "/api/comics/comps", params={"comic_id": comic_id}).json()] == ["15719"]
+    other_row = next(row for row in api.get("/api/comics/comps", params={
+        "comic_id": comic_id, "include_excluded": "true",
+    }).json() if row["id"] == other_id)
+    assert other_row["excluded_code"] == "hard_exclude"
+
+
+def test_unstamp_endpoint_422s_an_empty_ids_list(api):
+    r = api.post("/api/comics/comps/unstamp", json={"ids": []})
+    assert r.status_code == 422
+
+
+def test_unstamp_endpoint_422s_a_missing_ids_field(api):
+    r = api.post("/api/comics/comps/unstamp", json={"dry_run": False})
     assert r.status_code == 422
