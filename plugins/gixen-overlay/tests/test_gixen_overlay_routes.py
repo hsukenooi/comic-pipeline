@@ -2365,13 +2365,29 @@ def test_comics_snipes_includes_ended_but_pending_bid(api):
     A snipe whose auction has ended but whose status hasn't transitioned yet
     should still appear in /api/comics/snipes — the JS will partition it via
     isEnded() and move it to the ended table.
+
+    BUI-970: /api/comics/snipes unconditionally calls _ensure_fresh_sync and
+    _spawn_fallback_task (see test_comics_snipes_triggers_fresh_sync below).
+    _ensure_fresh_sync dedupes on a module-level _last_sync_at timestamp that
+    is NOT reset per test/app lifespan, so it's only stale (and a no-op) when
+    an earlier test in the same process happened to prime it within the last
+    _SYNC_TTL seconds — order-dependent. Run this test alone and _last_sync_at
+    is still its interpreter-fresh 0.0, so the call is not deduped: a real
+    _sync_gixen runs against the mocked GixenClient (list_snipes() -> []),
+    which reclassifies this PENDING-but-vanished-from-Gixen bid via the
+    BUI-371 vanished-while-live check before the assertion below ever runs,
+    removing the row this test exists to prove stays visible. Patching both
+    calls (same pattern as test_comics_snipes_triggers_fresh_sync) makes the
+    sync/fallback side effect explicit and removes the ordering dependency.
     """
     db_path = os.environ["DB_PATH"]
     api.post("/api/bids", json={"item_id": "100000007", "max_bid": 50.0})
     _set_bid_fields(db_path, "100000007",
                     auction_end_at="2000-01-01T00:00:00+00:00")  # past
 
-    r = api.get("/api/comics/snipes")
+    with patch("gixen_overlay.routes._ensure_fresh_sync"), \
+         patch("gixen_overlay.routes._spawn_fallback_task"):
+        r = api.get("/api/comics/snipes")
     assert any(row["item_id"] == "100000007" for row in r.json())
 
 
