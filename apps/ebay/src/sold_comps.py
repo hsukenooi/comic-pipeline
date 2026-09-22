@@ -1655,7 +1655,19 @@ def _fetch_with_fallback(nkw: str, api_key: str, *, force: bool = False,
 # The word boundary is load-bearing and does most of the precision work on its
 # own: it rejects "DESIGN"/"Designs", "unsigned", and "METAL SIGN". The one
 # residual false positive the corpus holds is a seller advertising a book as
-# "NOT signed", hence the fixed-width negative lookbehind.
+# "NOT signed", hence the negative lookbehind.
+#
+# BUI-969: that lookbehind was fixed-width (`(?<!not\s)`), so "not  signed"
+# with two or more spaces slipped past it. Python's `re` has no variable-width
+# lookbehind, so the guard now anchors at the START of the whitespace run
+# before "signed" and checks the word before it:
+# `(?<!\s)(?<!not)\s*\bsigned\b`. `(?<!\s)` forbids starting mid-run, so
+# `\s*` must consume the whole run and `(?<!not)` sees the preceding word.
+# Same "not" test as before (no `\b`, so "cannot signed" stays guarded
+# exactly as it was). Measured over the offline corpus (24,238 comp rows,
+# 16,688 unique titles): 0 titles carry a multi-space "not  signed", and the
+# old and new branches agree on every title, so no raw or graded pool changes
+# membership -- a latent-gap fix, not a measured pool move.
 #
 # Measured over the offline corpus at ~/.cache/ebay-sold-comps (518 cached
 # responses, 483 of them yielding a priced pool) — BUI-668: agrees with the
@@ -1682,7 +1694,7 @@ LOCAL_EXCLUDE_RE = re.compile(
     missing\s+pages? | missing\s+pin | missing\s+wrap |
     vol[\s.]?[2-9] | \bv[2-9]\b |
     \bpsa\b | \bpgx\b |
-    (?<!not\s)\bsigned\b | \bautograph | stan\s+lee.*sign | signature\s+series |
+    (?<!\s)(?<!not)\s*\bsigned\b | \bautograph | stan\s+lee.*sign | signature\s+series |
     ww\s+live\s+sale | space\s+filler | restored | water.?stain
     ''',
     re.IGNORECASE | re.VERBOSE,

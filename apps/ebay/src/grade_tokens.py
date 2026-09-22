@@ -199,10 +199,13 @@ def resolve_certifier_from_specifics_value(value):
 
 # ─── Label tokens (BUI-923; autograph split BUI-941) ────────────────────────
 #
-# "signed" reuses the exact `(?<!not\s)` fixed-width negative lookbehind that
-# sold_comps.LOCAL_EXCLUDE_RE already relies on (BUI-668): the corpus's one
-# residual false positive was a seller advertising a book as "NOT signed",
-# and the guard is what keeps that from being read as a signature at all.
+# "signed" reuses the exact "not" guard that sold_comps.LOCAL_EXCLUDE_RE
+# already relies on (BUI-668): the corpus's one residual false positive was a
+# seller advertising a book as "NOT signed", and the guard is what keeps that
+# from being read as a signature at all. BUI-969 widened both copies from the
+# fixed-width `(?<!not\s)` to `(?<!\s)(?<!not)\s*`, so "not  signed" with
+# any run of whitespace is guarded too (see LOCAL_EXCLUDE_RE's comment for
+# the mechanism and the corpus measurement: 0 titles move).
 #
 # BUI-941 split the one signature pattern into three, because a single
 # `-> signature_series` mapping was wrong in both directions:
@@ -288,7 +291,11 @@ def resolve_certifier_from_specifics_value(value):
 #     measurable and avoids an out-of-sample hazard. 82 titles carry PSA, 2 of
 #     them alongside a signature word, 0 of those naming CGC/CBCS -- and
 #     `\bpsa\b` is in both LOCAL_EXCLUDE_RE and _GRADED_MODE_EXCLUDE_RE
-#     anyway, so a PSA comp never reaches a pool in either mode.)
+#     anyway, so a PSA comp never reaches a pool in either mode. That is by
+#     design, not a leak: a PSA slab is neither a raw comp nor a CGC/CBCS
+#     comp -- fmv-math-spec.md lists "psa" under "Other graders" beside the
+#     raw fetch's `-cgc -cbcs -graded -slab` -- so BUI-969 declined to make
+#     the raw-side exclusion target-side only.)
 #     The gate narrows the JSA collision without dissolving it: a SIGNED
 #     Justice Society slab (`JSA #1 CGC 9.8 SS Signed by Geoff Johns`) still
 #     reads `qualified` off its own series name. That residual is bounded to
@@ -326,7 +333,7 @@ _EXPLICIT_LABEL_PATTERNS = (
 
 # Any assertion that the book carries a signature, of any provenance.
 _SIGNATURE_RE = re.compile(
-    r'\bautograph(?:s|ed)?\b|(?<!not\s)\bsigned\b|\bsignature\b', re.I)
+    r'\bautograph(?:s|ed)?\b|(?<!\s)(?<!not)\s*\bsigned\b|\bsignature\b', re.I)
 
 # An assertion that CGC/CBCS WITNESSED the signing -- the yellow label.
 _WITNESSED_SIGNATURE_RE = re.compile(
@@ -469,10 +476,17 @@ def extract_title_certification(title):
 # Qualified/Restored/Conserved) and leaves PGX alone -- this is a
 # title-matching aid for the two scan tools, not price-identity label
 # resolution (see resolve_label for that).
+#
+# `SS` uses the same hyphen-aware bounds as _WITNESSED_SIGNATURE_RE (BUI-969):
+# a loose `\bss\b` fires on the "SS" half of a seller stock number like
+# "SS-254", stripping it to a dangling "-254". Measured over the offline
+# corpus (16,688 unique titles): the loose form's only extra hits are the two
+# stock-number titles resolve_label's block comment names; no genuine SS
+# token is lost.
 _TITLE_KEY_CERT_PATTERNS = (
     re.compile(r'\bcgc\b', re.IGNORECASE),
     re.compile(r'\bcbcs\b', re.IGNORECASE),
-    re.compile(r'\bss\b', re.IGNORECASE),
+    re.compile(r'(?<![-\w])ss(?![-\w])', re.IGNORECASE),
 )
 
 
