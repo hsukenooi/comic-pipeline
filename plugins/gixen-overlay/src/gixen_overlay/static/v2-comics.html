@@ -605,6 +605,10 @@ async function load() {
 //
 // The whole point of both tables is that a failure here is INVISIBLE by
 // default: a write the server refused, or a job that quietly stopped running.
+// `rejected_writes` also holds writes that were ACCEPTED but logged for review
+// (BUI-964's yeared_sibling_conflict: status 409, detail "Not refused"), so the
+// copy below must stay true for both classes (BUI-973). The chip cannot split
+// the two by reading rows: `count` is the window total, `rejections` is capped.
 // So this strip has one rule — it may only render "fine" when the server has
 // affirmatively said so. A failed health fetch renders as `unknown` (orange),
 // never as green and never as nothing.
@@ -625,7 +629,7 @@ function healthChips() {
   let out = "";
   if (rej.count > 0) {
     out += `<span class="health-chip bad" data-health-toggle
-             title="writes the server refused in the last ${rej.window_hours}h">`
+             title="writes the server refused, or accepted but logged for review (a row's detail says which), in the last ${rej.window_hours}h">`
         + `✕ ${rej.count} rejected write${rej.count === 1 ? "" : "s"}</span>`;
   }
   const broken = (hb.stale_jobs || []).length + (hb.never_seen_jobs || []).length;
@@ -691,7 +695,7 @@ function renderHealth() {
     <div class="panel-head"><span class="label">rejected writes</span>
       <span class="count">${rej.count} in ${rej.window_hours}h</span></div>
     ${rej.count === 0
-      ? `<div style="padding:8px">no writes refused in the last ${rej.window_hours}h</div>`
+      ? `<div style="padding:8px">no writes refused or logged for review in the last ${rej.window_hours}h</div>`
       : `<div class="scroll"><table><thead><tr>
           <th>when</th><th>status</th><th>endpoint</th><th>detail</th><th>payload</th>
         </tr></thead><tbody>${rejRows}</tbody></table></div>`}

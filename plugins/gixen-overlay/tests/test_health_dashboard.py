@@ -145,6 +145,17 @@ def test_single_rejection_is_not_pluralised(node, html):
     assert "1 rejected write<" in out
 
 
+def test_rejections_tooltip_is_true_for_logged_not_refused_rows(node, html):
+    """BUI-973: `rejected_writes` also carries BUI-964's logged-but-accepted
+    conflicts, so the tooltip must not claim every counted write was refused."""
+    out = _run_health_chips(
+        node, html, _healthy_payload(rejections={"count": 2, "window_hours": 24.0})
+    )
+    title = re.search(r'title="([^"]*)">[^<]*2 rejected writes', out).group(1)
+    assert "logged for review" in title
+    assert not title.startswith("writes the server refused in")
+
+
 def test_stale_job_shows_as_bad(node, html):
     out = _run_health_chips(
         node,
