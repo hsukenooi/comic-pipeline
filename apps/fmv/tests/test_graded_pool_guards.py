@@ -109,8 +109,20 @@ class TestBatman227Replay:
 
         after = _price(_guarded(data), target, page_quality=None)
         assert after["flag_reason"] is None
-        assert after["fmv_high"] == 775
-        assert after["fmv_low"] == 775 and after["median"] == 775
+        # BUI-952 moved this replay off the ladder ON PURPOSE, and the number
+        # moved with it: the guarded pool holds ONE fresh 4.5 sale at $700,
+        # bracketed by 2.5 ($500) and 5.5 ($899) — a 1.80x bracket — so the row
+        # now prints that observed sale instead of the $775 the ladder
+        # interpolated ACROSS it. The replay's claim ("the refusal becomes a
+        # price") is unchanged; the tier and the cap are not. The cap rises,
+        # $465 → $500, because a real sale at the exact grade earns 0.70 where
+        # a line drawn over it earns 0.60.
+        assert after["pricing_basis"] == "lone_sale"
+        assert after["fmv_high"] == 700
+        assert after["fmv_low"] == 700 and after["median"] == 700
+        assert after["lone_sale_bracket"] == {
+            "lo": 500.0, "hi": 899.0, "lo_grade": 2.5, "hi_grade": 5.5}
+        assert after["bid_factor"] == 0.70
         assert after["pool_n"] == len(data["comps"]) - 2
 
     def test_the_bogus_4_0_rung_no_longer_outranks_the_genuine_6_0(self):
@@ -144,7 +156,13 @@ class TestInvincible1Replay:
 
         after = _price(_guarded(data), target, page_quality=None)
         assert after["flag_reason"] is None
-        assert after["fmv_high"] == 3650
+        # BUI-952, same deliberate move as the Batman replay above: the
+        # guarded pool's 9.4 rung is one fresh $3,609 white sale, bracketed by
+        # 9.2 ($2,803.50) and 9.6 ($4,500) at 1.61x, so the row prints the sale
+        # ($3,600 clean-rounded) rather than the $3,650 the ladder
+        # interpolated across it.
+        assert after["pricing_basis"] == "lone_sale"
+        assert after["fmv_high"] == 3600
         assert after["pool_n"] == len(data["comps"]) - 5
 
     def test_the_target_s_own_neighbour_rung_stops_inverting(self):
@@ -180,7 +198,20 @@ class TestInvincible1Replay:
         # pool is starved for the ladder and widens back to the whole pool
         # (`ladder_starved`), so the outcome is whatever the WHOLE pool says:
         # unguarded it still inverts (BUI-939 alone does not price this book),
-        # guarded it prices — the same $3,650 as with no page quality at all.
+        # guarded it prices — the same number as with no page quality at all.
+        #
+        # BUI-952 changed which HALF of that sentence applies once the guards
+        # run. The scoped white pool's exact bucket is the lone $3,609 white
+        # 9.4 sale, and the lone-sale tier prices off the SCOPED bucket exactly
+        # as the exact tier does — so the row no longer falls through to the
+        # ladder and no longer claims `ladder_starved`. That disclosure means
+        # "this row's rungs are the whole pool's BECAUSE the same-quality pool
+        # was too thin at the exact grade to price from" (BUI-939), and here it
+        # was not too thin: it priced. The bracket rungs are still read from
+        # every quality, which is the same all-quality read the exact tier's
+        # envelope clamp already makes on a scoped band (BUI-937) — and the
+        # ladder would have read those identical rungs to draw its line, so
+        # nothing enters the price that was not already entering it.
         data = _pool(self.SERVER)
         target = data["target"]
         assert target["page_quality"] == "white"
@@ -188,9 +219,15 @@ class TestInvincible1Replay:
         assert before["page_quality_fallback_reason"] == "ladder_starved"
         assert before["flag_reason"] == "ladder_non_monotone"
         after = _price(_guarded(data), target, page_quality="white")
-        assert after["page_quality_fallback_reason"] == "ladder_starved"
+        assert after["pricing_basis"] == "lone_sale"
+        assert after["page_quality_fallback"] is False
+        assert after["page_quality_fallback_reason"] is None
         assert after["flag_reason"] is None
-        assert after["fmv_high"] == 3650
+        assert after["fmv_high"] == 3600
+        # Scoped and unscoped land on the same number here, as they did before:
+        # the price is the one white sale either way.
+        assert after["fmv_high"] == _price(
+            _guarded(data), target, page_quality=None)["fmv_high"]
 
 def _dropped_ids(data: dict) -> set[str]:
     """The product_ids the BUI-922/938 guards excluded from `data["comps"]`
@@ -232,8 +269,12 @@ class TestLedgerHonoursGuards:
         assert priced["fmv_high"] is None
 
     @pytest.mark.parametrize("name,expected_fmv_high", [
-        ("graded_pool_bui922_batman227.json", 775),
-        ("graded_pool_bui938_invincible1_server.json", 3650),
+        # BUI-952 moved both books from the ladder to the lone-sale tier; see
+        # the two replays above for why each number changed. What this test
+        # pins is unchanged: the honoured merge prices, and prices IDENTICALLY
+        # to the guarded-only pool.
+        ("graded_pool_bui922_batman227.json", 700),
+        ("graded_pool_bui938_invincible1_server.json", 3600),
     ])
     def test_merge_with_dropped_ids_prices(self, name, expected_fmv_high):
         # The FIX: passing dropped_ids (the same product_ids

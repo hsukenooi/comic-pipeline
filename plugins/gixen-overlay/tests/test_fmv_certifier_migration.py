@@ -198,7 +198,12 @@ def test_vocabularies_are_the_documented_closed_sets():
     assert COMP_PAGE_QUALITIES == (
         "white", "ow_w", "ow", "c_ow", "cream", "unknown",
     )
-    assert FMV_PRICING_BASES == ("direct", "interpolated", "ladder", "proxy")
+    # BUI-952 appended 'lone_sale'. Appending to this tuple is never the
+    # whole change: the CHECK constraint that enforces it is frozen into the
+    # stored schema of every DB that already ran, so see
+    # `test_the_pricing_basis_check_is_widened_on_an_existing_db` below.
+    assert FMV_PRICING_BASES == (
+        "direct", "interpolated", "ladder", "proxy", "lone_sale")
 
 
 # ---------------------------------------------------------------------------
@@ -535,6 +540,139 @@ def test_upsert_derives_pricing_basis_from_notes_when_omitted():
     assert conn.execute(
         "SELECT pricing_basis FROM fmv WHERE id=?", (plain,)
     ).fetchone()[0] == "direct"
+
+
+def _narrow_the_pricing_basis_check(conn: sqlite3.Connection) -> None:
+    """Rewind a fresh DB's `fmv.pricing_basis` CHECK to the pre-BUI-952
+    vocabulary — i.e. the shape the Mac Mini is actually running.
+
+    Built by rewriting the table's OWN stored DDL rather than by pasting a
+    frozen `CREATE TABLE` literal here, so a column added to `fmv` next year
+    cannot make this fixture quietly stop resembling production. The table is
+    empty at this point (the caller seeds after), so nothing has to be moved.
+    """
+    sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='fmv'"
+    ).fetchone()[0]
+    current = ", ".join(f"'{b}'" for b in FMV_PRICING_BASES)
+    old = ", ".join(f"'{b}'" for b in
+                    ("direct", "interpolated", "ladder", "proxy"))
+    assert current in sql, "the fmv DDL no longer spells the basis list this way"
+    assert not conn.execute("SELECT 1 FROM fmv LIMIT 1").fetchone()
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute("DROP TABLE fmv")
+    conn.execute(sql.replace(current, old))
+    conn.execute("PRAGMA foreign_keys=ON")
+
+
+def test_a_pre_bui952_db_rejects_the_new_basis_before_the_migration():
+    """The fixture is only worth anything if it reproduces the failure. A
+    CHECK frozen at four values raises IntegrityError several frames below
+    `upsert_fmv`'s own vocabulary check — the write dies and the server
+    discards the whole row (the BUI-593 class)."""
+    conn = _fresh_db()
+    _narrow_the_pricing_basis_check(conn)
+    conn.execute(
+        "INSERT INTO comics (id, title, issue, year) VALUES (1, 'X', '1', 1963)"
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO fmv (comic_id, grade, low, high, pricing_basis) "
+            "VALUES (1, 4.5, 1000, 1000, 'lone_sale')"
+        )
+
+
+def test_the_pricing_basis_check_is_widened_on_an_existing_db():
+    """BUI-952: `create_tables` widens the stale CHECK, and the rebuild that
+    does it loses nothing — the same three inbound paths BUI-924's rebuild had
+    to survive, each queried DIRECTLY rather than through a JOIN (a JOIN
+    returns empty for exactly the dangling case it would be catching)."""
+    conn = _fresh_db()
+    _narrow_the_pricing_basis_check(conn)
+    conn.execute(
+        "INSERT INTO comics (id, title, issue, year) VALUES (1, 'X', '1', 1963)"
+    )
+    conn.execute(
+        "INSERT INTO fmv (id, comic_id, grade, low, high, comps, certifier, "
+        "label, pricing_basis) VALUES "
+        "(11, 1, 4.5, 700, 900, 3, 'cgc', 'universal', 'ladder')"
+    )
+    conn.execute(
+        "INSERT INTO bids (id, item_id, max_bid, fmv_id) "
+        "VALUES (5, 'i5', 420, 11)"
+    )
+    conn.execute(
+        "INSERT INTO bid_fmvs (bid_id, fmv_id, is_primary) VALUES (5, 11, 1)"
+    )
+    conn.commit()
+
+    create_tables(conn)
+    conn.commit()
+
+    # The constraint now names every current basis...
+    sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='fmv'"
+    ).fetchone()[0]
+    assert "'lone_sale'" in sql
+    # ...and a lone_sale row actually lands.
+    fmv_id = upsert_fmv(conn, 1, 5.5, low=1000, high=1000, certifier="cgc",
+                        pricing_basis="lone_sale")
+    assert conn.execute(
+        "SELECT pricing_basis FROM fmv WHERE id=?", (fmv_id,)
+    ).fetchone()[0] == "lone_sale"
+
+    # Nothing was lost by the rebuild.
+    row = conn.execute("SELECT * FROM fmv WHERE id=11").fetchone()
+    assert row["low"] == 700 and row["high"] == 900
+    assert row["certifier"] == "cgc" and row["pricing_basis"] == "ladder"
+    assert conn.execute(
+        "SELECT fmv_id FROM bids WHERE id=5"
+    ).fetchone()[0] == 11
+    assert conn.execute(
+        "SELECT is_primary FROM bid_fmvs WHERE bid_id=5 AND fmv_id=11"
+    ).fetchone()[0] == 1
+
+
+def test_the_pricing_basis_check_widen_is_a_no_op_once_current():
+    """Gated on the CONSTRAINT, not a marker, so a restart must not rebuild
+    the money table again. Asserted by identity of the stored DDL and by the
+    row ids surviving — a second rebuild would renumber nothing but would
+    still be a DROP nobody asked for."""
+    conn = _fresh_db()
+    conn.execute(
+        "INSERT INTO comics (id, title, issue, year) VALUES (1, 'X', '1', 1963)"
+    )
+    fmv_id = upsert_fmv(conn, 1, 4.5, low=1000, high=1000, certifier="cgc",
+                        pricing_basis="lone_sale")
+    conn.commit()
+    before = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='fmv'"
+    ).fetchone()[0]
+
+    create_tables(conn)
+    create_tables(conn)
+    conn.commit()
+
+    after = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='fmv'"
+    ).fetchone()[0]
+    assert after == before
+    assert conn.execute(
+        "SELECT pricing_basis FROM fmv WHERE id=?", (fmv_id,)
+    ).fetchone()[0] == "lone_sale"
+
+
+def test_upsert_accepts_the_lone_sale_basis_on_a_fresh_db():
+    conn = _fresh_db()
+    comic_id = upsert_comic(conn, title="X", issue="1", year=1963)
+    fmv_id = upsert_fmv(
+        conn, comic_id, 4.5, low=1000, high=1000, certifier="cgc",
+        notes="certifier=cgc | label=universal | basis=lone_sale",
+        pricing_basis="lone_sale",
+    )
+    assert conn.execute(
+        "SELECT pricing_basis FROM fmv WHERE id=?", (fmv_id,)
+    ).fetchone()[0] == "lone_sale"
 
 
 def test_explicit_pricing_basis_wins_over_the_derived_one():

@@ -3961,8 +3961,11 @@ def _graded_note_parts(fmv: dict) -> list[str]:
 
     Everything a human needs to audit a four-figure slab cap without the
     pool: which market it was priced in, how (`basis=`), what the ladder
-    looked like, and — the one that matters most — that a lone sale at the
-    exact grade was SEEN and deliberately not used as the price.
+    looked like, and — the one that matters most — what became of a lone sale
+    at the exact grade. On a `ladder` row that sale was SEEN and deliberately
+    not used as the price; on a `lone_sale` row (BUI-952) it IS the price, and
+    the token names the bracket that admitted it. The two read differently on
+    purpose: the distinction is the haircut, 0.60 against 0.70.
     """
     parts = [f"certifier={fmv.get('certifier')}",
              f"label={fmv.get('label')}"]
@@ -4022,6 +4025,20 @@ def _graded_note_parts(fmv: dict) -> list[str]:
         parts.append(
             f"n={fmv.get('n')} is slab-ladder comps, not depth at the target "
             "grade")
+    bracket = fmv.get("lone_sale_bracket")
+    if basis == "lone_sale" and bracket:
+        # THE money sentence for this tier, and the counterpart of the ladder's
+        # above: the price is ONE observed sale, and what let it stand as the
+        # price is that the neighbouring rungs bracket it. Both halves are
+        # named so an auditor can re-check the admission rule from the note
+        # alone, without the pool.
+        parts.append(
+            f"lone_sale=${fmv.get('fmv_high') or 0:g} bracket "
+            f"${bracket['lo']:g}-${bracket['hi']:g} "
+            f"(rungs {bracket['lo_grade']:g}→{bracket['hi_grade']:g}, within "
+            f"{fmv_math.SMALL_POOL_MAX_RATIO:g}x); the single fresh sale at the "
+            "exact grade IS the price, not an interpolation across it; "
+            "confidence LOW")
     if basis == "direct" and fmv.get("envelope_clamped"):
         parts.append(
             "envelope_clamped=exact-grade band bounded from above by the "
@@ -4411,6 +4428,7 @@ def _window_from_notes(notes: str | None) -> float | None:
 # are listed so a reader can see the vocabulary is closed).
 _PRICING_BASIS_BID_FACTORS: dict[str, float] = {
     "ladder": fmv_math.GRADED_LADDER_BID_FACTOR,          # 0.60 (BUI-930)
+    "lone_sale": fmv_math.GRADED_LONE_SALE_BID_FACTOR,    # 0.70 (BUI-952)
     "interpolated": fmv_math.INTERPOLATED_BID_FACTOR,     # 0.60 (BUI-318 §7)
     "proxy": fmv_math.CGC_PROXY_BID_FACTOR,               # 0.70 (BUI-348)
 }
@@ -4419,7 +4437,7 @@ _PRICING_BASIS_BID_FACTORS: dict[str, float] = {
 # STORED collapsed — `_confidence_to_db_label` writes LOW and MEDIUM-LOW alike
 # as 'low' — so the stored label cannot be trusted to carry the distinction
 # back, which is exactly the trap this column was added to replace.
-_PRICING_BASIS_FORCES_LOW = ("ladder", "interpolated")
+_PRICING_BASIS_FORCES_LOW = ("ladder", "interpolated", "lone_sale")
 
 
 def _fmv_from_db_row(row: dict, grade_confidence: str | None = None) -> dict:
@@ -4630,10 +4648,18 @@ def _certified_provenance(fmv: dict) -> str:
     elif basis == "ladder":
         rungs = _ladder_rung_count(fmv)
         tokens.append(f"ladder {rungs} rungs" if rungs is not None else "ladder")
+    elif basis == "lone_sale":
+        # BUI-952: the number IS the one exact-grade sale, so name it — that
+        # single price is the whole evidence, and an operator reading
+        # "lone sale $900" knows at a glance not to expect a band behind it.
+        # Read off `fmv_high` (== `fmv_low` == `median` on this basis) rather
+        # than `lone_sale_bracket`, which a cache hit does not carry.
+        sale = fmv.get("fmv_high")
+        tokens.append(f"lone sale ${sale:g}" if sale is not None else "lone sale")
     else:
-        # Closed vocabulary (BUI-930): a priced graded row's basis is always
-        # 'direct' or 'ladder'. Fall back to naming whatever's there rather
-        # than crashing if that vocabulary ever widens.
+        # Closed vocabulary (BUI-930/952): a priced graded row's basis is
+        # always 'direct', 'lone_sale' or 'ladder'. Fall back to naming
+        # whatever's there rather than crashing if that vocabulary widens again.
         tokens.append(basis or "?")
     if fmv.get("page_quality_fallback"):
         tokens.append("pq widened")

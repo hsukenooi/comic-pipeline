@@ -189,6 +189,26 @@ GRADED_CASES = [
      _slab([(700, 4.5, 3), (500, 2.5, 60), (900, 4.0, 40),
             (1400, 5.5, 50), (1500, 6.0, 55)]), 4.5, None),
 
+    # BUI-952 — the same shape as AE4's second half with ONE number moved:
+    # the lone 4.5 sale is $1,000, INSIDE the $900 (4.0) / $1,400 (5.5)
+    # bracket instead of below it. The answer must now be the sale itself, at
+    # 0.70, not the ~$1,067 the ladder would interpolate across it at 0.60.
+    # Frozen beside AE4 on purpose: the two cases differ only in the sale's
+    # position relative to its bracket, which is the whole rule.
+    ("lone_sale_inside_its_bracket_is_the_price",
+     _slab([(1000, 4.5, 3), (500, 2.5, 60), (900, 4.0, 40),
+            (1400, 5.5, 50), (1500, 6.0, 55)]), 4.5, None),
+
+    # BUI-952, the nearest miss: the identical pool with the 4.0 rung at $400
+    # instead of $900. The $1,000 sale is still INSIDE its bracket, but the
+    # bracket itself is now $400 -> $1,400, a 3.5x spread past
+    # SMALL_POOL_MAX_RATIO — two rungs that far apart are not one market, so
+    # they cannot vouch for anything between them and the row stays a ladder
+    # row. "Inside the bracket" alone is not the rule.
+    ("lone_sale_in_too_wide_a_bracket_falls_to_the_ladder",
+     _slab([(1000, 4.5, 3), (500, 2.5, 60), (400, 4.0, 40),
+            (1400, 5.5, 50), (1500, 6.0, 55)]), 4.5, None),
+
     # Effective n 1.5 (one live sale + one 120-day ledger sale) is BELOW the
     # exact tier's floor, so the same pool that would price directly on two
     # live sales goes to the ladder instead.
@@ -300,6 +320,15 @@ def test_the_lone_exact_sale_is_not_the_golden_price():
     frozen comparison if a regression made the lone $700 sale the answer and
     the baseline were regenerated alongside it. Naming the forbidden value
     here means the regeneration cannot quietly bless it.
+
+    BUI-952 narrowed the claim this guard makes and left the guard standing.
+    A lone exact sale CAN now be the price — but only inside a bracket its
+    neighbouring rungs agree on, and this case's $700 sits $200 BELOW its own
+    $900 4.0 rung, so it is exactly the sale the lone-sale tier declines and
+    hands to the ladder. `lone_sale_inside_its_bracket_is_the_price` is the
+    same pool with the sale moved inside the bracket, frozen separately; the
+    pair is what keeps "below its bracket" and "inside its bracket" from
+    collapsing into each other under a later edit.
     """
     baseline = _load_graded_baseline()["ae4_ladder_lone_exact_sale_is_never_the_price"]
     assert baseline["pricing_basis"] == "ladder"
@@ -312,6 +341,35 @@ def test_the_lone_exact_sale_is_not_the_golden_price():
     assert baseline["bid_factor"] == 0.60
     assert baseline["max_bid"] == fmv_math.clean_round(
         baseline["fmv_high"] * 0.60)
+
+
+def test_the_lone_sale_golden_pair_differs_only_in_the_bracket():
+    """BUI-952's rule, stated as a diff between two frozen rows.
+
+    Same five comps, same target, one number moved: with the lone 4.5 sale at
+    $700 (below the $900 4.0 rung) the row is a ladder point at 0.60; with it
+    at $1,000 (inside the $900-$1,400 bracket) the row IS that sale at 0.70.
+    Asserted against the BASELINE rather than by re-running the math, so a
+    regeneration that quietly merged the two outcomes fails here.
+    """
+    baseline = _load_graded_baseline()
+    below = baseline["ae4_ladder_lone_exact_sale_is_never_the_price"]
+    inside = baseline["lone_sale_inside_its_bracket_is_the_price"]
+    too_wide = baseline["lone_sale_in_too_wide_a_bracket_falls_to_the_ladder"]
+
+    assert below["pricing_basis"] == "ladder"
+    assert inside["pricing_basis"] == "lone_sale"
+    assert too_wide["pricing_basis"] == "ladder"
+
+    # The priced row is the sale, flat: no band, and the 0.70 cap.
+    assert inside["fmv_low"] == inside["fmv_high"] == inside["median"] == 1000
+    assert inside["confidence"] == "LOW"
+    assert inside["bid_factor"] == 0.70
+    assert inside["max_bid"] == fmv_math.clean_round(1000 * 0.70)
+    # And it beats the ladder's cap on the same book, which is the trade the
+    # ticket is making: 1000 * 0.70 against ~1067 * 0.60.
+    assert inside["max_bid"] > fmv_math.clean_round(
+        below["fmv_high"] * 0.60)
 
 
 def _regen() -> None:

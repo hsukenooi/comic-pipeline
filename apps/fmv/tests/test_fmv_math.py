@@ -1963,6 +1963,189 @@ class TestGradedLadderTier:
         assert out["flag_reason"] == "ladder_too_thin"
 
 
+class TestGradedLoneSaleTier:
+    """BUI-952: one fresh sale at the exact grade, inside a bracket its
+    neighbouring rungs agree on, IS the price.
+
+    The tier's whole surface is a set of fall-throughs, so most of these
+    tests assert `pricing_basis == "ladder"` — that is the point. Read them
+    against `TestGradedLadderTier` above, whose fixture is deliberately the
+    near-miss of this one: the same four rungs with the lone 4.5 sale at $700,
+    which sits BELOW its $900 bracket floor and therefore stays a ladder row.
+    """
+
+    def _rungs(self):
+        # 2.5 -> $500, 4.0 -> $900, 5.5 -> $1,400, 6.0 -> $1,500. Four
+        # anchor-eligible rungs, so `ladder_too_thin` never fires and every
+        # test below is about the bracket rather than the rung count.
+        return [_slab_comp(900, 4.0, age=10), _slab_comp(1400, 5.5, age=12),
+                _slab_comp(1500, 6.0, age=14), _slab_comp(500, 2.5, age=16)]
+
+    def test_a_bracketed_lone_sale_is_the_price_at_seventy_percent(self):
+        out = _graded(self._rungs() + [_slab_comp(1000, 4.5, age=1)], 4.5)
+        assert out["flag_reason"] is None
+        assert out["pricing_basis"] == "lone_sale"
+        # The band is the sale, flat — no quartiles, because there is nothing
+        # to take quartiles of.
+        assert out["fmv_low"] == out["fmv_high"] == out["median"] == 1000
+        assert out["confidence"] == "LOW"
+        assert out["bid_factor"] == 0.70
+        assert out["max_bid"] == fm.clean_round(1000 * 0.70)
+        assert out["lone_sale_bracket"] == {
+            "lo": 900.0, "hi": 1400.0, "lo_grade": 4.0, "hi_grade": 5.5}
+        # `n`/`effective_n` describe the exact bucket, not the pool: this
+        # price rests on one sale and must not report five.
+        assert out["n"] == 1 and out["effective_n"] == 1.0
+        assert out["trimmed_pool"] == [1000.0]
+
+    def test_it_beats_the_ladder_cap_it_replaces(self):
+        """The trade the ticket is making, in one assertion: the same book
+        priced by the ladder (sale moved below its bracket) caps lower than
+        the observed sale does at 0.70."""
+        priced = _graded(self._rungs() + [_slab_comp(1000, 4.5, age=1)], 4.5)
+        laddered = _graded(self._rungs() + [_slab_comp(700, 4.5, age=1)], 4.5)
+        assert laddered["pricing_basis"] == "ladder"
+        assert priced["max_bid"] > laddered["max_bid"]
+
+    def test_a_sale_below_its_bracket_falls_to_the_ladder(self):
+        out = _graded(self._rungs() + [_slab_comp(700, 4.5, age=1)], 4.5)
+        assert out["pricing_basis"] == "ladder"
+        assert out["lone_sale_bracket"] is None
+        assert out["bid_factor"] == 0.60
+
+    def test_a_sale_above_its_bracket_falls_to_the_ladder(self):
+        """The other side, and the expensive one: a lone $2,000 sale above a
+        $1,400 ceiling is exactly the outlier this tier must not print."""
+        out = _graded(self._rungs() + [_slab_comp(2000, 4.5, age=1)], 4.5)
+        assert out["pricing_basis"] == "ladder"
+        assert out["fmv_high"] != 2000
+
+    def test_a_bracket_wider_than_three_times_falls_to_the_ladder(self):
+        """Inside the bracket is not enough. $400 -> $1,400 is 3.5x, and two
+        rungs that far apart are not one market to be inside of."""
+        rungs = [_slab_comp(400, 4.0, age=10), _slab_comp(1400, 5.5, age=12),
+                 _slab_comp(1500, 6.0, age=14), _slab_comp(500, 2.5, age=16)]
+        out = _graded(rungs + [_slab_comp(1000, 4.5, age=1)], 4.5)
+        assert out["pricing_basis"] == "ladder"
+        # ...and the same pool one dollar inside the ratio does price, so the
+        # assertion above is about the ratio and not about the pool.
+        ok = [_slab_comp(467, 4.0, age=10)] + rungs[1:]
+        assert _graded(ok + [_slab_comp(1000, 4.5, age=1)], 4.5)[
+            "pricing_basis"] == "lone_sale"
+
+    def test_a_half_weight_lone_sale_does_not_qualify(self):
+        """A 91-365-day sale weighs 0.5. `bucket_effective_n` already refuses
+        it the right to ANCHOR a bracket, so letting it BE one would
+        contradict the module's own rule about the same observation."""
+        out = _graded(self._rungs() + [_slab_comp(1000, 4.5, age=200)], 4.5)
+        assert out["exact_effective_n"] == 0.5
+        assert out["pricing_basis"] == "ladder"
+
+    def test_two_sales_at_the_target_grade_are_not_a_lone_sale(self):
+        """Effective n 1.0 and 1.5 both sit below the exact tier's floor, and
+        both are still MORE than one observation. The basis is called
+        `lone_sale` because the number is one observed price; a weighted
+        median of two under that name would be a different claim."""
+        two_stale = self._rungs() + [_slab_comp(1000, 4.5, age=200,
+                                                product_id="a"),
+                                     _slab_comp(1020, 4.5, age=210,
+                                                product_id="b")]
+        out = _graded(two_stale, 4.5)
+        assert out["exact_effective_n"] == 1.0
+        assert out["pricing_basis"] == "ladder"
+
+        fresh_plus_stale = self._rungs() + [
+            _slab_comp(1000, 4.5, age=1, product_id="a"),
+            _slab_comp(1020, 4.5, age=200, product_id="b")]
+        out = _graded(fresh_plus_stale, 4.5)
+        assert out["exact_effective_n"] == 1.5
+        assert out["pricing_basis"] == "ladder"
+
+    def test_it_never_rescues_a_refusal(self):
+        """The safety property the tier is built to have. Each refusal below
+        is reached by removing exactly one of the tier's preconditions from an
+        otherwise-qualifying pool, so the tier declines every row the ladder
+        refuses and can only ever take rows the ladder would have priced."""
+        sale = _slab_comp(1000, 4.5, age=1)
+
+        # ladder_too_thin — two eligible rungs, bracketing, within 3x. This is
+        # BUI-953's case and stays BUI-953's to decide.
+        thin = [_slab_comp(900, 4.0, age=10), _slab_comp(1400, 5.5, age=12)]
+        assert _graded(thin + [sale], 4.5)["flag_reason"] == "ladder_too_thin"
+
+        # outside_ladder — no eligible rung above the target.
+        one_sided = [_slab_comp(900, 4.0, age=10), _slab_comp(500, 2.5, age=12),
+                     _slab_comp(300, 1.5, age=14)]
+        assert _graded(one_sided + [_slab_comp(1000, 4.5, age=1)],
+                       4.5)["flag_reason"] == "outside_ladder"
+
+        # ladder_non_monotone — the bracket inverts, so `lo <= sale <= hi` can
+        # never hold (lo is the BELOW rung, not min(lo, hi)).
+        inverted = [_slab_comp(2000, 8.5, age=10), _slab_comp(3000, 9.2, age=12),
+                    _slab_comp(2500, 9.6, age=14), _slab_comp(4000, 9.8, age=16)]
+        out = _graded(inverted + [_slab_comp(2800, 9.4, age=1)], 9.4)
+        assert out["flag_reason"] == "ladder_non_monotone"
+
+    def test_the_bracket_rungs_are_the_ladder_s_own(self):
+        """Not recomputed here: the same `_nearest_rungs` call the ladder tier
+        makes, at the same eligibility bar, so the two can never disagree
+        about which rungs surround a target."""
+        comps = self._rungs() + [_slab_comp(1000, 4.5, age=1)]
+        pool, _, _ = _pool(comps)
+        nearest = fm._nearest_rungs(
+            fm.bucket_weighted_medians(pool), fm.bucket_effective_n(pool),
+            4.5, fm.GRADED_LADDER_MIN_BUCKET_N)
+        bracket = _graded(comps, 4.5)["lone_sale_bracket"]
+        assert bracket["lo_grade"] == nearest["below"]["grade"]
+        assert bracket["hi_grade"] == nearest["above"]["grade"]
+        assert bracket["lo"] == nearest["below"]["median"]
+        assert bracket["hi"] == nearest["above"]["median"]
+
+    def test_a_stale_rung_cannot_be_a_bracket_end(self):
+        """The mirror of `TestGradedLadderTier`'s anchor test: a 0.5-weight
+        rung is skipped, and the bracket widens past it — which here moves the
+        floor from $900 (4.0) to $500 (2.5) and lets a $700 sale in that the
+        4.0 rung would have excluded."""
+        stale_40 = [_slab_comp(900, 4.0, age=200), _slab_comp(1400, 5.5, age=12),
+                    _slab_comp(1500, 6.0, age=14), _slab_comp(500, 2.5, age=16)]
+        out = _graded(stale_40 + [_slab_comp(700, 4.5, age=1)], 4.5)
+        assert out["pricing_basis"] == "lone_sale"
+        assert out["lone_sale_bracket"]["lo_grade"] == 2.5
+
+    def test_clean_rounding_can_print_just_past_the_bracket_top(self):
+        """A known, bounded edge, pinned so nobody 'fixes' it silently. The
+        price is the SALE, clean-rounded exactly as the ladder rounds its own
+        point, so the printed number can land up to half a clean step above
+        `hi`. `hi` is a neighbouring rung's median, not a cap — the bracket is
+        what admitted the sale, not a bound on it.
+        """
+        rungs = [_slab_comp(500, 4.0, age=10), _slab_comp(1015, 5.5, age=12),
+                 _slab_comp(1500, 6.0, age=14), _slab_comp(450, 2.5, age=16)]
+        out = _graded(rungs + [_slab_comp(1013, 4.5, age=1)], 4.5)
+        assert out["pricing_basis"] == "lone_sale"
+        assert out["fmv_high"] == 1025                    # the sale, rounded
+        assert out["lone_sale_bracket"]["hi"] == 1015.0
+        assert out["fmv_high"] - out["lone_sale_bracket"]["hi"] < fm._clean_step(
+            out["fmv_high"])
+
+    def test_the_exact_tier_still_wins_at_effective_n_two(self):
+        """Ordering: a bucket that clears the exact tier's gate never reaches
+        this one, even when its sales sit neatly inside a bracket."""
+        comps = self._rungs() + [_slab_comp(1000, 4.5, age=1, product_id="a"),
+                                 _slab_comp(1020, 4.5, age=2, product_id="b")]
+        assert _graded(comps, 4.5)["pricing_basis"] == "direct"
+
+    def test_a_non_universal_target_never_reaches_any_tier(self):
+        """The identity filter runs FIRST and off the listing alone (R31), so
+        a Signature Series or non-CGC/CBCS slab is refused before a comp is
+        fetched — there is no pool for this tier to find a lone sale in."""
+        punt = fm.graded_punt("label_signature_series", certifier="cgc",
+                              label="signature_series")
+        assert punt["pricing_basis"] is None
+        assert punt["lone_sale_bracket"] is None
+        assert punt["max_bid"] is None
+
+
 class TestGradedPuntEvidence:
     """BUI-940: a refused (or ladder-priced) row still names the exact-grade
     sale(s) and the nearest anchor-eligible rung on each side, so a human
