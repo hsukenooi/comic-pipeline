@@ -30,6 +30,7 @@ a ping is the alarm.
 | `collection-sync` | 336h | 672h | A `/comic:collection-sync` round-trip that completed its Step 5 re-import and its Step 6 post-import safety check. An aborted sync (the `Deleted from Collection.` probe tripping, the BUI-122 guard) must **not** ping — an abort is the sync working correctly but *not* having synced. | yes |
 | `fmv-refresh` | 168h | 336h | A `comic-fmv` batch that fetched sold comps **and persisted them**. BUI-593 is precisely a run where the fetch succeeded and the write 422'd, so "`comic-fmv` exited 0" alone is not the success definition; the upsert must have been accepted. | yes |
 | `sentinel-probe` | 168h | 336h | A `comic-fmv --sentinel-probe` run (BUI-603) where every sentinel book **and** the negative control passed — exit 0. Stricter than the rest on purpose: exit 1 means the probe ran and found the comp pipeline miscalibrated, which already alarms via its own exit code. Exit 2 (could not complete) does not ping either. | yes |
+| `slab-watch-collect` | 672h | 1344h | A `comic-fmv --slab-watch-collect` run (BUI-951) where every comp fetch **and** every ledger write it attempted succeeded — exit 0. Mirrors `fmv-refresh`'s BUI-593 lesson: a fetch that ran clean while its ledger POST failed must not ping. A run where every watch-set book was already fresh (nothing fetched) still pings, and so does a run that hit its request cap as long as nothing it attempted failed. | yes |
 
 Cadences are sized to the **slowest normal run**, not the average, and a job is
 only flagged once it is `HEARTBEAT_STALE_FACTOR` (2×) cadences late. A watchdog
@@ -69,14 +70,15 @@ The report's top-level `healthy` means *every job in the contract is verified
 to be running*, so an uninstrumented job makes it `false` exactly as a stale one
 does. Before BUI-624 that meant `healthy` was permanently `false`: nothing
 pinged, and a version that counted only wired jobs would have handed an external
-monitor a green light for a system observing almost nothing. All five are wired
-now, so `healthy: true` is finally reachable — and still means what it said. A
-consumer wanting the narrower question ("is anything I *am* watching broken?")
-reads `stale_jobs` and `never_seen_jobs` directly.
+monitor a green light for a system observing almost nothing. All six are wired
+now (BUI-951 added the sixth, `slab-watch-collect`), so `healthy: true` is
+finally reachable — and still means what it said. A consumer wanting the
+narrower question ("is anything I *am* watching broken?") reads `stale_jobs`
+and `never_seen_jobs` directly.
 
-## Where the five jobs ping (BUI-624)
+## Where the jobs ping (BUI-624, extended BUI-951)
 
-Four of the five ping over HTTP. `gixen-sync` cannot, and the exception is
+Five of the six ping over HTTP. `gixen-sync` cannot, and the exception is
 instructive rather than incidental.
 
 - **`gixen-sync`** — `server.main._sync_gixen`, as the **last statement inside**
@@ -120,8 +122,15 @@ instructive rather than incidental.
   on the all-pass branch only. Best-effort: a failed ping never changes the
   probe's exit code, which is the primary alert surface. It needs a schedule to
   be worth anything — see `docs/reference/sentinel-probe-scheduling.md`.
+- **`slab-watch-collect`** — `apps/fmv/src/fmv_runner.py`'s
+  `run_slab_watch_collect`, via `_ping_slab_watch_collect_heartbeat`, only when
+  every comp fetch and every ledger write it attempted succeeded. Best-effort,
+  same posture as the other four HTTP pings. Scheduled monthly (the closest
+  launchd calendar slot to "every four weeks") by
+  `scripts/launchd/com.comics.slab-watch-collect.plist` — see
+  `scripts/launchd/README.md` for install/verify steps.
 
-Every ping is **advisory to its caller**: none of the five may fail, block, or
+Every ping is **advisory to its caller**: none of the six may fail, block, or
 alter the job it reports on. A watchdog that can break the work it watches has
 bought nothing.
 

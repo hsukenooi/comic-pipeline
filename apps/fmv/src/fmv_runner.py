@@ -5200,3 +5200,416 @@ def run_list_slab_watch(*, server_url: str | None) -> None:
             f"{it.get('reason', '?'):<9} {it.get('certifier', '?'):<4} "
             f"raw_high={raw_high_str}"
         )
+
+
+# ─── BUI-951 — scheduled slab-comp collection for the watch set ──────────────
+#
+# `comic-fmv --slab-watch-collect`: a launchd job (com.comics.slab-watch-collect,
+# scripts/launchd/), never an interactive mode. It reads `GET
+# /api/comics/slab-watch` (BUI-950's watch set) and, for each book the ledger
+# hasn't observed in the last `_SLAB_WATCH_COLLECT_FRESHNESS_DAYS`, fetches ONE
+# certifier-targeted query (`build_query`'s `graded_target` knob,
+# apps/ebay/src/sold_comps.py:964 — a certified fetch collapses to exactly one
+# query, so "books fetched" and "provider requests" are the same number here)
+# and posts the surviving slab comps through the SAME guard-and-post steps
+# `_compute_graded_one` runs for a live pricing fetch: the certifier/label
+# identity filter, the BUI-946/947 dropped-id exclusion stamp, then
+# `_post_comps` (`pool='slab'`, `provenance='live'`, both set inside
+# `_comp_to_ledger_item`).
+#
+# Deliberately NOT a call into `_compute_graded_one`/`run()`: this mode prices
+# nothing (no `fmv_math.graded_fmv`, no `/api/comics` upsert) — it only grows
+# the comps ledger, using the `comic_id` the watch-set endpoint already
+# resolved. Reusing the pricing path's own guard/merge/post code directly
+# (rather than reimplementing it) would have meant refactoring `run()`'s
+# certified branch to separate "guard and post" from "price and upsert" — the
+# License to Stop case in the ticket. It didn't come to that: `_post_comps`,
+# `_post_comps_exclusions` and `_fetch_ledger_comps` are already the right
+# shape as standalone functions, and only the certifier/label identity filter
+# (`_compute_graded_one`'s `live_slab = [...]` line) needed duplicating, which
+# is four lines, not a refactor.
+
+# BUI-951's freshness gate: skip a book whose ledger already holds a
+# `pool='slab'` observation for this certifier within this many days. Sized
+# to the ticket's own math — both sold-comps providers serve a ~90-day sold
+# window (see `_fetch_ledger_comps`'s docstring), so a 4-weekly cadence sees
+# every sale at least twice, and the ledger read costs nothing (no provider
+# request) so checking it before every fetch is free.
+_SLAB_WATCH_COLLECT_FRESHNESS_DAYS = 21.0
+
+# Hard per-run cap on provider requests. `SLAB_WATCH_MAX_REQUESTS` (env,
+# read fresh per run — no launchd restart needed to change it) overrides
+# this; `run_slab_watch_collect`'s own `max_requests` kwarg overrides both
+# (used by tests and any future caller that isn't the CLI).
+_SLAB_WATCH_COLLECT_DEFAULT_MAX_REQUESTS = 80
+
+# No per-book label override exists on the watch-set endpoint today (same gap
+# `_book_label` documents for a hand-priced batch row) — every collected slab
+# targets the universal-label pool, same default `_book_label` falls back to.
+_SLAB_WATCH_COLLECT_LABEL = _RAW_LABEL
+
+
+def _slab_watch_max_requests(override: int | None) -> int:
+    """Resolve the per-run provider-request cap (BUI-951).
+
+    `override` (an explicit kwarg — tests, or a future CLI flag) wins over
+    `SLAB_WATCH_MAX_REQUESTS`, which wins over the default. An unparseable env
+    value warns and falls back rather than crashing an unattended scheduled
+    job over a typo'd `.env` file.
+    """
+    if override is not None:
+        return override
+    raw = os.environ.get("SLAB_WATCH_MAX_REQUESTS")
+    if not raw:
+        return _SLAB_WATCH_COLLECT_DEFAULT_MAX_REQUESTS
+    try:
+        return int(raw)
+    except ValueError:
+        click.echo(
+            f"Warning: SLAB_WATCH_MAX_REQUESTS={raw!r} does not parse as an "
+            "int; using the default "
+            f"({_SLAB_WATCH_COLLECT_DEFAULT_MAX_REQUESTS}).",
+            err=True,
+        )
+        return _SLAB_WATCH_COLLECT_DEFAULT_MAX_REQUESTS
+
+
+def _parse_ledger_timestamp(value: object) -> datetime | None:
+    """Best-effort parse of a `comps` row's `observed_at`/`last_seen_at` into
+    a UTC-aware datetime, or None for anything unreadable.
+
+    Two producers, two shapes, both handled by one `datetime.fromisoformat`
+    call: `observed_at` is written by `_observed_at_iso` as a UTC
+    `.isoformat()` string (`T` separator), while `last_seen_at` is SQLite's
+    own `datetime('now')` — a naive "YYYY-MM-DD HH:MM:SS" string that
+    `fromisoformat` also accepts (it round-trips `str(datetime)`'s space
+    separator). A naive result is assumed UTC, matching SQLite's own clock,
+    never local time. Returns None rather than raising on anything else — a
+    malformed timestamp must read as "not fresh" (fetch it), never crash the
+    freshness check.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _slab_ledger_freshest(rows: list[dict]) -> datetime | None:
+    """The most recent observation timestamp across every row's
+    `observed_at`/`last_seen_at`, or None when every row/field is missing or
+    unparseable — which the caller treats as "not fresh" (the safe direction:
+    it costs one extra provider request rather than silently skipping a book
+    whose ledger data can't be read)."""
+    stamps = [
+        dt
+        for row in rows if isinstance(row, dict)
+        for dt in (_parse_ledger_timestamp(row.get("observed_at")),
+                   _parse_ledger_timestamp(row.get("last_seen_at")))
+        if dt is not None
+    ]
+    return max(stamps) if stamps else None
+
+
+def _ping_slab_watch_collect_heartbeat(server_url: str, *, detail: str) -> None:
+    """Record the `slab-watch-collect` heartbeat (BUI-951, contract: BUI-602).
+
+    Best-effort, mirroring `_ping_fmv_heartbeat`/`sentinel_probe._ping_heartbeat`
+    exactly: a failed ping is reported on stderr and never changes this
+    command's exit code. Called ONLY from `run_slab_watch_collect`'s success
+    branch — see that function's docstring for what "success" means here
+    (BUI-593: a fetch that ran clean but whose ledger write silently failed
+    must not ping).
+    """
+    try:
+        resp = requests.post(
+            f"{server_url}/api/heartbeat/slab-watch-collect",
+            params={"detail": detail},
+            timeout=10,
+        )
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        click.echo(
+            f"slab-watch-collect heartbeat ping failed (non-fatal): {e}",
+            err=True,
+        )
+
+
+def run_slab_watch_collect(*, server_url: str | None,
+                           max_requests: int | None = None) -> int:
+    """Driver for `comic-fmv --slab-watch-collect` (BUI-951).
+
+    Returns the process exit code rather than calling `sys.exit` itself, so
+    tests (and any future caller) can run it in-process:
+
+    \b
+      0 — success. Includes a run where every watch-set book was skipped by
+          the freshness gate — "zero results is a success" (the heartbeat
+          contract's own rule, docs/reference/job-heartbeat-contract.md) —
+          and a run that hit the request cap with everything it DID attempt
+          succeeding (the leftover books are simply next run's job, not a
+          failure of this one).
+      1 — at least one book's comp fetch or ledger write failed. The run
+          still processes every OTHER book rather than aborting (a scheduled
+          job with no operator watching it must not let one bad book cost
+          the whole batch), but does not ping — a heartbeat pinging over a
+          run with a real failure in it would certify the failure as health.
+      2 — the run could not start at all (no server URL, or the watch-set
+          read itself failed) — never pings, and never touches the ledger.
+
+    Deliberately never calls `sys.exit`: every failure path below is
+    reported on stderr and folded into the return code instead, so a bug in
+    ONE book's processing can't take the interpreter down mid-batch the way
+    an uncaught exception would (see `_post_comps`'s docstring for the
+    precedent — this mirrors its per-book exception posture, not `run()`'s
+    batch-wide `_fail_mapping`).
+    """
+    if not server_url:
+        click.echo(
+            "Error: COMICS_SERVER_URL must be set. --slab-watch-collect reads "
+            "the watch set and writes the comps ledger.", err=True,
+        )
+        return 2
+
+    watch = _get_json_or_warn(
+        f"{server_url}/api/comics/slab-watch", params={},
+        warn="slab-watch-collect: /api/comics/slab-watch read failed",
+        default=_LOOKUP_FAILED,
+    )
+    if watch is _LOOKUP_FAILED or not isinstance(watch, dict):
+        click.echo(
+            "Error: failed to read the slab watch set from the comics "
+            "server; the run did not start.", err=True,
+        )
+        return 2
+
+    items = [it for it in (watch.get("items") or []) if isinstance(it, dict)]
+    max_req = _slab_watch_max_requests(max_requests)
+    started_at = datetime.now(timezone.utc)
+
+    # Phase 1 — classify every book: skip (fresh) or queue for fetch. The
+    # ledger read here is a comics-server GET, never a provider request, so
+    # every book gets checked regardless of the cap below.
+    to_fetch: list[dict] = []
+    ledger_by_idx: dict[int, list[dict]] = {}
+    meta_by_idx: dict[int, dict] = {}
+    n_skipped_fresh = 0
+    n_skipped_malformed = 0
+
+    for it in items:
+        comic_id = it.get("comic_id")
+        title = it.get("title")
+        issue = it.get("issue")
+        if comic_id is None or not title or issue in (None, ""):
+            n_skipped_malformed += 1
+            click.echo(
+                "Warning: slab-watch-collect: skipping a malformed watch-set "
+                f"item (comic_id={comic_id!r}, title={title!r}, "
+                f"issue={issue!r})", err=True,
+            )
+            continue
+        # BUI-950: the endpoint hard-codes "cgc" today (no per-book grader
+        # override yet), but a future one might — pass through whatever the
+        # item says and fall back to "cgc" only when it's absent, so a later
+        # `"cbcs"` value is honoured rather than silently overwritten.
+        certifier = _identity_token(it.get("certifier"), "cgc")
+        year = it.get("year")
+        ledger_rows = _fetch_ledger_comps(
+            server_url, title=title, issue=issue, year=year,
+            pool="slab", certifier=certifier,
+        ) or []
+        freshest = _slab_ledger_freshest(ledger_rows)
+        if freshest is not None:
+            age_days = (started_at - freshest).total_seconds() / 86400.0
+            if age_days <= _SLAB_WATCH_COLLECT_FRESHNESS_DAYS:
+                n_skipped_fresh += 1
+                continue
+        fetch_idx = len(to_fetch)
+        to_fetch.append({
+            "_idx": fetch_idx, "title": title, "issue": str(issue),
+            "year": year, "certifier": certifier,
+        })
+        ledger_by_idx[fetch_idx] = ledger_rows
+        meta_by_idx[fetch_idx] = {
+            "comic_id": comic_id, "certifier": certifier,
+            "label": _SLAB_WATCH_COLLECT_LABEL, "title": title, "issue": issue,
+        }
+
+    # Phase 2 — the hard cap. Applied to the QUEUE, not inside the fetch
+    # loop, so "left for next run" is exact rather than an approximation of
+    # wherever a retry happened to land.
+    leftover = to_fetch[max_req:]
+    to_fetch = to_fetch[:max_req]
+
+    n_rows_posted = 0
+    n_guard_dropped = 0
+    n_ledger_stamped = 0
+    any_fetch_failed = False
+    any_write_failed = False
+    n_books_attempted = len(to_fetch)
+
+    # Phase 3 — one batch subprocess call for every book still queued (never
+    # one call per book — see `_fetch_comps`'s own batching contract).
+    # `hard_fail=False`: a total fetch failure (binary missing, timeout,
+    # unparseable output) must report and return 1, never `sys.exit` an
+    # unattended job out from under launchd.
+    if to_fetch:
+        results = _fetch_comps(to_fetch, force=False, hard_fail=False)
+        if results is None:
+            any_fetch_failed = True
+            click.echo(
+                "Error: slab-watch-collect: the batch comp fetch failed; no "
+                "slab comps were collected this run.", err=True,
+            )
+        else:
+            results_by_id: dict[object, dict] = {}
+            for result in results:
+                rid = (result.get("input") or {}).get("_req_id")
+                results_by_id[rid] = result
+
+            for fetch_idx in range(len(to_fetch)):
+                meta = meta_by_idx[fetch_idx]
+                # Named distinctly from the `result` above (not reused): mypy
+                # infers a loop variable's type from its first binding, and
+                # `results_by_id.get(...)` is `dict | None` where the earlier
+                # `for result in results` bound a plain `dict`.
+                book_result = results_by_id.get(fetch_idx)
+                if book_result is None:
+                    # BUI-174/187-shaped guard, softened for this job: `run()`
+                    # hard-fails the whole batch on an id/result mismatch;
+                    # here one book's missing result must not cost every
+                    # other book's already-collected comps, so it is counted
+                    # as a per-book fetch failure instead.
+                    any_fetch_failed = True
+                    click.echo(
+                        "Warning: slab-watch-collect: no result for "
+                        f"{meta['title']} #{meta['issue']} (comic_id="
+                        f"{meta['comic_id']}) — id/result mismatch from "
+                        "ebay-sold-comps.", err=True,
+                    )
+                    continue
+
+                comps = book_result.get("comps", [])
+                slab_comps = book_result.get("slab_comps") or []
+
+                # BUI-565's per-book raise, and the BUI-565/570 "fetch error
+                # reads as a clean n=0" class it named: both must be caught
+                # HERE, before an empty `live_slab` is read as "genuinely no
+                # comps, nothing to post" rather than "the fetch failed."
+                if book_result.get("error") is not None:
+                    any_fetch_failed = True
+                    click.echo(
+                        "Warning: slab-watch-collect: fetch-err for "
+                        f"{meta['title']} #{meta['issue']} (comic_id="
+                        f"{meta['comic_id']}): "
+                        f"{book_result.get('error') or '<no message>'}", err=True,
+                    )
+                    continue
+                if _is_fetch_error({
+                    "comp_count_total": len(comps) + len(slab_comps),
+                    "queries_used": book_result.get("queries_used", []),
+                }):
+                    any_fetch_failed = True
+                    click.echo(
+                        "Warning: slab-watch-collect: all queries errored "
+                        f"for {meta['title']} #{meta['issue']} (comic_id="
+                        f"{meta['comic_id']}) — treated as a fetch failure, "
+                        "not a genuine zero (BUI-565/570).", err=True,
+                    )
+                    continue
+
+                # The same identity filter `_compute_graded_one` applies to
+                # `live_slab` before posting — a certifier-targeted query can
+                # still surface another certifier's slab as incidental noise
+                # (BUI-929), and this endpoint has no per-book label override
+                # (see `_SLAB_WATCH_COLLECT_LABEL` above).
+                certifier, label = meta["certifier"], meta["label"]
+                live_slab = [
+                    c for c in slab_comps
+                    if _identity_token(c.get("certifier"), "") == certifier
+                    and _identity_token(c.get("label"), "") == label
+                ]
+                n_guard_dropped += len(slab_comps) - len(live_slab)
+
+                # BUI-946/947: make this run's guard drops durable against the
+                # STORED copy of the same listing, exactly as
+                # `_compute_graded_one` does at merge time — unconditional,
+                # relying on `_post_comps_exclusions`' own no-op guard for the
+                # (overwhelmingly common) case where nothing was dropped.
+                ledger_rows = ledger_by_idx[fetch_idx]
+                dropped_ids = {
+                    str(d["product_id"])
+                    for d in (book_result.get("graded_identity_dropped_ids") or [])
+                    if isinstance(d, dict) and d.get("product_id") not in (None, "")
+                }
+                dropped_rows = [
+                    c for c in ledger_rows
+                    if c.get("product_id") not in (None, "")
+                    and str(c["product_id"]) in dropped_ids
+                ]
+                n_ledger_stamped += _post_comps_exclusions(
+                    server_url, dropped_rows,
+                    book_result.get("graded_identity_dropped_ids") or [],
+                )
+
+                posted = _post_comps(server_url, meta["comic_id"], [], live_slab)
+                if posted is False:
+                    any_write_failed = True
+                    click.echo(
+                        "Warning: slab-watch-collect: ledger write failed "
+                        f"for {meta['title']} #{meta['issue']} (comic_id="
+                        f"{meta['comic_id']}); {len(live_slab)} slab row(s) "
+                        "fetched but NOT stored.", err=True,
+                    )
+                elif posted is True:
+                    n_rows_posted += len(live_slab)
+                # posted is None: nothing to post (live_slab empty) — a
+                # genuine zero for this book this round, not a failure.
+
+    elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
+    click.echo(
+        f"slab-watch-collect: {len(items)} book(s) in the watch set, "
+        f"{n_skipped_fresh} skipped (fresh <= "
+        f"{_SLAB_WATCH_COLLECT_FRESHNESS_DAYS:g}d), {n_books_attempted} "
+        f"fetched, {n_rows_posted} slab row(s) posted, {n_guard_dropped} "
+        f"row(s) dropped by identity guards, {n_books_attempted} provider "
+        f"request(s), {elapsed:.1f}s elapsed."
+    )
+    if n_ledger_stamped:
+        click.echo(
+            f"slab-watch-collect: {n_ledger_stamped} stored ledger row(s) "
+            "stamped excluded (BUI-947) alongside this run's live guard "
+            "drops.", err=True,
+        )
+    if leftover:
+        left_names = ", ".join(
+            f"{meta_by_idx[b['_idx']]['title']} #{meta_by_idx[b['_idx']]['issue']}"
+            for b in leftover
+        )
+        click.echo(
+            f"slab-watch-collect: request cap ({max_req}) reached; "
+            f"{len(leftover)} book(s) left for the next run: {left_names}",
+            err=True,
+        )
+    if n_skipped_malformed:
+        click.echo(
+            f"slab-watch-collect: {n_skipped_malformed} malformed watch-set "
+            "item(s) skipped.", err=True,
+        )
+
+    if any_fetch_failed or any_write_failed:
+        return 1
+
+    _ping_slab_watch_collect_heartbeat(
+        server_url,
+        detail=(f"{n_books_attempted} fetched, {n_rows_posted} row(s) "
+               f"posted, {n_skipped_fresh} skipped fresh"),
+    )
+    return 0

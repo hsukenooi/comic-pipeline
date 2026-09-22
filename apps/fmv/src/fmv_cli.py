@@ -107,11 +107,27 @@ def _print_version(ctx: click.Context, param: click.Parameter, value: bool) -> N
                    "any hand override — from GET /api/comics/slab-watch, "
                    "then exit. Read-only: no comps are fetched, nothing is "
                    "written. Ignores --batch.")
+@click.option("--slab-watch-collect", is_flag=True,
+              help="BUI-951: for every book in the slab watch set "
+                   "(GET /api/comics/slab-watch) whose comps ledger has no "
+                   "slab observation in the last 21 days, fetch ONE "
+                   "certifier-targeted query and POST the surviving comps "
+                   "to the ledger (pool='slab') — never prices or upserts "
+                   "an FMV. Meant for a scheduled (~4-weekly) launchd job "
+                   "(scripts/launchd/com.comics.slab-watch-collect.plist), "
+                   "not interactive use. Hard-capped at "
+                   "SLAB_WATCH_MAX_REQUESTS provider requests per run "
+                   "(default 80); leftover books roll to the next run. "
+                   "Pings /api/heartbeat/slab-watch-collect only when every "
+                   "fetch and every ledger write this run succeeded — a run "
+                   "where every book was already fresh still pings (zero "
+                   "results is a success). Exits 0 (success), 1 (a fetch or "
+                   "write failed), 2 (could not start). Ignores --batch.")
 def cli(batch_path: str | None, out_path: str | None,
         max_age_days: float, force: bool, grade_window: float | None,
         quiet: bool, brief: bool, server_url: str | None,
         inversion_sweep: bool, sentinel_probe: bool,
-        list_slab_watch: bool) -> None:
+        list_slab_watch: bool, slab_watch_collect: bool) -> None:
     """Compute fair market value for a batch of comics.
 
     Pipeline per book:
@@ -170,6 +186,13 @@ def cli(batch_path: str | None, out_path: str | None,
     if list_slab_watch:
         fmv_runner.run_list_slab_watch(server_url=server_url)
         return
+    # BUI-951: a scheduled collection run, not a pricing run — same
+    # "handled before run()'s --batch gate" reason as the three modes above.
+    # Unlike them it DOES write (the comps ledger), so — unlike
+    # --list-slab-watch — it returns a real success/failure exit code rather
+    # than always returning 0.
+    if slab_watch_collect:
+        sys.exit(fmv_runner.run_slab_watch_collect(server_url=server_url))
     fmv_runner.run(
         batch_path=batch_path,
         out_path=out_path,

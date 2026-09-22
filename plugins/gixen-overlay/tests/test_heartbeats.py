@@ -47,18 +47,20 @@ def conn():
 # ---------------------------------------------------------------------------
 
 
-def test_the_five_named_jobs_are_declared():
+def test_the_six_named_jobs_are_declared():
     """BUI-624 added `sentinel-probe` (BUI-603's probe, which pings but had no
-    contract entry, so every ping 404'd). The set is still pinned rather than
-    derived: a job silently disappearing from the contract removes it from the
-    watchdog's iteration entirely, and `heartbeat_report` iterates the contract
-    precisely so a missing job is visible instead of absent."""
+    contract entry, so every ping 404'd); BUI-951 added `slab-watch-collect`
+    (the scheduled slab-comp collection job). The set is still pinned rather
+    than derived: a job silently disappearing from the contract removes it
+    from the watchdog's iteration entirely, and `heartbeat_report` iterates
+    the contract precisely so a missing job is visible instead of absent."""
     assert set(JOB_CONTRACTS) == {
         "gixen-sync",
         "wishlist-sellers",
         "collection-sync",
         "fmv-refresh",
         "sentinel-probe",
+        "slab-watch-collect",
     }
 
 

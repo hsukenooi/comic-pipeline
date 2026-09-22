@@ -4384,6 +4384,32 @@ JOB_CONTRACTS: dict[str, dict[str, Any]] = {
             "(weekly — each run spends real provider request budget)."
         ),
     },
+    "slab-watch-collect": {
+        "cadence_hours": 672.0,
+        "success": (
+            "A `comic-fmv --slab-watch-collect` run (BUI-951) in which every "
+            "comp fetch it attempted AND every ledger write it attempted "
+            "succeeded — exit 0. Mirrors fmv-refresh's own BUI-593 lesson: a "
+            "fetch that ran clean while its POST to the comps ledger failed "
+            "must not ping. A run where every watch-set book was already "
+            "fresh (no fetch attempted at all) still pings — 'zero results is "
+            "a success' applies here exactly as it does to wishlist-sellers. "
+            "A run that hit its request cap still pings, as long as nothing "
+            "it DID attempt failed; the leftover books are next run's job, "
+            "not this run's failure."
+        ),
+        "wired": True,
+        "ping": (
+            "apps/fmv/src/fmv_runner.py's run_slab_watch_collect, via "
+            "_ping_slab_watch_collect_heartbeat on the no-failure branch: "
+            "POST /api/heartbeat/slab-watch-collect. Best-effort — a failed "
+            "ping never changes the run's own exit code. Scheduling: "
+            "scripts/launchd/com.comics.slab-watch-collect.plist (monthly — "
+            "the closest launchd calendar slot to 'every four weeks'; each "
+            "run spends real provider request budget, capped by "
+            "SLAB_WATCH_MAX_REQUESTS)."
+        ),
+    },
 }
 
 # THE OUTER LAYER — WIRED (BUI-672). Read this before trusting the watchdog.
