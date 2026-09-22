@@ -3,10 +3,11 @@
 #
 # Fired by the LaunchAgent com.comics.em-batch-nightly (scripts/launchd/) at
 # 01:00 on the Mac Mini. One run: pick tickets -> fresh detached worktree ->
-# `claude -p "/em-batch mode:autonomous ..."` -> post the run's summary to
-# Telegram (Telegram only, by request; the daily note is not touched). The model
-# run does the engineering (implement, review, CI, merge, deploy, close); this
-# file only frames it and reports.
+# `claude -p "/em-batch mode:autonomous ..."` -> save the run's summary to the
+# run dir. Nothing is pushed to the user: the Linear tickets carry the per-ticket
+# closing comments, and this log plus summary.md carry the run record (a fatal
+# error still raises a macOS notification). The model run does the engineering
+# (implement, review, CI, merge, deploy, close); this file only frames it.
 #
 # If the EM's last message is not the summary (it ended its turn waiting on a
 # background command; headless claude resumes it only for subagent completions),
@@ -39,8 +40,6 @@ REPO="/Users/hsukenooi/Projects/comic-pipeline"          # shared checkout: sett
 RUN_WT="/Users/hsukenooi/Projects/comic-pipeline-nightly" # the EM's own detached worktree
 STATE_DIR="/Users/hsukenooi/.local/state/em-batch-nightly"
 LOCK_DIR="$STATE_DIR/lock"
-SHARED_DIR="/Users/hsukenooi/.claude/scripts/shared"    # telegram_report.py
-ENVFILE="/Users/hsukenooi/.config/tasks-to-linear.env"  # TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
 KNOBS="/Users/hsukenooi/.config/em-batch-nightly.env"
 CLAUDE="/Users/hsukenooi/.local/bin/claude"
 TITLE="Nightly comics run"
@@ -73,7 +72,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-for f in "$ENVFILE" "$KNOBS"; do
+for f in "$KNOBS"; do
   if [ -f "$f" ]; then set -a; source "$f"; set +a; fi
 done
 CAP="${EM_BATCH_NIGHTLY_CAP:-8}"
@@ -83,27 +82,10 @@ MODEL="${EM_BATCH_NIGHTLY_MODEL:-}"
 
 notify() { /usr/bin/osascript -e "display notification \"$1\" with title \"$TITLE\"" >/dev/null 2>&1; }
 
-# Telegram, falling back to a macOS notification inside telegram_report.py.
-tg_send() {  # $1 = message
-  python3 - "$1" "$TITLE" "$LOG_PATH" "$SHARED_DIR" <<'PY'
-import sys
-from pathlib import Path
-msg, title, log, shared = sys.argv[1:5]
-sys.path.insert(0, shared)
-try:
-    import telegram_report
-except Exception as e:  # shared helper missing: say so on stderr, keep going
-    print("warning: telegram_report unavailable (%s)" % e, file=sys.stderr)
-    sys.exit(1)
-first = msg.strip().splitlines()[0] if msg.strip() else title
-sys.exit(telegram_report.send(msg, summary=first[:200], title=title, log=Path(log), spool=False))
-PY
-}
-
 fatal() {
   local msg="$1"
   echo "FATAL: $msg" >&2
-  python3 "$SHARED_DIR/telegram_report.py" send-fatal "$TITLE" "$msg" "$LOG_PATH" || notify "$msg"
+  notify "$msg"
   cleanup
   exit 1
 }
@@ -145,7 +127,7 @@ fi
 
 # --- Select tickets -------------------------------------------------------------
 RUN_DIR="$STATE_DIR/runs/$(date '+%Y-%m-%d_%H%M')"
-mkdir -p "$RUN_DIR"
+[ -n "$RESUME_RUN" ] || mkdir -p "$RUN_DIR"   # a resume reuses its own run dir
 if [ -n "$RESUME_RUN" ]; then
   RUN_DIR="$STATE_DIR/runs/$RESUME_RUN"
   [ -f "$RUN_DIR/tickets.txt" ] || fatal "no run to resume at $RUN_DIR"
@@ -161,7 +143,6 @@ echo "tickets: ${TICKETS:-<none>}"
 printf '%s\n' "$TICKETS" > "$RUN_DIR/tickets.txt"
 if [ -z "$TICKETS" ]; then
   echo "nothing to pick up; exiting"
-  [ "$DRY_RUN" -eq 1 ] || tg_send "$TITLE, $(date '+%a %d %b'): nothing to pick up. No unassigned comics tickets in Today, Soon, or Someday."
   exit 0
 fi
 
@@ -178,7 +159,7 @@ Run context from scripts/em-batch-nightly.sh (BUI-972):
 - Run dir for wave-plan.md and handoff.md: $RUN_DIR
 - Budget: about \$$BUDGET and $TIMEOUT of wall clock. Prefer finishing fewer tickets cleanly over starting all of them.
 - Headless: only a subagent's completion resumes you. A background Bash command, a Monitor, or a CI watch never wakes you, so never end your turn while waiting on one. Wait in the foreground: a normal Bash call such as \`gh pr checks N --watch\` with a long tool timeout, repeated as needed.
-- Your FINAL message is the user summary defined in the skill's mode:autonomous section (20 lines max, written for the person who uses the pipeline, not a code reader). It is posted to Telegram as-is."
+- Your FINAL message is the user summary defined in the skill's mode:autonomous section (20 lines max, written for the person who uses the pipeline, not a code reader). It is saved as summary.md in the run dir and its first line is the wrapper's completion check; nothing is pushed to the user, who reads the Linear tickets, so put the per-ticket outcome in each ticket's closing comment."
 printf '%s\n' "$PROMPT" > "$RUN_DIR/prompt.md"
 
 if [ "$DRY_RUN" -eq 1 ]; then
@@ -258,14 +239,17 @@ try:
 except Exception:
     sys.exit(0)
 print(doc.get("result", "").strip())
-segs = []
+# total_cost_usd in a resumed segment is cumulative for the session (checked
+# 2026-09-22: modelUsage lines carried over unchanged), so the last file is the
+# run total; only the turn counts add up. No apostrophes in here: bash 3.2 cannot
+# parse a quote inside a heredoc inside a command substitution.
+turns = 0
 for f in sorted(glob.glob(sys.argv[2] + "/result*.json")):
     try:
-        d = json.load(open(f)); segs.append((d.get("total_cost_usd", 0.0), d.get("num_turns", 0)))
+        turns += json.load(open(f)).get("num_turns", 0)
     except Exception:
         pass
-cost = " + ".join("$%.2f" % c for c, _ in segs) if len(segs) > 1 else "$%.2f" % (segs[0][0] if segs else 0.0)
-print("\nCost: %s, %s turns." % (cost, sum(t for _, t in segs)))
+print("\nCost: $%.2f, %s turns." % (doc.get("total_cost_usd", 0.0), turns))
 EOPY
 )"
 if [ -z "$SUMMARY" ]; then
@@ -279,8 +263,8 @@ fi
 printf '%s\n' "$SUMMARY" > "$RUN_DIR/summary.md"
 
 # --- Report ------------------------------------------------------------------------
-tg_send "$TITLE, $(date '+%a %d %b'):
-$SUMMARY"
+printf '%s\n' "$SUMMARY"
+echo "summary saved to $RUN_DIR/summary.md"
 
 echo "=== $(date '+%Y-%m-%d %H:%M:%S') exit 0 ==="
 exit 0
