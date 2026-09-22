@@ -5366,7 +5366,10 @@ class TestBriefProjection:
                   "certifier", "label", "pricing_basis",
                   # BUI-949: the short provenance cell. Additive — every key
                   # above is unchanged.
-                  "provenance"}
+                  "provenance",
+                  # BUI-954: the active-ask ceiling. Additive — null on every
+                  # row without one.
+                  "active_ask_low", "active_ask_n"}
 
     def test_fresh_row_projects_top_level_ids(self):
         row = {
@@ -5391,7 +5394,9 @@ class TestBriefProjection:
                          "pricing_basis": None,
                          # BUI-949: 0.80 is BASE_BID_FACTOR (no haircut), so
                          # no `haircut` token.
-                         "provenance": "direct n5"}
+                         "provenance": "direct n5",
+                         # BUI-954: a priced row never fetches an ask ceiling.
+                         "active_ask_low": None, "active_ask_n": None}
 
     def test_fresh_row_fmv_notes_matches_upsert_notes(self):
         # BUI-505: the brief line's fmv_notes must be exactly what
@@ -7546,6 +7551,343 @@ class TestProvenanceCell:
         assert fmv_runner._is_fetch_error(row)  # sanity: the trap condition
         assert fmv_runner._provenance(row) == "ledger-advisory"
         assert fmv_runner._brief_row(row)["provenance"] == "ledger-advisory"
+
+    def test_refused_raw_row_appends_the_ask_ceiling(self):
+        """BUI-954: the token appends to the existing refused-row cell — it
+        never replaces the flag_reason a reader needs first."""
+        fmv = {"flag_reason": "too_wide", "fmv_low": None, "fmv_high": None,
+               "max_bid": None, "active_ask_low": 650.0, "active_ask_n": 3}
+        row = {"input": {"item_id": "1", "title": "X", "issue": "1"},
+               "fmv": fmv, "comic_id": 1, "fmv_id": 1, "source": "fresh"}
+        assert (fmv_runner._provenance(row)
+                == "too_wide — asks from $650 (n3)")
+        assert (fmv_runner._brief_row(row)["provenance"]
+                == "too_wide — asks from $650 (n3)")
+
+    def test_refused_certified_row_appends_the_ask_ceiling(self):
+        fmv = {"flag_reason": "label_signature_series", "fmv_low": None,
+               "fmv_high": None, "max_bid": None, "graded": True,
+               "certifier": "cgc", "label": "signature_series",
+               "active_ask_low": 1495.0, "active_ask_n": 1}
+        row = {"input": {"item_id": "1", "title": "X", "issue": "1"},
+               "fmv": fmv, "comic_id": 1, "fmv_id": 1, "source": "fresh"}
+        assert (fmv_runner._provenance(row)
+                == "refused label_signature_series — asks from $1495 (n1)")
+
+    def test_refused_row_without_an_ask_ceiling_is_unchanged(self):
+        """No `active_ask_n` (the fetch never ran, failed, or found nothing)
+        → the cell is exactly the bare reason, byte-for-byte what it was
+        before BUI-954."""
+        fmv = {"flag_reason": "too_sparse", "fmv_low": None,
+               "fmv_high": None, "max_bid": None}
+        row = {"input": {"item_id": "1", "title": "X", "issue": "1"},
+               "fmv": fmv, "comic_id": 1, "fmv_id": 1, "source": "fresh"}
+        assert fmv_runner._provenance(row) == "too_sparse"
+
+
+class TestActiveAskCeiling:
+    """BUI-954: `_fetch_active_asks` (the ebay-fetch subprocess wrapper) and
+    `_maybe_attach_active_ask_ceiling` (the row-level gate that calls it).
+
+    Every test here mocks the subprocess boundary — never a real network
+    call — matching this file's own stated contract."""
+
+    # ── _build_notes' ask_ceiling= token ────────────────────────────────
+
+    def test_build_notes_includes_ask_ceiling_on_a_refused_row(self):
+        fmv = {"window": None, "cv_pct": "n/a", "confidence": "LOW",
+               "flag_reason": "too_wide", "active_ask_low": 650.0,
+               "active_ask_n": 3}
+        notes = fmv_runner._build_notes(fmv)
+        assert "manual_review=too_wide" in notes
+        assert "ask_ceiling=$650 (n3)" in notes
+
+    def test_build_notes_omits_ask_ceiling_when_absent(self):
+        fmv = {"window": None, "cv_pct": "n/a", "confidence": "LOW",
+               "flag_reason": "too_wide"}
+        assert "ask_ceiling" not in fmv_runner._build_notes(fmv)
+
+    def test_build_notes_never_adds_ask_ceiling_to_a_priced_row(self):
+        """Defense in depth: even if a caller mistakenly stashed
+        active_ask_n on a PRICED fmv, `_build_notes` gates on `flag`, so the
+        token still can't appear — a priced row's notes read exactly as
+        they did before BUI-954."""
+        fmv = {"window": 0.5, "cv_pct": "10%", "confidence": "HIGH",
+               "flag_reason": None, "active_ask_low": 650.0,
+               "active_ask_n": 3, "bid_factor": fmv_math.BASE_BID_FACTOR}
+        assert "ask_ceiling" not in fmv_runner._build_notes(fmv)
+
+    # ── _maybe_attach_active_ask_ceiling ────────────────────────────────
+
+    def _refused_raw_row(self, **fmv_over):
+        fmv = {"flag_reason": "too_wide", "fmv_low": None, "fmv_high": None,
+               "max_bid": None}
+        fmv.update(fmv_over)
+        return {"input": {"title": "X", "issue": "1", "grade": 8.0},
+               "fmv": fmv, "source": "fresh"}
+
+    def _refused_certified_row(self, **fmv_over):
+        fmv = {"flag_reason": "label_signature_series", "fmv_low": None,
+               "fmv_high": None, "max_bid": None, "graded": True,
+               "certifier": "cgc", "label": "signature_series"}
+        fmv.update(fmv_over)
+        return {"input": {"title": "X", "issue": "1", "grade": 4.5},
+               "fmv": fmv, "source": "fresh"}
+
+    def _priced_row(self):
+        return {"input": {"title": "X", "issue": "1", "grade": 8.0},
+               "fmv": {"flag_reason": None, "fmv_low": 90, "fmv_high": 100,
+                       "max_bid": 80},
+               "source": "fresh"}
+
+    def test_fetches_and_attaches_on_a_refused_raw_row(self):
+        row = self._refused_raw_row()
+        with patch("fmv_runner._fetch_active_asks",
+                   return_value={"low": 650.0, "n": 3}) as mock_fetch:
+            fmv_runner._maybe_attach_active_ask_ceiling(row)
+        mock_fetch.assert_called_once_with("X", "1", 8.0, certifier=None,
+                                           label=None)
+        assert row["fmv"]["active_ask_low"] == 650.0
+        assert row["fmv"]["active_ask_n"] == 3
+        # Never touches the priced fields (the ticket's own invariant).
+        assert row["fmv"]["fmv_low"] is None
+        assert row["fmv"]["fmv_high"] is None
+        assert row["fmv"]["max_bid"] is None
+
+    def test_fetches_with_certifier_and_label_on_a_refused_certified_row(self):
+        row = self._refused_certified_row()
+        with patch("fmv_runner._fetch_active_asks",
+                   return_value={"low": 1495.0, "n": 1}) as mock_fetch:
+            fmv_runner._maybe_attach_active_ask_ceiling(row)
+        mock_fetch.assert_called_once_with("X", "1", 4.5, certifier="cgc",
+                                           label="signature_series")
+        assert row["fmv"]["active_ask_low"] == 1495.0
+        assert row["fmv"]["active_ask_n"] == 1
+        assert row["fmv"]["fmv_low"] is None
+        assert row["fmv"]["fmv_high"] is None
+        assert row["fmv"]["max_bid"] is None
+
+    def test_never_fetches_for_a_priced_row(self):
+        """The structural guard: a row the CGC-proxy rescue or cross-check
+        already priced (fmv_high set) must never trigger a search — this is
+        what keeps a priced run from slowing down or spending eBay quota."""
+        row = self._priced_row()
+        with patch("fmv_runner._fetch_active_asks") as mock_fetch:
+            fmv_runner._maybe_attach_active_ask_ceiling(row)
+        mock_fetch.assert_not_called()
+        assert "active_ask_low" not in row["fmv"]
+        assert "active_ask_n" not in row["fmv"]
+        assert row["fmv"]["fmv_low"] == 90
+        assert row["fmv"]["fmv_high"] == 100
+        assert row["fmv"]["max_bid"] == 80
+
+    def test_never_fetches_for_a_fetch_error_row(self):
+        """`fmv` is None on a fetch-err/skip row — never a dict with
+        `flag_reason` — so the guard must not crash or fetch."""
+        row = {"input": {"title": "X", "issue": "1", "grade": 8.0},
+               "fmv": None, "source": "error"}
+        with patch("fmv_runner._fetch_active_asks") as mock_fetch:
+            fmv_runner._maybe_attach_active_ask_ceiling(row)
+        mock_fetch.assert_not_called()
+
+    def test_subprocess_failure_leaves_the_row_untouched(self):
+        """A fail-soft `_fetch_active_asks` return of None (binary missing,
+        timeout, bad exit, bad JSON) must leave the refused row exactly as
+        it was — no active_ask_low/n key at all, not even null."""
+        row = self._refused_raw_row()
+        before = json.loads(json.dumps(row))  # deep copy for comparison
+        with patch("fmv_runner._fetch_active_asks", return_value=None):
+            fmv_runner._maybe_attach_active_ask_ceiling(row)
+        assert row == before
+        assert "active_ask_low" not in row["fmv"]
+        assert "active_ask_n" not in row["fmv"]
+
+    def test_skips_when_grade_is_missing(self):
+        row = self._refused_raw_row()
+        row["input"]["grade"] = None
+        with patch("fmv_runner._fetch_active_asks") as mock_fetch:
+            fmv_runner._maybe_attach_active_ask_ceiling(row)
+        mock_fetch.assert_not_called()
+
+    # ── _fetch_active_asks itself ───────────────────────────────────────
+
+    def test_fetch_active_asks_warns_and_returns_none_when_binary_missing(
+            self, capsys):
+        with patch("fmv_runner.shutil.which", return_value=None):
+            result = fmv_runner._fetch_active_asks(
+                "X", "1", 8.0, certifier=None, label=None)
+        assert result is None
+        assert "not found on PATH" in capsys.readouterr().err
+
+    def test_fetch_active_asks_warns_and_returns_none_on_nonzero_exit(
+            self, capsys):
+        fake = MagicMock(returncode=1, stdout="", stderr="boom")
+        with patch("fmv_runner.shutil.which", return_value="/usr/bin/ebay-fetch"), \
+             patch("fmv_runner.subprocess.run", return_value=fake):
+            result = fmv_runner._fetch_active_asks(
+                "X", "1", 8.0, certifier=None, label=None)
+        assert result is None
+        assert "boom" in capsys.readouterr().err
+
+    def test_fetch_active_asks_warns_and_returns_none_on_timeout(self, capsys):
+        import subprocess as _subprocess
+        with patch("fmv_runner.shutil.which", return_value="/usr/bin/ebay-fetch"), \
+             patch("fmv_runner.subprocess.run",
+                   side_effect=_subprocess.TimeoutExpired(cmd="ebay-fetch",
+                                                          timeout=30)):
+            result = fmv_runner._fetch_active_asks(
+                "X", "1", 8.0, certifier=None, label=None)
+        assert result is None
+        assert "timed out" in capsys.readouterr().err
+
+    def test_fetch_active_asks_warns_and_returns_none_on_bad_json(self, capsys):
+        fake = MagicMock(returncode=0, stdout="not json", stderr="")
+        with patch("fmv_runner.shutil.which", return_value="/usr/bin/ebay-fetch"), \
+             patch("fmv_runner.subprocess.run", return_value=fake):
+            result = fmv_runner._fetch_active_asks(
+                "X", "1", 8.0, certifier=None, label=None)
+        assert result is None
+        assert "unparseable" in capsys.readouterr().err
+
+    def test_fetch_active_asks_returns_none_when_n_is_zero(self):
+        """`n == 0` means the search ran fine and found nothing to show —
+        not a failure, but nothing to attach either."""
+        fake = MagicMock(returncode=0, stdout=json.dumps({"low": None, "n": 0}),
+                         stderr="")
+        with patch("fmv_runner.shutil.which", return_value="/usr/bin/ebay-fetch"), \
+             patch("fmv_runner.subprocess.run", return_value=fake):
+            result = fmv_runner._fetch_active_asks(
+                "X", "1", 8.0, certifier=None, label=None)
+        assert result is None
+
+    def test_fetch_active_asks_returns_the_parsed_result_on_success(self):
+        fake = MagicMock(returncode=0,
+                         stdout=json.dumps({"low": 1495.0, "n": 3}), stderr="")
+        with patch("fmv_runner.shutil.which", return_value="/usr/bin/ebay-fetch"), \
+             patch("fmv_runner.subprocess.run", return_value=fake) as mock_run:
+            result = fmv_runner._fetch_active_asks(
+                "X", "50", 4.5, certifier="cgc", label="signature_series")
+        assert result == {"low": 1495.0, "n": 3}
+        cmd = mock_run.call_args.args[0]
+        assert cmd[:3] == ["ebay-fetch", "--active-asks", "X #50"]
+        assert "--certifier" in cmd and "cgc" in cmd
+        assert "--label" in cmd and "signature_series" in cmd
+
+
+class TestActiveAskCeilingRunEndToEnd:
+    """`run()`'s wiring for BUI-954 — the fetch fires on a refused row of
+    EACH path (raw, certified) after every pricing decision has settled,
+    and never on a priced row."""
+
+    def test_refused_raw_row_gets_the_ceiling_in_a_live_run(
+            self, tmp_path, server_url):
+        # year=2015 (not vintage) keeps the CGC-proxy rescue/cross-check
+        # tiers — both gated on `_is_vintage` — from firing a SECOND fetch,
+        # so this book's only fetch is the primary comps one plus (once
+        # refused) the active-ask one under test.
+        batch = [{"item_id": "1", "title": "FF", "issue": "63", "year": 2015,
+                  "grade": 9.6}]
+        batch_path = tmp_path / "batch.json"
+        batch_path.write_text(json.dumps(batch))
+        out_path = tmp_path / "out.json"
+        # Every comp sits at 9.0, one full grade below the 9.6 target — a
+        # real fmv_math `one_sided` refusal (mirrors
+        # TestComputeOne.test_grade_window_threads_through_without_bypassing_guard).
+        comps = [_make_comp(p, 9.0) for p in [40, 42, 44, 45, 41]]
+        fake_result = [{
+            "input": {"_req_id": 0, "title": "FF", "issue": "63",
+                      "year": 2015, "grade": 9.6, "item_id": "1"},
+            "comps": comps, "queries_used": [{"tier": "base"}],
+        }]
+        with patch("fmv_runner._fetch_comps", return_value=fake_result), \
+             patch("fmv_runner._upsert_fmv", return_value={"id": 1}), \
+             patch("fmv_runner._fetch_active_asks",
+                   return_value={"low": 300.0, "n": 2}) as mock_fetch:
+            fmv_runner.run(batch_path=str(batch_path), out_path=str(out_path),
+                           max_age_days=7, force=False, quiet=True,
+                           server_url=server_url)
+        row = json.loads(out_path.read_text())[0]
+        assert row["fmv"]["flag_reason"] == "one_sided"
+        assert row["fmv"]["active_ask_low"] == 300.0
+        assert row["fmv"]["active_ask_n"] == 2
+        # The invariant the ticket pins: the ceiling never becomes a price.
+        assert row["fmv"]["fmv_low"] is None
+        assert row["fmv"]["fmv_high"] is None
+        assert row["fmv"]["max_bid"] is None
+        mock_fetch.assert_called_once()
+        _, kwargs = mock_fetch.call_args
+        assert kwargs["certifier"] is None
+        assert kwargs["label"] is None
+
+    def test_refused_certified_punt_row_gets_the_ceiling_in_a_live_run(
+            self, tmp_path, server_url):
+        batch = [{"item_id": "1", "title": "Batman", "issue": "227",
+                  "year": 1974, "grade": 4.5, "certifier": "cgc",
+                  "label": "signature_series"}]
+        batch_path = tmp_path / "b.json"
+        batch_path.write_text(json.dumps(batch))
+        out_path = tmp_path / "o.json"
+        with patch("fmv_runner._fetch_comps", return_value=[]), \
+             patch("fmv_runner._upsert_fmv",
+                   return_value={"comic_id": 42, "fmv_id": 7,
+                                "certifier": "cgc"}), \
+             patch("fmv_runner._probe_certifier_support", return_value=True), \
+             patch("fmv_runner._fetch_active_asks",
+                   return_value={"low": 1495.0, "n": 1}) as mock_fetch:
+            fmv_runner.run(batch_path=str(batch_path), out_path=str(out_path),
+                           max_age_days=7, force=False, quiet=True,
+                           server_url=server_url)
+        row = json.loads(out_path.read_text())[0]
+        assert row["fmv"]["flag_reason"] == "label_signature_series"
+        assert row["fmv"]["active_ask_low"] == 1495.0
+        assert row["fmv"]["active_ask_n"] == 1
+        assert row["fmv"]["fmv_low"] is None
+        assert row["fmv"]["fmv_high"] is None
+        assert row["fmv"]["max_bid"] is None
+        _, kwargs = mock_fetch.call_args
+        assert kwargs["certifier"] == "cgc"
+        assert kwargs["label"] == "signature_series"
+
+    def test_a_priced_row_in_the_same_batch_never_triggers_a_fetch(
+            self, tmp_path, server_url):
+        """One priced book, one refused book, ONE batch — proves the ask
+        fetch is per-refused-row, not per-batch, and a priced neighbour
+        doesn't leak a spurious fetch onto it."""
+        batch = [
+            {"item_id": "1", "title": "X", "issue": "1", "year": 2015,
+             "grade": 8.0},  # will price cleanly
+            {"item_id": "2", "title": "FF", "issue": "63", "year": 2015,
+             "grade": 9.6},  # will refuse one_sided
+        ]
+        batch_path = tmp_path / "batch.json"
+        batch_path.write_text(json.dumps(batch))
+        out_path = tmp_path / "out.json"
+        priced_comps = [_make_comp(p, 8.0) for p in [10, 11, 12, 13, 14]]
+        refused_comps = [_make_comp(p, 9.0) for p in [40, 42, 44, 45, 41]]
+        fake_results = [
+            {"input": {"_req_id": 0, "title": "X", "issue": "1", "year": 2015,
+                      "grade": 8.0, "item_id": "1"},
+             "comps": priced_comps, "queries_used": [{"tier": "base"}]},
+            {"input": {"_req_id": 1, "title": "FF", "issue": "63",
+                      "year": 2015, "grade": 9.6, "item_id": "2"},
+             "comps": refused_comps, "queries_used": [{"tier": "base"}]},
+        ]
+        with patch("fmv_runner._fetch_comps", return_value=fake_results), \
+             patch("fmv_runner._upsert_fmv", return_value={"id": 1}), \
+             patch("fmv_runner._fetch_active_asks",
+                   return_value={"low": 300.0, "n": 2}) as mock_fetch:
+            fmv_runner.run(batch_path=str(batch_path), out_path=str(out_path),
+                           max_age_days=7, force=False, quiet=True,
+                           server_url=server_url)
+        out = json.loads(out_path.read_text())
+        priced_row = next(r for r in out if r["input"]["item_id"] == "1")
+        refused_row = next(r for r in out if r["input"]["item_id"] == "2")
+        assert priced_row["fmv"]["flag_reason"] is None
+        assert "active_ask_low" not in priced_row["fmv"]
+        assert refused_row["fmv"]["flag_reason"] == "one_sided"
+        assert refused_row["fmv"]["active_ask_low"] == 300.0
+        mock_fetch.assert_called_once()  # only the refused book fetched
+
 
 
 # ─── BUI-951: `comic-fmv --slab-watch-collect` ─────────────────────────────────

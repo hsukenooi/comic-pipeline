@@ -2044,6 +2044,174 @@ class TestSearchByKeyword:
         assert "Network error" in capsys.readouterr().err
 
 
+class TestActiveAsks:
+    """BUI-954: the active-ask ceiling — `search_active_asks` and its
+    identity filter `_title_matches_ask_identity`, all network mocked."""
+
+    # ── _parse_active_ask_price ─────────────────────────────────────────
+
+    def test_price_parses_usd(self):
+        assert ebay_fetch._parse_active_ask_price(
+            {"current_price": "$1,495.00"}
+        ) == 1495.00
+
+    def test_price_rejects_non_usd(self):
+        """A non-USD price (GBP 25.00, no leading '$') is never counted —
+        no FX conversion, and a display-only ceiling must not blend
+        currencies (same posture as BUI-675's raw-comp currency gate)."""
+        assert ebay_fetch._parse_active_ask_price(
+            {"current_price": "GBP 25.00"}
+        ) is None
+
+    def test_price_rejects_missing_or_unparseable(self):
+        assert ebay_fetch._parse_active_ask_price({}) is None
+        assert ebay_fetch._parse_active_ask_price(
+            {"current_price": "$not-a-number"}
+        ) is None
+
+    # ── _title_matches_ask_identity ─────────────────────────────────────
+
+    def test_raw_target_drops_slab_ask(self):
+        """A raw refused row must never count a slab ask, whatever its
+        grade — the two are different markets."""
+        assert not ebay_fetch._title_matches_ask_identity(
+            "Amazing Spider-Man #50 CGC 4.5",
+            grade=4.5, certifier=None, label=None,
+        )
+
+    def test_raw_target_matches_same_grade_raw_ask(self):
+        assert ebay_fetch._title_matches_ask_identity(
+            "Amazing Spider-Man #50 VG/FN 4.5 Kingpin",
+            grade=4.5, certifier=None, label=None,
+        )
+
+    def test_raw_target_drops_wrong_grade(self):
+        assert not ebay_fetch._title_matches_ask_identity(
+            "Amazing Spider-Man #50 6.0 Kingpin",
+            grade=4.5, certifier=None, label=None,
+        )
+
+    def test_raw_target_drops_title_with_no_readable_grade(self):
+        """No numeric grade in the title at all — dropped rather than
+        guessed at (conservative-by-design, see the function's docstring)."""
+        assert not ebay_fetch._title_matches_ask_identity(
+            "Amazing Spider-Man #50 Kingpin app",
+            grade=4.5, certifier=None, label=None,
+        )
+
+    def test_certified_target_matches_same_certifier_label_grade(self):
+        assert ebay_fetch._title_matches_ask_identity(
+            "Amazing Spider-Man #50 CGC 4.5 Signature Series",
+            grade=4.5, certifier="cgc", label="signature_series",
+        )
+
+    def test_certified_target_drops_wrong_grade(self):
+        """The ticket's own example: a CGC 4.5 row must never count a CGC
+        6.0 ask."""
+        assert not ebay_fetch._title_matches_ask_identity(
+            "Amazing Spider-Man #50 CGC 6.0 Signature Series",
+            grade=4.5, certifier="cgc", label="signature_series",
+        )
+
+    def test_certified_target_drops_wrong_certifier(self):
+        assert not ebay_fetch._title_matches_ask_identity(
+            "Amazing Spider-Man #50 CBCS 4.5 Signature Series",
+            grade=4.5, certifier="cgc", label="signature_series",
+        )
+
+    def test_certified_target_drops_wrong_label(self):
+        assert not ebay_fetch._title_matches_ask_identity(
+            "Amazing Spider-Man #50 CGC 4.5",  # plain Universal label
+            grade=4.5, certifier="cgc", label="signature_series",
+        )
+
+    def test_certified_target_drops_raw_ask(self):
+        assert not ebay_fetch._title_matches_ask_identity(
+            "Amazing Spider-Man #50 4.5 Kingpin",
+            grade=4.5, certifier="cgc", label="universal",
+        )
+
+    # ── search_active_asks ───────────────────────────────────────────────
+
+    def _item(self, title, price):
+        return {"title": title, "current_price": price}
+
+    def test_returns_lowest_ask_and_count_among_matches(self):
+        items = [
+            self._item("Amazing Spider-Man #50 CGC 4.5 Signature Series", "$1,495.00"),
+            self._item("Amazing Spider-Man #50 CGC 4.5 Signature Series", "$1,600.00"),
+            # wrong grade — excluded from both low and n
+            self._item("Amazing Spider-Man #50 CGC 6.0 Signature Series", "$500.00"),
+        ]
+        with patch("ebay_fetch.search_by_keyword", return_value=items):
+            result = ebay_fetch.search_active_asks(
+                "Amazing Spider-Man #50", "tok", ebay_fetch.PRODUCTION_BASE,
+                grade=4.5, certifier="cgc", label="signature_series",
+            )
+        assert result == {"low": 1495.00, "n": 2}
+
+    def test_no_matches_returns_zero_n_and_none_low(self):
+        items = [
+            self._item("Amazing Spider-Man #50 CGC 6.0 Signature Series", "$500.00"),
+        ]
+        with patch("ebay_fetch.search_by_keyword", return_value=items):
+            result = ebay_fetch.search_active_asks(
+                "Amazing Spider-Man #50", "tok", ebay_fetch.PRODUCTION_BASE,
+                grade=4.5, certifier="cgc", label="signature_series",
+            )
+        assert result == {"low": None, "n": 0}
+
+    def test_raw_search_excludes_slab_asks_from_the_ceiling(self):
+        items = [
+            self._item("Amazing Spider-Man #50 4.5 Kingpin", "$650.00"),
+            self._item("Amazing Spider-Man #50 CGC 4.5 Signature Series", "$1,495.00"),
+        ]
+        with patch("ebay_fetch.search_by_keyword", return_value=items):
+            result = ebay_fetch.search_active_asks(
+                "Amazing Spider-Man #50", "tok", ebay_fetch.PRODUCTION_BASE,
+                grade=4.5,
+            )
+        assert result == {"low": 650.00, "n": 1}
+
+    def test_forwards_fixed_price_buying_option_and_max_results(self):
+        with patch("ebay_fetch.search_by_keyword", return_value=[]) as mock_search:
+            ebay_fetch.search_active_asks(
+                "Amazing Spider-Man #50", "tok", ebay_fetch.PRODUCTION_BASE,
+                grade=4.5, max_results=25,
+            )
+        _, kwargs = mock_search.call_args
+        assert kwargs["buying_options"] == "FIXED_PRICE"
+        assert kwargs["max_results"] == 25
+
+    # ── main()'s --active-asks wiring ────────────────────────────────────
+
+    def test_main_requires_grade_with_active_asks(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            ebay_fetch.main(["--active-asks", "Amazing Spider-Man #50"])
+        assert exc.value.code == 2
+        assert "--grade" in capsys.readouterr().err
+
+    def test_main_prints_json_and_never_touches_positional_items(self, capsys):
+        with patch("ebay_fetch.load_config",
+                   return_value=("id", "secret", ebay_fetch.PRODUCTION_BASE)):
+            with patch("ebay_fetch.get_token", return_value="tok"):
+                with patch(
+                    "ebay_fetch.search_active_asks",
+                    return_value={"low": 1495.0, "n": 3},
+                ) as mock_search:
+                    ebay_fetch.main([
+                        "--active-asks", "Amazing Spider-Man #50",
+                        "--grade", "4.5", "--certifier", "cgc",
+                        "--label", "signature_series",
+                    ])
+        out = json.loads(capsys.readouterr().out)
+        assert out == {"low": 1495.0, "n": 3}
+        _, kwargs = mock_search.call_args
+        assert kwargs["grade"] == 4.5
+        assert kwargs["certifier"] == "cgc"
+        assert kwargs["label"] == "signature_series"
+
+
 # ============================================================
 # Integration Tests — hit real eBay API
 # ============================================================

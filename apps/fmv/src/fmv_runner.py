@@ -36,6 +36,12 @@ import fmv_math
 
 
 EBAY_SOLD_COMPS_BIN = "ebay-sold-comps"
+# BUI-954: the active-ask ceiling's fetch. A single keyword search (one
+# eBay Browse API call, capped at ~50 results server-side — see
+# ebay_fetch.search_active_asks), so a short fixed timeout is enough; no
+# per-book scaling like EBAY_SOLD_COMPS_BIN's needs.
+EBAY_FETCH_BIN = "ebay-fetch"
+_ACTIVE_ASK_SUBPROCESS_TIMEOUT = 30  # seconds
 
 # BUI-184: ebay-sold-comps subprocess timeout, scaled with batch size. Each book
 # may run up to 3 SerpApi queries at a 15s HTTP timeout, fanned out across a
@@ -555,6 +561,14 @@ def run(*, batch_path: str | None, out_path: str | None,
             )
         except _UpsertRejected as exc:
             skipped_rejected[idx] = str(exc)
+
+    # 3e. BUI-954: the active-ask ceiling. Runs LAST, after every pricing
+    # decision above (rescue, cross-check, and the graded punts just added)
+    # has settled — see `_maybe_attach_active_ask_ceiling`'s docstring for
+    # why that ordering is what keeps a priced row from ever being fetched
+    # for.
+    for row in fresh_fmvs.values():
+        _maybe_attach_active_ask_ceiling(row)
 
     # 4. Stitch cached + fresh + hand-priced-skipped + lookup-error-skipped +
     #    write-rejected-skipped + schema-mismatch-skipped (BUI-930)
@@ -1707,6 +1721,116 @@ def _fetch_comps(books: list[dict], *, force: bool,
                 os.unlink(p)
             except OSError:
                 pass
+
+
+# ─── Active-ask ceiling (BUI-954) ──────────────────────────────────────────
+
+def _fetch_active_asks(title: str, issue: str, grade: float, *,
+                       certifier: str | None,
+                       label: str | None) -> dict | None:
+    """Shell out to `ebay-fetch --active-asks` for the lowest active Buy-It-
+    Now ask matching a refused row's identity, or None on ANY failure.
+
+    Fails SOFT and LOUD-ONCE: a missing binary, a timeout, a non-zero exit,
+    or unparseable output each print one stderr warning and return None —
+    never raise, never sys.exit. This is a display-only extra on a row that
+    is already fully decided (see `_maybe_attach_active_ask_ceiling`), so a
+    failure here must never touch the price or block the run, unlike
+    `_fetch_comps`'s hard-fail-by-default posture on the primary pricing
+    fetch.
+
+    ``certifier``/``label`` are passed only for a CERTIFIED row — `None` for
+    a raw one, which tells `ebay-fetch` to exclude any slab ask (see
+    `ebay_fetch._title_matches_ask_identity`).
+    """
+    if shutil.which(EBAY_FETCH_BIN) is None:
+        click.echo(
+            f"Warning: '{EBAY_FETCH_BIN}' not found on PATH; skipping the "
+            f"active-ask ceiling for {title} #{issue}.",
+            err=True,
+        )
+        return None
+    keyword = f"{title} #{issue}"
+    cmd = [EBAY_FETCH_BIN, "--active-asks", keyword, "--grade", str(grade)]
+    if certifier:
+        cmd += ["--certifier", certifier]
+    if label:
+        cmd += ["--label", label]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=_ACTIVE_ASK_SUBPROCESS_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        click.echo(
+            f"Warning: {EBAY_FETCH_BIN} --active-asks timed out for "
+            f"{title} #{issue}; skipping the active-ask ceiling.",
+            err=True,
+        )
+        return None
+    if result.returncode != 0:
+        click.echo(
+            f"Warning: {EBAY_FETCH_BIN} --active-asks failed for {title} "
+            f"#{issue} (exit {result.returncode}): "
+            f"{(result.stderr or '').strip()}; skipping the active-ask "
+            "ceiling.",
+            err=True,
+        )
+        return None
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        click.echo(
+            f"Warning: {EBAY_FETCH_BIN} --active-asks produced unparseable "
+            f"output for {title} #{issue}; skipping the active-ask "
+            "ceiling.",
+            err=True,
+        )
+        return None
+    low, n = data.get("low"), data.get("n")
+    if not isinstance(n, int) or n <= 0 or not isinstance(low, (int, float)):
+        return None
+    return {"low": float(low), "n": n}
+
+
+def _maybe_attach_active_ask_ceiling(row: dict) -> None:
+    """BUI-954: on a row that is FINAL and refused (flag_reason set, no
+    band), fetch the lowest active Buy-It-Now ask for the same title/issue/
+    grade[/certifier/label] identity and stash it on the row's `fmv` dict as
+    `active_ask_low`/`active_ask_n`.
+
+    Display only, exactly like the BUI-712 ungraded anchor: `_build_notes`,
+    `_provenance`, and `_brief_row` are the only readers — nothing here (or
+    downstream of it) enters a pool, moves a guard, or sets `fmv_low`/
+    `fmv_high`/`max_bid`. The early return below on ``fmv_high is not None``
+    is what keeps that true structurally rather than by convention: a row
+    the CGC-proxy rescue or cross-check goes on to PRICE already carries a
+    band by the time this runs (see the call site in `run()`, placed AFTER
+    both), so it is never fetched for — one search per refused row, never
+    one for a priced row.
+
+    Never mutates a cached/skipped row (those never reach `fresh_fmvs`, the
+    only dict this is ever called over) — a reused row's persisted
+    `fmv_notes` is not rewritten by this (client-side only: no re-upsert
+    follows), so it simply carries none, the same lossy-on-cache-hit
+    trade-off BUI-712's own anchor already makes.
+    """
+    fmv = row.get("fmv")
+    if not fmv or not fmv.get("flag_reason") or fmv.get("fmv_high") is not None:
+        return
+    inp = row.get("input") or {}
+    title = inp.get("title")
+    issue = inp.get("issue")
+    grade = inp.get("grade")
+    if not title or not issue or not isinstance(grade, (int, float)):
+        return
+    graded = bool(fmv.get("graded"))
+    certifier = fmv.get("certifier") if graded else None
+    label = fmv.get("label") if graded else None
+    ask = _fetch_active_asks(str(title), str(issue), float(grade),
+                             certifier=certifier, label=label)
+    if ask is None:
+        return
+    fmv["active_ask_low"] = ask["low"]
+    fmv["active_ask_n"] = ask["n"]
 
 
 def _get_json_or_warn(url: str, *, params: dict, warn: str, default,
@@ -4145,6 +4269,20 @@ def _build_notes(fmv: dict) -> str:
     flag = fmv.get("flag_reason")
     if flag:
         parts.append(f"manual_review={flag}")
+    # BUI-954: the active-ask ceiling — display only, set by
+    # `_maybe_attach_active_ask_ceiling` and read nowhere else. Placed
+    # immediately after `manual_review=` so a reader hits WHY the row is
+    # refused before WHAT the market currently asks for it. The token name
+    # is deliberately "ask_ceiling", not "ask_price"/"market_price": a
+    # Buy-It-Now ask is what a seller WANTS, not what a buyer paid, and the
+    # ticket's own motivating case (seven of eight spike slabs were unsold
+    # BIN asks sitting above sold prices) is exactly the reading this must
+    # not invite — a floor to bid up toward. Only ever set alongside `flag`
+    # (see the early return in `_maybe_attach_active_ask_ceiling`), so
+    # `flag` here is redundant with `ask_n` but kept for defense in depth.
+    ask_n = fmv.get("active_ask_n")
+    if flag and ask_n:
+        parts.append(f"ask_ceiling=${fmv['active_ask_low']:g} (n{ask_n})")
     # BUI-348: state EXPLICITLY that the price is a CGC-proxy band (raw priced
     # off the slab ladder, not off raw comps), naming the slab anchor and the
     # discount so a downstream reader can see how the number was derived. The
@@ -4764,7 +4902,17 @@ def _provenance(r: dict) -> str:
     fmv = r.get("fmv") or {}
     if fmv.get("flag_reason"):
         reason = fmv["flag_reason"]
-        return f"refused {reason}" if fmv.get("graded") else reason
+        cell = f"refused {reason}" if fmv.get("graded") else reason
+        # BUI-954: append the active-ask ceiling when this refused row has
+        # one — worded as a ceiling ("asks from", not "asking") so it can't
+        # be misread as a value to bid up toward (see `_build_notes`'s
+        # `ask_ceiling=` token for the same wording rule, and the ticket's
+        # own motivating case: unsold BIN asks routinely sit above sold
+        # prices).
+        ask_n = fmv.get("active_ask_n")
+        if ask_n:
+            cell += f" — asks from ${fmv['active_ask_low']:g} (n{ask_n})"
+        return cell
     if fmv.get("ledger_advisory"):
         return "ledger-advisory"
     if fmv.get("graded") and fmv.get("fmv_low") is not None:
@@ -4830,6 +4978,11 @@ def _brief_row(r: dict) -> dict:
         not just `fmv`, so it can name the skip states (BUI-143/549/639/930)
         that otherwise leave `fmv` empty exactly like a genuine no-comps book
         — the same distinction `source` above exists to carry.
+      - active_ask_low / active_ask_n (BUI-954) → the lowest active
+        Buy-It-Now ask (and how many) matching a REFUSED row's identity —
+        `fmv.get("active_ask_low"/"active_ask_n")`, null on every other row.
+        Display only, like `fmv_ungraded_anchor`: never a pool input, never
+        a cap.
     """
     fmv = r.get("fmv") or {}
     db_row = r.get("db_row") or {}
@@ -4867,6 +5020,12 @@ def _brief_row(r: dict) -> dict:
         # BUI-949: additive — every key above is unchanged, so an existing
         # `--brief` consumer that ignores unknown keys sees no drift.
         "provenance": _provenance(r),
+        # BUI-954: the active-ask ceiling — null on every row without one
+        # (priced, cached, or a fetch that errored/found nothing; see
+        # `_maybe_attach_active_ask_ceiling`). Display only: never read back
+        # as a price, only shown alongside one.
+        "active_ask_low": fmv.get("active_ask_low"),
+        "active_ask_n": fmv.get("active_ask_n"),
     }
 
 
