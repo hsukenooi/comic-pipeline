@@ -2226,6 +2226,15 @@ def upsert_comic(
       duplicate alongside the yearless placeholder. Exception: if a yeared row
       at a *different* year already exists, promotion is skipped (warning logged,
       yearless row returned unchanged) to prevent two yeared siblings (PER-104).
+    - Yeared insert finds neither a same-year row nor a yearless placeholder
+      → inserts fresh. BUI-964: if a yeared row at a *different* year already
+      exists for the same (title, issue, variant), the insert still proceeds
+      (this key cannot tell a duplicate apart from a genuine different
+      volume/reboot — see the guard's comment), but the conflict is logged to
+      `rejected_writes` (warning also logged) for manual review. Unlike the
+      PER-104 promotion guard, this one is silent-but-logged rather than
+      surfaced through `skip_reason` — the write is never declined, so there
+      is nothing for a caller to distinguish via that out-param.
     - Yearless insert finds an existing yeared row for the same (title, issue)
       → prefers the yeared one (returns its id without creating a yearless
       duplicate). Locg metadata still gets merged in.
@@ -2326,11 +2335,72 @@ def upsert_comic(
             conn.commit()
             return existing_yearless["id"]
         # No existing row — insert fresh.
+        #
+        # Guard (BUI-964): a fresh yeared INSERT can still land beside an
+        # existing yeared sibling at a *different* year for the same
+        # (title, issue, variant) — the branch the PER-104 guard above never
+        # covered (that one only fires when a yearless row exists to promote;
+        # this is the "neither SELECT above matched" case). This is exactly
+        # how the 2026-06-10 batch (BUI-915) planted 5 duplicate identities:
+        # a wrong-year row — often the series *start* year rather than the
+        # issue year — inserted right beside the pre-existing correct one,
+        # and nothing surfaced it.
+        #
+        # UNLIKE the promotion guard, this one must NOT refuse the write.
+        # `title` here is a bare series name — BUI-591/599's
+        # `_normalize_comic_title` strips a duplicated issue number and
+        # listing junk, but never encodes a volume or start year — so
+        # (title, issue, variant) alone cannot distinguish a genuine
+        # duplicate from a genuine *different* volume/reboot sharing the same
+        # title and issue number. PER-104's own writeup names that exact
+        # case as legitimate ("a deliberate reboot listing on a series
+        # that's already been year-tagged"). Refusing here would risk
+        # silently discarding — or worse, misfiling onto the wrong sibling —
+        # a genuinely distinct comic's data, which is worse than the
+        # duplicate-row bug this guard exists to catch. So the insert
+        # proceeds unchanged, and the conflict is recorded to the
+        # `rejected_writes` ledger (BUI-601) for a human to review — the
+        # observability BUI-915's incident needed and didn't have.
+        conflicting_siblings = conn.execute(
+            "SELECT id, year FROM comics "
+            f"WHERE LOWER(title)=LOWER(?) AND issue=? AND year IS NOT NULL AND year!=? AND {v_sql}",
+            (title, issue, year, *v_param),
+        ).fetchall()
         cur = conn.execute(
             "INSERT INTO comics (title, issue, year, variant, locg_id, locg_variant_id) "
             "VALUES (?, ?, ?, ?, ?, ?)",
             (title, issue, year, variant, locg_id, locg_variant_id),
         )
+        new_id = cur.lastrowid
+        if conflicting_siblings:
+            sibling_pairs = [(row["id"], row["year"]) for row in conflicting_siblings]
+            logger.warning(
+                "upsert_comic: fresh yeared insert id=%s year=%r beside yeared "
+                "sibling(s) %r (title=%r issue=%r variant=%r) — logged to "
+                "rejected_writes for review; write NOT refused (could be a "
+                "genuine different volume/reboot)",
+                new_id,
+                year,
+                sibling_pairs,
+                title,
+                issue,
+                variant,
+            )
+            record_rejected_write(
+                conn,
+                method="INTERNAL",
+                path="/internal/upsert_comic",
+                status=409,
+                detail=(
+                    "yeared_sibling_conflict (BUI-964): fresh yeared INSERT "
+                    f"id={new_id} year={year!r} created beside existing yeared "
+                    f"sibling(s) {sibling_pairs!r} for the same "
+                    f"(title={title!r}, issue={issue!r}, variant={variant!r}). "
+                    "Not refused — (title, issue, variant) cannot tell a "
+                    "duplicate identity apart from a genuine different "
+                    "volume/reboot. Review manually."
+                ),
+            )
         conn.commit()
         return cur.lastrowid  # type: ignore[return-value]  # INSERT always yields int lastrowid
 
