@@ -98,6 +98,12 @@ The pipeline runs several deterministic gates to avoid surfacing the wrong volum
 - **Item-specifics era filter** — for bare titles with no era signal, the Publication Year aspect is fetched and checked against the wish series' year range (see `--no-item-specifics` above).
 - **Era hint to Haiku** — the verify prompt includes the wish series' decorated name (e.g. "The Amazing Spider-Man (1963 - 1998)") as a "Correct series:" line, so Haiku can reject vol/relaunch mismatches that the deterministic gates missed.
 
+## Condition-defect gate (BUI-919/BUI-968)
+
+The pipeline's last gate — run on the final post-verify survivors, after the ≥2-per-seller gate above has already shrunk the set — is Hsu Ken's standing buy rule (2026-09-16): never carry a comic to purchase whose seller-disclosed condition text names **moisture damage**, **rust**, or a **loose/detached staple**, at any price or stated grade. `/comic:buy` Step 1.5 already enforces this on the identify table; BUI-968 extends the same rule here via the same shared helper `/comic:seller-scan` uses — see `seller-scan.md § Condition-defect gate` for the full rationale (one extra eBay call per survivor, disk-cached 7 days; drops are printed and never marked seen; a drop is a completed verdict so it never affects `incomplete`/exit code).
+
+A seller can fall back below the ≥2 threshold here if one of its two matches is dropped — the ≥2 gate is re-applied one more time after this step, same as it is after the item-specifics era gate above.
+
 ## Only new finds by default
 
 The script shares the **global seen set** (`/api/comics/seller-scan/seen`, keyed by `item_id`) with `/comic:seller-scan`. A listing that was surfaced by either tool — regardless of which seller it was grouped under — is recorded as seen and will not re-appear in future runs.
@@ -136,11 +142,13 @@ For programmatic use, `--json` emits a single top-level **object** (never a bare
 {
   "incomplete": false,
   "sellers": [{"seller": "a4k92xbp7...", "matches": [{"wish_name": "...", "title": "...", "price": "...", "listing_url": "..."}]}],
-  "dropped_candidates": []
+  "dropped_candidates": [],
+  "defect_dropped": []
 }
 ```
 
 - `incomplete` is `true` exactly when the run was **partial** — one or more candidates were never verified (claude CLI timeout / transport failure). Those listings appear in `dropped_candidates` (each carries its own `seller` key). They are deliberately **not** recorded as seen and **not** cached, so they resurface on the next run.
+- `defect_dropped` (BUI-968, see § Condition-defect gate above) is a separate, FLAT list of `{item_id, title, wish_name, seller, condition_defects, reason}` — a completed rule verdict, not a failed verification, so it never sets `incomplete` or changes the exit code.
 - The process **exit code** signals the same thing without parsing stdout:
 
 | Exit | Meaning |

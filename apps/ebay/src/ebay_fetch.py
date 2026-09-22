@@ -1566,6 +1566,96 @@ def get_item_aspects(legacy_item_id: str, token: str, base_url: str, *, retries:
     return aspects
 
 
+# Per-item disk cache for the raw `conditionDescription` text (BUI-968: the
+# condition-defect gate, extended from /comic:buy Step 1.5 to seller-scan and
+# wishlist-sellers). Same endpoint and cache shape as the aspects cache above,
+# but a SEPARATE namespace and a SEPARATE cache semantic: this caches the
+# seller's raw words, not a computed verdict, so a later condition_defects.py
+# pattern fix reclassifies a cached item immediately on its next call instead
+# of waiting out the 7-day TTL. The cached payload is `{"condition_description":
+# <str-or-None>}` rather than a bare value — unlike the aspects cache (which
+# only ever caches a successful non-empty result), a listing with NO seller
+# note is a common, legitimate, cacheable outcome here (most listings carry no
+# conditionDescription at all), and a bare `None` on disk would be
+# indistinguishable from "no cache file" to _condition_cache_get() below.
+_CONDITION_CACHE_DIR: Path = Path.home() / ".cache" / "ebay-fetch" / "condition"
+_CONDITION_CACHE_TTL_SEC: int = 7 * 24 * 3600  # 7 days
+
+
+def _condition_cache_path(item_id: str) -> Path:
+    """Return the path where a condition description would be cached."""
+    return _CONDITION_CACHE_DIR / f"{item_id}.json"
+
+
+def _condition_cache_get(item_id: str) -> "dict | None":
+    """Return the cached `{"condition_description": ...}` payload if present
+    and fresh, else None (cache miss — never fetched, or expired/corrupt)."""
+    path = _condition_cache_path(item_id)
+    if not path.exists():
+        return None
+    age = time.time() - path.stat().st_mtime
+    if age > _CONDITION_CACHE_TTL_SEC:
+        return None
+    try:
+        data = json.loads(path.read_text())
+        return data if isinstance(data, dict) else None
+    except Exception:  # noqa: BLE001 — corrupt/partial file → cache miss
+        return None
+
+
+def _condition_cache_put(item_id: str, payload: dict) -> None:
+    """Write `{"condition_description": ...}` to the item-level disk cache
+    (atomic tmp→rename via the shared atomic_write_json(), BUI-323)."""
+    atomic_write_json(_condition_cache_path(item_id), payload)
+
+
+def get_condition_description(legacy_item_id: str, token: str, base_url: str, *, retries: int = 3) -> "str | None":
+    """Fetch one item's raw `conditionDescription` text (BUI-968).
+
+    Same `get_item_by_legacy_id` call as get_item_aspects() above, but reads a
+    different field. Disk-cached 7 days, keyed by item_id, in a namespace
+    separate from the aspects cache (see the comment above _CONDITION_CACHE_DIR).
+
+    Fail-open: returns None on any HTTP/network/parse error, AND when the
+    seller simply wrote no condition note at all (the common case). A caller
+    cannot and must not treat None as "verified clean" — see
+    condition_defects.py's own warning that a blank Defects cell is not a
+    clean bill of health, only "nothing to read".
+    """
+    cached = _condition_cache_get(legacy_item_id)
+    if cached is not None:
+        return cached.get("condition_description")
+
+    url = f"{base_url}/buy/browse/v1/item/get_item_by_legacy_id"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-EBAY-C-MARKETPLACE-ID": "EBAY_US",
+    }
+    params = {"legacy_item_id": legacy_item_id}
+
+    try:
+        resp = retry_request(
+            lambda: requests.get(url, headers=headers, params=params, timeout=10),
+            retries=retries,
+            is_retryable_status=lambda code: code == 429,
+            retry_network_errors=False,
+        )
+    except (requests.exceptions.RequestException, RetryExhausted):
+        return None  # network error or retry-exhausted → fail-open
+
+    if resp.status_code != 200:
+        return None  # non-retryable status → fail-open
+
+    try:
+        data = resp.json()
+    except (ValueError, AttributeError):
+        return None
+
+    condition_description = data.get("conditionDescription")
+    _condition_cache_put(legacy_item_id, {"condition_description": condition_description})
+    return condition_description
+
+
 def truncate(text, width):
     """Truncate text to width with ellipsis."""
     if not text:

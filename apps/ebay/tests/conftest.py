@@ -62,6 +62,23 @@ def _no_printing_guard_credentials(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _no_condition_defect_network_calls(monkeypatch):
+    """BUI-968: pin apply_condition_defect_gate()'s per-candidate getItem
+    fetch to a no-op ("no seller note") for every test, same reasoning as
+    `_no_printing_guard_credentials` above (BUI-929) — without this, ANY
+    seller_scan/wishlist_sellers test whose stubbed verify_with_claude
+    returns a non-empty matches/survivors list would have
+    apply_condition_defect_gate() make a REAL HTTP call to eBay's Browse API
+    get_item_by_legacy_id endpoint (fail-open on the resulting 401/timeout,
+    so it wouldn't fail the test outright, but it's a real external network
+    dependency and a real API call neither test intends to make). Tests that
+    exercise the gate itself re-patch seller_scan.get_condition_description
+    after this fixture runs.
+    """
+    monkeypatch.setattr(seller_scan, "get_condition_description", lambda *a, **k: None)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_raw_response_capture(monkeypatch, tmp_path):
     """BUI-614: redirect the raw-response capture file to a per-test tmp path.
 

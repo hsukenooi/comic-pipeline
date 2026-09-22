@@ -2518,6 +2518,197 @@ class TestVerifyWithClaudeNoSilentDrop:
         assert "Annual, not the regular series" in err
 
 
+# ─── BUI-968: condition-defect gate ────────────────────────────────────────────
+
+
+class TestApplyConditionDefectGate:
+    """apply_condition_defect_gate() — the shared drop helper BUI-968 gives
+    seller_scan.py and wishlist_sellers.py, extending BUI-919's standing
+    moisture/rust/loose-staple rule from /comic:buy Step 1.5 to both scan
+    tools."""
+
+    def _match(self, item_id="1", title="Amazing Spider-Man #300 NM",
+               wish_name="Amazing Spider-Man #300"):
+        return {"item_id": item_id, "title": title, "wish_name": wish_name}
+
+    def test_rust_in_condition_description_drops_the_match(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            seller_scan, "get_condition_description",
+            lambda item_id, token, base_url: "VG condition, rusty staple",
+        )
+        clean, dropped = seller_scan.apply_condition_defect_gate(
+            [self._match()], "tok", "http://x",
+        )
+        assert clean == []
+        assert len(dropped) == 1
+        assert dropped[0]["item_id"] == "1"
+        assert dropped[0]["condition_defects"][0]["code"] == "rust"
+        assert dropped[0]["reason"] == 'rust: "rusty staple"'
+        err = capsys.readouterr().err
+        assert "Dropped 1 listing(s) on the condition-defect rule (BUI-919):" in err
+        assert "Amazing Spider-Man #300 NM" in err
+        assert "rusty staple" in err
+
+    def test_moisture_damage_drops(self, monkeypatch):
+        monkeypatch.setattr(
+            seller_scan, "get_condition_description",
+            lambda item_id, token, base_url: "some water damage to back cover",
+        )
+        clean, dropped = seller_scan.apply_condition_defect_gate(
+            [self._match()], "tok", "http://x",
+        )
+        assert clean == []
+        assert dropped[0]["condition_defects"][0]["code"] == "moisture"
+
+    def test_loose_staple_drops(self, monkeypatch):
+        monkeypatch.setattr(
+            seller_scan, "get_condition_description",
+            lambda item_id, token, base_url: "cover detached both staples",
+        )
+        clean, dropped = seller_scan.apply_condition_defect_gate(
+            [self._match()], "tok", "http://x",
+        )
+        assert clean == []
+        assert dropped[0]["condition_defects"][0]["code"] == "loose_staple"
+
+    def test_plain_staining_does_not_drop(self, monkeypatch):
+        """Out of scope by design (condition_defects.py) — mirrors Step 1.5."""
+        monkeypatch.setattr(
+            seller_scan, "get_condition_description",
+            lambda item_id, token, base_url: "some staining on back cover",
+        )
+        clean, dropped = seller_scan.apply_condition_defect_gate(
+            [self._match()], "tok", "http://x",
+        )
+        assert clean == [self._match()]
+        assert dropped == []
+
+    def test_no_condition_description_keeps_the_match(self, monkeypatch):
+        """The common case — no seller note at all — is NOT a drop, and the
+        title alone (no defect words here) is also clean."""
+        monkeypatch.setattr(
+            seller_scan, "get_condition_description",
+            lambda item_id, token, base_url: None,
+        )
+        clean, dropped = seller_scan.apply_condition_defect_gate(
+            [self._match()], "tok", "http://x",
+        )
+        assert clean == [self._match()]
+        assert dropped == []
+
+    def test_defect_named_only_in_title_still_drops(self, monkeypatch):
+        """A fetch failure/absent note doesn't blind the gate to a defect the
+        seller named directly in the title."""
+        monkeypatch.setattr(
+            seller_scan, "get_condition_description",
+            lambda item_id, token, base_url: None,
+        )
+        clean, dropped = seller_scan.apply_condition_defect_gate(
+            [self._match(title="Amazing Spider-Man #300 rusty staple")],
+            "tok", "http://x",
+        )
+        assert clean == []
+        assert dropped[0]["condition_defects"][0]["source"] == "title"
+
+    def test_mixed_batch_only_drops_the_defective_one(self, monkeypatch):
+        by_item = {
+            "1": "VG condition, rusty staple",
+            "2": None,
+        }
+        monkeypatch.setattr(
+            seller_scan, "get_condition_description",
+            lambda item_id, token, base_url: by_item.get(item_id),
+        )
+        clean, dropped = seller_scan.apply_condition_defect_gate(
+            [self._match(item_id="1"), self._match(item_id="2", wish_name="Other")],
+            "tok", "http://x",
+        )
+        assert [m["item_id"] for m in clean] == ["2"]
+        assert [d["item_id"] for d in dropped] == ["1"]
+
+    def test_no_drops_prints_nothing(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            seller_scan, "get_condition_description",
+            lambda item_id, token, base_url: None,
+        )
+        seller_scan.apply_condition_defect_gate([self._match()], "tok", "http://x")
+        assert capsys.readouterr().err == ""
+
+    def test_empty_matches_returns_empty(self, monkeypatch):
+        called = []
+        monkeypatch.setattr(
+            seller_scan, "get_condition_description",
+            lambda *a, **k: called.append(1),
+        )
+        clean, dropped = seller_scan.apply_condition_defect_gate([], "tok", "http://x")
+        assert clean == []
+        assert dropped == []
+        assert called == []  # no getItem call for an empty input
+
+
+class TestScanOneSellerConditionDefectGate:
+    """apply_condition_defect_gate() wired into _scan_one_seller_impl (BUI-968):
+    a verified match naming a defect never reaches the seller's `matches`,
+    is reported in `defect_dropped`, and is never marked seen."""
+
+    def _wire(self, monkeypatch, *, title, condition_description):
+        monkeypatch.setattr(
+            seller_scan, "search_seller_listings",
+            lambda username, token, base_url, max_results=1000: [
+                {"item_id": "X1", "title": title},
+            ],
+        )
+        monkeypatch.setattr(seller_scan, "parse_item_summary", lambda raw: dict(raw))
+        monkeypatch.setattr(seller_scan, "fetch_seen_item_ids", lambda seller: set())
+        monkeypatch.setattr(
+            seller_scan, "verify_with_claude",
+            lambda cands, **kwargs: (list(cands), [], []),
+        )
+        recorded = {}
+        monkeypatch.setattr(
+            seller_scan, "record_items_seen",
+            lambda ids, seller: recorded.setdefault(seller, []).extend(ids),
+        )
+        monkeypatch.setattr(
+            seller_scan, "get_condition_description",
+            lambda item_id, token, base_url: condition_description,
+        )
+        return recorded
+
+    def _wish(self):
+        return [{
+            "id": 1, "name": "Ultimate Fallout #4",
+            "series": "Ultimate Fallout", "issue": "4",
+            "_tokens": ["ultimate", "fallout"],
+            "_series_name": None, "_release_year": None,
+        }]
+
+    def test_defective_match_dropped_from_result_and_never_seen(self, monkeypatch, capsys):
+        recorded = self._wire(
+            monkeypatch, title="Ultimate Fallout #4",
+            condition_description="VG condition, rusty staple",
+        )
+        result = seller_scan._scan_one_seller(
+            "seller1", "seller1", "tok", "http://x", self._wish(), 1000, False,
+        )
+        assert result["matches"] == []
+        assert len(result["defect_dropped"]) == 1
+        assert result["defect_dropped"][0]["item_id"] == "X1"
+        assert result["incomplete"] is False  # completed verdict, not a failure
+        assert "seller1" not in recorded  # never marked seen
+
+    def test_clean_match_unaffected(self, monkeypatch):
+        recorded = self._wire(
+            monkeypatch, title="Ultimate Fallout #4", condition_description=None,
+        )
+        result = seller_scan._scan_one_seller(
+            "seller1", "seller1", "tok", "http://x", self._wish(), 1000, False,
+        )
+        assert len(result["matches"]) == 1
+        assert result["defect_dropped"] == []
+        assert recorded["seller1"] == ["X1"]
+
+
 # ─── BUI-297: bisection retry + dropped (never-verified) candidates ──────────
 
 
