@@ -1361,7 +1361,7 @@ def _title_matches_ask_identity(title: str, *, grade: float,
 
 
 def search_active_asks(keyword, token, base_url, *, grade, certifier=None,
-                       label=None, max_results=50):
+                       label=None, max_results=200):
     """Search active (Buy It Now) listings and return the lowest ask + count
     for the same title/issue/grade[/certifier/label] identity (BUI-954).
 
@@ -1826,8 +1826,8 @@ def main(argv=None):
     parser.add_argument(
         "--max-results",
         type=int,
-        default=50,
-        help="Max active listings to fetch for --active-asks (default 50).",
+        default=200,
+        help="Max active listings to fetch for --active-asks (default 200: one Browse page; a lower cap truncates the page before the graded listings, which sit anywhere in best-match order).",
     )
 
     args = parser.parse_args(argv)
