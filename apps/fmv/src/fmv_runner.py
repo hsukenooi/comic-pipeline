@@ -1819,8 +1819,12 @@ def _maybe_attach_active_ask_ceiling(row: dict) -> None:
     inp = row.get("input") or {}
     title = inp.get("title")
     issue = inp.get("issue")
-    grade = inp.get("grade")
-    if not title or not issue or not isinstance(grade, (int, float)):
+    # Batch input carries `grade` as a STRING ("5.5", "VG 4.0") on every
+    # /comic:buy row; an isinstance(int|float) gate here silently skipped
+    # every raw refused row in the first live probe (2026-09-22). Coerce
+    # the same way the pricing path does.
+    grade = _coerce_grade(inp.get("grade"))
+    if not title or not issue or grade is None:
         return
     graded = bool(fmv.get("graded"))
     certifier = fmv.get("certifier") if graded else None

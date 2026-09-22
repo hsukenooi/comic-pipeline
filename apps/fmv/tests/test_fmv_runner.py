@@ -81,6 +81,23 @@ _REAL_GRADED_AS_OF = fmv_runner._graded_as_of
 
 
 @pytest.fixture(autouse=True)
+def _stub_active_ask_fetch(request, monkeypatch):
+    """BUI-954: `_maybe_attach_active_ask_ceiling` runs a real `ebay-fetch`
+    subprocess for every refused row a test drives through `run()`. Stub it
+    to "no asks" suite-wide so no test reaches eBay; a test that wants a
+    ceiling patches `fmv_runner._fetch_active_asks` explicitly (the inner
+    patch wins). Found the day the string-grade gate was fixed: the old gate
+    had been silently skipping every refused harness row, so the suite had
+    never actually exercised this call. `TestActiveAskCeiling` unit-tests
+    the helper itself (binary missing, timeout, bad JSON) and needs the real
+    function, so it is the one class left unstubbed."""
+    if request.cls is not None and request.cls.__name__ == "TestActiveAskCeiling":
+        return
+    monkeypatch.setattr(fmv_runner, "_fetch_active_asks",
+                        lambda *a, **k: None)
+
+
+@pytest.fixture(autouse=True)
 def _pin_graded_as_of(monkeypatch):
     """BUI-948: freeze the graded path's calendar reference.
 
@@ -7653,6 +7670,25 @@ class TestActiveAskCeiling:
         assert row["fmv"]["fmv_low"] is None
         assert row["fmv"]["fmv_high"] is None
         assert row["fmv"]["max_bid"] is None
+
+    def test_a_string_grade_on_a_refused_raw_row_still_fetches(self):
+        """Batch input carries `grade` as a string ("5.5", "VG 4.0"); the
+        gate must coerce it, not skip the row (live probe, 2026-09-22)."""
+        row = self._refused_raw_row()
+        row["input"]["grade"] = "8.0"
+        with patch("fmv_runner._fetch_active_asks",
+                   return_value={"low": 650.0, "n": 3}) as mock_fetch:
+            fmv_runner._maybe_attach_active_ask_ceiling(row)
+        mock_fetch.assert_called_once_with("X", "1", 8.0, certifier=None,
+                                           label=None)
+        assert row["fmv"]["active_ask_n"] == 3
+
+    def test_an_unreadable_grade_skips_the_fetch(self):
+        row = self._refused_raw_row()
+        row["input"]["grade"] = "mystery"
+        with patch("fmv_runner._fetch_active_asks") as mock_fetch:
+            fmv_runner._maybe_attach_active_ask_ceiling(row)
+        mock_fetch.assert_not_called()
 
     def test_fetches_with_certifier_and_label_on_a_refused_certified_row(self):
         row = self._refused_certified_row()
