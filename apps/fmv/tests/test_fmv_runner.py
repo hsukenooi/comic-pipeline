@@ -7909,9 +7909,11 @@ class TestActiveAskCeiling:
         assert result is None
         assert "unparseable" in capsys.readouterr().err
 
-    def test_fetch_active_asks_returns_none_when_n_is_zero(self):
+    def test_fetch_active_asks_returns_none_when_n_is_zero(self, capsys):
         """`n == 0` means the search ran fine and found nothing to show —
-        not a failure, but nothing to attach either."""
+        not a failure, but nothing to attach either. It must stay SILENT
+        (BUI-971): warning on every ask-less book would drown the one line
+        that means an outage."""
         fake = MagicMock(returncode=0, stdout=json.dumps({"low": None, "n": 0}),
                          stderr="")
         with patch("fmv_runner.shutil.which", return_value="/usr/bin/ebay-fetch"), \
@@ -7919,6 +7921,71 @@ class TestActiveAskCeiling:
             result = fmv_runner._fetch_active_asks(
                 "X", "1", 8.0, certifier=None, label=None)
         assert result is None
+        assert capsys.readouterr().err == ""
+
+    # ── errored search vs genuine zero (BUI-971) ────────────────────────
+
+    def test_fetch_active_asks_warns_on_a_browse_search_error(self, capsys):
+        """`ebay-fetch --active-asks` exits 0 with an `error` key when the
+        Browse search itself fails. That must warn and return None, exactly
+        like a timeout or bad JSON — never pass silently."""
+        payload = {"low": None, "n": None,
+                   "error": "Error searching by keyword: HTTP 401: "
+                            "Invalid access token"}
+        fake = MagicMock(returncode=0, stdout=json.dumps(payload), stderr="")
+        with patch("fmv_runner.shutil.which", return_value="/usr/bin/ebay-fetch"), \
+             patch("fmv_runner.subprocess.run", return_value=fake):
+            result = fmv_runner._fetch_active_asks(
+                "X", "1", 8.0, certifier=None, label=None)
+        assert result is None
+        err = capsys.readouterr().err
+        assert "search failed" in err
+        assert "HTTP 401" in err
+        assert "X #1" in err
+
+    def test_fetch_active_asks_warns_even_if_the_error_payload_says_n_zero(
+            self, capsys):
+        """Defense in depth: the `error` key is checked BEFORE the n/low
+        guard, so an outage cannot slip through the silent zero path even if
+        some future producer emits `n: 0` alongside the error."""
+        payload = {"low": None, "n": 0, "error": "Network error searching "
+                                                 "by keyword: timed out"}
+        fake = MagicMock(returncode=0, stdout=json.dumps(payload), stderr="")
+        with patch("fmv_runner.shutil.which", return_value="/usr/bin/ebay-fetch"), \
+             patch("fmv_runner.subprocess.run", return_value=fake):
+            result = fmv_runner._fetch_active_asks(
+                "X", "1", 8.0, certifier=None, label=None)
+        assert result is None
+        assert "search failed" in capsys.readouterr().err
+
+    def test_fetch_active_asks_warns_on_a_non_dict_payload(self, capsys):
+        """A bare list/string is as unusable as unparseable text — and
+        reaching `.get` on it would raise out of a fail-soft helper."""
+        fake = MagicMock(returncode=0, stdout=json.dumps([1, 2]), stderr="")
+        with patch("fmv_runner.shutil.which", return_value="/usr/bin/ebay-fetch"), \
+             patch("fmv_runner.subprocess.run", return_value=fake):
+            result = fmv_runner._fetch_active_asks(
+                "X", "1", 8.0, certifier=None, label=None)
+        assert result is None
+        assert "unparseable" in capsys.readouterr().err
+
+    def test_a_browse_error_warns_on_the_refused_row_and_attaches_nothing(
+            self, capsys):
+        """The ticket's Done-when, at the row level: a Browse HTTP error
+        surfaces as a warning on the refused row, and never as an `n: 0`
+        ceiling silently missing."""
+        row = self._refused_raw_row()
+        before = json.loads(json.dumps(row))
+        payload = {"low": None, "n": None,
+                   "error": "Error searching by keyword: HTTP 500: boom"}
+        fake = MagicMock(returncode=0, stdout=json.dumps(payload), stderr="")
+        with patch("fmv_runner.shutil.which", return_value="/usr/bin/ebay-fetch"), \
+             patch("fmv_runner.subprocess.run", return_value=fake):
+            fmv_runner._maybe_attach_active_ask_ceiling(row)
+        assert row == before
+        assert "active_ask_low" not in row["fmv"]
+        assert "active_ask_n" not in row["fmv"]
+        assert "search failed" in capsys.readouterr().err
 
     def test_fetch_active_asks_returns_the_parsed_result_on_success(self):
         fake = MagicMock(returncode=0,
