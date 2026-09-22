@@ -7,6 +7,7 @@ import pytest
 
 from gixen_overlay.db import (
     create_tables,
+    rejected_writes_report,
     upsert_comic,
     upsert_fmv,
     sweep_orphan_yearless_comics,
@@ -263,6 +264,88 @@ def test_upsert_yeared_with_conflicting_sibling_skips_promotion():
         "SELECT count(*) FROM comics WHERE title='X' AND issue='1'"
     ).fetchone()[0]
     assert count == 2
+
+
+def test_upsert_fresh_yeared_insert_beside_sibling_logs_rejected_write():
+    """BUI-964: a fresh yeared INSERT beside an existing yeared sibling at a
+    *different* year is the gap PER-104's guard left open (that one only
+    covers yearless-PROMOTION). The insert must still proceed — the
+    (title, issue, variant) key can't tell a genuine duplicate apart from a
+    genuine different volume/reboot — but the conflict must land in
+    `rejected_writes` for a human to review. This is the exact shape of the
+    2026-06-10 batch (BUI-915) that planted 5 duplicate identities."""
+    conn = _fresh_db()
+    correct_id = upsert_comic(conn, title="Thor", issue="137", year=1967)
+
+    new_id = upsert_comic(conn, title="Thor", issue="137", year=1966)
+
+    # Both rows exist — the write was not refused, nor did it clobber/merge
+    # the existing sibling.
+    assert new_id != correct_id
+    rows = conn.execute(
+        "SELECT id, year FROM comics WHERE title='Thor' AND issue='137' ORDER BY year"
+    ).fetchall()
+    assert [(r["id"], r["year"]) for r in rows] == [
+        (new_id, 1966),
+        (correct_id, 1967),
+    ]
+
+    # The conflict is visible in the rejected-writes ledger.
+    report = rejected_writes_report(conn)
+    assert report["count"] == 1
+    (rejection,) = report["rejections"]
+    assert rejection["method"] == "INTERNAL"
+    assert "yeared_sibling_conflict" in rejection["detail"]
+    assert "Thor" in rejection["detail"]
+    assert str(correct_id) in rejection["detail"]
+    assert str(new_id) in rejection["detail"]
+
+
+def test_upsert_fresh_yeared_insert_same_year_no_rejection():
+    """Same-year re-insert resolves onto the existing row (existing_yeared
+    branch, above the new guard) — no duplicate row, no ledger entry."""
+    conn = _fresh_db()
+    a = upsert_comic(conn, title="X", issue="1", year=1987)
+    b = upsert_comic(conn, title="X", issue="1", year=1987)
+    assert a == b
+    count = conn.execute(
+        "SELECT count(*) FROM comics WHERE title='X' AND issue='1'"
+    ).fetchone()[0]
+    assert count == 1
+    assert rejected_writes_report(conn)["count"] == 0
+
+
+def test_upsert_yearless_insert_beside_yeared_sibling_unaffected_by_new_guard():
+    """A yearless insert beside an existing yeared row is a different branch
+    entirely (BUI-964 only touches the fresh-yeared-INSERT branch) — behavior
+    is unchanged: resolves onto the yeared row, no ledger entry."""
+    conn = _fresh_db()
+    yeared_id = upsert_comic(conn, title="X", issue="1", year=1987)
+    result = upsert_comic(conn, title="X", issue="1")
+    assert result == yeared_id
+    count = conn.execute(
+        "SELECT count(*) FROM comics WHERE title='X' AND issue='1'"
+    ).fetchone()[0]
+    assert count == 1
+    assert rejected_writes_report(conn)["count"] == 0
+
+
+def test_upsert_fresh_yeared_insert_beside_sibling_idempotent_on_rerun():
+    """Re-running the exact same conflicting insert must not create a second
+    duplicate row or a second ledger entry — the second call lands on the
+    now-existing exact-year row (existing_yeared branch) before the new
+    guard's query ever runs."""
+    conn = _fresh_db()
+    correct_id = upsert_comic(conn, title="Thor", issue="137", year=1967)
+    first_id = upsert_comic(conn, title="Thor", issue="137", year=1966)
+    second_id = upsert_comic(conn, title="Thor", issue="137", year=1966)
+
+    assert first_id == second_id
+    count = conn.execute(
+        "SELECT count(*) FROM comics WHERE title='Thor' AND issue='137'"
+    ).fetchone()[0]
+    assert count == 2  # correct_id (1967) + first_id/second_id (1966), no third
+    assert rejected_writes_report(conn)["count"] == 1
 
 
 def test_yearless_insert_with_multiple_yeared_prefers_locg():
