@@ -27,6 +27,7 @@ throughout (never hit the real network), matching test_fmv_runner.py's
 established convention for this module.
 """
 
+import itertools
 import json
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
@@ -63,7 +64,16 @@ def _no_identity_rows_by_default(monkeypatch):
 _STAMPED_OBSERVED_AT = 1785587400.0  # 2026-08-01T12:30:00+00:00
 
 
-def _make_comp(price, grade, product_id="x", provider="serpapi", tier="base",
+# BUI-956: a per-call counter, not a shared literal ("x") — `_compute_and_
+# upsert_one` now runs `comps + first_party` through
+# `_dedupe_pool_by_identity`, which treats two comps sharing a `product_id`
+# as the SAME sale regardless of any other field. A shared default would
+# silently collapse every multi-comp pool built via `[_make_comp(p, g) for p
+# in prices]` below to one comp before it ever reached `_post_comps`.
+_next_comp_id = itertools.count()
+
+
+def _make_comp(price, grade, product_id=None, provider="serpapi", tier="base",
                query="q", from_cache=False,
                observed_at=_STAMPED_OBSERVED_AT, title=None,
                sold_date="2026-07-01", buying_format="Auction",
@@ -71,6 +81,8 @@ def _make_comp(price, grade, product_id="x", provider="serpapi", tier="base",
     """A comp in the exact shape `parse_comp`/`parse_comp_sold_comps` +
     BUI-657's provenance stamping produce — everything `_comp_to_ledger_item`
     reads."""
+    if product_id is None:
+        product_id = f"comp{next(_next_comp_id)}"
     return {
         "product_id": product_id,
         "title": title or f"comic {price}",

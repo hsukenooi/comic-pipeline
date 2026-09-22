@@ -298,15 +298,23 @@ class TestPoolDepthFloor:
 
     def test_three_comps_is_enough(self, server_url):
         """The floor is a floor, not a wall — pin the boundary from both
-        sides so a silent off-by-one can't pass."""
+        sides so a silent off-by-one can't pass.
+
+        BUI-956: same sold_date on all three, so every comp carries the
+        recency weight 1.0 (each is "the newest" relative to itself) and
+        effective_n lands EXACTLY on the floor — a same-dated pool is the
+        one shape where raw count and effective n agree, so this pins the
+        boundary without the fixture's own aging incidentally deciding the
+        answer (see `TestEffectiveNFloor` below for a pool where it does)."""
         pool = [
-            _ledger_row(1, price=45.0, grade=8.0, sold_date="2026-06-15"),
-            _ledger_row(2, price=50.0, grade=8.0, sold_date="2026-06-29"),
+            _ledger_row(1, price=45.0, grade=8.0, sold_date="2026-07-06"),
+            _ledger_row(2, price=50.0, grade=8.0, sold_date="2026-07-06"),
             _ledger_row(3, price=55.0, grade=8.0, sold_date="2026-07-06"),
         ]
         out, _ = _price_with_ledger(pool, server_url=server_url)
         assert out["source"] == "ledger-advisory"
         assert out["fmv"]["n"] >= fmv_runner.LEDGER_ADVISORY_MIN_POOL
+        assert out["fmv"]["effective_n"] >= fmv_runner.LEDGER_ADVISORY_MIN_POOL
 
     def test_a_cross_provider_duplicate_row_collapses_to_one_comp(
             self, server_url):
@@ -352,6 +360,52 @@ class TestPoolDepthFloor:
         ]
         out, _ = _price_with_ledger(pool, server_url=server_url)
         assert out["source"] == "error"
+
+
+class TestEffectiveNFloor:
+    """BUI-956: `_ledger_advisory`'s depth floor gates on the SAME weighted,
+    recency-aware effective-n notion `_graded_ledger_advisory` gates on
+    (`fmv_math.bucket_effective_n` there; `compute_fmv`'s own `effective_n`
+    output here — see `TestGradedLedgerAdvisoryEffectiveNFloor` in
+    test_fmv_runner.py for the slab-path equivalent), not the raw trimmed-pool
+    row count. `TestPoolDepthFloor.test_three_comps_is_enough` above already
+    pins the same-dated case where the two notions agree; these pin the case
+    where they diverge.
+    """
+
+    def test_three_rows_clear_row_count_but_not_effective_n(self, server_url):
+        # Two of the three comps are 200 days older than the newest — at
+        # RECENCY_HALF_LIFE_DAYS=75 that is weight exp(-ln2*200/75) ~= 0.157
+        # each, so effective_n ~= 1.0 + 0.157 + 0.157 ~= 1.31, under
+        # LEDGER_ADVISORY_MIN_POOL (3), even though raw row count (3) would
+        # have cleared the pre-BUI-956 floor.
+        pool = [
+            _ledger_row(1, price=45.0, grade=8.0, sold_date="2026-01-01"),
+            _ledger_row(2, price=50.0, grade=8.0, sold_date="2026-01-01"),
+            _ledger_row(3, price=55.0, grade=8.0, sold_date="2026-07-20"),
+        ]
+        out, upsert_mock = _price_with_ledger(pool, server_url=server_url)
+        assert out["source"] == "error"
+        assert out["fmv"] is None
+        upsert_mock.assert_not_called()
+
+    def test_a_pool_with_effective_n_at_the_floor_still_prices(self, server_url):
+        # Non-vacuity: one fresh comp plus four comps 75 days old (one
+        # RECENCY_HALF_LIFE_DAYS, weight 0.5 each) reach effective n == 3.0
+        # and price — proving the None above is the floor refusing a thin
+        # pool, not a broken pool always refusing.
+        pool = [
+            _ledger_row(1, price=45.0, grade=8.0, sold_date="2026-07-20"),
+            _ledger_row(2, price=48.0, grade=8.0, sold_date="2026-05-06"),
+            _ledger_row(3, price=50.0, grade=8.0, sold_date="2026-05-06"),
+            _ledger_row(4, price=52.0, grade=8.0, sold_date="2026-05-06"),
+            _ledger_row(5, price=55.0, grade=8.0, sold_date="2026-05-06"),
+        ]
+        out, _ = _price_with_ledger(pool, server_url=server_url)
+        assert out["source"] == "ledger-advisory"
+        assert out["fmv"]["max_bid"] is None
+        assert out["fmv"]["fmv_high"] is not None
+        assert out["fmv"]["effective_n"] >= fmv_runner.LEDGER_ADVISORY_MIN_POOL
 
 
 # ─── Failure modes of the ledger read itself ──────────────────────────────────

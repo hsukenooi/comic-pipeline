@@ -4,6 +4,7 @@ We mock requests (DB cache + upsert) and subprocess (ebay-sold-comps),
 so these tests don't hit the network or shell out.
 """
 
+import itertools
 import json
 from datetime import date
 
@@ -137,7 +138,21 @@ def _make_book(item_id, title, issue, year, grade, locg_id=None):
     return book
 
 
-def _make_comp(price, grade, product_id="x"):
+# BUI-956: a per-call counter, not a shared literal ("x") — `comps + first_
+# party` is now run through `_dedupe_pool_by_identity` in
+# `_compute_and_upsert_one`, which treats two comps sharing a `product_id` as
+# the SAME sale regardless of any other field. Every pre-BUI-956 fixture that
+# built an N-comp pool via `[_make_comp(p, g) for p in prices]` shared one
+# literal "x" across every comp in the pool — harmless before the dedupe
+# existed, but it would now silently collapse every such pool down to a
+# single comp. `None` still means "give me a fresh id"; pass `product_id=`
+# explicitly for a test that is itself about the dedupe.
+_next_comp_id = itertools.count()
+
+
+def _make_comp(price, grade, product_id=None):
+    if product_id is None:
+        product_id = f"comp{next(_next_comp_id)}"
     return {"product_id": product_id, "title": f"comic {price}",
             "price": price, "grade": grade, "sold_date": "", "buying_format": ""}
 

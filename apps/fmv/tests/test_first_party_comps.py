@@ -15,13 +15,24 @@ exercises the apps/fmv side of the seam.
 """
 
 import inspect
+import itertools
 from unittest.mock import MagicMock, patch
 
 import fmv_math
 import fmv_runner
 
 
-def _make_comp(price, grade, product_id="x"):
+# BUI-956: `_compute_and_upsert_one` now runs `comps + first_party` through
+# `_dedupe_pool_by_identity`, which treats two comps sharing a `product_id`
+# as one sale regardless of any other field — a shared literal "x" would
+# silently collapse every multi-comp pool built via `[_make_comp(p, g) for p
+# in prices]` below down to a single comp. `None` means "give me a fresh id".
+_next_comp_id = itertools.count()
+
+
+def _make_comp(price, grade, product_id=None):
+    if product_id is None:
+        product_id = f"comp{next(_next_comp_id)}"
     return {"product_id": product_id, "title": f"comic {price}",
             "price": price, "grade": grade, "sold_date": "", "buying_format": ""}
 
@@ -199,7 +210,13 @@ class TestFetchFirstPartyOutcomes:
 
 class TestFirstPartyMergeIntoComputeOne:
     def test_empty_first_party_prices_identically_to_baseline(self):
-        """A book with no resolved auctions must price EXACTLY as today."""
+        """A book with no resolved auctions must price EXACTLY as today.
+
+        BUI-956: also doubles as the "distinct product_ids" pin for the new
+        `_dedupe_pool_by_identity` pass on `pool_comps` — every `_make_comp`
+        call below now gets its own unique id, so nothing here is a genuine
+        duplicate and the dedupe pass must remove nothing (see
+        `TestLiveRawPoolDedupe` for the pass actually removing one)."""
         comps = [_make_comp(p, 9.0) for p in [40, 42, 44, 45, 41]]
         result = {
             "input": {"title": "X", "issue": "1", "year": 1990, "grade": 9.0},
@@ -288,6 +305,74 @@ class TestFirstPartyMergeIntoComputeOne:
             fmv_runner._compute_and_upsert_one(
                 result, book, server_url=server_url())
         assert fp_mock.call_args.kwargs["target_grade"] == 9.0
+
+
+# ─── BUI-956: the live raw pool is deduped before it prices ───────────────────
+
+class TestLiveRawPoolDedupe:
+    """`_compute_and_upsert_one` builds `pool_comps = comps + first_party` and
+    hands it straight to `fmv_math.compute_fmv` — before this ticket, with NO
+    dedupe pass of any kind. A book fetched via both sold-comps providers
+    (BUI-545) can report the SAME sale twice under two different
+    `product_id`s (see `_comp_identity_key`'s docstring for why product_id
+    alone can't catch it), which would double-count that sale into the
+    priced pool. This mirrors the graded path's `_merge_slab_pool` (BUI-936)
+    and the raw ledger-advisory path's own pre-existing dedupe pass — this
+    was the one raw-pricing pool that still had none.
+    """
+
+    def test_a_cross_provider_duplicate_collapses_to_one_comp(self):
+        # Same underlying sale, reported under two different product_ids —
+        # identical price/grade/sold_date/title, the BUI-936 identity key.
+        dup_a = {"product_id": "serpapi-1", "title": "comic 50", "price": 50,
+                 "grade": 9.0, "sold_date": "2026-08-01", "buying_format": ""}
+        dup_b = {"product_id": "sold-comps-1", "title": "comic 50",
+                 "price": 50, "grade": 9.0, "sold_date": "2026-08-01",
+                 "buying_format": ""}
+        comps = [dup_a, dup_b, _make_comp(55, 9.0), _make_comp(60, 9.0)]
+        result = {
+            "input": {"title": "X", "issue": "1", "year": 1990, "grade": 9.0},
+            "comps": comps,
+        }
+        book = {"title": "X", "issue": "1", "grade": 9.0}
+        with patch("fmv_runner._fetch_first_party_outcomes", return_value=[]), \
+             patch("fmv_runner._upsert_fmv", return_value={"id": 1}), \
+             patch("fmv_runner._post_comps", return_value=None):
+            out = fmv_runner._compute_and_upsert_one(
+                result, book, server_url=server_url())
+        # 4 comps fetched, but only 3 genuine sales — the priced pool must
+        # reflect 3, not 4.
+        assert out["fmv"]["n"] == 3
+        # `comp_count_total` is the BUI-143 fetch-error signal and must stay
+        # the RAW fetched count — the dedupe only thins the PRICED pool.
+        assert out["comp_count_total"] == 4
+
+    def test_a_first_party_comp_is_never_collapsed_against_a_provider_comp(
+            self):
+        """First-party rows carry no `title` (see `_fetch_first_party_
+        outcomes`) and no `product_id`, so `_comp_identity_key` can never
+        build a key for one — even a first-party comp that happens to share
+        a provider comp's exact price/grade/sold_date must survive as its
+        own entry, since dedupe never force-matches a comp it lacks the
+        evidence to compare (a genuine independent sale at the same price is
+        common, and collapsing it would silently drop real observations)."""
+        comps = [_make_comp(p, 9.0) for p in [40, 42, 44, 45, 41]]
+        result = {
+            "input": {"title": "X", "issue": "1", "year": 1990, "grade": 9.0},
+            "comps": comps,
+        }
+        book = {"title": "X", "issue": "1", "grade": 9.0}
+        # Coincides exactly with one of `comps`' sold_date/price/grade.
+        first_party = [{"price": 40.0, "grade": 9.0, "sold_date": "",
+                        "source": "first_party"}]
+        with patch("fmv_runner._fetch_first_party_outcomes",
+                  return_value=first_party), \
+             patch("fmv_runner._upsert_fmv", return_value={"id": 1}), \
+             patch("fmv_runner._post_comps", return_value=None):
+            out = fmv_runner._compute_and_upsert_one(
+                result, book, server_url=server_url())
+        assert out["fmv"]["n"] == 6  # 5 SerpApi + 1 first-party, none dropped
+        assert out["fmv"]["first_party_count"] == 1
 
 
 # ─── fmv_math: source-tagged comps flow through untouched ─────────────────────
