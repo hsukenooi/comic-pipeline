@@ -10,6 +10,17 @@ import {
 const SESSION_EXPIRED_MSG =
   "Session expired. Run: ezship set-cookie \"<paste from DevTools>\"";
 
+// BUI-966: a typed error lets the CLI map this specific failure to a distinct
+// exit code (an expired cookie needs a human to paste a fresh one, versus any
+// other failure which is just "retry"), instead of pattern-matching the
+// message text at the exit boundary.
+export class SessionExpiredError extends Error {
+  constructor(message: string = SESSION_EXPIRED_MSG) {
+    super(message);
+    this.name = "SessionExpiredError";
+  }
+}
+
 // BUI-184: bound a stalled connection so order submission can't block forever.
 const REQUEST_TIMEOUT_MS = 30_000;
 
@@ -53,7 +64,7 @@ export async function callRpc(
   if (REDIRECT_CODES.has(response.status)) {
     const location = response.headers.get("location") ?? "";
     if (location.includes("/Account/Login")) {
-      throw new Error(SESSION_EXPIRED_MSG);
+      throw new SessionExpiredError();
     }
     throw new Error(`Unexpected redirect to: ${location || "(empty Location header)"}`);
   }
@@ -97,7 +108,7 @@ export async function callRpc(
           ? r.message
           : "";
   if (msg.includes("please login")) {
-    throw new Error(SESSION_EXPIRED_MSG);
+    throw new SessionExpiredError();
   }
   throw new Error(
     `EZShip did not confirm success (no result:true): ${msg || JSON.stringify(result)}`
