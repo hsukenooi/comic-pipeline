@@ -2185,6 +2185,19 @@ class TestActiveAsks:
 
     # ── main()'s --active-asks wiring ────────────────────────────────────
 
+    def test_main_default_cap_is_one_full_browse_page(self):
+        """The Browse page is 200 items and best-match order puts the graded
+        listings anywhere in it. A 50-item default truncated the page before
+        them: FF #93 at 6.0 found 0 asks at 50 and 5 at 200 (2026-09-22)."""
+        with patch("ebay_fetch.load_config",
+                   return_value=("id", "secret", ebay_fetch.PRODUCTION_BASE)):
+            with patch("ebay_fetch.get_token", return_value="tok"):
+                with patch("ebay_fetch.search_active_asks",
+                           return_value={"low": None, "n": 0}) as mock_search:
+                    ebay_fetch.main(["--active-asks", "Fantastic Four #93",
+                                     "--grade", "6.0"])
+        assert mock_search.call_args.kwargs["max_results"] == 200
+
     def test_main_requires_grade_with_active_asks(self, capsys):
         with pytest.raises(SystemExit) as exc:
             ebay_fetch.main(["--active-asks", "Amazing Spider-Man #50"])
