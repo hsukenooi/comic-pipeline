@@ -7,7 +7,7 @@
     <string>com.comics.em-batch-nightly</string>
     <!-- BUI-972: the fully unattended nightly /em-batch over open `comics`
          tickets. The wrapper does the framing (ticket pick, worktree,
-         permissions, Telegram + daily-note summary); see its header. It is
+         permissions, Telegram summary); see its header. It is
          run from the shared checkout so a merged change to the wrapper is
          what fires next night, no install-copy step. -->
     <key>ProgramArguments</key>
@@ -22,8 +22,7 @@
         <key>PATH</key>
         <string>/Users/hsukenooi/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
-    <!-- 01:00: after the 23:35 daily routine has written tomorrow's note
-         (the summary is appended to it), well clear of sentinel-probe
+    <!-- 01:00: after the 23:35 daily routine, well clear of sentinel-probe
          (Sun 09:00) and slab-watch-collect (1st, 09:30). A run can take
          hours; the wrapper's own timeout (default 6h) ends it before the
          morning. A missed slot runs once at wake, never a backlog. -->

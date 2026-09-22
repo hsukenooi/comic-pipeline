@@ -50,8 +50,8 @@ Runs `scripts/em-batch-nightly.sh` at 01:00 every night: picks up to
 `EM_BATCH_NIGHTLY_CAP` (default 8) unassigned `comics` tickets in Today,
 Soon, or Someday, and runs `/em-batch mode:autonomous` over them in a fresh
 detached worktree, headless, through implement, review, CI, merge, deploy,
-and close. The run's summary goes to Telegram and is appended to that day's
-Reflect daily note. The wrapper's header documents the knobs and the
+and close. The run's summary goes to Telegram (only; the Reflect daily note
+is not written). The wrapper's header documents the knobs and the
 `--dry-run` / `--tickets` switches.
 
 Preconditions, all user-authored (the run never widens its own permissions):
@@ -62,8 +62,6 @@ Preconditions, all user-authored (the run never widens its own permissions):
   a missing rule is a denied step and a held ticket, never a hung job.
 - `gh auth status` green and `~/.config/linear/credentials.toml` readable
   for the launchd user.
-- `/bin/bash` has Full Disk Access (already granted for the daily routine),
-  or the daily-note append is skipped and only Telegram gets the summary.
 
 Install:
 
