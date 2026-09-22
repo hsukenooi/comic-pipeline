@@ -46,11 +46,14 @@ from gixen_overlay.db import (
     get_comps,
     get_fmv_history,
     stamp_comps_excluded,
+    list_comics_for_slab_watch,
+    set_comic_slab_watch,
     DEFAULT_OUTCOME_GRADE_WINDOW,
     DEFAULT_OUTCOME_RECENCY_DAYS,
     DEFAULT_CALIBRATION_MIN_LOSSES,
     DEFAULT_COMPS_READ_LIMIT,
     DEFAULT_FMV_HISTORY_READ_LIMIT,
+    SLAB_WATCH_DEFAULT_MIN_FMV,
 )
 from gixen_overlay.ledger import LedgerRoute
 from gixen_overlay import locg_lookup
@@ -74,6 +77,7 @@ from gixen_overlay.models import (
     SellerScanSeenRequest,
     CollectionCheckBatchRequest,
     SeriesNameResolveRequest,
+    SlabWatchRequest,
 )
 from gixen_overlay.title_parser import parse_title
 from server.db import (
@@ -95,7 +99,11 @@ from server.main import (
 # write paths) behind /api/comics/* instead of porting any of it to SQL. These
 # imports prove the locg workspace dependency resolves (exercised by the
 # workspace-imports canary).
-from locg.collection_cache import CollectionCache, collection_backups_root
+from locg.collection_cache import (
+    CollectionCache,
+    collection_backups_root,
+    _normalize_series_key,
+)
 from locg.collection_io import MAX_XLSX_BYTES
 from locg.commands import (
     _decrement_or_remove,
@@ -2428,6 +2436,223 @@ async def api_wish_list(title: str | None = None):
         # only fails to surface a wanted book; it cannot buy a dupe), and a 500
         # here would break seller-scan entirely on a single bad write.
         return []
+
+
+def _read_slab_watch_min_fmv() -> float:
+    """Read `SLAB_WATCH_MIN_FMV` per request (BUI-950), never cached.
+
+    Same KTD2/non-disabling-default posture as policy.py's
+    `_read_policy_float` (`POLICY_FMV_MULTIPLE`/`POLICY_FMV_STALE_DAYS`):
+    leaving the env var unset does NOT turn threshold-based inclusion off,
+    it falls back to `SLAB_WATCH_DEFAULT_MIN_FMV`. Unlike that helper this
+    isn't feeding a policy-check result object (there is no "unevaluable"
+    verdict for a plain listing endpoint to report), so a present-but-
+    non-numeric value degrades to the same default rather than 500ing the
+    whole listing — logged loudly so a config typo stays visible instead of
+    silently changing the watch set's size.
+    """
+    raw = os.getenv("SLAB_WATCH_MIN_FMV")
+    if raw is None or not raw.strip():
+        return SLAB_WATCH_DEFAULT_MIN_FMV
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning(
+            "gixen_overlay.routes: SLAB_WATCH_MIN_FMV=%r does not parse as "
+            "a number; falling back to default $%.2f",
+            raw, SLAB_WATCH_DEFAULT_MIN_FMV,
+        )
+        return SLAB_WATCH_DEFAULT_MIN_FMV
+
+
+def _wish_item_tiebreak_year(item: dict[str, Any]) -> int | None:
+    """Best-effort year for BREAKING a tie among multiple `comics` matches
+    (BUI-950) — never a gate. Prefers the wish's own stamped per-issue Cover
+    Year (`item["year"]`, BUI-387 — absent on unstamped pre-387 wishes), and
+    falls back to the year parsed off `release_date` (e.g. ``"1998-05-27"``)
+    only when no stamped year exists. Both are LOCG-side dates, not Metron
+    cover dates, and the two can legitimately disagree (see BUI-950's
+    ticket text) — that disagreement is exactly why this is a tiebreak
+    among already-key-matched candidates, never a filter that could reject
+    the correct one.
+    """
+    stamped = item.get("year")
+    if stamped:
+        try:
+            return int(str(stamped)[:4])
+        except ValueError:
+            pass
+    release_date = item.get("release_date")
+    if release_date:
+        try:
+            return int(str(release_date)[:4])
+        except ValueError:
+            pass
+    return None
+
+
+@router.get("/api/comics/slab-watch")
+async def api_slab_watch(request: Request):
+    """BUI-950: the slab watch set — wish-list books worth pricing as slabs.
+
+    A wish-list book qualifies when its highest RAW `fmv.high` across any
+    grade (`certifier='none'`, hand-priced or pooled — see
+    `list_comics_for_slab_watch`) is at or above `SLAB_WATCH_MIN_FMV`
+    (default $100, read PER REQUEST via `_read_slab_watch_min_fmv`, never
+    cached), OR the matched `comics` row carries a hand INCLUDE
+    (`slab_watch=1`, see `POST .../slab-watch` below) — UNLESS it carries a
+    hand EXCLUDE (`slab_watch=0`), which always wins and drops it from the
+    set regardless of price. A book with no raw `fmv` row at all can only
+    ever enter by the hand-include path (never by threshold — there is
+    nothing to compare against the line).
+
+    **The identity join.** The wish list is a JSON store (`locg-cli`'s
+    cache), not a SQL table, so this is a Python-side join, not a SQL one:
+    each wish entry's raw `name` (e.g. ``"300 #1"``) is split into
+    (series, issue) with `_split_wish_list_name` — the SAME parser
+    `cmd_wish_list_conflicts` uses, so this endpoint's notion of "series"
+    and "issue" for a wish agrees with the rest of locg-cli rather than
+    reinventing its own. The series half is folded through
+    `_normalize_series_key` (strips `(Vol. N)`/`(YYYY)` decoration, leading
+    articles, and punctuation) and matched against every `comics.title`
+    folded the same way, then narrowed to an exact `comics.issue` match.
+    Deliberately loose: `_normalize_series_key` collapses different eras of
+    the same masthead onto one key (see the "LOCG reuses Vol. N labels"
+    project memory), so when more than one `comics` row shares a
+    (key, issue), `_wish_item_tiebreak_year` picks the one whose year is
+    closest to the wish's own — but a MISSING or non-matching year never
+    excludes a candidate outright, it just leaves the tie broken
+    arbitrarily (lowest `comics.id`). This is the ticket's own explicit
+    instruction: "year only as a tiebreak … never as a gate."
+
+    **Owned-book exclusion — deliberately NOT done here.** BUI-950 asks for
+    owned books to be excluded, noting the wish-list store is "already only
+    wishes" as the baseline. The one existing helper that finds owned-but-
+    wished books, `cmd_wish_list_conflicts` (BUI-130), does a full
+    `cmd_collection_check` pass per wish item — hundreds of individual
+    `CollectionCache().load()` calls (it does not accept a shared `cache=`
+    from its own caller) — which is the right cost for its own endpoint
+    (`GET /api/comics/wish-list/conflicts`, a deliberate audit a human or
+    `/comic:collection-sync`'s conflict-cleaning step runs) but is real
+    added per-request latency to fold into a plain threshold listing that
+    exists to feed a scheduled collection job and `comic-fmv
+    --list-slab-watch`. The failure mode if a conflict slips through
+    un-cleaned is also low-stakes here specifically: this endpoint only
+    decides which books' SLAB comps get fetched next, never writes
+    anything and is nowhere near the BUI-122 export/delete path that makes
+    an owned-but-wished book dangerous. Operators clear conflicts via the
+    dedicated audit/remove pair before they'd ever reach this endpoint in
+    steady state. If that stops being true, add the exclusion by
+    intersecting this endpoint's matched comic_ids against
+    `cmd_wish_list_conflicts()["conflicts"]` — the data needed is already
+    one function call away.
+
+    Returns ``{threshold, count, items: [{comic_id, title, issue, year,
+    raw_high, reason: "threshold"|"hand", certifier}]}``. `certifier` is
+    always ``"cgc"`` for now (BUI-950's stated default grader to fetch) —
+    there is no per-book grader override yet, so this is a flat constant,
+    not a stored field; widen it if/when a book needs a different grader.
+    An unparseable wish name (no ``#`` token) or one with no matching
+    `comics` row is silently skipped, same fail-soft posture as the
+    wish-list endpoints above it (a miss here only means a book won't get
+    slab comps fetched, never a wrong price or a lost book).
+    """
+    _ensure_collection_store()
+    try:
+        wish_items = cmd_wish_list_from_cache()
+    except (FileNotFoundError, json.JSONDecodeError):
+        wish_items = []
+
+    threshold = _read_slab_watch_min_fmv()
+    db = request.app.state.db
+    comic_rows = list_comics_for_slab_watch(db)
+
+    by_key: dict[str, list[Any]] = {}
+    for row in comic_rows:
+        key = _normalize_series_key(row["title"] or "")
+        by_key.setdefault(key, []).append(row)
+
+    checked = 0
+    unparseable = 0
+    no_match = 0
+    resolved: dict[int, dict[str, Any]] = {}
+    for it in wish_items:
+        name = it.get("name") or ""
+        parsed = _split_wish_list_name(name)
+        if parsed is None:
+            unparseable += 1
+            continue
+        series, issue = parsed
+        checked += 1
+        key = _normalize_series_key(series)
+        candidates = [
+            r for r in by_key.get(key, []) if (r["issue"] or "") == issue
+        ]
+        if not candidates:
+            no_match += 1
+            continue
+        comic_row = candidates[0]
+        if len(candidates) > 1:
+            wish_year = _wish_item_tiebreak_year(it)
+            if wish_year is not None:
+                year_matches = [r for r in candidates if r["year"] == wish_year]
+                if year_matches:
+                    comic_row = year_matches[0]
+        if comic_row["id"] in resolved:
+            continue
+
+        slab_watch = comic_row["slab_watch"]
+        raw_high = comic_row["raw_high"]
+        if slab_watch == 0:
+            continue
+        if slab_watch == 1:
+            reason = "hand"
+        elif raw_high is not None and raw_high >= threshold:
+            reason = "threshold"
+        else:
+            continue
+        resolved[comic_row["id"]] = {
+            "comic_id": comic_row["id"],
+            "title": comic_row["title"],
+            "issue": comic_row["issue"],
+            "year": comic_row["year"],
+            "raw_high": raw_high,
+            "reason": reason,
+            "certifier": "cgc",
+        }
+
+    items = list(resolved.values())
+    logger.info(
+        "api_slab_watch: wish_items=%d checked=%d unparseable=%d no_match=%d "
+        "threshold=%.2f count=%d",
+        len(wish_items), checked, unparseable, no_match, threshold, len(items),
+    )
+    return {"threshold": threshold, "count": len(items), "items": items}
+
+
+@router.post("/api/comics/{comic_id}/slab-watch")
+async def api_set_slab_watch(
+    comic_id: int, req: SlabWatchRequest, request: Request
+):
+    """BUI-950: set or clear the hand override for one comic's slab-watch
+    membership.
+
+    `req.slab_watch`: `1` hand-includes the comic (always in the set,
+    whatever its raw FMV), `0` hand-excludes it (always out), `null` clears
+    the override back to threshold-only. See `SlabWatchRequest` for the
+    422 boundary and `set_comic_slab_watch` for the write.
+
+    404 when `comic_id` names no known book — mirrors
+    `POST /api/comics/comps/exclude`'s contract (an id-addressed write
+    against a missing row is a 404, not a bad query).
+    """
+    db = request.app.state.db
+    result = set_comic_slab_watch(db, comic_id, req.slab_watch)
+    if result is None:
+        raise HTTPException(
+            status_code=404, detail=f"comic_id {comic_id} not in DB"
+        )
+    return result
 
 
 def _require_imported_collection() -> None:

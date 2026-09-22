@@ -797,3 +797,27 @@ class CompsExcludeRequest(BaseModel):
                 f"code must be one of: {', '.join(COMPS_EXCLUSION_CODES)}"
             )
         return v
+
+
+class SlabWatchRequest(BaseModel):
+    """POST /api/comics/{comic_id}/slab-watch — hand override (BUI-950).
+
+    `slab_watch` is `1` (hand include — always in the slab watch set), `0`
+    (hand exclude — always out), or `None`/omitted (clear the override, fall
+    back to `SLAB_WATCH_MIN_FMV`). Note pydantic's default `int` coercion
+    accepts JSON `true`/`false` as `1`/`0` here, same as any other `int`
+    field in this module — that is accepted, not a gap. Any other value
+    (`2`, a string, a float) 422s the whole call before anything is written
+    — same request-model-boundary posture as `CompsExcludeRequest.code`
+    above, and the same CHECK constraint (`comics.slab_watch`) backs it up
+    server-side as defense in depth.
+    """
+
+    slab_watch: int | None = None
+
+    @field_validator("slab_watch")
+    @classmethod
+    def _validate_slab_watch(cls, v: int | None) -> int | None:
+        if v not in (0, 1, None):
+            raise ValueError("slab_watch must be 1, 0, or null")
+        return v

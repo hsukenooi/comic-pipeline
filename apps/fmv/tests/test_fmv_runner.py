@@ -7302,3 +7302,63 @@ class TestCompsExclusionStamp:
                 pool="slab", certifier="cgc", label="universal")
         assert "include_excluded" not in captured
         assert captured["pool"] == "slab"
+
+
+# ─── BUI-950 — the slab watch set (read-only, prints and exits) ──────────────
+
+
+class TestRunListSlabWatch:
+    """Mirrors TestRunInversionSweep's coverage shape for the third
+    read-only report mode: missing-server-url, failed-read, empty-set, and
+    a populated-set print."""
+
+    def test_missing_server_url_exits_1(self):
+        with pytest.raises(SystemExit) as e:
+            fmv_runner.run_list_slab_watch(server_url=None)
+        assert e.value.code == 1
+
+    def test_failed_read_exits_1_without_a_list(self, server_url, capsys):
+        with patch("fmv_runner._get_json_or_warn",
+                   return_value=fmv_runner._LOOKUP_FAILED):
+            with pytest.raises(SystemExit) as e:
+                fmv_runner.run_list_slab_watch(server_url=server_url)
+        assert e.value.code == 1
+        assert "no list rendered" in capsys.readouterr().err
+
+    def test_non_dict_body_exits_1(self, server_url, capsys):
+        """A malformed (non-dict) response must not degrade into a silently
+        empty list — same R11-shaped contract as fetch_inversions."""
+        with patch("fmv_runner._get_json_or_warn", return_value=[1, 2, 3]):
+            with pytest.raises(SystemExit) as e:
+                fmv_runner.run_list_slab_watch(server_url=server_url)
+        assert e.value.code == 1
+
+    def test_empty_set_reports_zero_and_returns(self, server_url, capsys):
+        with patch("fmv_runner._get_json_or_warn",
+                   return_value={"threshold": 100.0, "count": 0, "items": []}):
+            fmv_runner.run_list_slab_watch(server_url=server_url)
+        out = capsys.readouterr().out
+        assert "0 book(s)" in out
+        assert "threshold $100" in out
+
+    def test_populated_set_prints_one_line_per_book(self, server_url, capsys):
+        body = {
+            "threshold": 100.0,
+            "count": 2,
+            "items": [
+                {"comic_id": 812, "title": "X-Men", "issue": "83", "year": 1975,
+                 "raw_high": 250.0, "reason": "threshold", "certifier": "cgc"},
+                {"comic_id": 5, "title": "Unpriced Book", "issue": "1",
+                 "year": None, "raw_high": None, "reason": "hand",
+                 "certifier": "cgc"},
+            ],
+        }
+        with patch("fmv_runner._get_json_or_warn", return_value=body):
+            fmv_runner.run_list_slab_watch(server_url=server_url)
+        out = capsys.readouterr().out
+        assert "2 book(s)" in out
+        assert "X-Men #83 (1975)" in out
+        assert "threshold" in out and "cgc" in out
+        assert "raw_high=$250" in out
+        assert "Unpriced Book #1" in out
+        assert "raw_high=—" in out

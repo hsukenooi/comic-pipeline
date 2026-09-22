@@ -107,6 +107,41 @@ def test_inversion_sweep_needs_no_batch(monkeypatch):
     assert "--batch is required" not in result.output
 
 
+def test_list_slab_watch_short_circuits_the_pricing_run(monkeypatch):
+    """BUI-950: same short-circuit shape as --inversion-sweep — a
+    `--list-slab-watch` call must reach run_list_slab_watch and NOT run(),
+    or a read-only report mode would fall through into a real pricing pass."""
+    import fmv_cli
+
+    listed, priced = [], []
+    monkeypatch.setattr(fmv_cli.fmv_runner, "run_list_slab_watch",
+                        lambda **kwargs: listed.append(kwargs))
+    monkeypatch.setattr(fmv_cli.fmv_runner, "run",
+                        lambda **kwargs: priced.append(kwargs))
+
+    result = CliRunner().invoke(
+        cli, ["--list-slab-watch", "--server-url", "http://x"])
+
+    assert result.exit_code == 0
+    assert listed == [{"server_url": "http://x"}]
+    assert priced == []
+
+
+def test_list_slab_watch_needs_no_batch(monkeypatch):
+    """Reads an existing server-side set, so it must not be gated on --batch
+    the way a pricing run is (run() exits 2 without one)."""
+    import fmv_cli
+
+    monkeypatch.setattr(fmv_cli.fmv_runner, "run_list_slab_watch",
+                        lambda **kwargs: None)
+
+    result = CliRunner().invoke(
+        cli, ["--list-slab-watch", "--server-url", "http://x"])
+
+    assert result.exit_code == 0
+    assert "--batch is required" not in result.output
+
+
 def test_sentinel_probe_short_circuits_the_pricing_run(monkeypatch):
     """BUI-603: --sentinel-probe must reach run_sentinel_probe and NOT
     fmv_runner.run() — a regression here would spend real pricing-run
