@@ -330,6 +330,7 @@ def confident_cover_year(
     item_specifics: "dict | None",
     *,
     certified: bool = False,
+    era_range: "tuple[int, int | None] | None" = None,
 ) -> "int | None":
     """Return a per-issue cover year to forward to /comic:collection-check ONLY
     when two independent signals corroborate it — else None (year-agnostic).
@@ -363,6 +364,30 @@ def confident_cover_year(
     stands alone (it is exactly the volume-start-year shape BUI-129 was), and
     nothing changes for a raw listing — ``certified`` defaults to False, so the
     well-exercised raw path keeps the BUI-316 paren-only gate verbatim.
+
+    ERA CORROBORATION (BUI-958). Two of the eight spike slabs (Silver Surfer
+    #4, Ultimate Fallout #4) carry a Publication Year but state NO year
+    anywhere in the title — not even bare — so BUI-942's relaxation still
+    leaves them blank: a Publication Year with zero title-year corroborators
+    is a lone source, the same shape BUI-129 was (a single field forwarded
+    unconditionally). ``era_range`` — the ``(start, end)`` bounds of eBay's
+    ``Era`` item specific (e.g. "Silver Age (1956-69)" -> ``(1956, 1969)``;
+    "Modern Age (1992-Now)" -> ``(1992, None)``, open-ended), parsed by the
+    caller (``ebay_fetch._parse_era_range``) — is the SECOND source that lets
+    the Publication Year resolve in exactly that case:
+
+      - Only consulted when ``certified`` is True (same certified-only scope
+        as the rest of this relaxation) AND the title contributed NO year of
+        its own (``corroborators`` is empty). A title year that failed to
+        corroborate above is a genuine disagreement — Era is a decade-scale
+        range, coarser than a specific title year, so it must never overrule
+        one. See test_era_disagreeing_with_title_year_still_suppresses.
+      - Fires when ``pub_year`` falls within ``[start, end]`` (``end=None``
+        meaning unbounded above). The year returned is still ``pub_year`` —
+        Era only ever corroborates, exactly like a title year does.
+      - Era can NEVER resolve a year on its own: with no Publication Year at
+        all, ``era_range`` is not even consulted (see the no-pub-year branch
+        below) — a lone Era is still a lone source.
 
     The Publication Year is the authoritative per-issue cover year and is what
     we return; the title's parenthesized year is the corroborating check. This
@@ -416,6 +441,14 @@ def confident_cover_year(
         # only thing ever returned on this path; the title year is the check.
         if any(abs(py - pub_year) <= 1 for py in corroborators):
             return pub_year
+        # BUI-958: Era corroboration — only when the title stated NO year of
+        # its own (corroborators empty). A non-empty corroborators list here
+        # means the title DID state a year and it failed to agree above; that
+        # is a disagreement Era must not overrule (see docstring).
+        if certified and not corroborators and era_range is not None:
+            era_start, era_end = era_range
+            if era_start <= pub_year and (era_end is None or pub_year <= era_end):
+                return pub_year
         return None
 
     # No Publication Year aspect at all (spike listing 298687063023 carries

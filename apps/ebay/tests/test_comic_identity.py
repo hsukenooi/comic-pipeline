@@ -1163,3 +1163,133 @@ class TestCertifiedCoverYearRelaxation:
         # numeric run on either side, and a "#"-prefixed numbered copy.
         for title in ("1/66", "3/10", "3/665", "13/66", "9.8/66", "#5/50", "3/66/7"):
             assert ciy._title_cover_date_years(title) == [], title
+
+
+# ─── confident_cover_year(era_range=...) — the BUI-958 Era corroboration ────
+# BUI-942 left two of the eight spike slabs blank: Silver Surfer #4 and
+# Ultimate Fallout #4 both carry a Publication Year item-specific but state NO
+# year anywhere in the title (not even bare), so the BUI-942 relaxation's
+# title-year corroborators list is empty and the gate refuses — a lone
+# source, the same shape BUI-129 was. era_range — the caller-parsed (start,
+# end) bounds of eBay's "Era" item specific (e.g. "Silver Age (1956-69)" ->
+# (1956, 1969); "Modern Age (1992-Now)" -> (1992, None)) — is the second
+# source that resolves exactly that case. See ebay_fetch._parse_era_range for
+# the string->tuple parsing (covered in test_ebay_fetch.py) and parse_item's
+# wiring (also there); this class exercises confident_cover_year directly
+# with pre-parsed tuples.
+class TestEraCorroboration:
+    # Real item specifics fetched live 2026-09-22 for both BUI-958 spike
+    # listings via `ebay-fetch --json --fields item_id,title,item_specifics`.
+    _SILVER_SURFER_TITLE = (
+        "THE SILVER SURFER #4 CGC 5.5 MARVEL THOR LOKI APPEARANCE RARE HIGH "
+        "DEMAND ISSUE"
+    )
+    _SILVER_SURFER_SPECIFICS = {
+        "Publication Year": "1969", "Era": "Silver Age (1956-69)",
+    }
+
+    _ULTIMATE_FALLOUT_TITLE = (
+        "Ultimate Fallout #4 CGC 9.8 1st Miles Morales - 1st print - custom label"
+    )
+    _ULTIMATE_FALLOUT_SPECIFICS = {
+        "Publication Year": "2011", "Era": "Modern Age (1992-Now)",
+    }
+
+    def test_silver_surfer_4_resolves_via_era_corroboration(self):
+        """Spike listing 377507539790: no title year anywhere, but the Era
+        (1956-69) agrees with Publication Year 1969 — a second source."""
+        assert (
+            ci.confident_cover_year(
+                self._SILVER_SURFER_TITLE,
+                self._SILVER_SURFER_SPECIFICS,
+                certified=True,
+                era_range=(1956, 1969),
+            )
+            == 1969
+        )
+
+    def test_ultimate_fallout_4_resolves_via_era_corroboration(self):
+        """Spike listing 407184193219: the open-ended Era (1992-Now) agrees
+        with Publication Year 2011."""
+        assert (
+            ci.confident_cover_year(
+                self._ULTIMATE_FALLOUT_TITLE,
+                self._ULTIMATE_FALLOUT_SPECIFICS,
+                certified=True,
+                era_range=(1992, None),
+            )
+            == 2011
+        )
+
+    def test_without_era_range_both_spike_slabs_still_stay_blank(self):
+        """The BUI-942 pinned expectation (both None) holds when era_range
+        isn't supplied — Era corroboration is additive, not a lowered bar."""
+        assert (
+            ci.confident_cover_year(
+                self._SILVER_SURFER_TITLE, self._SILVER_SURFER_SPECIFICS,
+                certified=True,
+            )
+            is None
+        )
+        assert (
+            ci.confident_cover_year(
+                self._ULTIMATE_FALLOUT_TITLE, self._ULTIMATE_FALLOUT_SPECIFICS,
+                certified=True,
+            )
+            is None
+        )
+
+    def test_era_disagreeing_with_title_year_still_suppresses(self):
+        """A title year that fails to corroborate the Publication Year is a
+        genuine disagreement — Era (a decade-scale range) must not overrule a
+        specific, disagreeing title year. Title states 2024 (the grading
+        year, not the cover year); Publication Year says 2011; Era backs
+        2011 — but the disagreeing title year still wins the refusal."""
+        assert (
+            ci.confident_cover_year(
+                "Ultimate Fallout #4 CGC 9.8 graded 2024",
+                self._ULTIMATE_FALLOUT_SPECIFICS,
+                certified=True,
+                era_range=(1992, None),
+            )
+            is None
+        )
+
+    def test_era_alone_with_no_publication_year_does_not_resolve(self):
+        """Era is a corroborating signal only. With no Publication Year to
+        corroborate, it is never consulted — still a lone source, same as an
+        unaccompanied bare title year would be."""
+        assert (
+            ci.confident_cover_year(
+                self._SILVER_SURFER_TITLE,
+                {"Era": "Silver Age (1956-69)"},  # no Publication Year
+                certified=True,
+                era_range=(1956, 1969),
+            )
+            is None
+        )
+
+    def test_era_range_ignored_on_a_raw_listing(self):
+        """The relaxation (including Era corroboration) is certified-only —
+        passing era_range with certified defaulting to False has no effect."""
+        assert (
+            ci.confident_cover_year(
+                self._SILVER_SURFER_TITLE,
+                self._SILVER_SURFER_SPECIFICS,
+                era_range=(1956, 1969),
+            )
+            is None
+        )
+
+    def test_publication_year_outside_era_bounds_suppresses(self):
+        """A Publication Year outside the Era's own bounds is a genuinely
+        inconsistent listing (or a bad Era parse) — must not resolve."""
+        assert (
+            ci.confident_cover_year(
+                self._ULTIMATE_FALLOUT_TITLE,
+                {"Publication Year": "1969", "Era": "Modern Age (1992-Now)"},
+                certified=True,
+                era_range=(1992, None),
+            )
+            is None
+        )
