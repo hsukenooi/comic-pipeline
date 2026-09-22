@@ -47,6 +47,12 @@ export PATH="/Users/hsukenooi/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/b
 # Downgrade the linear-guard Done gate from a prompt to a reminder (BUI-878);
 # the skill's own Done-when gate still applies inside the run.
 export LINEAR_GUARD_UNATTENDED=1
+# Headless claude keeps the process alive for in-flight background subagents only
+# up to this ceiling (default 10 min), then kills them and returns the EM's last
+# message as the "summary". A wave of ticket agents runs far longer than that, so
+# raise it past the run's own wall clock; gtimeout below stays the real bound.
+# (2026-09-22 12:23 run: three agents killed at 10 min, $13 for nothing.)
+export CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=86400000
 
 DRY_RUN=0
 TICKETS_OVERRIDE=""
