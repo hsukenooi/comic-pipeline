@@ -783,6 +783,46 @@ def extract_variant(item_specifics, title):
     return None
 
 
+# eBay's Comics category "Era" item specific is a free-text range like
+# "Silver Age (1956-69)" or "Modern Age (1992-Now)" — the parenthesized start
+# year is always 4 digits; the end is either "Now"/"Present" (Modern Age is
+# still running) or a 2- or 4-digit year.
+_ERA_RANGE_RE = re.compile(r"\((\d{4})\s*-\s*(now|present|\d{2,4})\)", re.IGNORECASE)
+
+
+def _parse_era_range(era):
+    """Parse an ``Era`` item specific (BUI-958) into a ``(start, end)`` year
+    tuple for confident_cover_year's Era-corroboration signal, or None if
+    *era* is missing/unparseable.
+
+    ``end`` is None for an open-ended era ("...-Now"/"...-Present"). A
+    2-digit end year ("1956-69") is expanded into the same century as the
+    start year (-> 1969, never the literal 69), with a defensive rollover for
+    the rare case where the 2-digit value is numerically less than the
+    start year's own remainder (e.g. a hypothetical "1998-05" -> 2005, not
+    1905 — eras never run backwards).
+
+    This is a corroborating signal only — a decade-scale range, never a
+    fabricated single year — so failing open (None) here just means the Era
+    can't help; it never causes a wrong year to be forwarded.
+    """
+    if not era:
+        return None
+    m = _ERA_RANGE_RE.search(str(era))
+    if not m:
+        return None
+    start = int(m.group(1))
+    end_raw = m.group(2).lower()
+    if end_raw in ("now", "present"):
+        return (start, None)
+    if len(end_raw) == 2:
+        end = (start // 100) * 100 + int(end_raw)
+        if end < start:
+            end += 100
+        return (start, end)
+    return (start, int(end_raw))
+
+
 def format_end_date(iso_str):
     """Convert ISO 8601 date to local time formatted string."""
     if not iso_str:
@@ -935,8 +975,17 @@ def parse_item(data):
         # their parens on the cert, so the paren-only gate left 6 of the 8
         # spike slabs yearless. certified is keyed off the same signal that
         # sets grade_source == "certified" above.
+        # BUI-958: eBay's "Era" item specific (e.g. "Silver Age (1956-69)")
+        # is a second source that lets a Publication Year resolve even when
+        # the title states no year at all (spike listings 377507539790 /
+        # Silver Surfer #4 and 407184193219 / Ultimate Fallout #4 — both
+        # carry a Publication Year but zero title-stated years). Parsed
+        # unconditionally; confident_cover_year only consults it when
+        # certified=True, so a raw listing is unaffected regardless.
         "cover_year": confident_cover_year(
-            title, item_specifics, certified=bool(certification.certifier),
+            title, item_specifics,
+            certified=bool(certification.certifier),
+            era_range=_parse_era_range(item_specifics.get("Era")),
         ),
         "item_specifics": item_specifics,
         "description_snippet": description_snippet,

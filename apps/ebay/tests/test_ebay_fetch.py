@@ -270,6 +270,52 @@ class TestTruncate:
         assert ebay_fetch.truncate("", 10) == ""
 
 
+class TestParseEraRange:
+    """_parse_era_range (BUI-958): eBay's "Era" item specific -> (start, end)
+    year tuple, the second source confident_cover_year uses to corroborate a
+    Publication Year when the title states no year of its own."""
+
+    def test_silver_age_two_digit_end_year(self):
+        assert ebay_fetch._parse_era_range("Silver Age (1956-69)") == (1956, 1969)
+
+    def test_golden_age_four_digit_end_year(self):
+        assert ebay_fetch._parse_era_range("Golden Age (1938-1956)") == (1938, 1956)
+
+    def test_bronze_age(self):
+        assert ebay_fetch._parse_era_range("Bronze Age (1970-1985)") == (1970, 1985)
+
+    def test_modern_age_is_open_ended(self):
+        assert ebay_fetch._parse_era_range("Modern Age (1992-Now)") == (1992, None)
+
+    def test_open_ended_is_case_insensitive_and_accepts_present(self):
+        assert ebay_fetch._parse_era_range("Modern Age (1992-now)") == (1992, None)
+        assert ebay_fetch._parse_era_range("Modern Age (1992-Present)") == (1992, None)
+
+    def test_two_digit_end_stays_within_start_century(self):
+        # 69 must expand to 1969, never the literal int 69.
+        start, end = ebay_fetch._parse_era_range("Silver Age (1956-69)")
+        assert end == 1969
+        assert end != 69
+
+    def test_two_digit_end_rollover_across_a_century(self):
+        # Defensive case: a 2-digit end numerically less than the start
+        # year's own remainder rolls into the next century rather than
+        # running backwards (e.g. a hypothetical "1998-05" -> 2005).
+        assert ebay_fetch._parse_era_range("Hypothetical Age (1998-05)") == (1998, 2005)
+
+    def test_none_and_empty_string(self):
+        assert ebay_fetch._parse_era_range(None) is None
+        assert ebay_fetch._parse_era_range("") is None
+
+    def test_missing_parens_is_unparseable(self):
+        assert ebay_fetch._parse_era_range("Silver Age") is None
+        assert ebay_fetch._parse_era_range("1956-69") is None
+
+    def test_garbage_is_unparseable(self):
+        assert ebay_fetch._parse_era_range("Copper Age") is None
+        assert ebay_fetch._parse_era_range("(not a range)") is None
+
+
 class TestParseItem:
     """Test parse_item with synthetic API response data."""
 
@@ -401,6 +447,76 @@ class TestParseItem:
         item = self._bin_item(
             "Giant-Size X-Men #1 1st New X-Men 1975 Marvel VF",
             {"Publication Year": "1975"},
+        )
+        parsed = ebay_fetch.parse_item(item)
+        assert parsed["certifier"] is None
+        assert parsed["cover_year"] is None
+
+    # ─── BUI-958: Era corroboration wired end to end through parse_item ─────
+    # Real item specifics fetched live 2026-09-22 for both spike listings via
+    # `ebay-fetch --json --fields item_id,title,item_specifics`.
+
+    def test_silver_surfer_4_resolves_via_era_item_specific(self):
+        """Spike listing 377507539790: no year anywhere in the title, so the
+        BUI-942 relaxation alone leaves cover_year blank; the Era item
+        specific ("Silver Age (1956-69)") agrees with Publication Year 1969
+        and is the second source that resolves it."""
+        item = self._bin_item(
+            "THE SILVER SURFER #4 CGC 5.5 MARVEL THOR LOKI APPEARANCE RARE "
+            "HIGH DEMAND ISSUE",
+            {
+                "Professional Grader": "CGC", "Grade": "5.5",
+                "Publication Year": "1969", "Era": "Silver Age (1956-69)",
+            },
+        )
+        parsed = ebay_fetch.parse_item(item)
+        assert parsed["certifier"] == "cgc"
+        assert parsed["cover_year"] == 1969
+
+    def test_ultimate_fallout_4_resolves_via_era_item_specific(self):
+        """Spike listing 407184193219: open-ended Era ("Modern Age
+        (1992-Now)") agrees with Publication Year 2011."""
+        item = self._bin_item(
+            "Ultimate Fallout #4 CGC 9.8 1st Miles Morales - 1st print - "
+            "custom label",
+            {
+                "Professional Grader": "CGC", "Grade": "9.8",
+                "Publication Year": "2011", "Era": "Modern Age (1992-Now)",
+            },
+        )
+        parsed = ebay_fetch.parse_item(item)
+        assert parsed["certifier"] == "cgc"
+        assert parsed["cover_year"] == 2011
+
+    def test_era_disagreeing_title_year_does_not_resolve_via_parse_item(self):
+        """A title year that disagrees with Publication Year suppresses even
+        when the Era backs the Publication Year — a specific disagreeing
+        title year is not overruled by a decade-scale Era range."""
+        item = self._bin_item(
+            "Ultimate Fallout #4 CGC 9.8 graded 2024",
+            {
+                "Professional Grader": "CGC", "Grade": "9.8",
+                "Publication Year": "2011", "Era": "Modern Age (1992-Now)",
+            },
+        )
+        parsed = ebay_fetch.parse_item(item)
+        assert parsed["cover_year"] is None
+
+    def test_era_without_publication_year_does_not_resolve_via_parse_item(self):
+        """Era alone (no Publication Year aspect) is still a lone source."""
+        item = self._bin_item(
+            "THE SILVER SURFER #4 CGC 5.5 MARVEL THOR LOKI APPEARANCE",
+            {"Professional Grader": "CGC", "Grade": "5.5", "Era": "Silver Age (1956-69)"},
+        )
+        parsed = ebay_fetch.parse_item(item)
+        assert parsed["cover_year"] is None
+
+    def test_era_ignored_on_raw_listing_via_parse_item(self):
+        """A raw (non-certified) listing with the same Publication Year +
+        Era is unaffected — the relaxation stays certified-only."""
+        item = self._bin_item(
+            "THE SILVER SURFER #4 MARVEL THOR LOKI APPEARANCE",
+            {"Publication Year": "1969", "Era": "Silver Age (1956-69)"},
         )
         parsed = ebay_fetch.parse_item(item)
         assert parsed["certifier"] is None
