@@ -158,6 +158,8 @@ Run context from scripts/em-batch-nightly.sh (BUI-972):
 - Shared checkout, for deploy only: $REPO (see the profile's Deploy model for the on-main-and-clean rule).
 - Run dir for wave-plan.md and handoff.md: $RUN_DIR
 - Budget: about \$$BUDGET and $TIMEOUT of wall clock. Prefer finishing fewer tickets cleanly over starting all of them.
+- A hold (a ticket that needs the user) = a Linear comment naming the one decision + \`linear issue update ID -a hsukenooi\`, state unchanged. Never set Blocked; that state is the user's own.
+- In handoff.md record every agent's usage from its completion notification per ticket: model, output tokens, cache-read tokens, tool uses, duration, review depth run. Tokens, never dollars.
 - Headless: only a subagent's completion resumes you. A background Bash command, a Monitor, or a CI watch never wakes you, so never end your turn while waiting on one. Wait in the foreground: a normal Bash call such as \`gh pr checks N --watch\` with a long tool timeout, repeated as needed.
 - Your FINAL message is the user summary defined in the skill's mode:autonomous section (20 lines max, written for the person who uses the pipeline, not a code reader). It is saved as summary.md in the run dir and its first line is the wrapper's completion check; nothing is pushed to the user, who reads the Linear tickets, so put the per-ticket outcome in each ticket's closing comment."
 printf '%s\n' "$PROMPT" > "$RUN_DIR/prompt.md"

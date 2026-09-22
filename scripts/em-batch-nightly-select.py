@@ -8,8 +8,10 @@ LINEAR_API_KEY), and never prints it.
 Selection (all must hold):
   team BUI, label `comics`, unassigned, state in Today / Soon / Someday.
 In Progress and Blocked are excluded on purpose: In Progress means another
-agent (or a previous night) owns it; Blocked is how an autonomous run parks a
-ticket that needs Hsu Ken, so the same ticket is not re-picked every night.
+agent (or a previous night) owns it; Blocked is Hsu Ken's own state (waiting on
+something he cannot do right now). A run that needs him does NOT set Blocked: it
+assigns the ticket to him (`linear issue update ID -a hsukenooi`), and the
+unassigned filter then keeps it out of every later night.
 
 Order: Today, then Soon, then Someday; within a state by Linear priority
 (urgent first; "no priority" sorts last); then oldest first.
