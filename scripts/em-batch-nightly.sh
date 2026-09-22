@@ -4,9 +4,9 @@
 # Fired by the LaunchAgent com.comics.em-batch-nightly (scripts/launchd/) at
 # 01:00 on the Mac Mini. One run: pick tickets -> fresh detached worktree ->
 # `claude -p "/em-batch mode:autonomous ..."` -> post the run's summary to
-# Telegram and append it to today's Reflect daily note. The model run does the
-# engineering (implement, review, CI, merge, deploy, close); this file only
-# frames it and reports.
+# Telegram (Telegram only, by request; the daily note is not touched). The model
+# run does the engineering (implement, review, CI, merge, deploy, close); this
+# file only frames it and reports.
 #
 # Run it now (does not wait for 01:00):
 #   launchctl kickstart -k "gui/$(id -u)/com.comics.em-batch-nightly"
@@ -34,7 +34,6 @@ REPO="/Users/hsukenooi/Projects/comic-pipeline"          # shared checkout: sett
 RUN_WT="/Users/hsukenooi/Projects/comic-pipeline-nightly" # the EM's own detached worktree
 STATE_DIR="/Users/hsukenooi/.local/state/em-batch-nightly"
 LOCK_DIR="$STATE_DIR/lock"
-GRAPH="/Users/hsukenooi/Library/Mobile Documents/iCloud~app~reflect/Documents/Notes"
 SHARED_DIR="/Users/hsukenooi/.claude/scripts/shared"    # telegram_report.py
 ENVFILE="/Users/hsukenooi/.config/tasks-to-linear.env"  # TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
 KNOBS="/Users/hsukenooi/.config/em-batch-nightly.env"
@@ -159,7 +158,7 @@ Run context from scripts/em-batch-nightly.sh (BUI-972):
 - Shared checkout, for deploy only: $REPO (see the profile's Deploy model for the on-main-and-clean rule).
 - Run dir for wave-plan.md and handoff.md: $RUN_DIR
 - Budget: about \$$BUDGET and $TIMEOUT of wall clock. Prefer finishing fewer tickets cleanly over starting all of them.
-- Your FINAL message is the user summary defined in the skill's mode:autonomous section (20 lines max, written for the person who uses the pipeline, not a code reader). It is posted to Telegram and the daily note as-is."
+- Your FINAL message is the user summary defined in the skill's mode:autonomous section (20 lines max, written for the person who uses the pipeline, not a code reader). It is posted to Telegram as-is."
 printf '%s\n' "$PROMPT" > "$RUN_DIR/prompt.md"
 
 if [ "$DRY_RUN" -eq 1 ]; then
@@ -207,17 +206,6 @@ printf '%s\n' "$SUMMARY" > "$RUN_DIR/summary.md"
 # --- Report ------------------------------------------------------------------------
 tg_send "$TITLE, $(date '+%a %d %b'):
 $SUMMARY"
-
-NOTE="$GRAPH/daily/$(date '+%Y-%m-%d').md"
-if /bin/ls "$GRAPH/daily" >/dev/null 2>&1 && [ -f "$NOTE" ]; then
-  {
-    printf '\n- %s\n' "$TITLE"
-    printf '%s\n' "$SUMMARY" | sed -e '/^[[:space:]]*$/d' -e 's/^- /  - /' -e '/^  - /!s/^/  - /'
-  } >> "$NOTE"
-  echo "appended to $NOTE"
-else
-  echo "daily note not writable or missing ($NOTE); Telegram only"
-fi
 
 echo "=== $(date '+%Y-%m-%d %H:%M:%S') exit 0 ==="
 exit 0
