@@ -1757,6 +1757,21 @@ def _multibook_graded_lot(title: str) -> bool:
     return False
 
 
+# BUI-962: the code a graded-mode `hard_exclude` drop is reported under in
+# `graded_identity_dropped_ids` (see `_run`'s call site below). `hard_exclude`
+# itself keeps returning a bare bool — its internal checks (the shared
+# `comic_identity.is_comp_excluded`, plus `_GRADED_MODE_EXCLUDE_RE` in graded
+# mode) span several unrelated lexicons, and splitting the code by which one
+# fired would just move that internal seam into the exclusion vocabulary
+# without buying a downstream caller anything: the ledger's whole use of a
+# code is "so a sweep/correction can name this row's reason", and "matched
+# hard_exclude" already answers that. Single-sourced here so
+# `apps/fmv/scripts/backfill_comps_ledger.py`'s offline sweep (`sc.
+# HARD_EXCLUDE_CODE`) can emit the identical string rather than a second
+# literal that could drift from this one.
+HARD_EXCLUDE_CODE = "hard_exclude"
+
+
 def hard_exclude(title: str, *, graded_target: str | None = None) -> bool:
     """True when `title` must never enter any comp pool.
 
@@ -1768,6 +1783,9 @@ def hard_exclude(title: str, *, graded_target: str | None = None) -> bool:
     the BUI-348/BUI-524 include_graded-only modes) is byte-for-byte
     unaffected.  BUI-922 adds the ampersand multi-book lot on the same
     graded-only branch, for the same reason.
+
+    A True verdict, in graded mode, is reported to the caller under
+    `HARD_EXCLUDE_CODE` (BUI-962) — see `_run`'s call site.
     """
     if comic_identity.is_comp_excluded(title):
         return True
@@ -2493,10 +2511,11 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
     # present so a caller reads "0" rather than a missing key; all zero for
     # every raw call, which never runs the guards at all.
     graded_identity_dropped = dict.fromkeys(GRADED_IDENTITY_CODES, 0)
-    # BUI-946: per-comp record of every graded-only guard drop this call
+    # BUI-946/962: per-comp record of every graded-only guard drop this call
     # makes — the ampersand-lot guard (`multibook_lot`), the two
-    # `graded_identity_exclude` codes, and the printing guard (`printing`) —
-    # so a downstream caller (fmv_runner's ledger merge) can drop the SAME
+    # `graded_identity_exclude` codes, `hard_exclude`'s own verdict
+    # (`HARD_EXCLUDE_CODE`), and the printing guard (`printing`) — so a
+    # downstream caller (fmv_runner's ledger merge) can drop the SAME
     # listing out of a stored ledger comp by product_id, not just see a
     # count. Only comps with a product_id can be listed here (every slab/
     # comp candidate that reaches these checks already passed the
@@ -2638,6 +2657,21 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
                         {"product_id": comp["product_id"], "code": "multibook_lot"})
                     continue
                 if hard_exclude(comp["title"], graded_target=graded_target):
+                    # BUI-962: previously a bare `continue` — a hard_exclude
+                    # drop that wasn't the ampersand lot (handled above,
+                    # before this call) carried no code at all, so a
+                    # downstream sweep of the stored ledger
+                    # (backfill_comps_ledger.sweep_verdict) could only
+                    # report it as `uncoded_hard_exclude` and never stamp
+                    # it. Graded mode only, mirroring
+                    # `graded_identity_dropped_ids`'s "empty on every raw
+                    # call" contract (see its declaration) — a raw call's
+                    # pool is unaffected either way, since both branches
+                    # `continue`.
+                    if graded_target:
+                        graded_identity_dropped_ids.append(
+                            {"product_id": comp["product_id"],
+                             "code": HARD_EXCLUDE_CODE})
                     continue
                 # BUI-922/938: the two guards that need the TARGET's identity
                 # rather than just the comp's title. Graded mode only — a raw
@@ -2952,11 +2986,12 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
             # BUI-922/938: {code: count} for the graded-only identity guards
             # (cross_title, store_variant). All zeros on every raw call.
             "graded_identity_dropped": graded_identity_dropped,
-            # BUI-946: [{"product_id", "code"}] for EVERY graded-only guard
-            # drop this call made — multibook_lot, cross_title, store_variant,
-            # printing — so a caller (fmv_runner's ledger merge) can drop the
-            # same listing's stored ledger copy by id. Always empty on a raw
-            # call, which never runs these guards.
+            # BUI-946/962: [{"product_id", "code"}] for EVERY graded-only
+            # guard drop this call made — multibook_lot, cross_title,
+            # store_variant, hard_exclude, printing — so a caller
+            # (fmv_runner's ledger merge) can drop the same listing's stored
+            # ledger copy by id. Always empty on a raw call, which never runs
+            # these guards.
             "graded_identity_dropped_ids": graded_identity_dropped_ids,
         }
     except Exception as e:  # noqa: BLE001 — BUI-537: preserve the partial

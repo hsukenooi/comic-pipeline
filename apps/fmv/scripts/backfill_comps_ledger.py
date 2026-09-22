@@ -867,23 +867,30 @@ def verify_shape(sc: types.ModuleType, responses: list[RawResponse],
 #     replaying it online would re-bill a second API for the whole archive.
 #     A `printing` stamp still reaches the ledger the ordinary way, from a
 #     live run via `fmv_runner._post_comps_exclusions`.
-#   * `hard_exclude`'s own verdict, when it is not the ampersand lot. It
-#     returns a bare bool with no code, and the exclusion vocabulary is
-#     codes; there is nothing honest to stamp such a row WITH. They are
-#     counted and reported (`uncoded_hard_exclude`) so the gap is visible
-#     rather than implied.
 #   * A slab row whose `certifier` is not cgc/cbcs. The live guards only ever
 #     run under `graded_target in ("cgc", "cbcs")`; running them on a row
 #     that never met that condition would judge it by a rule it was never
 #     subject to. Counted as `skipped_certifier`.
 #
+# BUI-962 CLOSED a third bullet that used to live here: `hard_exclude`'s own
+# verdict, when it was not the ampersand lot, used to return a bare bool with
+# no code — the exclusion vocabulary is codes, and there was nothing honest
+# to stamp such a row WITH. It is now reported under `sc.HARD_EXCLUDE_CODE`
+# (`"hard_exclude"`), single-sourced from `sold_comps.py` so this file never
+# carries a second copy of that string. `UNCODED_HARD_EXCLUDE` stays below,
+# unreachable through this function today, as a canary: if `hard_exclude`
+# ever grows a branch this sweep's `sc.hard_exclude(...)` call reaches but
+# cannot name, this is where that gap would resurface, and the report is
+# what makes it visible rather than silently swallowed.
+#
 # Everything here is READ + one narrow POST. It never deletes, and a stamped
 # row is skipped by the read (`include_excluded=false`), so a second sweep
 # over a swept archive posts nothing.
 
-# The guard verdict for a row `hard_exclude` drops for a reason that has no
-# code. Not a member of `COMPS_EXCLUSION_CODES` and never posted — a sentinel
-# for the report only.
+# Kept for the reporting path only (see the BUI-962 note above) — `sc.
+# hard_exclude(...)`'s True branch is now always reported under
+# `sc.HARD_EXCLUDE_CODE`, so this sentinel is currently unreachable through
+# `sweep_verdict` and `totals[UNCODED_HARD_EXCLUDE]` should always read 0.
 UNCODED_HARD_EXCLUDE = "uncoded_hard_exclude"
 
 # Read every stored slab row per book, not the endpoint's 100-row default: a
@@ -896,13 +903,16 @@ def sweep_verdict(sc: types.ModuleType, *, title: str, issue,
                   target_is_variant: bool, certifier: str) -> str | None:
     """Replay the live graded guards over ONE stored slab row's title.
 
-    Returns an exclusion code, `UNCODED_HARD_EXCLUDE`, or None to keep.
+    Returns an exclusion code, or None to keep. (`UNCODED_HARD_EXCLUDE` was
+    the pre-BUI-962 return for a `hard_exclude` drop that wasn't the
+    ampersand lot; `hard_exclude`'s own verdict is now coded — see the module
+    comment above — so this function itself no longer produces it.)
 
     The ORDER is the live order in `fetch_book_comps`, and it is load-bearing
     in one direction: `hard_exclude` folds the ampersand-lot check in
     internally, so checking `_multibook_graded_lot` first is what lets a lot
-    be stamped with its own code instead of disappearing into the uncoded
-    bucket. Live, a title `hard_exclude` drops never reaches
+    be stamped with its own code instead of being reported as the coarser
+    `HARD_EXCLUDE_CODE`. Live, a title `hard_exclude` drops never reaches
     `graded_identity_exclude` at all, and this reproduces that — so this can
     only ever report a subset of what the live path would drop, never a
     superset. That is the safe direction: the failure mode to avoid is
@@ -917,7 +927,7 @@ def sweep_verdict(sc: types.ModuleType, *, title: str, issue,
     if sc._multibook_graded_lot(title):
         return "multibook_lot"
     if sc.hard_exclude(title, graded_target=certifier):
-        return UNCODED_HARD_EXCLUDE
+        return sc.HARD_EXCLUDE_CODE
     return sc.graded_identity_exclude(
         title, issue=issue, target_is_variant=target_is_variant)
 
@@ -988,6 +998,11 @@ def sweep_excluded(sc: types.ModuleType, server_url: str, *,
             if verdict is None:
                 totals["kept"] += 1
                 continue
+            # BUI-962: `sweep_verdict` no longer returns this sentinel — a
+            # `hard_exclude` drop is now reported (and stamped) under
+            # `sc.HARD_EXCLUDE_CODE` via the `match_{verdict}` branch below.
+            # Left here as a canary: `totals[UNCODED_HARD_EXCLUDE]` should
+            # always be 0.
             if verdict == UNCODED_HARD_EXCLUDE:
                 totals[UNCODED_HARD_EXCLUDE] += 1
                 print(f"  comic {comic_id} {book.get('title')!r} "

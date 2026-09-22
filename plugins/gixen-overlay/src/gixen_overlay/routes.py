@@ -46,6 +46,7 @@ from gixen_overlay.db import (
     get_comps,
     get_fmv_history,
     stamp_comps_excluded,
+    unstamp_comps_excluded,
     list_comics_for_slab_watch,
     set_comic_slab_watch,
     DEFAULT_OUTCOME_GRADE_WINDOW,
@@ -62,6 +63,7 @@ from gixen_overlay.models import (
     UpsertComicRequest,
     CompsIngestRequest,
     CompsExcludeRequest,
+    CompsUnstampRequest,
     LocgLinkRequest,
     LinkFmvRequest,
     VerifyRequest,
@@ -691,6 +693,46 @@ async def api_comics_comps_exclude(req: CompsExcludeRequest, request: Request):
             status_code=404, detail=f"comic_id {req.comic_id} not in DB"
         )
     return result
+
+
+@router.post("/api/comics/comps/unstamp")
+async def api_comics_comps_unstamp(req: CompsUnstampRequest, request: Request):
+    """BUI-962: correct an exclusion stamp — clear `excluded_code`/
+    `excluded_at` for specific, already-reviewed comps rows.
+
+    The correction path the BUI-947 exclude endpoint above never got.
+    `stamp_comps_excluded`'s own docstring used to name the only fix for a
+    wrong stamp as a direct `UPDATE comps SET excluded_code = NULL` — a
+    correction an autonomous operator cannot make: this repo's operating
+    rule is that only `comics-api POST` may mutate the comics server's data,
+    never a file-level UPDATE. This endpoint is that fix, over HTTP, so the
+    correction path an operator can actually use now exists.
+
+    Body: `{ids: [...], dry_run}`. `ids` are the `comps` table's own primary
+    keys — the same `id` every row already carries on `GET /api/comics/comps`
+    (`include_excluded=true` for the audit read that finds the row worth
+    correcting in the first place) — never `product_ids`: a row an operator
+    has already identified on that audit is already uniquely named by its
+    own id, and requiring a `comic_id` besides would only be a second way to
+    get the same row wrong.
+
+    `dry_run` (default `true`, mirrors `/api/sweep-orphans`) computes and
+    returns the exact same partition an apply call would, without writing —
+    review the preview, then repeat the call with `dry_run: false` to commit.
+
+    There is no "clear everything stamped" shape, by design: a correction is
+    a considered act on rows an operator has already reviewed, never a bulk
+    sweep — same posture the BUI-130 wish-list conflict removal takes on its
+    `names` scoping.
+
+    Returns `{dry_run, unstamped, not_stamped, not_found}` (see
+    `unstamp_comps_excluded`'s docstring for what each bucket means) — 200
+    always, even when every id lands in `not_stamped`/`not_found`, because
+    "none of these needed correcting" is a legitimate, non-error outcome for
+    a caller re-checking a stale list.
+    """
+    db = request.app.state.db
+    return unstamp_comps_excluded(db, req.ids, dry_run=req.dry_run)
 
 
 @router.get("/api/comics/fmv-history")
