@@ -5363,14 +5363,17 @@ class TestBriefProjection:
                   "flag_reason", "confidence", "fmv_low", "fmv_high",
                   "fmv_notes", "source",
                   # BUI-930: the price identity + basis. Null on a raw row.
-                  "certifier", "label", "pricing_basis"}
+                  "certifier", "label", "pricing_basis",
+                  # BUI-949: the short provenance cell. Additive — every key
+                  # above is unchanged.
+                  "provenance"}
 
     def test_fresh_row_projects_top_level_ids(self):
         row = {
             "input": {"item_id": "111", "title": "X", "issue": "1", "grade": 9.0},
             "fmv": {"max_bid": 80, "flag_reason": None, "confidence": "HIGH",
                     "fmv_low": 90, "fmv_high": 100, "trimmed_pool": [1, 2, 3],
-                    "cv_pct": "10%", "bid_factor": 0.80},
+                    "cv_pct": "10%", "bid_factor": 0.80, "n": 5},
             "comp_count_total": 5, "queries_used": [{"tier": "base"}],
             "db_row": {"id": 42, "comic_id": 42, "fmv_id": 7},
             "comic_id": 42, "fmv_id": 7, "source": "fresh",
@@ -5385,7 +5388,10 @@ class TestBriefProjection:
                          # BUI-930: a RAW row projects nulls, not the
                          # 'none'/'universal' sentinels.
                          "certifier": None, "label": None,
-                         "pricing_basis": None}
+                         "pricing_basis": None,
+                         # BUI-949: 0.80 is BASE_BID_FACTOR (no haircut), so
+                         # no `haircut` token.
+                         "provenance": "direct n5"}
 
     def test_fresh_row_fmv_notes_matches_upsert_notes(self):
         # BUI-505: the brief line's fmv_notes must be exactly what
@@ -5431,9 +5437,13 @@ class TestBriefProjection:
         # A _stitch error row (no comps, no cache) has neither top-level ids
         # nor a db_row nor an fmv dict — every pricing/linkage field is null,
         # but every key must still exist for a uniform downstream reader.
-        # `source` is the deliberate exception (BUI-549): it carries the
-        # row's real source ("error") rather than null, precisely so a
-        # --brief consumer can tell rows like this apart from each other.
+        # `source` and `provenance` are the deliberate exceptions: `source`
+        # (BUI-549) carries the row's real source ("error") rather than null,
+        # precisely so a --brief consumer can tell rows like this apart from
+        # each other; `provenance` (BUI-949) is never null by design — "n/a"
+        # is its own sentinel for "no comps, no known reason" (an ordinary
+        # `error` source has no skip-state token to name, unlike the
+        # skipped_lookup_error case below).
         row = {
             "input": {"item_id": "333", "title": "X", "issue": "1"},
             "fmv": None, "db_row": None, "source": "error",
@@ -5443,14 +5453,19 @@ class TestBriefProjection:
         assert set(brief) == self.BRIEF_KEYS
         assert brief["item_id"] == "333"
         assert brief["source"] == "error"
+        assert brief["provenance"] == "n/a"
         assert all(brief[k] is None
-                   for k in self.BRIEF_KEYS - {"item_id", "source"})
+                   for k in self.BRIEF_KEYS - {"item_id", "source", "provenance"})
 
     def test_skipped_lookup_error_row_has_distinct_source(self):
         # BUI-549: the whole point of adding `source` — a skipped_lookup_error
         # row (comics-server lookup FAILED) must be distinguishable in
         # --brief from an ordinary unpriced/error row, even though every
-        # pricing field is null in both cases.
+        # pricing field is null in both cases. BUI-949's `provenance` carries
+        # the same distinction as its own dedicated token (`skip:unverified`,
+        # matching `_print_table`'s column) rather than the bland "n/a" an
+        # ordinary no-comps/error row gets — reusing the BUI-143 fix rather
+        # than reopening it.
         row = {
             "input": {"item_id": "555", "title": "X", "issue": "1"},
             "fmv": None, "db_row": None, "source": "skipped_lookup_error",
@@ -5459,8 +5474,9 @@ class TestBriefProjection:
         brief = fmv_runner._brief_row(row)
         assert set(brief) == self.BRIEF_KEYS
         assert brief["source"] == "skipped_lookup_error"
+        assert brief["provenance"] == "skip:unverified"
         assert all(brief[k] is None
-                   for k in self.BRIEF_KEYS - {"item_id", "source"})
+                   for k in self.BRIEF_KEYS - {"item_id", "source", "provenance"})
 
     def test_skipped_hand_priced_row_has_distinct_source(self):
         # A hand-priced skip (BUI-533) is NOT the same source as a
@@ -7362,3 +7378,97 @@ class TestRunListSlabWatch:
         assert "raw_high=$250" in out
         assert "Unpriced Book #1" in out
         assert "raw_high=—" in out
+
+
+# ─── BUI-949: the provenance cell ──────────────────────────────────────────────
+
+class TestProvenanceCell:
+    """Pins the `provenance` cell's token vocabulary for the two reads it
+    serves (the Buy It Now stop, the auction approval gate) — one exact
+    certified row, one ladder certified row, one refused certified row, and
+    one raw direct row with a grade-confidence haircut. Built from the
+    structured fmv dict + `pricing_basis` only (BUI-949's own constraint),
+    never by parsing `fmv_notes` — so these are deliberately independent of
+    `_graded_note_parts`'/`_build_notes`' token spelling."""
+
+    def test_exact_tier_certified_row_names_the_tier_and_count(
+            self, tmp_path, server_url):
+        """A second 4.5 sale (from the ledger) lifts the exact bucket to
+        effective n 2 and flips the book from `ladder` to `direct` — the same
+        fixture `test_ledger_comps_join_the_pool` pins for `pricing_basis`.
+        Two comps land in the exact bucket (the live $700 sale plus the
+        ledger's $760 sale), so the count is 2."""
+        h = _graded_harness()
+        ledger = [_ledger_row()]
+        row, _, _ = h._run(h._book(), h._slab_result(), tmp_path, server_url,
+                           ledger=ledger)
+        fmv = row["fmv"]
+        assert fmv["pricing_basis"] == "direct"
+        assert fmv["n"] == 2
+        assert fmv_runner._provenance(row) == "exact n2"
+        assert fmv_runner._brief_row(row)["provenance"] == "exact n2"
+
+    def test_ladder_tier_certified_row_names_the_tier_and_rung_count(
+            self, tmp_path, server_url):
+        """The base slab fixture: a lone $700 exact sale (never the price —
+        BUI-940) with three neighbour rungs at 4.0/5.5/6.0, all full-weight
+        and each anchor-eligible (`GRADED_LADDER_MIN_BUCKET_N == 1`) — the
+        floor `GRADED_LADDER_MIN_RUNGS` needs to price rather than refuse."""
+        h = _graded_harness()
+        row, _, _ = h._run(h._book(), h._slab_result(), tmp_path, server_url)
+        fmv = row["fmv"]
+        assert fmv["pricing_basis"] == "ladder"
+        assert fmv_runner._provenance(row) == "ladder 3 rungs"
+        assert fmv_runner._brief_row(row)["provenance"] == "ladder 3 rungs"
+
+    def test_refused_ladder_row_names_the_refusal(self, tmp_path, server_url):
+        """Drop one of the three neighbour rungs (keep only 4.0 and 5.5) so
+        only 2 anchor-eligible rungs remain — below `GRADED_LADDER_MIN_RUNGS`
+        (3) — and the row refuses `ladder_too_thin` instead of pricing."""
+        h = _graded_harness()
+        result = h._slab_result(slab_comps=[
+            _make_slab_comp(700, 4.5, "e0", sold_date="2026-09-01"),
+            _make_slab_comp(900, 4.0, "e1", sold_date="2026-08-20"),
+            _make_slab_comp(1400, 5.5, "e2", sold_date="2026-08-10"),
+        ])
+        row, _, _ = h._run(h._book(), result, tmp_path, server_url)
+        fmv = row["fmv"]
+        assert fmv["flag_reason"] == "ladder_too_thin"
+        assert fmv_runner._provenance(row) == "refused ladder_too_thin"
+        assert fmv_runner._brief_row(row)["provenance"] == "refused ladder_too_thin"
+
+    def test_raw_direct_row_names_the_grade_confidence_haircut(self):
+        """A LOW photo grade_confidence (`/comic:grade`) out-ranks a
+        MEDIUM-LOW fmv-pool confidence, so it alone is the binding input in
+        `bid_factor`'s `min(rank(fmv), rank(grade))` — the cell must say
+        `grade`, not `fmv` or `both`. Verified against the real
+        `fmv_math.bid_factor`, not a hand-picked factor, so this can't drift
+        from the function it's attributing."""
+        factor = fmv_math.bid_factor("MEDIUM-LOW", "low")
+        assert factor == 0.60  # sanity: this IS the haircut being attributed
+        fmv = {"fmv_low": 90, "fmv_high": 100, "confidence": "MEDIUM-LOW",
+               "grade_confidence": "low", "bid_factor": factor, "n": 7,
+               "max_bid": 60, "flag_reason": None}
+        row = {"input": {"item_id": "1", "title": "X", "issue": "1"},
+               "fmv": fmv, "comic_id": 1, "fmv_id": 1, "source": "fresh"}
+        assert fmv_runner._provenance(row) == "direct n7 haircut grade"
+        assert fmv_runner._brief_row(row)["provenance"] == "direct n7 haircut grade"
+
+    def test_ledger_advisory_row_is_not_mislabeled_fetch_err(self):
+        """A ledger-advisory row's `_is_fetch_error(r)` is True BY DESIGN
+        (`run()`'s BUI-663 hook keeps it inside the fetch-err warning/count
+        on purpose — it has a real priced band underneath, from stored comps,
+        after the live fetch failed). The provenance cell must still read
+        `ledger-advisory`, not `fetch-err` — the same precedence
+        `_print_table` already gives its FMV column, and losing it here would
+        silently drop the one fact this row exists to carry: a band exists."""
+        fmv = {"ledger_advisory": True, "flag_reason": None,
+               "fmv_low": 200, "fmv_high": 300, "max_bid": None}
+        row = {"input": {"item_id": "1", "title": "X", "issue": "1"},
+               "fmv": fmv, "comic_id": None, "fmv_id": None,
+               "source": fmv_runner.SOURCE_LEDGER_ADVISORY,
+               "comp_count_total": 0,
+               "queries_used": [{"tier": "base", "error": "quota"}]}
+        assert fmv_runner._is_fetch_error(row)  # sanity: the trap condition
+        assert fmv_runner._provenance(row) == "ledger-advisory"
+        assert fmv_runner._brief_row(row)["provenance"] == "ledger-advisory"
