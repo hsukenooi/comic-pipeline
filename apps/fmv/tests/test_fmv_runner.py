@@ -7472,3 +7472,356 @@ class TestProvenanceCell:
         assert fmv_runner._is_fetch_error(row)  # sanity: the trap condition
         assert fmv_runner._provenance(row) == "ledger-advisory"
         assert fmv_runner._brief_row(row)["provenance"] == "ledger-advisory"
+
+
+# ─── BUI-951: `comic-fmv --slab-watch-collect` ─────────────────────────────────
+
+from datetime import datetime, timedelta, timezone  # noqa: E402 — appended (BUI-951)
+
+
+def _watch_item(comic_id, title, issue, year=None, certifier="cgc",
+                raw_high=250.0, reason="threshold"):
+    return {"comic_id": comic_id, "title": title, "issue": issue, "year": year,
+            "raw_high": raw_high, "reason": reason, "certifier": certifier}
+
+
+def _watch_body(items):
+    return {"threshold": 100.0, "count": len(items), "items": items}
+
+
+def _ledger_ts_row(days_old, *, certifier="cgc", product_id="L1", field="observed_at"):
+    ts = (datetime.now(timezone.utc) - timedelta(days=days_old)).isoformat()
+    row = {"product_id": product_id, "price": 700.0, "grade": 9.0,
+           "sold_date": "2026-08-01", "certifier": certifier, "label": "universal"}
+    row[field] = ts
+    return row
+
+
+def _collect_result(req_id, title, issue, year, *, certifier="cgc",
+                    slab_comps=None, comps=None, error=None,
+                    queries_used=None, graded_identity_dropped_ids=None):
+    return {
+        "input": {"_req_id": req_id, "title": title, "issue": issue,
+                  "year": year, "certifier": certifier},
+        "comps": comps if comps is not None else [],
+        "slab_comps": slab_comps if slab_comps is not None else [],
+        "queries_used": (queries_used if queries_used is not None
+                         else [{"tier": "base", "cached": False}]),
+        "error": error,
+        "graded_identity_dropped_ids": graded_identity_dropped_ids or [],
+    }
+
+
+class TestParseLedgerTimestamp:
+    def test_iso_with_offset_round_trips(self):
+        dt = fmv_runner._parse_ledger_timestamp("2026-08-25T12:00:00+00:00")
+        assert dt == datetime(2026, 8, 25, 12, 0, tzinfo=timezone.utc)
+
+    def test_sqlite_naive_string_is_assumed_utc(self):
+        """`last_seen_at` is SQLite's own `datetime('now')` — naive, UTC."""
+        dt = fmv_runner._parse_ledger_timestamp("2026-08-25 12:00:00")
+        assert dt == datetime(2026, 8, 25, 12, 0, tzinfo=timezone.utc)
+
+    def test_z_suffix_is_normalized(self):
+        dt = fmv_runner._parse_ledger_timestamp("2026-08-25T12:00:00Z")
+        assert dt == datetime(2026, 8, 25, 12, 0, tzinfo=timezone.utc)
+
+    def test_garbage_and_none_return_none(self):
+        assert fmv_runner._parse_ledger_timestamp("not a date") is None
+        assert fmv_runner._parse_ledger_timestamp(None) is None
+        assert fmv_runner._parse_ledger_timestamp("") is None
+        assert fmv_runner._parse_ledger_timestamp(12345) is None
+
+
+class TestSlabLedgerFreshest:
+    def test_empty_rows_is_none(self):
+        assert fmv_runner._slab_ledger_freshest([]) is None
+
+    def test_all_unparseable_is_none(self):
+        rows = [{"observed_at": "garbage", "last_seen_at": None}]
+        assert fmv_runner._slab_ledger_freshest(rows) is None
+
+    def test_picks_the_max_across_rows_and_fields(self):
+        rows = [
+            {"observed_at": "2026-08-01T00:00:00+00:00", "last_seen_at": None},
+            {"observed_at": None, "last_seen_at": "2026-08-20 00:00:00"},
+        ]
+        freshest = fmv_runner._slab_ledger_freshest(rows)
+        assert freshest == datetime(2026, 8, 20, tzinfo=timezone.utc)
+
+
+class TestSlabWatchMaxRequests:
+    def test_override_wins(self, monkeypatch):
+        monkeypatch.setenv("SLAB_WATCH_MAX_REQUESTS", "5")
+        assert fmv_runner._slab_watch_max_requests(10) == 10
+
+    def test_env_var_parses(self, monkeypatch):
+        monkeypatch.setenv("SLAB_WATCH_MAX_REQUESTS", "5")
+        assert fmv_runner._slab_watch_max_requests(None) == 5
+
+    def test_invalid_env_warns_and_falls_back(self, monkeypatch, capsys):
+        monkeypatch.setenv("SLAB_WATCH_MAX_REQUESTS", "not-a-number")
+        assert (fmv_runner._slab_watch_max_requests(None)
+               == fmv_runner._SLAB_WATCH_COLLECT_DEFAULT_MAX_REQUESTS)
+        assert "does not parse" in capsys.readouterr().err
+
+    def test_default_with_nothing_set(self, monkeypatch):
+        monkeypatch.delenv("SLAB_WATCH_MAX_REQUESTS", raising=False)
+        assert (fmv_runner._slab_watch_max_requests(None)
+               == fmv_runner._SLAB_WATCH_COLLECT_DEFAULT_MAX_REQUESTS)
+
+
+class TestSlabWatchCollectRun:
+    """`comic-fmv --slab-watch-collect` end to end, HTTP/subprocess faked."""
+
+    def test_missing_server_url_returns_2_no_ping(self):
+        with patch("fmv_runner.requests.post") as post:
+            code = fmv_runner.run_slab_watch_collect(server_url=None)
+        assert code == 2
+        post.assert_not_called()
+
+    def test_failed_watch_set_read_returns_2_no_ping(self, server_url, capsys):
+        with patch("fmv_runner._get_json_or_warn",
+                   return_value=fmv_runner._LOOKUP_FAILED), \
+             patch("fmv_runner.requests.post") as post:
+            code = fmv_runner.run_slab_watch_collect(server_url=server_url)
+        assert code == 2
+        assert "did not start" in capsys.readouterr().err
+        post.assert_not_called()
+
+    def test_skip_by_21_days_freshness(self, server_url, capsys):
+        """A book with a slab observation inside the 21-day window is
+        skipped without spending a provider request; a book with none (or a
+        stale one) is queued for fetch."""
+        items = [_watch_item(1, "Fresh Book", "1"),
+                 _watch_item(2, "Stale Book", "1")]
+
+        def ledger_side_effect(_server, *, title, issue, year, pool, certifier):
+            assert pool == "slab"
+            if title == "Fresh Book":
+                return [_ledger_ts_row(5)]
+            return [_ledger_ts_row(30)]  # older than the 21-day window
+
+        fetch = MagicMock(return_value=[
+            _collect_result(0, "Stale Book", "1", None),
+        ])
+        with patch("fmv_runner._get_json_or_warn", return_value=_watch_body(items)), \
+             patch("fmv_runner._fetch_ledger_comps", side_effect=ledger_side_effect), \
+             patch("fmv_runner._fetch_comps", fetch), \
+             patch("fmv_runner._post_comps", return_value=None), \
+             patch("fmv_runner._post_comps_exclusions", return_value=0), \
+             patch("fmv_runner.requests.post") as post:
+            code = fmv_runner.run_slab_watch_collect(server_url=server_url)
+
+        assert code == 0
+        sent_books = fetch.call_args.args[0]
+        assert [b["title"] for b in sent_books] == ["Stale Book"]
+        out = capsys.readouterr().out
+        assert "2 book(s) in the watch set" in out
+        assert "1 skipped" in out
+        assert "1 fetched" in out
+        post.assert_called_once()
+
+    def test_cap_stops_the_run_and_reports_leftovers(self, server_url, capsys):
+        items = [_watch_item(1, "B", "1"), _watch_item(2, "C", "1"),
+                 _watch_item(3, "D", "1")]
+        fetch = MagicMock(return_value=[_collect_result(0, "B", "1", None)])
+        with patch("fmv_runner._get_json_or_warn", return_value=_watch_body(items)), \
+             patch("fmv_runner._fetch_ledger_comps", return_value=[]), \
+             patch("fmv_runner._fetch_comps", fetch), \
+             patch("fmv_runner._post_comps", return_value=None), \
+             patch("fmv_runner._post_comps_exclusions", return_value=0), \
+             patch("fmv_runner.requests.post") as post:
+            code = fmv_runner.run_slab_watch_collect(
+                server_url=server_url, max_requests=1)
+
+        assert code == 0  # nothing ATTEMPTED failed — the cap isn't a failure
+        sent_books = fetch.call_args.args[0]
+        assert len(sent_books) == 1
+        assert sent_books[0]["title"] == "B"
+        err = capsys.readouterr().err
+        assert "cap (1) reached" in err
+        assert "C #1" in err and "D #1" in err
+        assert "B #1" not in err.split("cap (1) reached")[1]  # only leftovers named
+        post.assert_called_once()  # the cap alone must not suppress the ping
+
+    def test_write_failure_suppresses_the_ping(self, server_url):
+        items = [_watch_item(1, "B", "1")]
+        result = _collect_result(
+            0, "B", "1", None,
+            slab_comps=[_make_slab_comp(700, 9.0, "s0")])
+        with patch("fmv_runner._get_json_or_warn", return_value=_watch_body(items)), \
+             patch("fmv_runner._fetch_ledger_comps", return_value=[]), \
+             patch("fmv_runner._fetch_comps", return_value=[result]), \
+             patch("fmv_runner._post_comps", return_value=False), \
+             patch("fmv_runner._post_comps_exclusions", return_value=0), \
+             patch("fmv_runner.requests.post") as post:
+            code = fmv_runner.run_slab_watch_collect(server_url=server_url)
+
+        assert code == 1
+        post.assert_not_called()
+
+    def test_all_skipped_run_still_pings(self, server_url, capsys):
+        """'Zero results is a success' — every book fresh means zero fetches,
+        and that is still a completed, healthy run."""
+        items = [_watch_item(1, "A", "1"), _watch_item(2, "B", "1")]
+        fetch = MagicMock()
+        with patch("fmv_runner._get_json_or_warn", return_value=_watch_body(items)), \
+             patch("fmv_runner._fetch_ledger_comps",
+                   return_value=[_ledger_ts_row(1)]), \
+             patch("fmv_runner._fetch_comps", fetch), \
+             patch("fmv_runner.requests.post") as post:
+            code = fmv_runner.run_slab_watch_collect(server_url=server_url)
+
+        assert code == 0
+        fetch.assert_not_called()
+        post.assert_called_once()
+        assert post.call_args.args[0] == f"{server_url}/api/heartbeat/slab-watch-collect"
+
+    def test_the_cbcs_hand_case_picks_the_cbcs_certifier(self, server_url):
+        """A future per-book grader override on the watch-set item must be
+        honoured, not silently overwritten with the "cgc" default — and a
+        CGC comp that rides along in the same graded-only response must not
+        be posted for a CBCS target (the identity guard, same as the live
+        pricing path's `live_slab` filter)."""
+        items = [_watch_item(1, "Detective Comics", "27", certifier="cbcs")]
+        result = _collect_result(
+            0, "Detective Comics", "27", None, certifier="cbcs",
+            slab_comps=[
+                _make_slab_comp(500, 9.0, "cbcs1", certifier="cbcs"),
+                _make_slab_comp(9999, 9.0, "cgc-noise", certifier="cgc"),
+            ])
+        post_comps = MagicMock(return_value=True)
+        with patch("fmv_runner._get_json_or_warn", return_value=_watch_body(items)), \
+             patch("fmv_runner._fetch_ledger_comps", return_value=[]) as ledger, \
+             patch("fmv_runner._fetch_comps", return_value=[result]) as fetch, \
+             patch("fmv_runner._post_comps", post_comps), \
+             patch("fmv_runner._post_comps_exclusions", return_value=0), \
+             patch("fmv_runner.requests.post"):
+            code = fmv_runner.run_slab_watch_collect(server_url=server_url)
+
+        assert code == 0
+        assert fetch.call_args.args[0][0]["certifier"] == "cbcs"
+        assert ledger.call_args.kwargs["certifier"] == "cbcs"
+        posted_comic_id, raw_arg, slab_arg = post_comps.call_args.args[1:4]
+        assert posted_comic_id == 1
+        assert raw_arg == []
+        assert [c["product_id"] for c in slab_arg] == ["cbcs1"]
+
+    def test_a_fetch_error_is_not_mistaken_for_zero_comps(self, server_url, capsys):
+        """BUI-565/570 class: a per-book crash surfaces as `result["error"]`
+        set, not as an empty `slab_comps` list read as a genuine zero."""
+        items = [_watch_item(1, "B", "1")]
+        result = _collect_result(0, "B", "1", None, error="provider timeout")
+        with patch("fmv_runner._get_json_or_warn", return_value=_watch_body(items)), \
+             patch("fmv_runner._fetch_ledger_comps", return_value=[]), \
+             patch("fmv_runner._fetch_comps", return_value=[result]), \
+             patch("fmv_runner._post_comps") as post_comps, \
+             patch("fmv_runner._post_comps_exclusions", return_value=0), \
+             patch("fmv_runner.requests.post") as post:
+            code = fmv_runner.run_slab_watch_collect(server_url=server_url)
+
+        assert code == 1
+        post_comps.assert_not_called()  # never posts from a failed fetch
+        post.assert_not_called()
+        assert "fetch-err" in capsys.readouterr().err
+
+    def test_all_queries_errored_is_also_a_fetch_failure(self, server_url):
+        """The other BUI-565/570 shape: no per-book raise, but every query in
+        the trail carries its own `error` — `_is_fetch_error`'s signal."""
+        items = [_watch_item(1, "B", "1")]
+        result = _collect_result(
+            0, "B", "1", None,
+            queries_used=[{"tier": "base", "error": "RateLimiter 10001"}])
+        with patch("fmv_runner._get_json_or_warn", return_value=_watch_body(items)), \
+             patch("fmv_runner._fetch_ledger_comps", return_value=[]), \
+             patch("fmv_runner._fetch_comps", return_value=[result]), \
+             patch("fmv_runner._post_comps") as post_comps, \
+             patch("fmv_runner._post_comps_exclusions", return_value=0), \
+             patch("fmv_runner.requests.post") as post:
+            code = fmv_runner.run_slab_watch_collect(server_url=server_url)
+
+        assert code == 1
+        post_comps.assert_not_called()
+        post.assert_not_called()
+
+    def test_total_fetch_failure_returns_1_no_ping(self, server_url, capsys):
+        items = [_watch_item(1, "B", "1")]
+        with patch("fmv_runner._get_json_or_warn", return_value=_watch_body(items)), \
+             patch("fmv_runner._fetch_ledger_comps", return_value=[]), \
+             patch("fmv_runner._fetch_comps", return_value=None), \
+             patch("fmv_runner.requests.post") as post:
+            code = fmv_runner.run_slab_watch_collect(server_url=server_url)
+
+        assert code == 1
+        post.assert_not_called()
+        assert "batch comp fetch failed" in capsys.readouterr().err
+
+    def test_malformed_watch_item_is_skipped_not_fatal(self, server_url, capsys):
+        items = [{"comic_id": None, "title": "No Id", "issue": "1",
+                 "certifier": "cgc"},
+                 _watch_item(2, "Fine Book", "1")]
+        fetch = MagicMock(return_value=[_collect_result(0, "Fine Book", "1", None)])
+        with patch("fmv_runner._get_json_or_warn", return_value=_watch_body(items)), \
+             patch("fmv_runner._fetch_ledger_comps", return_value=[]), \
+             patch("fmv_runner._fetch_comps", fetch), \
+             patch("fmv_runner._post_comps", return_value=None), \
+             patch("fmv_runner._post_comps_exclusions", return_value=0), \
+             patch("fmv_runner.requests.post"):
+            code = fmv_runner.run_slab_watch_collect(server_url=server_url)
+
+        assert code == 0
+        sent_books = fetch.call_args.args[0]
+        assert [b["title"] for b in sent_books] == ["Fine Book"]
+        assert "malformed watch-set item" in capsys.readouterr().err
+
+    def test_summary_counts_rows_posted_and_dropped_by_guards(
+            self, server_url, capsys):
+        items = [_watch_item(1, "B", "1")]
+        result = _collect_result(
+            0, "B", "1", None,
+            slab_comps=[
+                _make_slab_comp(700, 9.0, "s0", certifier="cgc"),
+                _make_slab_comp(900, 9.2, "s1", certifier="cgc"),
+                # A different certifier's comp rides along in the same
+                # response (BUI-929) and must be excluded, not posted.
+                _make_slab_comp(9999, 9.0, "s2", certifier="cbcs"),
+            ])
+        with patch("fmv_runner._get_json_or_warn", return_value=_watch_body(items)), \
+             patch("fmv_runner._fetch_ledger_comps", return_value=[]), \
+             patch("fmv_runner._fetch_comps", return_value=[result]), \
+             patch("fmv_runner._post_comps", return_value=True), \
+             patch("fmv_runner._post_comps_exclusions", return_value=0), \
+             patch("fmv_runner.requests.post"):
+            code = fmv_runner.run_slab_watch_collect(server_url=server_url)
+
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "1 book(s) in the watch set" in out
+        assert "0 skipped" in out
+        assert "1 fetched" in out
+        assert "2 slab row(s) posted" in out
+        assert "1 row(s) dropped by identity guards" in out
+
+    def test_ledger_dropped_ids_are_stamped_via_the_shared_exclusion_helper(
+            self, server_url):
+        """Reuses `_post_comps_exclusions` exactly as the live pricing path's
+        `_compute_graded_one` does (BUI-946/947): a stored ledger row sharing
+        a product_id this run's guards just dropped gets stamped."""
+        items = [_watch_item(1, "B", "1")]
+        stored = _ledger_ts_row(30, product_id="L1")  # stale -> not skipped
+        result = _collect_result(
+            0, "B", "1", None,
+            graded_identity_dropped_ids=[{"product_id": "L1", "code": "cross_title"}])
+        exclusions = MagicMock(return_value=1)
+        with patch("fmv_runner._get_json_or_warn", return_value=_watch_body(items)), \
+             patch("fmv_runner._fetch_ledger_comps", return_value=[stored]), \
+             patch("fmv_runner._fetch_comps", return_value=[result]), \
+             patch("fmv_runner._post_comps", return_value=None), \
+             patch("fmv_runner._post_comps_exclusions", exclusions), \
+             patch("fmv_runner.requests.post"):
+            code = fmv_runner.run_slab_watch_collect(server_url=server_url)
+
+        assert code == 0
+        dropped_rows_arg = exclusions.call_args.args[1]
+        assert [r["product_id"] for r in dropped_rows_arg] == ["L1"]

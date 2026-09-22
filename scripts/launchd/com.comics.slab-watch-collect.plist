@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.comics.slab-watch-collect</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/hsukenooi/.local/bin/comic-fmv</string>
+        <string>--slab-watch-collect</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>COMICS_SERVER_URL</key>
+        <string>http://localhost:8080</string>
+        <!-- launchd starts jobs with a minimal PATH that omits ~/.local/bin,
+             where uv installs the ebay-sold-comps console script comic-fmv
+             shells out to (BUI-27). -->
+        <key>PATH</key>
+        <string>/Users/hsukenooi/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <!-- Optional (BUI-951): override the default 80-request-per-run
+             cap without a code deploy. Uncomment and set a value, then
+             `launchctl unload`/`launchctl load -w` to pick it up. -->
+        <!--
+        <key>SLAB_WATCH_MAX_REQUESTS</key>
+        <string>80</string>
+        -->
+    </dict>
+    <!-- BUI-951: StartCalendarInterval has no "every four weeks" unit, so
+         this is the closest calendar slot — monthly, on the 1st. A fixed
+         weekday (like sentinel-probe's) drifts across months; the 1st does
+         not. 09:30 — half an hour after sentinel-probe's Sunday 09:00 slot,
+         so the two provider-spending scheduled jobs don't usually land in
+         the same minute. A missed slot (the Mini asleep) runs once at wake,
+         same as sentinel-probe — never a backlog of replayed ticks. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Day</key>
+        <integer>1</integer>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/Users/hsukenooi/.comics-server/slab-watch-collect.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/hsukenooi/.comics-server/slab-watch-collect.error.log</string>
+</dict>
+</plist>
