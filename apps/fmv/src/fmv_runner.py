@@ -2252,15 +2252,18 @@ def _ledger_advisory(server_url: str, *, inp: dict, target_grade: float,
     the ledger rows carry, or None>, "ledger_rows": <rows read>}`.
 
     Returns None — meaning "the caller emits the ordinary fetch-err" — for
-    every one of: the ledger read failed, the book resolved to nothing, the
-    rows carry too few usable (price, grade) pairs, `compute_fmv` set a
-    pool-shape `flag_reason` (the book is needs-manual on the ledger pool
-    exactly as it would be on a live one), the band came back unpriced, or the
-    TRIMMED pool fell under `LEDGER_ADVISORY_MIN_POOL`. That last one is the
-    ticket's "what happens when the ledger is also thin" — it is the same
-    question the pipeline already answers, answered the same way, and a book
-    that fails it is left in the honest fetch-err state rather than given a
-    number two observations wide.
+    every one of: the ledger read failed, the book resolved to nothing,
+    `compute_fmv` set a pool-shape `flag_reason` (the book is needs-manual on
+    the ledger pool exactly as it would be on a live one) — which also covers
+    "too few usable (price, grade) pairs" via `too_sparse`, since a 0- or
+    1-comp pool always trips that flag — the band came back unpriced, or the
+    EFFECTIVE n (BUI-956: `fmv["effective_n"]`, the same recency-weighted sum
+    `_graded_ledger_advisory` gates on via `bucket_effective_n`, not the raw
+    trimmed-pool count) fell under `LEDGER_ADVISORY_MIN_POOL`. That last one
+    is the ticket's "what happens when the ledger is also thin" — it is the
+    same question the pipeline already answers, answered the same way, and a
+    book that fails it is left in the honest fetch-err state rather than
+    given a number whose observations may be too stale to count as three.
 
     The band itself is `fmv_math.compute_fmv` unchanged — the same math, the
     same guards, the same recency weighting — run over ledger comps instead of
@@ -2297,8 +2300,6 @@ def _ledger_advisory(server_url: str, *, inp: dict, target_grade: float,
         if _is_priceable_number(r.get("price"))
         and _is_priceable_number(r.get("grade"))
     ]
-    if len(comps) < LEDGER_ADVISORY_MIN_POOL:
-        return None
 
     fmv = fmv_math.compute_fmv(
         comps, target_grade=target_grade,
@@ -2307,8 +2308,15 @@ def _ledger_advisory(server_url: str, *, inp: dict, target_grade: float,
     )
     if fmv.get("flag_reason") is not None or fmv.get("fmv_high") is None:
         return None
-    n = fmv.get("n")
-    if not isinstance(n, int) or n < LEDGER_ADVISORY_MIN_POOL:
+    # BUI-956: gate on EFFECTIVE n, not raw row count — the same fix BUI-936
+    # already made for `_graded_ledger_advisory`. `compute_fmv` already sums
+    # the pool's recency weights into `effective_n` (fmv_math.py's own
+    # BUI-287 U2 field); reusing it here, rather than re-deriving a weighted
+    # count some other way, is what guarantees this gate can never disagree
+    # with the math that priced the band right above it.
+    effective_n = fmv.get("effective_n")
+    if (not isinstance(effective_n, (int, float))
+            or effective_n < LEDGER_ADVISORY_MIN_POOL):
         return None
 
     # THE withholding. Nulled after compute_fmv rather than by asking it not to
@@ -2515,15 +2523,24 @@ def _compute_and_upsert_one(result: dict, original_book: dict, *,
     # never inside fmv_math's pure math). `comps` itself is left untouched so
     # `comp_count_total` below still reflects the SerpApi/ebay-sold-comps pool
     # only (BUI-143's fetch-error signal keys off that count); first-party rows
-    # are added only to the pool actually priced. A book with no resolved
-    # auctions gets `first_party == []`, so `pool_comps == comps` and pricing
-    # is byte-for-byte what it was before this feature existed.
+    # are added only to the pool actually priced.
     first_party = _fetch_first_party_outcomes(
         server_url, target_grade=target_grade,
         locg_id=inp.get("locg_id"), locg_variant_id=inp.get("locg_variant_id"),
         title=inp.get("title"), issue=inp.get("issue"), year=inp.get("year"),
     )
-    pool_comps = comps + first_party
+    # BUI-956: dedupe the LIVE pool the same way `_merge_slab_pool` (graded)
+    # and `_ledger_advisory` (raw, degraded-mode) already do — a book fetched
+    # via both sold-comps.com and SerpApi (BUI-545) can return the SAME sale
+    # twice under two different `product_id`s, and this merge point had no
+    # dedupe pass of any kind before this ticket. A book with no resolved
+    # auctions AND no cross-provider duplicate in `comps` still gets
+    # `pool_comps == comps` (first_party carries no `title`, so it can never
+    # match anything in `_dedupe_pool_by_identity`'s identity pass, and it
+    # carries no `product_id` either), so pricing is unchanged for the common
+    # case — this only ever removes a comp when there is real duplicate
+    # evidence.
+    pool_comps = _dedupe_pool_by_identity(comps + first_party)
 
     # BUI-51: grade_confidence (photo-coverage confidence from /comic:grade)
     # rides the batch envelope and haircuts the bid cap when low. Absent → no
