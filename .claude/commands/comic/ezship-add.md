@@ -14,7 +14,7 @@ Submit shipment orders to EZShip. Typically run after a won eBay auction has shi
 cd ~/Projects/comic-pipeline/apps/ezship && npx tsx src/cli.ts new -t {tracking} -c {carrier} [options]
 ```
 
-**Auth:** Session cookie at `~/.config/ezship/config.json`. On a session-expiration error the CLI itself prints `Run: ezship set-cookie "<paste from DevTools>"` — use that subcommand (BUI-159); it edits the cookie field in place and writes valid JSON. Have the user paste a fresh cookie from DevTools and run:
+**Auth:** Session cookie at `~/.config/ezship/config.json`. On a session-expiration error the CLI itself prints one line, `Session expired. Run: ezship set-cookie "<paste from DevTools>"`, and exits with code **3** — distinct from exit code 1 for any other error (BUI-966), so an unattended caller can branch on the exit code alone without parsing stderr. Use that subcommand (BUI-159); it edits the cookie field in place and writes valid JSON. Have the user paste a fresh cookie from DevTools and run:
 
 ```bash
 cd ~/Projects/comic-pipeline/apps/ezship && npx tsx src/cli.ts set-cookie "<paste from DevTools>"
@@ -73,5 +73,5 @@ Run one at a time. **Confirm success before the next (BUI-141):** mark `✅ Subm
 |---|---|
 | Declared value as dollars | CLI takes cents — multiply by 100 |
 | Wrong carrier name | Must match exactly: UPS, FedEx, USPS, DHL, Amazon, Ontrac, Other |
-| Session expired error | Run `npx tsx src/cli.ts set-cookie "<paste from DevTools>"` — don't hand-edit `config.json` |
+| Session expired error (exit code 3) | Run `npx tsx src/cli.ts set-cookie "<paste from DevTools>"` — don't hand-edit `config.json` |
 | Non-US seller | Set `-w guangzhou`, `-w shanghai`, or `-w taiwan` as appropriate |

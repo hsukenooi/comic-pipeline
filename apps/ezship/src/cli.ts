@@ -4,6 +4,7 @@ import { Command } from "commander";
 import { loadConfig, saveCookie } from "./auth.js";
 import { submitNewOrder } from "./api.js";
 import { WAREHOUSE_VALUES, CARRIER_MAP } from "./types.js";
+import { exitCodeFor, EXIT_SESSION_EXPIRED } from "./exit-codes.js";
 
 const program = new Command();
 
@@ -79,10 +80,17 @@ program
 
         console.log("Response:", JSON.stringify(result, null, 2));
       } catch (err) {
-        console.error(
-          `Error: ${err instanceof Error ? err.message : String(err)}`
-        );
-        process.exit(1);
+        const code = exitCodeFor(err);
+        if (code === EXIT_SESSION_EXPIRED) {
+          // BUI-966: print exactly the operator guidance, not double-prefixed
+          // with "Error:" — the message itself IS the fix (`ezship set-cookie ...`).
+          console.error(err instanceof Error ? err.message : String(err));
+        } else {
+          console.error(
+            `Error: ${err instanceof Error ? err.message : String(err)}`
+          );
+        }
+        process.exit(code);
       }
     }
   );

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { callRpc } from "../src/api.js";
+import { callRpc, SessionExpiredError } from "../src/api.js";
 import type { Config } from "../src/types.js";
 
 const CONFIG: Config = {
@@ -53,6 +53,14 @@ describe("callRpc business-layer rejection handling (BUI-141)", () => {
     await expect(callRpc(CONFIG, "ep", {})).rejects.toThrow(/set-cookie/);
   });
 
+  it("throws a typed SessionExpiredError on a login-rejection body (BUI-966)", async () => {
+    // The exit-code mapping in cli.ts keys off this type, not the message text.
+    vi.stubGlobal("fetch", mockFetchJson(200, { result: false, msg: "please login" }));
+    await expect(callRpc(CONFIG, "ep", {})).rejects.toBeInstanceOf(
+      SessionExpiredError
+    );
+  });
+
   it("returns a successful body unchanged", async () => {
     vi.stubGlobal("fetch", mockFetchJson(200, { result: true, data: { id: 1 } }));
     const r = (await callRpc(CONFIG, "ep", {})) as Record<string, unknown>;
@@ -96,6 +104,16 @@ describe("callRpc redirect handling (BUI-184)", () => {
   it("reports a non-login redirect distinctly (not a generic error)", async () => {
     vi.stubGlobal("fetch", mockFetchRedirect(301, "https://ezship.test/elsewhere"));
     await expect(callRpc(CONFIG, "ep", {})).rejects.toThrow(/Unexpected redirect/);
+  });
+
+  it("throws a typed SessionExpiredError on a redirect to /Account/Login (BUI-966)", async () => {
+    vi.stubGlobal(
+      "fetch",
+      mockFetchRedirect(302, "https://ezship.test/Account/Login")
+    );
+    await expect(callRpc(CONFIG, "ep", {})).rejects.toBeInstanceOf(
+      SessionExpiredError
+    );
   });
 });
 
