@@ -50,9 +50,10 @@ Runs `scripts/em-batch-nightly.sh` at 01:00 every night: picks up to
 `EM_BATCH_NIGHTLY_CAP` (default 8) unassigned `comics` tickets in Today,
 Soon, or Someday, and runs `/em-batch mode:autonomous` over them in a fresh
 detached worktree, headless, through implement, review, CI, merge, deploy,
-and close. The run's summary goes to Telegram (only; the Reflect daily note
-is not written). The wrapper's header documents the knobs and the
-`--dry-run` / `--tickets` switches.
+and close. Nothing is pushed to the user: each ticket's closing comment in
+Linear is the record, and the run's summary is saved under the state dir.
+The wrapper's header documents the knobs and the `--dry-run` / `--tickets` /
+`--resume-run` switches.
 
 Preconditions, all user-authored (the run never widens its own permissions):
 

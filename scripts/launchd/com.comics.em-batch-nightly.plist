@@ -7,7 +7,7 @@
     <string>com.comics.em-batch-nightly</string>
     <!-- BUI-972: the fully unattended nightly /em-batch over open `comics`
          tickets. The wrapper does the framing (ticket pick, worktree,
-         permissions, Telegram summary); see its header. It is
+         permissions, run record); see its header. It is
          run from the shared checkout so a merged change to the wrapper is
          what fires next night, no install-copy step. -->
     <key>ProgramArguments</key>
