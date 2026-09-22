@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.comics.em-batch-nightly</string>
+    <!-- BUI-972: the fully unattended nightly /em-batch over open `comics`
+         tickets. The wrapper does the framing (ticket pick, worktree,
+         permissions, Telegram + daily-note summary); see its header. It is
+         run from the shared checkout so a merged change to the wrapper is
+         what fires next night, no install-copy step. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/hsukenooi/Projects/comic-pipeline/scripts/em-batch-nightly.sh</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>COMICS_SERVER_URL</key>
+        <string>http://localhost:8080</string>
+        <key>PATH</key>
+        <string>/Users/hsukenooi/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <!-- 01:00: after the 23:35 daily routine has written tomorrow's note
+         (the summary is appended to it), well clear of sentinel-probe
+         (Sun 09:00) and slab-watch-collect (1st, 09:30). A run can take
+         hours; the wrapper's own timeout (default 6h) ends it before the
+         morning. A missed slot runs once at wake, never a backlog. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>1</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/Users/hsukenooi/Library/Logs/em-batch-nightly.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/hsukenooi/Library/Logs/em-batch-nightly.log</string>
+</dict>
+</plist>
