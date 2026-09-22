@@ -156,7 +156,7 @@
     "median": 1200,
     "n": 2,
     "page_quality_fallback": false,
-    "pool_n": 2,
+    "pool_n": 6,
     "pool_stale_dropped": 0,
     "pool_undated_dropped": 0,
     "pricing_basis": "direct"

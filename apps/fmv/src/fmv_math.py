@@ -1763,12 +1763,19 @@ def _graded_result(**over) -> dict:
         "page_quality_fallback": False,
         # None while `page_quality_fallback` is False; otherwise
         # "too_few_matches" (fewer than 2 same-quality comps, so nothing was
-        # scoped at all — BUI-930) or "ladder_starved" (2+ same-quality comps
-        # and the exact bucket WAS scoped to them, but it was too thin to
-        # price from, so the row is a ladder row and its rungs are the whole
-        # pool's — BUI-939, generalised by BUI-937 from "the scoped ladder
-        # ran short of rungs" to every scoped ladder row). Additive: a reader
-        # that only checks the boolean sees the same thing it always has.
+        # scoped at all — BUI-930) or "ladder_reads_all_qualities" (2+
+        # same-quality comps, so the exact bucket WAS scoped to them, but it
+        # did not price, and the ladder point that did comes off rungs read
+        # from every quality). Additive: a reader that only checks the boolean
+        # sees the same thing it always has.
+        #
+        # BUI-957 renamed the second value from "ladder_starved". That name
+        # was BUI-939's, when the widen was CONDITIONAL on the scoped ladder
+        # running short of rungs; BUI-937 made the ladder read the whole pool
+        # unconditionally, so the value started firing on every scoped ladder
+        # row and named a starvation that no longer happens (and, by
+        # construction, no longer can). The new name states what the row is
+        # disclosing rather than a cause that has been designed out.
         "page_quality_fallback_reason": None,
         "exact_effective_n": 0.0,
         "exact_sales": [],
@@ -1782,6 +1789,14 @@ def _graded_result(**over) -> dict:
         # `no_certifier_pool` — nothing to show a neighbour from). Populated
         # by `_graded_ladder` for every ladder-tier outcome, refusal or not.
         "nearest_rungs": None,
+        # How many same-certifier, same-label slab sales survived the identity
+        # + age filters — the pool the `slab_pool=` note counts, and the same
+        # population its `live=`/`ledger=` companions count. NEVER the
+        # page-quality-scoped subset (BUI-957): scoping is a preference applied
+        # to the exact bucket, not a smaller pool, and reporting the scoped
+        # count here made a scoped `direct` row understate its own market
+        # against the two numbers printed beside it. The exact bucket's own
+        # depth is `n`/`effective_n`/`exact_sales`, which already say it.
         "pool_n": 0,
         "pool_undated_dropped": 0,
         "pool_stale_dropped": 0,
@@ -1803,7 +1818,8 @@ def _graded_page_quality_filter(
     would have thrown away the single graded-white rung of half the books).
     Falls back to the whole pool, with `fell_back=True` and
     `reason="too_few_matches"`, whenever fewer than two comps match — one
-    match is a single listing, not a market.
+    match is a single listing, not a market. An EMPTY pool is excluded from
+    that rule (BUI-957): see the guard below.
 
     This is the ONLY fallback this function decides. A second, independent
     one — scoping to the matched quality leaves the LADDER tier too thin
@@ -1814,6 +1830,18 @@ def _graded_page_quality_filter(
     knows the tier.
     """
     if not page_quality or page_quality == "unknown":
+        return pool, False, None
+    # BUI-957: an EMPTY pool is not a fallback. Nothing survived the identity
+    # + age filters, so there was no same-quality preference to decline and
+    # nothing to widen back TO — `graded_fmv` is about to refuse
+    # `no_certifier_pool`, and that is the row's one and only fact. Reporting
+    # `page_quality_fallback=True`/`too_few_matches` beside it named a second
+    # cause that did not happen, and pointed a reader at the page quality
+    # (fixable by finding same-quality comps) instead of at the empty pool
+    # (fixable only by finding ANY comp). `len(matched) >= 2` is false for an
+    # empty pool for the arithmetically right reason and the reportably wrong
+    # one, which is why this is a guard rather than a wider condition below.
+    if not pool:
         return pool, False, None
     matched = [c for c in pool if c.get("page_quality") == page_quality]
     if len(matched) >= 2:
@@ -1915,13 +1943,17 @@ def graded_fmv(comps: list[dict], target_grade: float, *,
         (and a ladder row's bracket) can be looser than a same-quality read
         would have been. That is the accepted price of never being starved —
         the nearer rung is the better evidence, and the band still cannot
-        exceed the scoped bucket's own weighted Q75.
+        exceed the scoped bucket's own weighted Q75. BUI-957 measured that
+        price on the live ledger and declined to clamp it; the numbers are in
+        `_graded_direct`, beside the clamp a rule would have had to change.
 
         A ladder-tier row whose scoped pool WAS narrower reports the widen in
         the two fields BUI-939 introduced for it (`page_quality_fallback=True`,
-        `page_quality_fallback_reason="ladder_starved"`, distinguishable from
-        the pre-existing `"too_few_matches"` fallback) — now on every such
-        row, not only the ones a rung count would have rescued.
+        `page_quality_fallback_reason="ladder_reads_all_qualities"`,
+        distinguishable from the pre-existing `"too_few_matches"` fallback) —
+        now on every such row, not only the ones a rung count would have
+        rescued. BUI-957 renamed that value (it was `"ladder_starved"`, and no
+        row is starved any more).
 
         **The exact-tier gate is never re-run on the wider pool (BUI-943).**
         The gate reads the scoped bucket, once. Sales at the target grade whose
@@ -1960,10 +1992,15 @@ def graded_fmv(comps: list[dict], target_grade: float, *,
         "page_quality": page_quality,
         "page_quality_fallback": pq_fallback,
         "page_quality_fallback_reason": pq_reason,
-        "pool_n": len(pool),
+        # The WHOLE same-label pool, always — never the page-quality-scoped
+        # subset (BUI-957; see `_graded_result`'s note on this key). Set once,
+        # here, so every branch below reports the same population.
+        "pool_n": len(full_pool),
         "pool_undated_dropped": undated_dropped,
         "pool_stale_dropped": stale_dropped,
     }
+    # `pool` is empty only when `full_pool` is (the filter above widens back
+    # rather than returning nothing), so this is the no-comps refusal.
     if not pool:
         return _graded_result(flag_reason="no_certifier_pool", **identity)
 
@@ -2020,8 +2057,9 @@ def graded_fmv(comps: list[dict], target_grade: float, *,
         # exact tier is the page-quality-preferring tier by definition
         # (BUI-937), and the wider pool is the ladder's.
         identity["page_quality_fallback"] = True
-        identity["page_quality_fallback_reason"] = "ladder_starved"
-        identity["pool_n"] = len(full_pool)
+        identity["page_quality_fallback_reason"] = "ladder_reads_all_qualities"
+        # `pool_n` is already the whole pool (BUI-957) — it never was the
+        # scoped count, so there is nothing to restore here.
         identity["exact_effective_n"] = eff_n.get(target_grade, 0.0)
         widened_exact = [c for c in full_pool if float(c["grade"]) == target_grade]
         identity["exact_sales"] = sorted(float(c["price"]) for c in widened_exact)
@@ -2066,6 +2104,45 @@ def _graded_direct(exact_comps: list[dict], ladder: dict[float, float],
     # wave a two-sale same-quality band through unbounded — while what bounds
     # it is the whole market's neighbours. With no scoping applied the override
     # is a no-op: `ladder[target_grade]` already IS `med`.
+    #
+    # ── BUI-957: no same-quality clamp on these neighbours. STANDING. ──
+    # The neighbours are read from every page quality, so a rung where another
+    # quality sold HIGHER can leave this band bounded LOOSER than a
+    # same-quality-only read would have. Real, and measured before designing a
+    # rule for it (`docs/solutions/best-practices/
+    # size-the-oracle-ceiling-before-designing-a-classifier.md`).
+    #
+    # Oracle, at precision 1.00, over the live comps ledger (2026-09-22: 958
+    # slab comps, 95 book/certifier/label groups, 39 book x page-quality cells
+    # holding 2+ same-quality comps, every one swept across the full CGC grade
+    # ladder = 902 (book, quality, target grade) pricing points). The rule
+    # oracled is the strongest one available — bound the published band by the
+    # FULLY-SCOPED read, i.e. `min(published, same_quality_read)`:
+    #
+    #   * it can bind on 86 of 902 points and MOVES 7 (0.8%)
+    #   * total fmv_high reduction $210, median $30, max $50
+    #   * on `max_bid`: lowers 5 caps by at most $25 — and RAISES one by $25
+    #     (the clamp flips a `lone_sale` row's basis, and 0.70 > 0.60)
+    #   * on the DIRECT tier — this clamp, right here — it moves 0 of 18.
+    #     All 7 moves are ladder/lone_sale rows, where "clamping" is really
+    #     re-pricing off a thinner ladder, not bounding a band.
+    #
+    # The mechanism that makes the ceiling that low: a looser rung only costs
+    # money if it BINDS, and this is a `min()` that binds only when the
+    # envelope falls BELOW the bucket's own weighted Q75. At the rung level the
+    # loosening is not rare — 24 of 63 comparable rungs sit above their
+    # same-quality twin, by up to $3,000 — but a rung 18-60% too high simply
+    # stops being the binding constraint instead of raising a price.
+    #
+    # And the direction the same measurement found: the whole-pool read is
+    # already TIGHTER on 47 of those 86 points (total $10,925, max $1,600) and
+    # turns 313 refusals into prices (259 of them `ladder_too_thin`). A clamp
+    # buys $25 of protection against those.
+    #
+    # Scope bound: measured on the ledger alone, with no live fetch merged in
+    # — the pool a real run prices from is this one plus that day's live
+    # comps. Re-measure before re-opening; do not re-derive the rule from the
+    # mechanism alone.
     clamp_ladder = {**ladder, target_grade: med}
     clamp_counts = {**eff_n, target_grade: effective_n}
     capped, envelope_clamped = _cgc_ladder_price_and_clamp(

@@ -4079,15 +4079,34 @@ def _graded_note_parts(fmv: dict) -> list[str]:
     if pq:
         # BUI-939: two distinct fallback reasons share the one boolean —
         # name which one fired so an auditor can tell "there weren't enough
-        # same-quality comps" apart from "there were, but scoping to them
-        # would have starved the ladder."
+        # same-quality comps" apart from "there were, and the exact bucket
+        # was scoped to them, but the price is a ladder point off every
+        # quality's rungs."
+        #
+        # BUI-957 reworded the second: it used to read "same-quality pool too
+        # thin for the ladder; widened to all qualities", which described
+        # BUI-939's conditional widen. BUI-937 made the ladder read every
+        # quality unconditionally, so nothing was ever too thin and nothing
+        # was widened — the row simply did not price from its scoped bucket.
         pq_note = ""
         if fmv.get("page_quality_fallback"):
-            pq_note = (" (same-quality pool too thin for the ladder; "
-                       "widened to all qualities)"
-                       if fmv.get("page_quality_fallback_reason") == "ladder_starved"
+            pq_note = (" (exact bucket scoped to same-quality but unpriced; "
+                       "ladder rungs read every quality)"
+                       if fmv.get("page_quality_fallback_reason")
+                       == "ladder_reads_all_qualities"
                        else " (no 2+ same-quality comps; pooled all qualities)")
         parts.append(f"page_quality={pq}{pq_note}")
+    # All three count the same population from different points on the way in:
+    # `live=`/`ledger=` are the two SOURCES as fetched, `slab_pool=` what
+    # survived the merge, the dedupe and the age filter — and the
+    # `undated_dropped=`/`stale_dropped=` tokens right below account for the
+    # difference. BUI-957 is why that reconciles at all: `pool_n` on a
+    # page-quality-scoped `direct` row used to report the SCOPED subset, a
+    # different kind of number entirely, printing e.g. `slab_pool=2 (live=5
+    # ledger=0)` — a pool smaller than one of its own sources, with no drop
+    # token to explain it. `fmv_math` owns that fix (see `_graded_result`'s
+    # note on the key); nothing is corrected here, and nothing may be — a
+    # reader reconstructing the pool at this layer would be guessing.
     pool_n = fmv.get("pool_n")
     if pool_n is not None:
         parts.append(
