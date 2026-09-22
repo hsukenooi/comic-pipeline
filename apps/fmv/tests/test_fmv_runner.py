@@ -7176,6 +7176,142 @@ def _ledger_row(product_id="L1", comic_id=42):
             "label": "universal", "page_quality": "unknown"}
 
 
+# ─── BUI-957: the page-quality row's own reporting ────────────────────────────
+
+class TestPageQualityRowReporting:
+    """Two residuals BUI-937 left in what a page-quality row SAYS about
+    itself, pinned on rendered rows rather than on the dicts behind them.
+
+    Both are reporting defects, not pricing ones — no assertion here moves a
+    price — so they are pinned where a reader meets them: the `fmv_notes`
+    string and the `_print_table` line (BUI-928: a row shape is only pinned
+    once something renders that exact row).
+    """
+
+    def _white_result(self, slab_comps, **over):
+        return _graded_harness()._slab_result(slab_comps=slab_comps, **over)
+
+    def _white_book(self):
+        return _graded_harness()._book(page_quality="white")
+
+    # Two white 4.5 sales carry the exact bucket to effective n 2, so the row
+    # prices `direct` off them while the 4.0/5.5/6.0 rungs (read from every
+    # quality) supply the envelope. The pool is 5 comps; the band is 2.
+    _SCOPED_DIRECT_COMPS = [
+        _make_slab_comp(700, 4.5, "w0", sold_date="2026-09-01",
+                        page_quality="white"),
+        _make_slab_comp(760, 4.5, "w1", sold_date="2026-08-28",
+                        page_quality="white"),
+        _make_slab_comp(900, 4.0, "e1", sold_date="2026-08-20"),
+        _make_slab_comp(1400, 5.5, "e2", sold_date="2026-08-10"),
+        _make_slab_comp(1500, 6.0, "e3", sold_date="2026-08-05"),
+    ]
+
+    def test_scoped_direct_row_counts_the_whole_pool_in_its_notes(
+            self, tmp_path, server_url):
+        """Residual 3. `slab_pool=` and the `live=`/`ledger=` pair beside it
+        count one population; before BUI-957 the scoped `direct` row printed
+        `slab_pool=2 (live=5 ledger=0)` — a pool smaller than its own live
+        count, which reads as a bug in the fetch rather than as scoping."""
+        h = _graded_harness()
+        row, upsert, _ = h._run(self._white_book(),
+                                self._white_result(self._SCOPED_DIRECT_COMPS),
+                                tmp_path, server_url)
+        fmv = row["fmv"]
+        assert fmv["pricing_basis"] == "direct"
+        assert fmv["page_quality"] == "white"
+        assert fmv["page_quality_fallback"] is False   # scoping SUCCEEDED
+        assert fmv["n"] == 2                           # the band is the pair
+        notes = fmv_runner._build_notes(upsert.call_args.args[2])
+        assert "slab_pool=5 (live=5 ledger=0)" in notes
+        assert "page_quality=white" in notes
+        # No fallback fired, so the token carries no parenthetical at all.
+        assert "page_quality=white (" not in notes
+
+    def test_the_scoped_direct_row_renders(self, tmp_path, server_url, capsys):
+        """BUI-928: the row above, through `_print_table` — the surface an
+        operator actually reads at the Buy It Now stop."""
+        h = _graded_harness()
+        row, _, _ = h._run(self._white_book(),
+                           self._white_result(self._SCOPED_DIRECT_COMPS),
+                           tmp_path, server_url)
+        capsys.readouterr()
+        fmv_runner._print_table([row])
+        out = capsys.readouterr().out
+        assert "Batman" in out
+        assert "exact n2" in out        # the provenance cell, unchanged
+
+    def _ladder_row(self, tmp_path, server_url):
+        """A scoped row that reaches the LADDER tier. The two white 4.5 sales
+        above would price `direct`, so the exact bucket is thinned to one
+        STALE white sale (weight 0.5, under the exact tier's floor of 2.0 and
+        under the lone-sale tier's freshness bar) while a second white comp at
+        another grade keeps the scoping itself alive (2 matches)."""
+        comps = [
+            _make_slab_comp(700, 4.5, "w0", sold_date="2026-01-05",
+                            page_quality="white"),      # stale: weight 0.5
+            _make_slab_comp(905, 4.0, "w1", sold_date="2026-08-21",
+                            page_quality="white"),
+            _make_slab_comp(900, 4.0, "e1", sold_date="2026-08-20"),
+            _make_slab_comp(1400, 5.5, "e2", sold_date="2026-08-10"),
+            _make_slab_comp(1500, 6.0, "e3", sold_date="2026-08-05"),
+        ]
+        return _graded_harness()._run(
+            self._white_book(), self._white_result(comps), tmp_path,
+            server_url)
+
+    def test_scoped_ladder_row_no_longer_claims_starvation(
+            self, tmp_path, server_url):
+        """Residual 2. BUI-939 named this reason `ladder_starved` when the
+        widen was CONDITIONAL on the scoped ladder running short of rungs.
+        BUI-937 made the ladder read every quality unconditionally, so the
+        value fired on every scoped ladder row and named a cause that can no
+        longer happen — the rungs here were never scoped, never short, and
+        nothing was widened back."""
+        row, upsert, _ = self._ladder_row(tmp_path, server_url)
+        fmv = row["fmv"]
+        assert fmv["pricing_basis"] == "ladder"
+        assert fmv["page_quality_fallback"] is True
+        assert fmv["page_quality_fallback_reason"] == "ladder_reads_all_qualities"
+        notes = fmv_runner._build_notes(upsert.call_args.args[2])
+        assert ("page_quality=white (exact bucket scoped to same-quality but "
+                "unpriced; ladder rungs read every quality)") in notes
+        # The retired wording, named so a revert is visible as a test failure.
+        assert "too thin for the ladder" not in notes
+        assert "widened to all qualities" not in notes
+
+    def test_the_scoped_ladder_row_renders(self, tmp_path, server_url, capsys):
+        """BUI-928, for the ladder shape."""
+        row, _, _ = self._ladder_row(tmp_path, server_url)
+        capsys.readouterr()
+        fmv_runner._print_table([row])
+        out = capsys.readouterr().out
+        assert "Batman" in out
+        assert "pq widened" in out      # the provenance cell's own token
+
+    def test_the_other_fallback_reason_still_reads_differently(
+            self, tmp_path, server_url):
+        """The two reasons share one boolean, so the rename must not have
+        collapsed them: a single white comp is `too_few_matches` — nothing was
+        ever scoped — and its note keeps BUI-930's original wording."""
+        comps = [
+            _make_slab_comp(700, 4.5, "w0", sold_date="2026-09-01",
+                            page_quality="white"),
+            _make_slab_comp(900, 4.0, "e1", sold_date="2026-08-20"),
+            _make_slab_comp(1400, 5.5, "e2", sold_date="2026-08-10"),
+            _make_slab_comp(1500, 6.0, "e3", sold_date="2026-08-05"),
+        ]
+        h = _graded_harness()
+        row, upsert, _ = h._run(self._white_book(),
+                                self._white_result(comps), tmp_path,
+                                server_url)
+        fmv = row["fmv"]
+        assert fmv["page_quality_fallback"] is True
+        assert fmv["page_quality_fallback_reason"] == "too_few_matches"
+        notes = fmv_runner._build_notes(upsert.call_args.args[2])
+        assert "(no 2+ same-quality comps; pooled all qualities)" in notes
+
+
 class TestCompsExclusionStamp:
     """BUI-947: `comic-fmv` makes BUI-946's in-memory drop DURABLE by posting
     the dropped ledger rows to `POST /api/comics/comps/exclude`.

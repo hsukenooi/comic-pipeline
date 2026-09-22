@@ -196,7 +196,7 @@ class TestInvincible1Replay:
         # "white", and `_graded_page_quality_filter` cuts the server pool to
         # the 2 comps whose own titles say "white". Post-BUI-939 that scoped
         # pool is starved for the ladder and widens back to the whole pool
-        # (`ladder_starved`), so the outcome is whatever the WHOLE pool says:
+        # (`ladder_reads_all_qualities`), so the outcome is whatever the WHOLE pool says:
         # unguarded it still inverts (BUI-939 alone does not price this book),
         # guarded it prices — the same number as with no page quality at all.
         #
@@ -204,7 +204,7 @@ class TestInvincible1Replay:
         # run. The scoped white pool's exact bucket is the lone $3,609 white
         # 9.4 sale, and the lone-sale tier prices off the SCOPED bucket exactly
         # as the exact tier does — so the row no longer falls through to the
-        # ladder and no longer claims `ladder_starved`. That disclosure means
+        # ladder and no longer claims `ladder_reads_all_qualities`. That disclosure means
         # "this row's rungs are the whole pool's BECAUSE the same-quality pool
         # was too thin at the exact grade to price from" (BUI-939), and here it
         # was not too thin: it priced. The bracket rungs are still read from
@@ -216,7 +216,7 @@ class TestInvincible1Replay:
         target = data["target"]
         assert target["page_quality"] == "white"
         before = _price(data["comps"], target, page_quality="white")
-        assert before["page_quality_fallback_reason"] == "ladder_starved"
+        assert before["page_quality_fallback_reason"] == "ladder_reads_all_qualities"
         assert before["flag_reason"] == "ladder_non_monotone"
         after = _price(_guarded(data), target, page_quality="white")
         assert after["pricing_basis"] == "lone_sale"

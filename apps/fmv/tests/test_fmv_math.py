@@ -2225,14 +2225,64 @@ class TestGradedPageQuality:
     def test_two_matching_comps_scope_the_pool(self):
         out = _graded(self._pool(2), 9.4, page_quality="white")
         assert out["page_quality_fallback"] is False
-        assert out["pool_n"] == 2
+        # The band is the 2 white sales — `n` says so — while `pool_n` counts
+        # every same-label sale that survived the age filter, scoped or not
+        # (BUI-957). It is the number the `slab_pool=` note prints beside
+        # `live=`/`ledger=`, so it has to count the same population they do.
+        assert out["n"] == 2
+        assert out["pool_n"] == 6
         assert out["fmv_low"] >= 3000
+
+    def test_pool_n_counts_the_same_pool_whether_or_not_scoping_applied(self):
+        """BUI-957: a scoped `direct` row used to report `pool_n=2` on a
+        6-comp pool, understating the market against the `live=`/`ledger=`
+        counts printed beside it. The scoped and unscoped reads of the SAME
+        comps must agree on how many comps there were."""
+        comps = self._pool(2)
+        scoped = _graded(comps, 9.4, page_quality="white")
+        unscoped = _graded(comps, 9.4, page_quality=None)
+        assert scoped["pricing_basis"] == "direct"
+        assert scoped["pool_n"] == unscoped["pool_n"] == len(comps)
+        # ...and the scoping is still real: the bands differ.
+        assert scoped["fmv_high"] != unscoped["fmv_high"]
 
     def test_one_matching_comp_falls_back_and_says_so(self):
         out = _graded(self._pool(1), 9.4, page_quality="white")
         assert out["page_quality_fallback"] is True
         assert out["page_quality_fallback_reason"] == "too_few_matches"
         assert out["pool_n"] == 5
+
+    def test_an_empty_pool_is_a_refusal_not_a_fallback(self):
+        """BUI-957: no comps survived the identity + age filters, so there was
+        no same-quality preference to decline and nothing to widen back to.
+
+        The row used to carry `page_quality_fallback=True`/`too_few_matches`
+        on top of its `no_certifier_pool` refusal — a second, invented cause
+        that pointed a reader at the page quality (fixable by finding
+        same-quality comps) instead of at the empty pool (fixable only by
+        finding ANY comp).
+        """
+        out = _graded([], 9.4, page_quality="white")
+        assert out["flag_reason"] == "no_certifier_pool"
+        assert out["page_quality_fallback"] is False
+        assert out["page_quality_fallback_reason"] is None
+        # The reading itself is still reported — it was read, and the refusal
+        # does not un-read it.
+        assert out["page_quality"] == "white"
+        assert out["pool_n"] == 0
+
+    def test_a_pool_emptied_by_the_age_filter_is_also_a_refusal(self):
+        """The same case reached the realistic way: comps exist but every one
+        is undated, so `graded_pool` drops them all before scoping is asked
+        anything."""
+        undated = [{"product_id": "u1", "price": 3000.0, "grade": 9.4,
+                    "page_quality": "white"},
+                   {"product_id": "u2", "price": 3200.0, "grade": 9.4,
+                    "page_quality": "white"}]
+        out = _graded(undated, 9.4, page_quality="white")
+        assert out["flag_reason"] == "no_certifier_pool"
+        assert out["page_quality_fallback"] is False
+        assert out["page_quality_fallback_reason"] is None
 
     def test_unknown_target_quality_is_not_a_filter(self):
         """`unknown` is the ABSENCE of a reading. Preferring the comps whose
@@ -2295,7 +2345,7 @@ class TestGradedPageQualityLadderFallback:
         assert out["flag_reason"] is None
         assert out["pricing_basis"] == "ladder"
         assert out["page_quality_fallback"] is True
-        assert out["page_quality_fallback_reason"] == "ladder_starved"
+        assert out["page_quality_fallback_reason"] == "ladder_reads_all_qualities"
         assert out["pool_n"] == 9
         # The bracket comes from the WIDENED (9.2/9.6) pair, not the
         # scoped-only (9.2/9.8) pair — proof the full pool, not just the two
@@ -2320,7 +2370,8 @@ class TestGradedPageQualityLadderFallback:
         assert out["pricing_basis"] == "direct"
         assert out["page_quality_fallback"] is False
         assert out["page_quality_fallback_reason"] is None
-        assert out["pool_n"] == 2
+        assert out["n"] == 2          # the band: both white sales
+        assert out["pool_n"] == 3     # the pool: every same-label sale
         assert out["fmv_low"] >= 3000
 
     def test_a_scoped_ladder_row_reads_every_quality_not_just_enough_rungs(self):
@@ -2350,7 +2401,7 @@ class TestGradedPageQualityLadderFallback:
         assert out["flag_reason"] is None
         assert out["pricing_basis"] == "ladder"
         assert out["page_quality_fallback"] is True
-        assert out["page_quality_fallback_reason"] == "ladder_starved"
+        assert out["page_quality_fallback_reason"] == "ladder_reads_all_qualities"
         assert out["pool_n"] == 4
         assert out["graded_ladder"]["grade_below"] == 9.2  # the cream rung
         assert out["graded_ladder"]["grade_above"] == 9.6
@@ -2374,7 +2425,7 @@ class TestGradedPageQualityLadderFallback:
         out = _graded(white + other, 9.4, page_quality="white")
         assert out["flag_reason"] == "ladder_too_thin"
         assert out["page_quality_fallback"] is True
-        assert out["page_quality_fallback_reason"] == "ladder_starved"
+        assert out["page_quality_fallback_reason"] == "ladder_reads_all_qualities"
         assert out["pool_n"] == 3  # widened to the full 3-comp pool
 
     def test_target_rung_is_the_only_matching_rung(self):
@@ -2402,7 +2453,7 @@ class TestGradedPageQualityLadderFallback:
         assert out["flag_reason"] is None
         assert out["pricing_basis"] == "ladder"
         assert out["page_quality_fallback"] is True
-        assert out["page_quality_fallback_reason"] == "ladder_starved"
+        assert out["page_quality_fallback_reason"] == "ladder_reads_all_qualities"
         assert out["graded_ladder"]["grade_below"] == 9.2
         assert out["graded_ladder"]["grade_above"] == 9.6
 
@@ -2435,7 +2486,7 @@ class TestGradedExactTierIsNotReRunAfterAWiden:
         assert out["confidence"] == "LOW"
         assert out["bid_factor"] == 0.60
         assert out["page_quality_fallback"] is True
-        assert out["page_quality_fallback_reason"] == "ladder_starved"
+        assert out["page_quality_fallback_reason"] == "ladder_reads_all_qualities"
         # The two cream sales are dropped with the rest of the target rung and
         # the white 9.2/9.6 neighbours interpolate across the gap.
         assert out["graded_ladder"]["grade_below"] == 9.2
@@ -2501,8 +2552,12 @@ class TestGradedPageQualityScopesTheExactBucketOnly:
         assert out["pricing_basis"] == "direct"
         # Scoping was honoured — the band is the white pair's, not a widen.
         assert out["page_quality_fallback"] is False
-        assert out["pool_n"] == 2
+        assert out["n"] == 2
         assert out["exact_sales"] == [5000.0, 5200.0]
+        # BUI-957: `pool_n` is the market the clamp read, not the band, so it
+        # counts all four comps. A `slab_pool=2` here would have contradicted
+        # the three-rung ladder asserted below it.
+        assert out["pool_n"] == 4
         # ... and the unscoped rungs bounded it.
         assert out["envelope_clamped"] is True
         assert out["fmv_low"] == out["median"] == out["fmv_high"] == 1200
