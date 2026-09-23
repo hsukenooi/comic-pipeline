@@ -3882,22 +3882,60 @@ class TestRateLimiter:
         # And comfortably under the 60 req/min ceiling with real headroom.
         assert realized_rate < 60.0
 
-    def test_thread_safety_real_threads_never_dispatch_closer_than_interval(self):
-        """Real concurrent threads (not the fake clock) hammering acquire()
-        must never produce two dispatches closer together than one
-        interval — proves the lock correctly protects `_next_slot` under
-        contention rather than two threads both reading a stale slot and
-        racing each other into (nearly) the same instant."""
-        interval = 0.02  # kept small so N threads finish quickly in CI
+    def test_thread_safety_real_threads_never_dispatch_closer_than_interval(
+        self, monkeypatch
+    ):
+        """Real concurrent threads hammering acquire() must never reserve two
+        dispatch slots closer together than one interval: proves the lock
+        protects `_next_slot` under contention rather than two threads both
+        reading a stale slot and racing each other into the same instant.
+
+        The threads are real, but the clock is frozen and sleep() only
+        records its target, so the assertion reads each thread's RESERVED
+        slot, not its wakeup time. Asserting on wakeup times flaked on the
+        Mac Mini (BUI-975): macOS coalesces timer wakeups, so correctly
+        spaced sleepers woke in bunches (gaps of 0.10s then ~0s). The
+        frozen clock yields the GIL between acquire()'s read and write of
+        `_next_slot`, so a limiter that drops the lock loses the race.
+        """
+        real_sleep = time.sleep
+        local = threading.local()
+
+        class _YieldingNow(float):
+            # acquire() compares now against the `_next_slot` it just read
+            # (max()), then writes the bumped slot. Yielding inside that
+            # comparison lands between the read and the write, so an
+            # unlocked limiter lets another thread read the same stale slot.
+            def __gt__(self, other):
+                real_sleep(0.0005)
+                return float(self) > other
+
+            def __lt__(self, other):
+                real_sleep(0.0005)
+                return float(self) < other
+
+        def frozen_monotonic():
+            return _YieldingNow(1000.0)
+
+        def recording_sleep(seconds):
+            local.waited = seconds
+
+        monkeypatch.setattr(sc.time, "monotonic", frozen_monotonic)
+        monkeypatch.setattr(sc.time, "sleep", recording_sleep)
+
+        interval = 0.02
         limiter = sc._RateLimiter(rate_per_min=60.0 / interval)
         n = 25
-        timestamps = []
+        slots = []
         lock = threading.Lock()
+        barrier = threading.Barrier(n)
 
         def worker():
+            local.waited = 0.0
+            barrier.wait()  # release every thread into acquire() at once
             limiter.acquire()
             with lock:
-                timestamps.append(time.monotonic())
+                slots.append(local.waited)
 
         threads = [threading.Thread(target=worker) for _ in range(n)]
         for t in threads:
@@ -3905,11 +3943,11 @@ class TestRateLimiter:
         for t in threads:
             t.join()
 
-        timestamps.sort()
-        assert len(timestamps) == n
-        gaps = [b - a for a, b in zip(timestamps, timestamps[1:])]
-        assert all(g >= interval - 0.01 for g in gaps), gaps
-        assert timestamps[-1] - timestamps[0] >= (n - 1) * interval - 0.01
+        slots.sort()
+        assert len(slots) == n
+        assert slots[0] == pytest.approx(0.0), "first dispatch never waits"
+        gaps = [b - a for a, b in zip(slots, slots[1:])]
+        assert all(g == pytest.approx(interval) for g in gaps), gaps
 
 
 class TestSoldCompsBackoff:
