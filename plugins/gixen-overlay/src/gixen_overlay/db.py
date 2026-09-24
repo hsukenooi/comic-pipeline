@@ -3887,6 +3887,88 @@ def _fmv_accuracy_split_by_status(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _fmv_accuracy_rows(
+    conn: sqlite3.Connection, *, days: float | None = None
+) -> list[dict[str, Any]]:
+    """The scored-auction row selection behind `fmv_accuracy_report` (BUI-977),
+    factored out so `band_comparison` (BUI-979) reuses the exact same
+    definition of "a resolved, per-book-scorable auction" instead of forking a
+    second one. Every exclusion, the in-force-at-bid-time band lookup, and the
+    leakage rationale are documented on `fmv_accuracy_report`. Each returned
+    dict also carries `label` and `added_at` (internal: the report's
+    `include_rows` output does not expose them).
+    """
+    clauses = [
+        _PRIMARY_LINK_CLAUSE,
+        _RESOLVED_STATUS_CLAUSE,
+        _WINNING_BID_NOT_NULL_CLAUSE,
+        # A lot's winning_bid prices every linked book at once, not one book
+        # — excluded outright rather than picked-a-primary-and-scored, unlike
+        # get_first_party_outcomes/calibration_report which only need "the"
+        # representative comic for a bid.
+        "(SELECT COUNT(*) FROM bid_fmvs bf2 WHERE bf2.bid_id = b.id) = 1",
+    ]
+    params: list[Any] = []
+    if days is not None:
+        clauses.append(_RESOLVED_RECENCY_CLAUSE)
+        params.append(f"-{days} days")
+    where = " AND ".join(clauses)
+
+    sql_rows = conn.execute(
+        f"""
+        SELECT
+            b.id                           AS bid_id,
+            b.item_id                      AS item_id,
+            c.id                           AS comic_id,
+            c.title                        AS title,
+            c.issue                        AS issue,
+            f.grade                        AS grade,
+            f.certifier                    AS certifier,
+            f.label                        AS label,
+            b.added_at                     AS added_at,
+            {_EFFECTIVE_STATUS_SQL}        AS status,
+            b.winning_bid                  AS price,
+            b.notes                        AS notes,
+            COALESCE(b.auction_end_at, b.resolved_at) AS ended,
+            mh.id                          AS fmv_history_id,
+            CASE WHEN mh.id IS NOT NULL THEN mh.low ELSE f.low END AS low,
+            CASE WHEN mh.id IS NOT NULL THEN mh.high ELSE f.high END AS high,
+            CASE WHEN mh.id IS NOT NULL THEN mh.confidence ELSE f.confidence END AS confidence,
+            CASE WHEN mh.id IS NOT NULL THEN mh.comps ELSE f.comps END AS comps,
+            CASE WHEN mh.id IS NOT NULL THEN 'history' ELSE 'current_fmv' END AS band_source
+        FROM bids b
+        JOIN bid_fmvs bf ON bf.bid_id = b.id
+        JOIN fmv f       ON f.id = bf.fmv_id
+        JOIN comics c    ON c.id = f.comic_id
+        LEFT JOIN fmv_history mh ON mh.id = (
+            SELECT fh.id
+            FROM fmv_history fh
+            WHERE fh.comic_id = f.comic_id
+              AND fh.grade = f.grade
+              AND fh.certifier = f.certifier
+              AND fh.label = f.label
+              AND fh.high IS NOT NULL AND fh.high > 0
+              AND substr(fh.recorded_at, 1, 19) <= replace(b.added_at, ' ', 'T')
+            ORDER BY fh.recorded_at DESC
+            LIMIT 1
+        )
+        WHERE {where}
+        ORDER BY ended
+        """,
+        params,
+    ).fetchall()
+
+    all_rows: list[dict[str, Any]] = []
+    for row in sql_rows:
+        d = dict(row)
+        low, high = d["low"], d["high"]
+        if low is None or high is None or low <= 0 or high <= 0:
+            continue
+        all_rows.append(d)
+
+    return all_rows
+
+
 def fmv_accuracy_report(
     conn: sqlite3.Connection,
     *,
@@ -3954,71 +4036,7 @@ def fmv_accuracy_report(
     `comps`, `notes`, `ended` — so a later analysis ticket can consume the raw
     rows instead of only the aggregates.
     """
-    clauses = [
-        _PRIMARY_LINK_CLAUSE,
-        _RESOLVED_STATUS_CLAUSE,
-        _WINNING_BID_NOT_NULL_CLAUSE,
-        # A lot's winning_bid prices every linked book at once, not one book
-        # — excluded outright rather than picked-a-primary-and-scored, unlike
-        # get_first_party_outcomes/calibration_report which only need "the"
-        # representative comic for a bid.
-        "(SELECT COUNT(*) FROM bid_fmvs bf2 WHERE bf2.bid_id = b.id) = 1",
-    ]
-    params: list[Any] = []
-    if days is not None:
-        clauses.append(_RESOLVED_RECENCY_CLAUSE)
-        params.append(f"-{days} days")
-    where = " AND ".join(clauses)
-
-    sql_rows = conn.execute(
-        f"""
-        SELECT
-            b.id                           AS bid_id,
-            b.item_id                      AS item_id,
-            c.id                           AS comic_id,
-            c.title                        AS title,
-            c.issue                        AS issue,
-            f.grade                        AS grade,
-            f.certifier                    AS certifier,
-            {_EFFECTIVE_STATUS_SQL}        AS status,
-            b.winning_bid                  AS price,
-            b.notes                        AS notes,
-            COALESCE(b.auction_end_at, b.resolved_at) AS ended,
-            mh.id                          AS fmv_history_id,
-            CASE WHEN mh.id IS NOT NULL THEN mh.low ELSE f.low END AS low,
-            CASE WHEN mh.id IS NOT NULL THEN mh.high ELSE f.high END AS high,
-            CASE WHEN mh.id IS NOT NULL THEN mh.confidence ELSE f.confidence END AS confidence,
-            CASE WHEN mh.id IS NOT NULL THEN mh.comps ELSE f.comps END AS comps,
-            CASE WHEN mh.id IS NOT NULL THEN 'history' ELSE 'current_fmv' END AS band_source
-        FROM bids b
-        JOIN bid_fmvs bf ON bf.bid_id = b.id
-        JOIN fmv f       ON f.id = bf.fmv_id
-        JOIN comics c    ON c.id = f.comic_id
-        LEFT JOIN fmv_history mh ON mh.id = (
-            SELECT fh.id
-            FROM fmv_history fh
-            WHERE fh.comic_id = f.comic_id
-              AND fh.grade = f.grade
-              AND fh.certifier = f.certifier
-              AND fh.label = f.label
-              AND fh.high IS NOT NULL AND fh.high > 0
-              AND substr(fh.recorded_at, 1, 19) <= replace(b.added_at, ' ', 'T')
-            ORDER BY fh.recorded_at DESC
-            LIMIT 1
-        )
-        WHERE {where}
-        ORDER BY ended
-        """,
-        params,
-    ).fetchall()
-
-    all_rows: list[dict[str, Any]] = []
-    for row in sql_rows:
-        d = dict(row)
-        low, high = d["low"], d["high"]
-        if low is None or high is None or low <= 0 or high <= 0:
-            continue
-        all_rows.append(d)
+    all_rows = _fmv_accuracy_rows(conn, days=days)
 
     band_source_counts: dict[str, int] = {}
     for r in all_rows:
