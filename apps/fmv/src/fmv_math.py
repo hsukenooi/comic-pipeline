@@ -869,8 +869,50 @@ def cgc_ladder_price(ladder: Mapping[float, float], target_grade: float,
     return price
 
 
+# ─── Proxy-vs-anchor flag (BUI-980) ────────────────────────────────────────
+#
+# BUI-976 measured the proxy tier's factor (0.50-0.55x the CGC slab price)
+# against real raw/slab pairs recorded in the comps ledger and found a median
+# ratio of 0.74 at the $400 proxy floor, with per-book medians ranging 0.26 to
+# 0.91 (`docs/audit/2026-09-24-cgc-proxy-ratio.md`). A new constant only trades
+# one set of misses for another (the ratio varies too much book-to-book to be
+# a single number), so the decision was to KEEP the factor and flag the worst
+# misses instead — this is that flag.
+#
+# PROXY_BELOW_ANCHOR_MIN_N = 8 mirrors ANCHOR_DIVERGES_MIN_N: an anchor built
+# on a handful of raw sales is noise, not signal, so the check is skipped
+# below this floor rather than firing on a thin anchor. Unlike
+# ``anchor_diverges`` there is no slack band (T = 1.0, a bare comparison): the
+# audit's 10/32 fires were ALL genuinely too low (never a false positive on a
+# healthy proxy band), so this stays a low-side-only, no-slack check rather
+# than importing anchor_diverges's symmetric ±50% band.
+PROXY_BELOW_ANCHOR_MIN_N = 8   # anchor n floor below which the check is skipped as noise
+
+
+def proxy_below_anchor(fmv_high: float | None, anchor: dict | None) -> bool:
+    """BUI-980: True when a CGC-proxy band's top sits below the ungraded-market
+    anchor built from the SAME book's raw (grade-less) comps —
+    ``fmv_high < anchor.median``, T = 1.0 (no slack, unlike ``anchor_diverges``).
+
+    FLAG ONLY — same philosophy as ``anchor_diverges``: never changes
+    fmv_low/fmv_high/median/max_bid/confidence/bid_factor, and a caller must
+    never re-derive the comp pool to "resolve" it. Returns False when there's
+    nothing to compare (no proxy band, or no anchor at all) or the anchor is
+    too thin to trust (fewer than PROXY_BELOW_ANCHOR_MIN_N raw sales).
+    """
+    if fmv_high is None or not anchor:
+        return False
+    if anchor.get("n", 0) < PROXY_BELOW_ANCHOR_MIN_N:
+        return False
+    median = anchor.get("median")
+    if not median or median <= 0:
+        return False
+    return fmv_high < median
+
+
 def cgc_proxy_fmv(graded_comps: list[dict], target_grade: float,
-                  grade_confidence: str | None = None) -> dict | None:
+                  grade_confidence: str | None = None,
+                  ungraded_anchor: dict | None = None) -> dict | None:
     """Price a raw copy off a CGC/CBCS slab ladder (BUI-348), or None.
 
     Returns a pricing dict shaped like ``compute_fmv``'s output (same keys, so
@@ -878,6 +920,12 @@ def cgc_proxy_fmv(graded_comps: list[dict], target_grade: float,
     ``cgc_proxy: True`` marker and a ``cgc_ladder`` summary for the notes. The
     band is ``[LOW, HIGH] factor × slab_price[target_grade]``, confidence is
     forced to MEDIUM-LOW, and the bid factor is capped at CGC_PROXY_BID_FACTOR.
+
+    ``ungraded_anchor`` (BUI-980) is the SAME book's raw-comps anchor
+    ({"median": ..., "n": ...} or None), computed by the caller's raw pass
+    (``compute_fmv``'s ``ungraded_anchor``) off comps this function never sees
+    (it only ever receives the GRADED-only fetch) — carried through purely so
+    it can be surfaced in the returned dict + notes, never recomputed here.
 
     Returns None (caller keeps the raw needs_manual result) when the proxy can't
     be trusted:
@@ -954,13 +1002,23 @@ def cgc_proxy_fmv(graded_comps: list[dict], target_grade: float,
             # `_cgc_ladder_price_and_clamp`'s docstring for when this fires.
             "envelope_clamped": envelope_clamped,
         },
-        # BUI-522: a proxy band is priced off the slab ladder, not raw comps, so
-        # it carries no ungraded-market anchor. Key present (== None) for shape
-        # parity with compute_fmv's output.
-        "ungraded_anchor": None,
-        # BUI-534: no anchor above → nothing to diverge from. Key present
-        # (== False) for shape parity with compute_fmv's output.
+        # BUI-980: a proxy band is priced off the slab ladder, not raw comps,
+        # so it carries no ungraded-market anchor OF ITS OWN — but the caller
+        # (fmv_runner._apply_cgc_proxy_rescue) may pass through the SAME
+        # book's raw-pass anchor (see this function's docstring), so it's no
+        # longer hard-coded None the way it was pre-BUI-980.
+        "ungraded_anchor": ungraded_anchor,
+        # BUI-534: anchor_diverges's ±50% symmetric band is a different check
+        # from BUI-980's proxy_below_anchor below (see the constant block
+        # above this function for why they stay separate) — a proxy band
+        # never runs it, so this stays False even when an anchor is present.
+        # Key present (== False) for shape parity with compute_fmv's output.
         "anchor_diverges": False,
+        # BUI-980: flag-only — fires when this band's top sits below the
+        # passed-through anchor's median (anchor n >= PROXY_BELOW_ANCHOR_MIN_N).
+        # Never changes fmv_low/fmv_high/median/max_bid/confidence/bid_factor
+        # above; see proxy_below_anchor's docstring.
+        "proxy_below_anchor": proxy_below_anchor(fmv_high, ungraded_anchor),
         # BUI-529: the always-on cross-check only runs on a book the RAW math
         # priced (see cgc_cross_check below) — a proxy band already IS the
         # slab-derived price, so a raw-vs-slab comparison is meaningless here.
@@ -1391,6 +1449,12 @@ def compute_fmv(comps: list[dict], target_grade: float,
         # fmv_notes on a cache hit the same lossy way as ungraded_anchor
         # itself, via _fmv_from_db_row / _anchor_diverges_from_notes.
         "anchor_diverges": diverges,
+        # BUI-980: a raw-priced row is never a proxy band, so there is nothing
+        # to compare to the anchor here — always False. Key present for shape
+        # parity with cgc_proxy_fmv's output (the rescue tier reads THIS
+        # dict's `ungraded_anchor` and passes it through to price the proxy
+        # band's own flag; see fmv_runner._apply_cgc_proxy_rescue).
+        "proxy_below_anchor": False,
         # BUI-529: populated by fmv_runner._apply_cgc_cross_check AFTER this
         # function returns (it needs the graded ladder, which compute_fmv never
         # fetches) — always None here. Key present for shape parity so every
@@ -1744,6 +1808,9 @@ def _graded_result(**over) -> dict:
         "cgc_ladder": None,
         "ungraded_anchor": None,
         "anchor_diverges": False,
+        # BUI-980: shape parity only — a graded (slab) row is never a raw
+        # CGC-proxy band, so nothing to compare to an anchor.
+        "proxy_below_anchor": False,
         "cgc_cross_check": None,
         # ── graded-only ──────────────────────────────────────────────────
         "graded": True,

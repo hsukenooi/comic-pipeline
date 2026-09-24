@@ -1295,6 +1295,107 @@ class TestCgcProxyShapeParity:
         assert proxy["cgc_cross_check"] is None
 
 
+# ─── Proxy-vs-anchor flag (BUI-980) ────────────────────────────────────────
+
+class TestProxyBelowAnchorFunction:
+    """Direct unit tests of the pure `proxy_below_anchor` helper."""
+
+    def test_named_constant_exists(self):
+        assert fm.PROXY_BELOW_ANCHOR_MIN_N == 8
+
+    def test_batman_227_numbers_fire(self):
+        # The actual BUI-976 audit incident: proxy band top $500, anchor
+        # $609 off 18 raw sales.
+        anchor = {"median": 609.0, "n": 18}
+        assert fm.proxy_below_anchor(500, anchor) is True
+
+    def test_fmv_high_at_median_does_not_fire(self):
+        # T = 1.0, no slack: exactly at the median must not trip (strict <).
+        anchor = {"median": 500.0, "n": 18}
+        assert fm.proxy_below_anchor(500, anchor) is False
+
+    def test_fmv_high_above_median_does_not_fire(self):
+        anchor = {"median": 500.0, "n": 18}
+        assert fm.proxy_below_anchor(550, anchor) is False
+
+    def test_thin_anchor_below_min_n_is_skipped(self):
+        anchor = {"median": 609.0, "n": 7}
+        assert fm.proxy_below_anchor(500, anchor) is False
+
+    def test_anchor_at_exactly_min_n_is_checked(self):
+        anchor = {"median": 609.0, "n": 8}
+        assert fm.proxy_below_anchor(500, anchor) is True
+
+    def test_no_anchor_never_fires(self):
+        assert fm.proxy_below_anchor(500, None) is False
+
+    def test_no_fmv_high_never_fires(self):
+        anchor = {"median": 609.0, "n": 18}
+        assert fm.proxy_below_anchor(None, anchor) is False
+
+    def test_degenerate_zero_median_never_fires(self):
+        assert fm.proxy_below_anchor(500, {"median": 0, "n": 18}) is False
+
+
+class TestProxyBelowAnchorInCgcProxyFmv:
+    def test_anchor_passed_through_to_output(self):
+        anchor = {"median": 609.0, "n": 18}
+        proxy = fm.cgc_proxy_fmv(_ASM50_LADDER, target_grade=6.5,
+                                 ungraded_anchor=anchor)
+        assert proxy["ungraded_anchor"] == anchor
+
+    def test_no_anchor_defaults_none_and_flag_false(self):
+        proxy = fm.cgc_proxy_fmv(_ASM50_LADDER, target_grade=6.5)
+        assert proxy["ungraded_anchor"] is None
+        assert proxy["proxy_below_anchor"] is False
+
+    def test_flag_fires_below_anchor_n_ge_8(self):
+        # ASM50's proxy band is $600-650; an anchor median above that with
+        # n>=8 fires.
+        anchor = {"median": 700.0, "n": 18}
+        proxy = fm.cgc_proxy_fmv(_ASM50_LADDER, target_grade=6.5,
+                                 ungraded_anchor=anchor)
+        assert proxy["proxy_below_anchor"] is True
+
+    def test_flag_does_not_fire_at_n_7(self):
+        anchor = {"median": 700.0, "n": 7}
+        proxy = fm.cgc_proxy_fmv(_ASM50_LADDER, target_grade=6.5,
+                                 ungraded_anchor=anchor)
+        assert proxy["proxy_below_anchor"] is False
+
+    def test_flag_does_not_fire_when_fmv_high_at_or_above_median(self):
+        anchor = {"median": 600.0, "n": 18}  # ASM50 fmv_high == 650
+        proxy = fm.cgc_proxy_fmv(_ASM50_LADDER, target_grade=6.5,
+                                 ungraded_anchor=anchor)
+        assert proxy["proxy_below_anchor"] is False
+
+    def test_band_and_max_bid_byte_identical_with_and_without_anchor(self):
+        """BUI-980 acceptance: passing an ungraded_anchor through (even one
+        that trips the flag) must NOT change fmv_low/fmv_high/median/
+        max_bid/confidence/bid_factor at all — same pure-flag philosophy as
+        BUI-534's anchor_diverges."""
+        anchor = {"median": 700.0, "n": 18}
+        with_anchor = fm.cgc_proxy_fmv(_ASM50_LADDER, target_grade=6.5,
+                                       ungraded_anchor=anchor)
+        without_anchor = fm.cgc_proxy_fmv(_ASM50_LADDER, target_grade=6.5)
+        assert with_anchor["proxy_below_anchor"] is True
+        assert without_anchor["proxy_below_anchor"] is False
+        assert with_anchor["fmv_low"] == without_anchor["fmv_low"]
+        assert with_anchor["fmv_high"] == without_anchor["fmv_high"]
+        assert with_anchor["median"] == without_anchor["median"]
+        assert with_anchor["max_bid"] == without_anchor["max_bid"]
+        assert with_anchor["confidence"] == without_anchor["confidence"]
+        assert with_anchor["bid_factor"] == without_anchor["bid_factor"]
+
+    def test_anchor_diverges_stays_false_on_proxy_even_with_anchor_present(self):
+        # BUI-534's symmetric ±50% check is a DIFFERENT flag; the proxy path
+        # never runs it, by design, even now that an anchor can be present.
+        anchor = {"median": 700.0, "n": 18}
+        proxy = fm.cgc_proxy_fmv(_ASM50_LADDER, target_grade=6.5,
+                                 ungraded_anchor=anchor)
+        assert proxy["anchor_diverges"] is False
+
+
 # ─── Always-on vintage cross-check (BUI-529) ──────────────────────────────────
 
 class TestCgcCrossCheck:

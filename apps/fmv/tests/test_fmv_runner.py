@@ -4453,6 +4453,52 @@ class TestCgcProxyRescue:
         # The successful ledger post is reflected in comps_posted.
         assert fresh[0]["comps_posted"] is True
 
+    def test_raw_anchor_is_passed_through_and_flag_fires(self, server_url):
+        # BUI-980: the raw pass's own ungraded_anchor (computed off the
+        # grade-less comps ITS fetch saw, before this rescue ever ran) must
+        # be carried onto the proxy result and drive proxy_below_anchor —
+        # ASM50's proxy band tops at $650, so an anchor median of $700 (n=18)
+        # sits above it and fires.
+        anchor = {"median": 700.0, "n": 18}
+        books = [{"item_id": "1", "title": "Amazing Spider-Man", "issue": "50",
+                  "year": 1967, "grade": 6.5}]
+        fresh = {0: {"input": {"title": "Amazing Spider-Man", "issue": "50",
+                               "year": 1967, "grade": 6.5},
+                     "fmv": {"fmv_high": None, "interpolated": False,
+                             "flag_reason": None, "ungraded_anchor": anchor},
+                     "comic_id": 5,
+                     "source": "fresh"}}
+        with patch("fmv_runner._fetch_comps",
+                   return_value=[_graded_result(0, _ASM50_SLABS)]), \
+             patch("fmv_runner._upsert_fmv",
+                   side_effect=lambda *a, **k: {"comic_id": 7, "fmv_id": 9}), \
+             patch("fmv_runner._post_comps", return_value=True):
+            fmv_runner._apply_cgc_proxy_rescue(
+                fresh, books, server_url=server_url, force=False)
+        assert fresh[0]["fmv"]["ungraded_anchor"] == anchor
+        assert fresh[0]["fmv"]["proxy_below_anchor"] is True
+
+    def test_raw_anchor_absent_leaves_flag_false(self, server_url):
+        # No grade-less comps on the raw pass → no anchor → the flag can't
+        # fire; ungraded_anchor stays None on the promoted proxy result too.
+        books = [{"item_id": "1", "title": "Amazing Spider-Man", "issue": "50",
+                  "year": 1967, "grade": 6.5}]
+        fresh = {0: {"input": {"title": "Amazing Spider-Man", "issue": "50",
+                               "year": 1967, "grade": 6.5},
+                     "fmv": {"fmv_high": None, "interpolated": False,
+                             "flag_reason": None, "ungraded_anchor": None},
+                     "comic_id": 5,
+                     "source": "fresh"}}
+        with patch("fmv_runner._fetch_comps",
+                   return_value=[_graded_result(0, _ASM50_SLABS)]), \
+             patch("fmv_runner._upsert_fmv",
+                   side_effect=lambda *a, **k: {"comic_id": 7, "fmv_id": 9}), \
+             patch("fmv_runner._post_comps", return_value=True):
+            fmv_runner._apply_cgc_proxy_rescue(
+                fresh, books, server_url=server_url, force=False)
+        assert fresh[0]["fmv"]["ungraded_anchor"] is None
+        assert fresh[0]["fmv"]["proxy_below_anchor"] is False
+
     def test_modern_book_is_not_rescued(self, server_url):
         # The 0.50-0.55 factor is vintage-calibrated; a modern book (year >=
         # cutoff) must never reach the proxy even with a sparse raw pool.
@@ -5119,6 +5165,85 @@ class TestCgcProxyNotesAndTable:
         notes = fmv_runner._build_notes(proxy)
         assert "envelope_clamped" not in notes
         assert "CGC proxy" in notes  # unaffected: existing token still present
+
+
+class TestProxyBelowAnchorNotes:
+    """BUI-980: the proxy-vs-anchor flag's notes token + cache-hit recovery,
+    mirroring TestAnchorDivergesNotes's coverage of the sibling BUI-534 flag."""
+
+    def test_notes_carry_token_when_flag_fires(self):
+        anchor = {"median": 700.0, "n": 18}
+        proxy = fmv_math.cgc_proxy_fmv(_ASM50_SLABS, target_grade=6.5,
+                                       ungraded_anchor=anchor)
+        assert proxy["proxy_below_anchor"] is True
+        proxy["first_party_count"] = 0
+        notes = fmv_runner._build_notes(proxy)
+        assert "ungraded_anchor=$700 (n=18 raw)" in notes
+        assert "proxy_below_anchor=1" in notes
+
+    def test_notes_omit_token_when_flag_does_not_fire(self):
+        anchor = {"median": 100.0, "n": 18}  # well below the ASM50 band
+        proxy = fmv_math.cgc_proxy_fmv(_ASM50_SLABS, target_grade=6.5,
+                                       ungraded_anchor=anchor)
+        assert proxy["proxy_below_anchor"] is False
+        proxy["first_party_count"] = 0
+        notes = fmv_runner._build_notes(proxy)
+        assert "ungraded_anchor=$100 (n=18 raw)" in notes
+        assert "proxy_below_anchor" not in notes
+
+    def test_notes_omit_token_when_key_absent(self):
+        fmv = {"cv_pct": "20%", "confidence": "MEDIUM-LOW"}
+        notes = fmv_runner._build_notes(fmv)
+        assert "proxy_below_anchor" not in notes
+
+    def test_cached_row_recovers_flag_from_notes(self):
+        row = {"fmv_low": 600, "fmv_high": 650, "fmv_comps": 6,
+               "fmv_confidence": "medium-low",
+               "fmv_notes": ("window=n/a | cv=n/a | label=MEDIUM-LOW | "
+                             "ungraded_anchor=$700 (n=18 raw) | "
+                             "proxy_below_anchor=1")}
+        out = fmv_runner._fmv_from_db_row(row)
+        assert out["proxy_below_anchor"] is True
+
+    def test_cached_row_without_token_recovers_false(self):
+        row = {"fmv_low": 600, "fmv_high": 650, "fmv_comps": 6,
+               "fmv_confidence": "medium-low",
+               "fmv_notes": "window=n/a | cv=n/a | label=MEDIUM-LOW"}
+        out = fmv_runner._fmv_from_db_row(row)
+        assert out["proxy_below_anchor"] is False
+
+    def test_db_row_shape_parity_carries_proxy_below_anchor(self):
+        computed = fmv_math.compute_fmv([{"price": 100, "grade": 9.2}],
+                                        target_grade=9.2)
+        assert "proxy_below_anchor" in computed
+        row = {"fmv_low": 100, "fmv_high": 150, "fmv_comps": 8,
+               "fmv_confidence": "high", "fmv_notes": "window=±0.5 | cv=20%"}
+        projected = fmv_runner._fmv_from_db_row(row)
+        assert "proxy_below_anchor" in projected
+
+    def test_print_table_renders_flagged_proxy_row_without_crashing(self, capsys):
+        anchor = {"median": 700.0, "n": 18}
+        proxy = fmv_math.cgc_proxy_fmv(_ASM50_SLABS, target_grade=6.5,
+                                       ungraded_anchor=anchor)
+        assert proxy["proxy_below_anchor"] is True
+        proxy["first_party_count"] = 0
+        row = {"input": {"title": "Amazing Spider-Man", "issue": "50",
+                         "grade": 6.5},
+               "fmv": proxy, "source": "cgc-proxy"}
+        fmv_runner._print_table([row])  # must not raise
+        out = capsys.readouterr().out
+        assert "cgc" in out
+
+    def test_brief_row_renders_flagged_proxy_row_without_crashing(self):
+        anchor = {"median": 700.0, "n": 18}
+        proxy = fmv_math.cgc_proxy_fmv(_ASM50_SLABS, target_grade=6.5,
+                                       ungraded_anchor=anchor)
+        assert proxy["proxy_below_anchor"] is True
+        proxy["first_party_count"] = 0
+        row = {"input": {"item_id": "1"}, "fmv": proxy,
+               "comic_id": 7, "fmv_id": 9, "source": "cgc-proxy"}
+        brief = fmv_runner._brief_row(row)  # must not raise
+        assert "proxy_below_anchor=1" in brief["fmv_notes"]
 
 
 class TestFmvRefreshHeartbeat:
