@@ -42,6 +42,7 @@ from gixen_overlay.db import (
     mark_collection_wins_seen,
     get_first_party_outcomes,
     calibration_report,
+    fmv_accuracy_report,
     get_won_auctions_cost_basis,
     get_comps,
     get_fmv_history,
@@ -366,6 +367,59 @@ async def api_comics_calibration(
     """
     db = request.app.state.db
     return calibration_report(db, days=days, min_losses=min_losses)
+
+
+@router.get("/api/comics/accuracy")
+async def api_comics_accuracy(
+    request: Request,
+    days: float | None = None,
+    include_rows: bool = False,
+):
+    """BUI-977: fixed-window FMV accuracy report — DIAGNOSTIC ONLY, read-only,
+    never an input to a bid.
+
+    Real-estate-style accuracy report, distinct from `/api/comics/calibration`
+    above: that endpoint ranks books whose `fmv.high` looks too low from
+    win/loss evidence; this one scores every eligible resolved auction's
+    final price (`winning_bid`) against the FMV band's midpoint
+    `(low+high)/2`, with no admit gate — every eligible row counts, whether
+    the band called it well or badly.
+
+    Reports, overall and per calendar month of
+    `COALESCE(auction_end_at, resolved_at)`, split by WON/LOST at both
+    levels: `n`; the share within +/-10% and +/-20% of the midpoint; MdAPE
+    (median absolute percentage error vs the midpoint); mean signed error vs
+    the midpoint (positive means the price cleared above the midpoint, i.e.
+    the band priced the book low); stored-band coverage (in/above/below
+    `[low, high]`); and median band width as a percentage of the midpoint.
+
+    **The band scored is the one in force when the bid was added** — the
+    latest `fmv_history` snapshot at-or-before `bids.added_at`, falling back
+    to the current `fmv` row only when no such snapshot exists (reported per
+    row as `band_source`, tallied in `band_source_counts`) — never the
+    current `fmv` row unconditionally, which would partly grade a band
+    against auctions whose own price had already fed back into it (comp-pool
+    leakage via `get_first_party_outcomes`). See `fmv_accuracy_report` in
+    `db.py` for the exact query, the added_at/recorded_at timestamp-format
+    normalization it depends on, and the full exclusion list (multi-comic
+    lots, an unresolved band).
+
+    `days` (default `None`, unlike `/api/comics/calibration`'s 180-day
+    default): omit for every resolved auction on file; pass to bound the
+    report to the last N days by the same recency rule `/api/comics/history`
+    uses.
+
+    `include_rows` (default `False`): also return one row per scored
+    auction — see `fmv_accuracy_report`'s docstring for the field list — so a
+    later analysis ticket can consume the raw rows instead of only the
+    aggregates.
+
+    Consumed by the `/comic:accuracy-report` skill, which curls this endpoint
+    and renders the summary tables — the same thin CLI/skill-over-server-
+    aggregate shape `/comic:calibration-report` already uses.
+    """
+    db = request.app.state.db
+    return fmv_accuracy_report(db, days=days, include_rows=include_rows)
 
 
 @router.get("/api/comics/won-auctions/value")
