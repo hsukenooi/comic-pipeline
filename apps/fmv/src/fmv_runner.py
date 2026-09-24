@@ -3361,9 +3361,19 @@ def _apply_cgc_proxy_rescue(fresh_fmvs: dict[int, dict], books: list[dict], *,
             fresh_fmvs[idx].get("comps_posted"), rescue_posted,
         )
         inp = fresh_fmvs[idx].get("input") or {}
+        # BUI-980: the raw pass (_compute_and_upsert_one, before this rescue
+        # tier ever ran) already computed the book's ungraded-market anchor
+        # off the grade-less comps ITS fetch saw (fmv_math.ungraded_market_
+        # anchor) — carried on fresh_fmvs[idx]["fmv"]["ungraded_anchor"] even
+        # though that raw result ended up needs_manual (the anchor is
+        # computed unconditionally, before any pricing/flag branch). Pass it
+        # through rather than re-deriving it from this pass's GRADED-only
+        # comps, which hold no grade-less prices to anchor from at all.
+        raw_anchor = (fresh_fmvs[idx].get("fmv") or {}).get("ungraded_anchor")
         proxy = fmv_math.cgc_proxy_fmv(
             graded_comps, target_grade=inp["grade"],
             grade_confidence=inp.get("grade_confidence"),
+            ungraded_anchor=raw_anchor,
         )
         if proxy is None:
             continue  # ladder too thin / cheap / non-monotonic / out of range
@@ -4248,6 +4258,12 @@ def _build_notes(fmv: dict) -> str:
     # reads this as "look at this one", not as an instruction already acted on.
     if fmv.get("anchor_diverges"):
         parts.append("anchor_diverges=1")
+    # BUI-980: flag (never re-price) when a CGC-proxy band's top sits below
+    # the ungraded anchor above (fmv_math.proxy_below_anchor). Same
+    # philosophy as anchor_diverges just above — the proxy factor is kept as
+    # calibrated, and this says "look at this one" rather than acting on it.
+    if fmv.get("proxy_below_anchor"):
+        parts.append("proxy_below_anchor=1")
     # BUI-529: surface the always-on vintage cross-check's divergence signal.
     # Informational only — this NEVER changes fmv_low/fmv_high/max_bid for a
     # book the raw math already priced (see _apply_cgc_cross_check); a human
@@ -4567,6 +4583,17 @@ def _anchor_diverges_from_notes(notes: str | None) -> bool:
     return notes is not None and "anchor_diverges=1" in notes
 
 
+def _proxy_below_anchor_from_notes(notes: str | None) -> bool:
+    """Recover the BUI-980 proxy-vs-anchor flag from persisted fmv_notes.
+
+    Same lossy recovery as ``_anchor_diverges_from_notes`` — the anchor's
+    median/n aren't reconstructible on a cache hit (the raw comps aren't
+    persisted), but `_build_notes` writes a plain `proxy_below_anchor=1` token
+    when the flag fired, so a re-served cached row can still surface it.
+    """
+    return notes is not None and "proxy_below_anchor=1" in notes
+
+
 def _window_from_notes(notes: str | None) -> float | None:
     """Recover the grade window the FMV was built at from persisted fmv_notes.
 
@@ -4708,6 +4735,11 @@ def _fmv_from_db_row(row: dict, grade_confidence: str | None = None) -> dict:
         # persisted `anchor_diverges=1` notes token, so a re-displayed /
         # re-served cached row still surfaces the divergence signal.
         "anchor_diverges": _anchor_diverges_from_notes(row.get("fmv_notes")),
+        # BUI-980: recover the flag (not the anchor itself — same lossy
+        # projection as anchor_diverges above) from the persisted
+        # `proxy_below_anchor=1` notes token, so a re-displayed / re-served
+        # cached CGC-proxy row still surfaces the divergence signal.
+        "proxy_below_anchor": _proxy_below_anchor_from_notes(row.get("fmv_notes")),
         # BUI-529: shape parity with compute_fmv. The cross-check result itself
         # isn't persisted (no DB column — same lossy projection as median/cv),
         # so a cache-reused row always reads as "not cross-checked" here; the
