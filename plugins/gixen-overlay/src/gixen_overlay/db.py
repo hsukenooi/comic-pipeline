@@ -3804,6 +3804,276 @@ def calibration_report(
 
 
 # ---------------------------------------------------------------------------
+# FMV accuracy report (BUI-977)
+# ---------------------------------------------------------------------------
+#
+# A real-estate-style fixed-window accuracy report, distinct from
+# `calibration_report` above: that report ranks books whose `fmv.high` looks
+# too low from win/loss evidence; this one scores every resolved auction's
+# final price against the FMV band midpoint it was actually bid against, with
+# no admit gate — every eligible row counts, whether the band called it well
+# or badly. Diagnostic only; issues zero writes.
+_STATUSES_FOR_ACCURACY_SPLIT = (_STATUS_WON, _STATUS_LOST)
+
+
+def _fmv_accuracy_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate the fixed-window accuracy metrics over already-filtered
+    *rows* (each a dict with numeric `price`, `low`, `high`).
+
+    All percentages are 0-100. Every field is `None` on an empty `rows` (a
+    month/status slice with no eligible auctions has no accuracy signal to
+    report — this deliberately never renders as 0%, which would read as
+    "perfect" rather than "no data").
+    """
+    n = len(rows)
+    if n == 0:
+        return {
+            "n": 0,
+            "share_within_10pct": None,
+            "share_within_20pct": None,
+            "mdape_pct": None,
+            "mean_signed_error_pct": None,
+            "in_band_pct": None,
+            "above_band_pct": None,
+            "below_band_pct": None,
+            "median_band_width_pct": None,
+        }
+
+    abs_errors: list[float] = []
+    signed_errors: list[float] = []
+    widths: list[float] = []
+    within_10 = within_20 = in_band = above_band = below_band = 0
+    for row in rows:
+        price = row["price"]
+        low = row["low"]
+        high = row["high"]
+        mid = (low + high) / 2
+        # Positive = the final price cleared above the band midpoint, i.e.
+        # the band priced the book LOW relative to what it actually sold
+        # for — matches the ticket's "positive = priced low" convention.
+        signed = (price - mid) / mid
+        abs_err = abs(signed)
+        abs_errors.append(abs_err)
+        signed_errors.append(signed)
+        widths.append((high - low) / mid)
+        if abs_err <= 0.10:
+            within_10 += 1
+        if abs_err <= 0.20:
+            within_20 += 1
+        if price > high:
+            above_band += 1
+        elif price < low:
+            below_band += 1
+        else:
+            in_band += 1
+
+    return {
+        "n": n,
+        "share_within_10pct": within_10 / n * 100,
+        "share_within_20pct": within_20 / n * 100,
+        "mdape_pct": median(abs_errors) * 100,
+        "mean_signed_error_pct": sum(signed_errors) / n * 100,
+        "in_band_pct": in_band / n * 100,
+        "above_band_pct": above_band / n * 100,
+        "below_band_pct": below_band / n * 100,
+        "median_band_width_pct": median(widths) * 100,
+    }
+
+
+def _fmv_accuracy_split_by_status(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        status: _fmv_accuracy_metrics([r for r in rows if r["status"] == status])
+        for status in _STATUSES_FOR_ACCURACY_SPLIT
+    }
+
+
+def fmv_accuracy_report(
+    conn: sqlite3.Connection,
+    *,
+    days: float | None = None,
+    include_rows: bool = False,
+) -> dict[str, Any]:
+    """DIAGNOSTIC-ONLY fixed-window FMV accuracy report (BUI-977). Read-only —
+    issues zero writes.
+
+    Scores each resolved auction's final price (`bids.winning_bid`) against
+    the FMV band's midpoint `(low+high)/2`, reporting: `n`; the share within
+    +/-10% and +/-20% of the midpoint; MdAPE (median absolute percentage
+    error) vs the midpoint; mean signed error vs the midpoint (positive means
+    the price cleared above the midpoint, i.e. the band priced the book low);
+    stored-band coverage (in/above/below the `[low, high]` band); and median
+    band width as a percentage of the midpoint. Reported overall, per
+    calendar month of `COALESCE(auction_end_at, resolved_at)`, and split by
+    WON/LOST at both the overall and per-month level (`by_status`) — see
+    `_fmv_accuracy_metrics`/`_fmv_accuracy_split_by_status`.
+
+    **The band scored is the one in force when the bid was added, not the
+    current `fmv` row.** For each row this looks up the latest `fmv_history`
+    snapshot for the same `(comic_id, grade, certifier, label)` with a
+    positive `high` and `recorded_at <= bids.added_at`, falling back to the
+    current `fmv` row only when no such snapshot exists. `band_source`
+    ('history' | 'current_fmv') is reported per row and tallied in
+    `band_source_counts`.
+
+    **Why the fallback matters (leakage):** `get_first_party_outcomes` feeds
+    a user's own resolved auctions straight into the comp pool that prices
+    later `fmv` rows, so a book's `fmv` row recorded *after* an auction ended
+    can already have been pulled toward that very auction's own price. Only a
+    fixed history snapshot from at-or-before the bid's `added_at` is free of
+    that leakage; scoring against the live `fmv` row would flatter the report
+    by partly grading the band against itself. The `current_fmv` fallback
+    only fires when no such snapshot exists at all (e.g. a book added and
+    priced once, never repriced since) — those rows are still scored (an
+    accuracy report that silently drops them would undercount), but their
+    `band_source` says so, so a reader can weigh the difference.
+
+    **Timestamp trap:** `bids.added_at` is stored `'YYYY-MM-DD HH:MM:SS'`
+    (space separator, no offset) while `fmv_history.recorded_at` is ISO
+    `'YYYY-MM-DDTHH:MM:SS.ffffff+00:00'` ('T' separator, offset-suffixed) —
+    comparing the two strings byte-for-byte is wrong (a `'T'` sorts after a
+    space in ASCII, and the offset suffix would need stripping too). Both
+    sides are normalized to a bare `'YYYY-MM-DDTHH:MM:SS'` prefix before
+    comparing: `replace(b.added_at, ' ', 'T')` against
+    `substr(fh.recorded_at, 1, 19)`.
+
+    **Exclusions:** reuses the exact "a resolved auction" predicate
+    `get_first_party_outcomes`/`calibration_report` use —
+    `_RESOLVED_STATUS_CLAUSE` (WON or LOST, including a purge-swept REMOVED
+    row via `prior_status`), `_PRIMARY_LINK_CLAUSE`, and
+    `_WINNING_BID_NOT_NULL_CLAUSE` — plus `_RESOLVED_RECENCY_CLAUSE` only when
+    `days` is given (unlike those two, this report defaults to no recency
+    bound at all: `days=None` scores every resolved auction on file). Also
+    excludes: a multi-comic lot (a bid with more than one `bid_fmvs` link —
+    its `winning_bid` prices the whole lot, not one book, so no per-book
+    price exists to score); and any row whose resolved band has a null or
+    non-positive `low`/`high` (no midpoint to score against).
+
+    With `include_rows=True`, also returns one row per scored auction: `bid_id`,
+    `item_id`, `comic_id`, `title`, `issue`, `grade`, `certifier`, `status`,
+    `price`, `low`, `high`, `band_source`, `fmv_history_id`, `confidence`,
+    `comps`, `notes`, `ended` — so a later analysis ticket can consume the raw
+    rows instead of only the aggregates.
+    """
+    clauses = [
+        _PRIMARY_LINK_CLAUSE,
+        _RESOLVED_STATUS_CLAUSE,
+        _WINNING_BID_NOT_NULL_CLAUSE,
+        # A lot's winning_bid prices every linked book at once, not one book
+        # — excluded outright rather than picked-a-primary-and-scored, unlike
+        # get_first_party_outcomes/calibration_report which only need "the"
+        # representative comic for a bid.
+        "(SELECT COUNT(*) FROM bid_fmvs bf2 WHERE bf2.bid_id = b.id) = 1",
+    ]
+    params: list[Any] = []
+    if days is not None:
+        clauses.append(_RESOLVED_RECENCY_CLAUSE)
+        params.append(f"-{days} days")
+    where = " AND ".join(clauses)
+
+    sql_rows = conn.execute(
+        f"""
+        SELECT
+            b.id                           AS bid_id,
+            b.item_id                      AS item_id,
+            c.id                           AS comic_id,
+            c.title                        AS title,
+            c.issue                        AS issue,
+            f.grade                        AS grade,
+            f.certifier                    AS certifier,
+            {_EFFECTIVE_STATUS_SQL}        AS status,
+            b.winning_bid                  AS price,
+            b.notes                        AS notes,
+            COALESCE(b.auction_end_at, b.resolved_at) AS ended,
+            mh.id                          AS fmv_history_id,
+            CASE WHEN mh.id IS NOT NULL THEN mh.low ELSE f.low END AS low,
+            CASE WHEN mh.id IS NOT NULL THEN mh.high ELSE f.high END AS high,
+            CASE WHEN mh.id IS NOT NULL THEN mh.confidence ELSE f.confidence END AS confidence,
+            CASE WHEN mh.id IS NOT NULL THEN mh.comps ELSE f.comps END AS comps,
+            CASE WHEN mh.id IS NOT NULL THEN 'history' ELSE 'current_fmv' END AS band_source
+        FROM bids b
+        JOIN bid_fmvs bf ON bf.bid_id = b.id
+        JOIN fmv f       ON f.id = bf.fmv_id
+        JOIN comics c    ON c.id = f.comic_id
+        LEFT JOIN fmv_history mh ON mh.id = (
+            SELECT fh.id
+            FROM fmv_history fh
+            WHERE fh.comic_id = f.comic_id
+              AND fh.grade = f.grade
+              AND fh.certifier = f.certifier
+              AND fh.label = f.label
+              AND fh.high IS NOT NULL AND fh.high > 0
+              AND substr(fh.recorded_at, 1, 19) <= replace(b.added_at, ' ', 'T')
+            ORDER BY fh.recorded_at DESC
+            LIMIT 1
+        )
+        WHERE {where}
+        ORDER BY ended
+        """,
+        params,
+    ).fetchall()
+
+    all_rows: list[dict[str, Any]] = []
+    for row in sql_rows:
+        d = dict(row)
+        low, high = d["low"], d["high"]
+        if low is None or high is None or low <= 0 or high <= 0:
+            continue
+        all_rows.append(d)
+
+    band_source_counts: dict[str, int] = {}
+    for r in all_rows:
+        band_source_counts[r["band_source"]] = band_source_counts.get(r["band_source"], 0) + 1
+
+    by_month: dict[str, list[dict[str, Any]]] = {}
+    for r in all_rows:
+        ended = r["ended"]
+        month = ended[:7] if ended else "unknown"
+        by_month.setdefault(month, []).append(r)
+
+    overall = _fmv_accuracy_metrics(all_rows)
+    overall["by_status"] = _fmv_accuracy_split_by_status(all_rows)
+
+    by_month_report: list[dict[str, Any]] = []
+    for month in sorted(by_month):
+        month_rows = by_month[month]
+        month_metrics = _fmv_accuracy_metrics(month_rows)
+        month_metrics["month"] = month
+        month_metrics["by_status"] = _fmv_accuracy_split_by_status(month_rows)
+        by_month_report.append(month_metrics)
+
+    result: dict[str, Any] = {
+        "days": days,
+        "overall": overall,
+        "by_month": by_month_report,
+        "band_source_counts": band_source_counts,
+    }
+    if include_rows:
+        result["rows"] = [
+            {
+                "bid_id": r["bid_id"],
+                "item_id": r["item_id"],
+                "comic_id": r["comic_id"],
+                "title": r["title"],
+                "issue": r["issue"],
+                "grade": r["grade"],
+                "certifier": r["certifier"],
+                "status": r["status"],
+                "price": r["price"],
+                "low": r["low"],
+                "high": r["high"],
+                "band_source": r["band_source"],
+                "fmv_history_id": r["fmv_history_id"],
+                "confidence": r["confidence"],
+                "comps": r["comps"],
+                "notes": r["notes"],
+                "ended": r["ended"],
+            }
+            for r in all_rows
+        ]
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Won-auctions cost basis (BUI-664)
 # ---------------------------------------------------------------------------
 #
