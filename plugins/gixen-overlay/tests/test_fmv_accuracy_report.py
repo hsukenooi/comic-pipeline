@@ -623,3 +623,155 @@ def test_route_excludes_lost_with_no_winning_bid(api):
 
     r = api.get("/api/comics/accuracy")
     assert r.json()["overall"]["n"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Band-width slice + pre/post BUI-528 split (BUI-983)
+# ---------------------------------------------------------------------------
+
+
+def test_zero_width_band_lands_in_zero_bucket():
+    """low == high (the legacy shape BUI-528 stopped producing) must land in
+    its own 'zero' bucket, not get folded into 'under_30pct' just because its
+    width ratio also happens to be under 30%."""
+    conn = _db()
+    _, fmv_id = _comic_and_fmv(conn, high=50.0, low=50.0)
+    bid_id = _bid(conn, "1", winning_bid=50.0)
+    _link(conn, bid_id, fmv_id)
+
+    report = fmv_accuracy_report(conn)
+    by_width = report["by_width_bucket"]
+    assert by_width["zero"]["n"] == 1
+    assert by_width["under_30pct"]["n"] == 0
+    assert by_width["30_50pct"]["n"] == 0
+    assert by_width["50pct_plus"]["n"] == 0
+
+
+def test_width_buckets_split_by_ratio():
+    """Four rows, one per bucket, at the exact boundary values: 0.30 and 0.50
+    are each pushed into the HIGHER bucket (half-open [lo, hi) on the low
+    side), matching the audit's 'under 30%' / '30-50%' / '50%+' labels."""
+    conn = _db()
+    # under_30pct: mid=112.5, width=25/112.5 ~= 22.2%
+    _, fmv1 = _comic_and_fmv(conn, title="A", high=125.0, low=100.0)
+    # exactly 30% wide (mid=100, width=30/100=0.30) -> falls into 30_50pct
+    _, fmv2 = _comic_and_fmv(conn, title="B", issue="2", high=115.0, low=85.0)
+    # exactly 50% wide (mid=100, width=50/100=0.50) -> falls into 50pct_plus
+    _, fmv3 = _comic_and_fmv(conn, title="C", issue="3", high=125.0, low=75.0)
+    # comfortably 50%+: mid=150, width=100/150 ~= 66.7%
+    _, fmv4 = _comic_and_fmv(conn, title="D", issue="4", high=200.0, low=100.0)
+    for i, fmv_id in enumerate([fmv1, fmv2, fmv3, fmv4], start=1):
+        bid_id = _bid(conn, str(i), winning_bid=100.0)
+        _link(conn, bid_id, fmv_id)
+
+    report = fmv_accuracy_report(conn)
+    by_width = report["by_width_bucket"]
+    assert by_width["zero"]["n"] == 0
+    assert by_width["under_30pct"]["n"] == 1
+    assert by_width["30_50pct"]["n"] == 1
+    assert by_width["50pct_plus"]["n"] == 2
+    # Additive: the overall population is untouched by the new slice.
+    assert report["overall"]["n"] == 4
+
+
+def test_prepost_bui528_split_by_history_recorded_at_boundary():
+    """A history row recorded exactly at the cutoff is 'post'; one recorded a
+    microsecond before is 'pre' — proves the boundary is >= (inclusive of the
+    cutoff instant), not a same-day approximation."""
+    conn = _db()
+    comic_pre, fmv_pre = _comic_and_fmv(conn, title="Pre", grade=9.0,
+                                         high=999.0, low=900.0)
+    _history(conn, comic_pre, 9.0, low=100.0, high=150.0,
+             recorded_at="2026-07-24T23:59:59.999999+00:00")
+    bid_pre = _bid(conn, "1", winning_bid=125.0, added_at="2026-08-01 00:00:00")
+    _link(conn, bid_pre, fmv_pre)
+
+    comic_post, fmv_post = _comic_and_fmv(conn, title="Post", grade=9.0,
+                                           high=999.0, low=900.0)
+    _history(conn, comic_post, 9.0, low=100.0, high=150.0,
+             recorded_at="2026-07-25T00:00:00+00:00")
+    bid_post = _bid(conn, "2", winning_bid=125.0, added_at="2026-08-01 00:00:00")
+    _link(conn, bid_post, fmv_post)
+
+    report = fmv_accuracy_report(conn)
+    by_prepost = report["by_prepost_bui528"]
+    assert by_prepost["pre_bui_528"]["n"] == 1
+    assert by_prepost["post_bui_528"]["n"] == 1
+    assert by_prepost["unknown"]["n"] == 0
+    assert report["overall"]["n"] == 2
+
+
+def test_prepost_bui528_uses_fmv_updated_at_for_current_fmv_rows():
+    """A current_fmv-fallback row (no history snapshot in force) is dated by
+    the live `fmv` row's own `updated_at`, not its auction's `added_at`."""
+    conn = _db()
+    _, fmv_id = _comic_and_fmv(conn, high=150.0, low=100.0)
+    conn.execute("UPDATE fmv SET updated_at=? WHERE id=?",
+                 ("2026-06-01T00:00:00.000000+00:00", fmv_id))
+    conn.commit()
+    bid_id = _bid(conn, "1", winning_bid=125.0, added_at="2026-08-01 00:00:00")
+    _link(conn, bid_id, fmv_id)
+
+    report = fmv_accuracy_report(conn)
+    assert report["by_prepost_bui528"]["pre_bui_528"]["n"] == 1
+    assert report["by_prepost_bui528"]["post_bui_528"]["n"] == 0
+
+
+def test_prepost_bui528_null_timestamp_goes_to_unknown_not_dropped():
+    """Defensive: a `current_fmv` row can in principle carry a real price
+    with a NULL `updated_at` (a row written by some path that never stamped
+    one). It must land in the explicit 'unknown' bucket — never silently
+    dropped, and never guessed into pre/post."""
+    conn = _db()
+    _, fmv_id = _comic_and_fmv(conn, high=150.0, low=100.0)
+    conn.execute("UPDATE fmv SET updated_at=NULL WHERE id=?", (fmv_id,))
+    conn.commit()
+    bid_id = _bid(conn, "1", winning_bid=125.0)
+    _link(conn, bid_id, fmv_id)
+
+    report = fmv_accuracy_report(conn)
+    by_prepost = report["by_prepost_bui528"]
+    assert by_prepost["unknown"]["n"] == 1
+    assert by_prepost["pre_bui_528"]["n"] == 0
+    assert by_prepost["post_bui_528"]["n"] == 0
+    # Never silently dropped from the overall population either.
+    assert report["overall"]["n"] == 1
+
+
+def test_new_slices_are_additive_existing_keys_unchanged():
+    """BUI-983 is additive-only: the pre-existing top-level keys and
+    `overall`'s own key set must not change shape."""
+    conn = _db()
+    _, fmv_id = _comic_and_fmv(conn, high=150.0, low=100.0)
+    bid_id = _bid(conn, "1", winning_bid=125.0)
+    _link(conn, bid_id, fmv_id)
+
+    report = fmv_accuracy_report(conn)
+    assert set(report) == {
+        "days", "overall", "by_month", "band_source_counts",
+        "by_width_bucket", "by_prepost_bui528",
+    }
+    assert set(report["overall"]) == {
+        "n", "share_within_10pct", "share_within_20pct", "mdape_pct",
+        "mean_signed_error_pct", "in_band_pct", "above_band_pct",
+        "below_band_pct", "median_band_width_pct", "by_status",
+    }
+    assert set(report["by_width_bucket"]) == {
+        "zero", "under_30pct", "30_50pct", "50pct_plus",
+    }
+    assert set(report["by_prepost_bui528"]) == {
+        "pre_bui_528", "post_bui_528", "unknown",
+    }
+
+
+def test_width_and_prepost_slices_present_and_empty_on_fresh_db():
+    """Both new slices must appear with n=0 (not be absent) when there is no
+    data at all — matches the existing empty-db contract for the other
+    slices."""
+    conn = _db()
+    report = fmv_accuracy_report(conn)
+    for bucket in ("zero", "under_30pct", "30_50pct", "50pct_plus"):
+        assert report["by_width_bucket"][bucket]["n"] == 0
+        assert report["by_width_bucket"][bucket]["share_within_10pct"] is None
+    for bucket in ("pre_bui_528", "post_bui_528", "unknown"):
+        assert report["by_prepost_bui528"][bucket]["n"] == 0

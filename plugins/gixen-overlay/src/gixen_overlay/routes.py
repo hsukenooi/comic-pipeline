@@ -414,6 +414,14 @@ async def api_comics_accuracy(
     later analysis ticket can consume the raw rows instead of only the
     aggregates.
 
+    Also reports two additive slices (BUI-983), each with the same metric set
+    as `overall`: `by_width_bucket` (`zero` | `under_30pct` | `30_50pct` |
+    `50pct_plus`, by `(high-low)/midpoint`) and `by_prepost_bui528`
+    (`pre_bui_528` | `post_bui_528` | `unknown`, by each row's own band-write
+    timestamp against BUI-528's merge) — see `fmv_accuracy_report`'s
+    docstring for why: the pre-BUI-528 zero-width band shape depresses the
+    baseline, so these let a reader tell that apart from current pricing.
+
     Consumed by the `/comic:accuracy-report` skill, which curls this endpoint
     and renders the summary tables — the same thin CLI/skill-over-server-
     aggregate shape `/comic:calibration-report` already uses.

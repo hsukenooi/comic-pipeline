@@ -3887,6 +3887,95 @@ def _fmv_accuracy_split_by_status(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Band-width slice (BUI-983)
+# ---------------------------------------------------------------------------
+#
+# The 2026-09-24 audit (docs/audit/2026-09-24-above-band-misses.md) found that
+# a quarter of the misses in the history cut sit on zero-width bands
+# (`low == high`, a class BUI-528 stopped producing 2026-07-24) and another
+# quarter sit on bands under 30% of the midpoint — both far worse-calibrated
+# than the 50%+ bucket. These are the same four buckets that audit used, kept
+# in the same order so a report reader can line the two up directly.
+_WIDTH_BUCKETS = ("zero", "under_30pct", "30_50pct", "50pct_plus")
+
+
+def _fmv_accuracy_width_bucket(row: dict[str, Any]) -> str:
+    """Which width bucket *row* falls into, by `(high-low)/midpoint`.
+
+    `low`/`high` are guaranteed non-None and > 0 by `_fmv_accuracy_rows`'s own
+    filter, so `mid = (low+high)/2` is always > 0 here — no zero-midpoint
+    guard needed. `low == high` (width exactly 0, the legacy pre-BUI-528
+    shape) is checked directly rather than via the width ratio so it can
+    never drift from "zero" due to float division.
+    """
+    low, high = row["low"], row["high"]
+    if low == high:
+        return "zero"
+    mid = (low + high) / 2
+    width = (high - low) / mid
+    if width < 0.30:
+        return "under_30pct"
+    if width < 0.50:
+        return "30_50pct"
+    return "50pct_plus"
+
+
+def _fmv_accuracy_split_by_width(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        bucket: _fmv_accuracy_metrics(
+            [r for r in rows if _fmv_accuracy_width_bucket(r) == bucket]
+        )
+        for bucket in _WIDTH_BUCKETS
+    }
+
+
+# ---------------------------------------------------------------------------
+# Pre/post BUI-528 split (BUI-983)
+# ---------------------------------------------------------------------------
+#
+# BUI-528 (merged 2026-07-24T17:52+08:00 == 2026-07-24T09:52:00+00:00, commit
+# 0e15cde) stopped writing zero-width bands. This cutoff keys on each row's
+# OWN band-write timestamp (`row["band_written_at"]`: `fmv_history.recorded_at`
+# for a 'history' row, `fmv.updated_at` for a 'current_fmv' fallback row — see
+# the CASE in `_fmv_accuracy_rows`'s SQL) — never the auction's `ended` or
+# `added_at`, either of which can land well after the band that priced it was
+# actually written, misfiling an old, pre-fix band as "post". A half day of
+# runway past the merge timestamp, rounded to the day boundary, matches the
+# 2026-09-24 audit's "recorded on or after 2026-07-25" recent-cut definition.
+_BUI_528_CUTOFF = "2026-07-25T00:00:00+00:00"
+
+_PREPOST_BUI_528_BUCKETS = ("pre_bui_528", "post_bui_528", "unknown")
+
+
+def _fmv_accuracy_prepost_bucket(row: dict[str, Any]) -> str:
+    """'pre_bui_528' / 'post_bui_528' / 'unknown' for *row*, by comparing its
+    `band_written_at` against `_BUI_528_CUTOFF`.
+
+    Both sides are `datetime.now(timezone.utc).isoformat()`-shaped strings
+    (fixed field widths, always a `+00:00` offset — never a bare 'Z' or a
+    non-UTC offset), so plain string comparison orders them correctly even
+    though `band_written_at` may carry microseconds the cutoff constant does
+    not. A missing timestamp (`None` — no path is known to produce this for a
+    row that reaches here, but nothing guarantees it can't) goes to the
+    explicit 'unknown' bucket rather than being silently dropped or mis-sorted
+    into one of the other two.
+    """
+    written_at = row.get("band_written_at")
+    if not written_at:
+        return "unknown"
+    return "post_bui_528" if written_at >= _BUI_528_CUTOFF else "pre_bui_528"
+
+
+def _fmv_accuracy_split_by_prepost_bui528(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        bucket: _fmv_accuracy_metrics(
+            [r for r in rows if _fmv_accuracy_prepost_bucket(r) == bucket]
+        )
+        for bucket in _PREPOST_BUI_528_BUCKETS
+    }
+
+
 def _fmv_accuracy_rows(
     conn: sqlite3.Connection, *, days: float | None = None
 ) -> list[dict[str, Any]]:
@@ -3935,7 +4024,19 @@ def _fmv_accuracy_rows(
             CASE WHEN mh.id IS NOT NULL THEN mh.high ELSE f.high END AS high,
             CASE WHEN mh.id IS NOT NULL THEN mh.confidence ELSE f.confidence END AS confidence,
             CASE WHEN mh.id IS NOT NULL THEN mh.comps ELSE f.comps END AS comps,
-            CASE WHEN mh.id IS NOT NULL THEN 'history' ELSE 'current_fmv' END AS band_source
+            CASE WHEN mh.id IS NOT NULL THEN 'history' ELSE 'current_fmv' END AS band_source,
+            -- BUI-983: when THIS band was written, not when the auction
+            -- ended/was added — `mh.recorded_at` for a 'history' row (the
+            -- snapshot itself), else `f.updated_at` for a 'current_fmv' row
+            -- (no snapshot exists, so the live row's own last write is the
+            -- closest available signal). Both columns are always populated
+            -- by `datetime.now(timezone.utc).isoformat()` (append_fmv_history
+            -- copies recorded_at straight from fmv.updated_at — see that
+            -- function's docstring), so they compare lexicographically as
+            -- the same ISO-8601 UTC format; NULL (a row written by some path
+            -- that never stamped a timestamp) is handled downstream as an
+            -- explicit "unknown" bucket, never dropped.
+            CASE WHEN mh.id IS NOT NULL THEN mh.recorded_at ELSE f.updated_at END AS band_written_at
         FROM bids b
         JOIN bid_fmvs bf ON bf.bid_id = b.id
         JOIN fmv f       ON f.id = bf.fmv_id
@@ -4035,6 +4136,23 @@ def fmv_accuracy_report(
     `price`, `low`, `high`, `band_source`, `fmv_history_id`, `confidence`,
     `comps`, `notes`, `ended` — so a later analysis ticket can consume the raw
     rows instead of only the aggregates.
+
+    **`by_width_bucket` (BUI-983):** the same metric set as `overall`, sliced
+    by band width `(high-low)/midpoint` into `zero` (`low == high` — the
+    legacy shape BUI-528 stopped producing 2026-07-24), `under_30pct`,
+    `30_50pct`, and `50pct_plus` — see `_fmv_accuracy_split_by_width`. The
+    2026-09-24 audit found the zero-width class scores far worse than the
+    rest of the baseline (docs/audit/2026-09-24-above-band-misses.md), so
+    without this slice a shrinking share of legacy rows can make a later run
+    look better on `overall` alone even though current pricing hasn't
+    changed.
+
+    **`by_prepost_bui528` (BUI-983):** the same metric set as `overall`,
+    sliced by each row's own band-write time (`_fmv_accuracy_prepost_bucket`)
+    against `_BUI_528_CUTOFF`, into `pre_bui_528`, `post_bui_528`, and
+    `unknown` (no usable timestamp — reported explicitly, never dropped) —
+    lets a reader compare only post-fix runs against each other instead of
+    against a baseline still carrying pre-fix bands.
     """
     all_rows = _fmv_accuracy_rows(conn, days=days)
 
@@ -4064,6 +4182,8 @@ def fmv_accuracy_report(
         "overall": overall,
         "by_month": by_month_report,
         "band_source_counts": band_source_counts,
+        "by_width_bucket": _fmv_accuracy_split_by_width(all_rows),
+        "by_prepost_bui528": _fmv_accuracy_split_by_prepost_bui528(all_rows),
     }
     if include_rows:
         result["rows"] = [
