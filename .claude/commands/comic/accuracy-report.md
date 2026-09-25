@@ -73,7 +73,18 @@ comics-api GET "/api/comics/accuracy?include_rows=true" || exit 1
   "by_month": [
     { "month": "2026-08", "n": 41, "...": "...", "by_status": { "WON": {"...": "..."}, "LOST": {"...": "..."} } }
   ],
-  "band_source_counts": { "history": 401, "current_fmv": 61 }
+  "band_source_counts": { "history": 401, "current_fmv": 61 },
+  "by_width_bucket": {
+    "zero": { "n": 64, "in_band_pct": 6.3, "...": "..." },
+    "under_30pct": { "n": 106, "in_band_pct": 27.4, "...": "..." },
+    "30_50pct": { "n": 69, "in_band_pct": 40.6, "...": "..." },
+    "50pct_plus": { "n": 206, "in_band_pct": 57.3, "...": "..." }
+  },
+  "by_prepost_bui528": {
+    "pre_bui_528": { "n": 313, "...": "..." },
+    "post_bui_528": { "n": 132, "...": "..." },
+    "unknown": { "n": 0, "...": "..." }
+  }
 }
 ```
 
@@ -101,10 +112,28 @@ comics-api GET "/api/comics/accuracy?include_rows=true" || exit 1
   docstring in `plugins/gixen-overlay/src/gixen_overlay/db.py` for the
   leakage this distinction exists to surface). With `include_rows=true`,
   each row also carries its own `band_source`.
+- **`by_width_bucket`** (BUI-983) — the same metric set as `overall`, sliced
+  by band width `(high-low)/midpoint`: `zero` (`low == high` — the legacy
+  shape BUI-528 stopped producing on 2026-07-24), `under_30pct`, `30_50pct`,
+  `50pct_plus`. **The zero-width bucket alone depresses the whole baseline by
+  about 6 points** — those 64 rows sit at ~6% in band vs. ~46% for everything
+  else (`docs/audit/2026-09-24-above-band-misses.md`), so as they age out of
+  the recency window a later run's `overall.in_band_pct` can rise even though
+  current pricing hasn't improved. Read `by_width_bucket` alongside `overall`
+  to tell the two apart, and don't compare one run's `overall` against
+  another's unless their `zero` counts are similar.
+- **`by_prepost_bui528`** (BUI-983) — the same metric set as `overall`,
+  sliced by each row's own band-write timestamp (the `fmv_history` snapshot's
+  `recorded_at` for a `band_source="history"` row, or the `fmv` row's
+  `updated_at` for `"current_fmv"`) against BUI-528's merge cutoff:
+  `pre_bui_528`, `post_bui_528`, `unknown` (no usable timestamp — reported
+  explicitly, never silently dropped). **Compare a post-BUI-528 run against
+  `by_prepost_bui528.post_bui_528` of an earlier run, not its `overall`** —
+  `overall` still blends in whatever pre-fix bands remain on file.
 
 ## Present the results
 
-Render three tables:
+Render five tables:
 
 1. **Overall** — the top-level metrics, one row.
 2. **By status** — `overall.by_status.WON` and `overall.by_status.LOST` side
@@ -113,6 +142,10 @@ Render three tables:
    server already returns them that way), each showing at minimum `n`,
    `share_within_20pct`, `mdape_pct`, and `mean_signed_error_pct` so a trend
    is visible at a glance.
+4. **By width bucket** — `by_width_bucket.zero` / `under_30pct` / `30_50pct`
+   / `50pct_plus`, each showing at minimum `n` and `in_band_pct`.
+5. **Pre/post BUI-528** — `by_prepost_bui528.pre_bui_528` / `post_bui_528` /
+   `unknown`, same columns as the width table.
 
 Call out `band_source_counts` once, near the top — a high `current_fmv`
 share means a meaningful slice of the report is scored against the fallback
@@ -131,6 +164,7 @@ An `overall.n` of 0 means no eligible resolved auctions are on file (or the
 | Assuming `days` defaults to 180 like `/comic:calibration-report` | It defaults to `null` (no bound) here — pass `days` explicitly to window it. |
 | Rendering an empty report on a failed `comics-api` call | STOP and report the error instead, per the hard-fail-loud rule every other `/comic:*` server call follows. |
 | Ignoring `band_source_counts` | A high `current_fmv` share is a caveat on the whole report's trustworthiness, not a detail to skip. |
+| Comparing two runs' bare `overall.in_band_pct` to claim pricing improved | `overall` still blends in `by_width_bucket.zero` legacy rows, which age out of the recency window over time and can lift `overall` on their own — compare `by_prepost_bui528.post_bui_528` instead, or check that both runs' `zero` counts are similar. |
 
 ---
 
