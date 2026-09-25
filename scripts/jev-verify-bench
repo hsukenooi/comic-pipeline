@@ -1,0 +1,402 @@
+#!/usr/bin/env python3
+"""jev-verify-bench — BUI-984: benchmark TypeSafe's Jev against the current
+seller-scan / wishlist-sellers match verifier.
+
+The incumbent is the verdict the current pipeline stored in the
+wishlist-sellers verdict cache (~/.cache/wishlist-sellers/verdicts.db): the
+Haiku verifier (`seller_scan.verify_with_claude`) plus the BUI-224 pristine
+shortcut, which writes `genuine=1` without a model call. The cache does not
+record which of the two produced a row, so the incumbent is scored as the
+whole pipeline, which is what production runs.
+
+Those stored verdicts are the incumbent's own output, so agreement with them
+measures agreement, not accuracy. Accuracy comes from a hand-checked label
+sheet (every disagreement plus a random sample of agreements), per the
+BUI-984 design:
+
+    jev-verify-bench run      # ask Jev about every cached pair (resumable)
+    jev-verify-bench sheet    # write the label sheet for Hsu Ken
+    jev-verify-bench score    # score both verifiers against the labels
+
+Jev input is the cache's `title_key` (lowercased, punctuation and grade
+tokens stripped), not the raw listing title Haiku saw. The "Correct series"
+era hint is rebuilt from today's wish-list, so pairs whose wish item has left
+the list go without it. Scoring excludes those unhinted pairs (see `_answered_pairs`).
+
+Stdlib only. Reads TYPESAFE_API_KEY from the environment or apps/ebay/.env.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import random
+import sqlite3
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+VERDICT_DB = Path(
+    os.environ.get("WISHLIST_SELLERS_VERDICT_DB")
+    or Path.home() / ".cache" / "wishlist-sellers" / "verdicts.db"
+)
+OUT_DIR = Path(os.environ.get("JEV_BENCH_DIR") or Path.home() / ".cache" / "jev-verify-bench")
+ANSWERS = OUT_DIR / "answers.jsonl"
+SHEET = OUT_DIR / "label-sheet.csv"
+API_URL = "https://api.typesafe.ai/v1/systemone"
+MODEL = "jev-latest"
+
+_TITLE_NOTE = (
+    "`listing_title` is an eBay listing title that has been lowercased with "
+    "punctuation removed, so '#' and ':' are gone."
+)
+
+# One narrow judgment per question (TypeSafe guidance). Each mirrors a reject
+# rule in seller_scan._build_verification_prompt; the verdict is composed in
+# code by `jev_genuine`, so thresholds can move without re-running inference.
+QUESTIONS = {
+    "same_series": {
+        "type": "noul",
+        "instructions": {
+            "question": "Is the comic being sold in `listing_title` from the same series as `wish_item`?",
+            "note": _TITLE_NOTE,
+            "rules": [
+                "The series is the title printed on the comic's own cover. A character or team named "
+                "elsewhere in the title (a guest appearance, a story title, a crossover, a creator "
+                "credit) does not make it that series: 'what if 42 fantastic four' is What If, not "
+                "Fantastic Four.",
+                "Series that share words are different series: X-Factor vs X-Men, Spider-Man Noir or "
+                "Superior Spider-Man vs Amazing Spider-Man, Invincible Iron Man vs Invincible, "
+                "Uncanny X-Force vs X-Force.",
+                "A leading 'The', a publisher name, or a year in the title does not change the series.",
+                "When `wish_item.series` names a volume and years, only that volume counts: a later "
+                "relaunch or an earlier volume of a same-named series is a different series. Use "
+                "`wish_item.release_year` and any year or 'vol' in the listing to tell eras apart.",
+            ],
+        },
+        "criteria": {
+            "true": "The listed comic's series is the wish item's series",
+            "false": "The listed comic belongs to a different series, even if the wish item's name appears in the title",
+        },
+    },
+    "same_issue": {
+        "type": "noul",
+        "instructions": {
+            "question": "Is the issue number of the comic being sold in `listing_title` the same as the issue number in `wish_item`?",
+            "note": _TITLE_NOTE,
+            "rules": [
+                "Only the comic's own issue number counts. Ignore lot sizes, years, grades, copy "
+                "counts, and numbers that belong to a different series named in the title.",
+                "A modern renumbered issue that shows a legacy number, such as '10 811', has issue "
+                "number 10, not 811.",
+            ],
+        },
+        "criteria": {
+            "true": "The listed comic's issue number equals the wish item's issue number",
+            "false": "The issue number differs, or the matching number is a lot size, year, grade, or legacy number",
+        },
+    },
+    "format_mismatch": {
+        "type": "noul",
+        "instructions": {
+            "question": "Is one of the two an Annual, Giant-Size, King-Size, Treasury, special, or one-shot edition while the other is a regular numbered series issue?",
+            "note": _TITLE_NOTE,
+        },
+        "criteria": {
+            "true": "One is an annual or special edition and the other is a regular issue",
+            "false": "Both are regular issues, or both are the same kind of special edition",
+        },
+    },
+    "multi_issue": {
+        "type": "noul",
+        "instructions": {
+            "question": "Is the listing a lot, set, bundle, or run of several different issues rather than one single comic?",
+            "note": _TITLE_NOTE,
+        },
+        "criteria": {
+            "true": "Several different issues are sold together (lot, set, full run, 'issues 1-6')",
+            "false": "One comic is being sold",
+        },
+    },
+    "foreign_edition": {
+        "type": "noul",
+        "instructions": {
+            "question": "Is the listed comic a foreign-language or foreign-market edition (for example Spanish, Mexican La Prensa or Novedades, French, German, Italian, or Panini) rather than the original US edition?",
+            "note": _TITLE_NOTE,
+            "rules": ["Canadian price variants and newsstand copies are US printings, not foreign editions."],
+        },
+        "criteria": {
+            "true": "A foreign-language or foreign-market edition",
+            "false": "The original US edition, or no sign of a foreign edition",
+        },
+    },
+    "reprint": {
+        "type": "noul",
+        "instructions": {
+            "question": "Is the listed comic a reprint rather than the original first printing: a 2nd or later printing, a facsimile, a Marvel Milestone or True Believers reprint, or a promotional reprint (Trick or Read, Local Comic Shop Day, Amazon promo, Undeluxe)?",
+            "note": _TITLE_NOTE,
+            "rules": ["Newsstand, direct, and cover variants of the original printing are not reprints."],
+        },
+        "criteria": {
+            "true": "A reprint, later printing, or facsimile",
+            "false": "An original printing, including newsstand, direct, and variant covers",
+        },
+    },
+}
+
+
+def jev_genuine(a: dict) -> float:
+    """Composite probability that the pair is a genuine match: every accept
+    condition holds and no reject condition does (independence assumed)."""
+    p = a["same_series"] * a["same_issue"]
+    for q in ("format_mismatch", "multi_issue", "foreign_edition", "reprint"):
+        p *= 1.0 - a[q]
+    return p
+
+
+def jev_gated(a: dict, t: float = 0.5) -> bool:
+    """Alternative composite: every accept question above t, every reject below."""
+    return (a["same_series"] >= t and a["same_issue"] >= t
+            and all(a[q] < t for q in ("format_mismatch", "multi_issue", "foreign_edition", "reprint")))
+
+
+def _api_key() -> str:
+    key = os.environ.get("TYPESAFE_API_KEY")
+    if not key:
+        env = REPO / "apps" / "ebay" / ".env"
+        if env.exists():
+            for line in env.read_text().splitlines():
+                if line.startswith("TYPESAFE_API_KEY="):
+                    key = line.split("=", 1)[1].strip()
+    if not key:
+        sys.exit("TYPESAFE_API_KEY not set (env or apps/ebay/.env)")
+    return key
+
+
+def _wish_hints() -> dict[str, dict]:
+    """wish name -> {series, release_year}, the same "Correct series" era hint
+    the Haiku prompt gets (seller_scan.prepare_wish_items). Names that appear
+    more than once on the wish-list, or have left it since the verdict was
+    cached, get no hint, as in production when series_name is missing."""
+    raw = subprocess.run(["comics-api", "GET", "/api/comics/wish-list"],
+                         check=True, capture_output=True, text=True).stdout
+    seen: dict[str, list] = {}
+    for it in json.loads(raw):
+        seen.setdefault(it.get("name", ""), []).append(it)
+    return {n: {"series": its[0].get("series_name"),
+                "release_year": (its[0].get("release_date") or "")[:4] or None}
+            for n, its in seen.items() if len(its) == 1 and its[0].get("series_name")}
+
+
+def load_pairs(hints: dict[str, dict]) -> list[dict]:
+    with sqlite3.connect(f"file:{VERDICT_DB}?mode=ro", uri=True) as con:
+        rows = con.execute("SELECT title_key, wish_name, genuine FROM verdicts").fetchall()
+    return [{"title_key": t, "wish_name": w, "incumbent": int(g),
+             "wish_item": {"name": w, **hints.get(w, {})}} for t, w, g in rows]
+
+
+def _pair_id(p: dict) -> str:
+    return f"{p['title_key']}\x1f{p['wish_name']}"
+
+
+def ask_jev(pair: dict, key: str) -> dict:
+    body = json.dumps({
+        "model": MODEL,
+        "state": {"listing_title": pair["title_key"], "wish_item": pair["wish_item"]},
+        "questions": QUESTIONS,
+    }).encode()
+    for attempt in range(6):
+        req = urllib.request.Request(API_URL, body, {
+            "Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                resp = json.load(r)
+            answers = {k: v["noul"] for k, v in resp["answers"].items()}
+            return {**pair, "jev": answers, "model": resp.get("model"),
+                    "input_tokens": resp.get("usage", {}).get("input_tokens")}
+        except urllib.error.HTTPError as e:
+            if e.code not in (429, 529, 500, 502, 503) or attempt == 5:
+                raise
+        except (urllib.error.URLError, TimeoutError):
+            if attempt == 5:
+                raise
+        time.sleep(2 ** attempt)
+    raise RuntimeError("unreachable")
+
+
+def load_answers() -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    if ANSWERS.exists():
+        for line in ANSWERS.read_text().splitlines():
+            if line.strip():
+                a = json.loads(line)
+                out[_pair_id(a)] = a
+    return out
+
+
+def cmd_run(args) -> None:
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    key = _api_key()
+    pairs = load_pairs(_wish_hints())
+    if args.limit:
+        random.Random(args.seed).shuffle(pairs)
+        pairs = pairs[: args.limit]
+    done = load_answers()
+    todo = [p for p in pairs if _pair_id(p) not in done]
+    print(f"{len(pairs)} pairs, {len(done)} already answered, {len(todo)} to ask", file=sys.stderr)
+    failed = 0
+    with ANSWERS.open("a") as fh, ThreadPoolExecutor(args.workers) as pool:
+        futures = [pool.submit(ask_jev, p, key) for p in todo]
+        for i, f in enumerate(futures, 1):
+            try:
+                fh.write(json.dumps(f.result()) + "\n")
+                fh.flush()
+            except Exception as e:  # noqa: BLE001 — reported, count kept, rerun resumes
+                failed += 1
+                print(f"FAIL {todo[i - 1]['title_key']!r}: {e}", file=sys.stderr)
+            if i % 200 == 0:
+                print(f"  {i}/{len(todo)}", file=sys.stderr)
+    print(f"done; {failed} failed (re-run to retry)", file=sys.stderr)
+    if failed:
+        sys.exit(1)
+
+
+def _answered_pairs() -> list[dict]:
+    rows = list(load_answers().values())
+    if not rows:
+        sys.exit(f"no answers in {ANSWERS}; run `jev-verify-bench run` first")
+    # Score only pairs whose wish item still carries the era hint, so Jev sees
+    # what Haiku saw. Without it Jev cannot tell "Spider-Man #22" (1990) from
+    # Sensational Spider-Man #22, and those misses measure the benchmark's
+    # missing input, not the model (1,705 of 3,397 pairs on 2026-09-25).
+    unhinted = sum(1 for r in rows if not r["wish_item"].get("series"))
+    rows = [r for r in rows if r["wish_item"].get("series")]
+    print(f"(scoring {len(rows)} hinted pairs; {unhinted} without the era hint excluded)",
+          file=sys.stderr)
+    for r in rows:
+        r["jev_p"] = jev_genuine(r["jev"])
+    return rows
+
+
+def cmd_agreement(args) -> None:
+    rows = _answered_pairs()
+    t = args.threshold
+    agree = sum((r["jev_p"] >= t) == bool(r["incumbent"]) for r in rows)
+    jy_in = sum(r["jev_p"] >= t and not r["incumbent"] for r in rows)
+    jn_iy = sum(r["jev_p"] < t and r["incumbent"] for r in rows)
+    tokens = sum(r.get("input_tokens") or 0 for r in rows)
+    print(f"pairs {len(rows)}  threshold {t}")
+    print(f"agreement {agree}/{len(rows)} = {agree / len(rows):.1%}")
+    print(f"Jev genuine, incumbent rejected: {jy_in}")
+    print(f"Jev rejected, incumbent genuine: {jn_iy}")
+    g_agree = sum(jev_gated(r["jev"], t) == bool(r["incumbent"]) for r in rows)
+    print(f"gated composite agreement {g_agree}/{len(rows)} = {g_agree / len(rows):.1%}")
+    print(f"input tokens {tokens:,}")
+
+
+def cmd_sheet(args) -> None:
+    rows = _answered_pairs()
+    t = args.threshold
+    disagree = [r for r in rows if (r["jev_p"] >= t) != bool(r["incumbent"])]
+    agree = [r for r in rows if (r["jev_p"] >= t) == bool(r["incumbent"])]
+    rng = random.Random(args.seed)
+    sample = rng.sample(agree, min(args.agree_sample, len(agree)))
+    picked = [(r, "disagree") for r in disagree] + [(r, "agree") for r in sample]
+    rng.shuffle(picked)  # blind: the labeller must not see which verifier said what
+    with SHEET.open("w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["id", "listing_title", "wish_item", "wish_volume", "genuine (y/n)", "note"])
+        for i, (r, _) in enumerate(picked, 1):
+            w.writerow([i, r["title_key"], r["wish_name"], r["wish_item"].get("series") or "", "", ""])
+    key = SHEET.with_suffix(".key.json")
+    key.write_text(json.dumps({
+        "threshold": t, "agree_total": len(agree), "disagree_total": len(disagree),
+        "rows": [{"id": i, "pair": _pair_id(r), "stratum": s}
+                 for i, (r, s) in enumerate(picked, 1)],
+    }, indent=1))
+    print(f"wrote {SHEET} ({len(disagree)} disagreements + {len(sample)} agreements, shuffled)")
+
+
+def cmd_score(args) -> None:
+    rows = {_pair_id(r): r for r in _answered_pairs()}
+    key = json.loads(SHEET.with_suffix(".key.json").read_text())
+    labels = {}
+    with SHEET.open() as fh:
+        for rec in csv.DictReader(fh):
+            v = rec["genuine (y/n)"].strip().lower()
+            if v in ("y", "n"):
+                labels[int(rec["id"])] = v == "y"
+    t = key["threshold"]
+    strata = {"agree": [], "disagree": []}
+    for k in key["rows"]:
+        if k["id"] in labels:
+            strata[k["stratum"]].append((rows[k["pair"]], labels[k["id"]]))
+    n_agree_lab = len(strata["agree"])
+    if not labels:
+        sys.exit("no labels filled in yet")
+    # Agreements are a sample; weight each labelled one up to the whole stratum.
+    w_agree = key["agree_total"] / n_agree_lab if n_agree_lab else 0.0
+    w_dis = key["disagree_total"] / len(strata["disagree"]) if strata["disagree"] else 0.0
+
+    def metrics(pred) -> dict:
+        tp = fp = fn = 0.0
+        for stratum, w in (("agree", w_agree), ("disagree", w_dis)):
+            for r, truth in strata[stratum]:
+                p = pred(r)
+                tp += w * (p and truth)
+                fp += w * (p and not truth)
+                fn += w * (not p and truth)
+        return {"precision": tp / (tp + fp) if tp + fp else 0.0,
+                "recall": tp / (tp + fn) if tp + fn else 0.0}
+
+    both_wrong = sum(1 for r, truth in strata["agree"] if bool(r["incumbent"]) != truth)
+    print(f"labelled: {len(strata['disagree'])}/{key['disagree_total']} disagreements, "
+          f"{n_agree_lab} of {key['agree_total']} agreements")
+    print(f"both wrong in the agreement sample: {both_wrong}/{n_agree_lab}")
+    dis = strata["disagree"]
+    jev_right = sum((r["jev_p"] >= t) == truth for r, truth in dis)
+    print(f"disagreements: Jev right {jev_right}, incumbent right {len(dis) - jev_right}")
+    # The strata are fixed by the sheet, so the weighted estimate stays
+    # unbiased for any predictor: sweep thresholds without new labels.
+    preds = [("incumbent", lambda r: bool(r["incumbent"]))]
+    preds += [(f"jev@{x}", lambda r, x=x: r["jev_p"] >= x) for x in (0.3, 0.4, 0.5, 0.6, 0.7)]
+    for name, pred in preds:
+        m = metrics(pred)
+        print(f"{name:>12}: precision {m['precision']:.3f}  recall {m['recall']:.3f}")
+    # Does Jev's probability predict its own errors? Error rate by confidence band.
+    print("Jev error rate by distance from threshold (labelled rows):")
+    lab = strata["agree"] + strata["disagree"]
+    for lo, hi in ((0.0, 0.1), (0.1, 0.3), (0.3, 1.0)):
+        band = [(r, tr) for r, tr in lab if lo <= abs(r["jev_p"] - t) < hi]
+        if band:
+            err = sum((r["jev_p"] >= t) != tr for r, tr in band)
+            print(f"  |p-t| in [{lo},{hi}): {err}/{len(band)} wrong")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    r = sub.add_parser("run")
+    r.add_argument("--limit", type=int, default=0, help="random subset size (0 = all)")
+    r.add_argument("--seed", type=int, default=984)
+    r.add_argument("--workers", type=int, default=8)
+    for name in ("agreement", "sheet"):
+        s = sub.add_parser(name)
+        s.add_argument("--threshold", type=float, default=0.5)
+        if name == "sheet":
+            s.add_argument("--agree-sample", type=int, default=100)
+            s.add_argument("--seed", type=int, default=984)
+    sub.add_parser("score")
+    args = ap.parse_args()
+    {"run": cmd_run, "agreement": cmd_agreement, "sheet": cmd_sheet, "score": cmd_score}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()
