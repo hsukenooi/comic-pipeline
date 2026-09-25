@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+"""jev-defect-bench — BUI-985: test TypeSafe's Jev as a second reader next to
+the condition-defect regex gate (apps/ebay/src/condition_defects.py).
+
+The gate drops a listing whose seller text names moisture damage, rust, or a
+loose/detached staple (BUI-919, BUI-968). In production it reads only the
+`conditionDescription` note and the title. This benchmark asks whether Jev,
+reading the note, title, AND full item description, catches defects the regex
+misses without flagging clean books, and whether it can spot a listing whose
+photos are not of the copy being sold (a stock photo), which nothing checks.
+
+    jev-defect-bench collect   # live eBay listings -> corpus.jsonl (getItem per listing)
+    jev-defect-bench run       # regex + Jev over the corpus (resumable)
+    jev-defect-bench sheet     # blind label sheet for Hsu Ken
+    jev-defect-bench score     # score regex vs Jev against the labels
+
+Two corpus strata, scored separately:
+  wish      random listings from keyword searches on random wish-list names:
+            the traffic seller-scan / wishlist-sellers actually see. Measures
+            false flags and the base rate.
+  enriched  listings from searches for defect words ("water damage", "rusty
+            staples", "stock photo"): enough true defects to measure recall.
+
+Runs with the system python3 plus `requests`, importing apps/ebay/src
+directly. Reads TYPESAFE_API_KEY from the environment or apps/ebay/.env.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import html
+import json
+import os
+import random
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from html.parser import HTMLParser
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "apps" / "ebay" / "src"))
+
+OUT_DIR = Path(os.environ.get("JEV_DEFECT_BENCH_DIR") or Path.home() / ".cache" / "jev-defect-bench")
+CORPUS = OUT_DIR / "corpus.jsonl"
+RESULTS = OUT_DIR / "results.jsonl"
+SHEET = OUT_DIR / "label-sheet.csv"
+API_URL = "https://api.typesafe.ai/v1/systemone"
+MODEL = "jev-latest"
+DESC_CAP = 8000  # chars of stripped description text; well inside Jev's 32k-token state budget
+
+CODES = ("moisture", "rust", "loose_staple", "stock_photo")
+
+ENRICH_KEYWORDS = (
+    "comic water damage", "comic moisture damage", "comic water stain",
+    "comic rusty staples", "comic rust staples", "comic loose staple",
+    "comic detached staple", "comic stock photo", "comic book stock image",
+    "comic photo not actual",
+)
+
+_SCOPE = (
+    "Judge only what the seller's text says about THIS copy. A defect the text "
+    "says is absent ('no water damage', 'rust-free staples', 'staples tight') "
+    "does not count. Shop boilerplate that is not about this copy (store policies, "
+    "generic grading legends, shipping notes) does not count."
+)
+
+QUESTIONS = {
+    "moisture": {
+        "type": "noul",
+        "instructions": {
+            "question": "Does the seller's text say this copy has water or moisture damage?",
+            "scope": _SCOPE,
+            "counts": ["water damage, water stains, water rings or spots", "moisture damage or stains",
+                       "mildew, mold, or dampness", "tide lines", "pages wavy or warped from getting wet"],
+            "does_not_count": ["plain 'staining', 'foxing', 'tanning', 'browning' with no mention of water or moisture",
+                               "a 'watermark' on the seller's photos"],
+        },
+        "criteria": {"true": "The text says this copy has water or moisture damage",
+                     "false": "No water or moisture damage is described for this copy"},
+    },
+    "rust": {
+        "type": "noul",
+        "instructions": {
+            "question": "Does the seller's text say this copy has rust (rusty staples, rust stains, rust migration)?",
+            "scope": _SCOPE,
+            "does_not_count": ["'rust' as a colour ('rust colored logo')"],
+        },
+        "criteria": {"true": "The text says this copy has rust",
+                     "false": "No rust is described for this copy"},
+    },
+    "loose_staple": {
+        "type": "noul",
+        "instructions": {
+            "question": "Does the seller's text say a staple on this copy is loose, detached, missing, popped, or pulling, or that the cover or pages have come away from the staples?",
+            "scope": _SCOPE,
+            "does_not_count": ["off-center or off-centre staples (a printing note on a sound book)",
+                               "a detached or missing piece of cover with the staples described as holding",
+                               "spine splits or tears that do not involve a staple"],
+        },
+        "criteria": {"true": "The text says a staple is loose, detached, missing, popped, or pulling",
+                     "false": "No staple problem is described for this copy"},
+    },
+    "stock_photo": {
+        "type": "noul",
+        "instructions": {
+            "question": "Does the seller's text say the photos are not of the exact copy being sold, for example a stock photo, a representative or example image, or 'you may receive a different copy'?",
+            "scope": "Judge only what the text says about the photos for this listing.",
+            "does_not_count": ["'photos are of the actual item' or 'what you see is what you get'",
+                               "a note that photos are watermarked or taken in daylight"],
+        },
+        "criteria": {"true": "The photos are stated or implied not to show the exact copy for sale",
+                     "false": "Nothing says the photos differ from the copy for sale"},
+    },
+}
+
+_STOCK_RE = re.compile(
+    r"\bstock\s+(?:photo|image|pic)\w*|\b(?:not\s+(?:the\s+)?actual|representative|example)\s+(?:photo|image|pic|item|copy)\w*"
+    r"|\bmay\s+(?:not\s+be|receive|get)\s+(?:the\s+)?(?:exact|a\s+different|different)",
+    re.IGNORECASE,
+)
+
+
+class _Text(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.parts: list[str] = []
+        self._skip = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self._skip += 1
+        elif tag in ("br", "p", "div", "li", "tr", "h1", "h2", "h3"):
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style") and self._skip:
+            self._skip -= 1
+
+    def handle_data(self, data):
+        if not self._skip:
+            self.parts.append(data)
+
+
+def html_to_text(raw: str | None) -> str:
+    if not raw:
+        return ""
+    p = _Text()
+    p.feed(raw)
+    text = html.unescape("".join(p.parts))
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    return re.sub(r"\n\s*\n+", "\n", text).strip()
+
+
+def _api_key() -> str:
+    key = os.environ.get("TYPESAFE_API_KEY")
+    env = REPO / "apps" / "ebay" / ".env"
+    if not key and env.exists():
+        for line in env.read_text().splitlines():
+            if line.startswith("TYPESAFE_API_KEY="):
+                key = line.split("=", 1)[1].strip()
+    if not key:
+        sys.exit("TYPESAFE_API_KEY not set (env or apps/ebay/.env)")
+    return key
+
+
+def _read_jsonl(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+# ─── collect ──────────────────────────────────────────────────────────────────
+
+def cmd_collect(args) -> None:
+    import ebay_fetch as ef
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    rng = random.Random(args.seed)
+    cid, secret, base = ef.load_config()
+    token = ef.get_token(cid, secret, base)
+    have = {r["item_id"] for r in _read_jsonl(CORPUS)}
+
+    wish = json.loads(subprocess.run(["comics-api", "GET", "/api/comics/wish-list"],
+                                     check=True, capture_output=True, text=True).stdout)
+    names = sorted({w["name"] for w in wish if w.get("name")})
+    picks: list[tuple[str, dict]] = []
+    for name in rng.sample(names, min(args.wish_keywords, len(names))):
+        found = ef.search_by_keyword(name, token, base, max_results=50)
+        for it in rng.sample(found, min(args.per_keyword, len(found))):
+            picks.append(("wish", it))
+    for kw in ENRICH_KEYWORDS:
+        found = ef.search_by_keyword(kw, token, base, max_results=50)
+        for it in rng.sample(found, min(args.per_enrich, len(found))):
+            picks.append(("enriched", it))
+
+    seen = set(have)
+    todo = []
+    for stratum, it in picks:
+        if it["item_id"] not in seen:
+            seen.add(it["item_id"])
+            todo.append((stratum, it))
+    print(f"{len(todo)} new listings to fetch ({len(have)} already in corpus)", file=sys.stderr)
+
+    ok = 0
+    with CORPUS.open("a") as fh:
+        for i, (stratum, it) in enumerate(todo, 1):
+            data, status = ef.fetch_item_with_status(it["item_id"], token, base)
+            if status == 401:
+                token = ef.get_token(cid, secret, base, force_refresh=True)
+                data, status = ef.fetch_item_with_status(it["item_id"], token, base)
+            if data is None:
+                continue
+            fh.write(json.dumps({
+                "item_id": it["item_id"], "stratum": stratum, "title": data.get("title", ""),
+                "url": data.get("itemWebUrl") or it.get("listing_url"),
+                "condition_note": data.get("conditionDescription") or "",
+                "description": html_to_text(data.get("description") or data.get("shortDescription"))[:DESC_CAP],
+            }) + "\n")
+            ok += 1
+            if i % 50 == 0:
+                print(f"  {i}/{len(todo)}", file=sys.stderr)
+    print(f"fetched {ok}/{len(todo)}", file=sys.stderr)
+
+
+# ─── run ──────────────────────────────────────────────────────────────────────
+
+def regex_verdicts(row: dict) -> dict:
+    from condition_defects import listing_defect_findings, detect_condition_defects
+
+    prod = {f["code"] for f in listing_defect_findings(row["condition_note"] or None, row["title"])}
+    all_text = "\n".join([row["title"], row["condition_note"], row["description"]])
+    every = set(detect_condition_defects(all_text)[0])
+    return {
+        "prod": {c: c in prod for c in CODES if c != "stock_photo"},
+        "all_text": {c: c in every for c in CODES if c != "stock_photo"}
+                    | {"stock_photo": bool(_STOCK_RE.search(all_text))},
+    }
+
+
+def ask_jev(row: dict, key: str) -> dict:
+    body = json.dumps({"model": MODEL, "questions": QUESTIONS, "state": {
+        "listing_title": row["title"],
+        "seller_condition_note": row["condition_note"] or "(none)",
+        "item_description": row["description"] or "(none)",
+    }}).encode()
+    for attempt in range(6):
+        req = urllib.request.Request(API_URL, body, {
+            "Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                resp = json.load(r)
+            return {"jev": {k: v["noul"] for k, v in resp["answers"].items()},
+                    "input_tokens": resp.get("usage", {}).get("input_tokens")}
+        except urllib.error.HTTPError as e:
+            if e.code not in (429, 529, 500, 502, 503) or attempt == 5:
+                raise
+        except (urllib.error.URLError, TimeoutError):
+            if attempt == 5:
+                raise
+        time.sleep(2 ** attempt)
+    raise RuntimeError("unreachable")
+
+
+def cmd_run(args) -> None:
+    key = _api_key()
+    done = {r["item_id"] for r in _read_jsonl(RESULTS)}
+    todo = [r for r in _read_jsonl(CORPUS) if r["item_id"] not in done]
+    print(f"{len(todo)} listings to score ({len(done)} done)", file=sys.stderr)
+    failed = 0
+
+    def one(row):
+        return {**row, "regex": regex_verdicts(row), **ask_jev(row, key)}
+
+    with RESULTS.open("a") as fh, ThreadPoolExecutor(args.workers) as pool:
+        futures = [pool.submit(one, r) for r in todo]
+        for row, f in zip(todo, futures):
+            try:
+                fh.write(json.dumps(f.result()) + "\n")
+                fh.flush()
+            except Exception as e:  # noqa: BLE001 — counted and reported; a re-run resumes
+                failed += 1
+                print(f"FAIL {row['item_id']}: {e}", file=sys.stderr)
+    print(f"done; {failed} failed", file=sys.stderr)
+    if failed:
+        sys.exit(1)
+
+
+# ─── sheet / score ────────────────────────────────────────────────────────────
+
+def _flagged(r: dict, code: str, t: float) -> bool:
+    return r["jev"][code] >= t
+
+
+def _needs_label(r: dict) -> bool:
+    """A listing goes on the sheet whole when, for any code, Jev (at 0.5) and
+    the all-text regex disagree, or Jev sits in the 0.3-0.7 review band."""
+    return any(_flagged(r, c, 0.5) != r["regex"]["all_text"][c] or 0.3 <= r["jev"][c] <= 0.7
+               for c in CODES)
+
+
+def cmd_sheet(args) -> None:
+    rows = _read_jsonl(RESULTS)
+    rng = random.Random(args.seed)
+    picked = []
+    for stratum in ("wish", "enriched"):
+        s = [r for r in rows if r["stratum"] == stratum]
+        hard = [r for r in s if _needs_label(r)]
+        easy = [r for r in s if not _needs_label(r)]
+        sample = rng.sample(easy, min(args.agree_sample, len(easy)))
+        picked += [(r, stratum, "disagree", len(hard)) for r in hard]
+        picked += [(r, stratum, "agree", len(easy)) for r in sample]
+    rng.shuffle(picked)
+    with SHEET.open("w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["id", "url", "title", "condition_note", "description_excerpt",
+                    *[f"{c} (y/n)" for c in CODES], "note"])
+        for i, (r, *_rest) in enumerate(picked, 1):
+            w.writerow([i, r["url"], r["title"], r["condition_note"][:1500], r["description"][:3000],
+                        "", "", "", "", ""])
+    SHEET.with_suffix(".key.json").write_text(json.dumps({"rows": [
+        {"id": i, "item_id": r["item_id"], "stratum": st, "group": g, "group_total": n}
+        for i, (r, st, g, n) in enumerate(picked, 1)]}, indent=1))
+    n_hard = sum(1 for p in picked if p[2] == "disagree")
+    print(f"wrote {SHEET}: {len(picked)} listings ({n_hard} disagreement/review, "
+          f"{len(picked) - n_hard} sampled agreements), shuffled")
+
+
+def cmd_score(args) -> None:
+    rows = {r["item_id"]: r for r in _read_jsonl(RESULTS)}
+    key = json.loads(SHEET.with_suffix(".key.json").read_text())["rows"]
+    labels = {}
+    with SHEET.open() as fh:
+        for rec in csv.DictReader(fh):
+            vals = [rec[f"{c} (y/n)"].strip().lower() for c in CODES]
+            if all(v in ("y", "n") for v in vals):
+                labels[int(rec["id"])] = dict(zip(CODES, (v == "y" for v in vals)))
+    if not labels:
+        sys.exit("no fully labelled rows yet")
+    for stratum in ("wish", "enriched"):
+        ks = [k for k in key if k["stratum"] == stratum and k["id"] in labels]
+        if not ks:
+            continue
+        # Weight each labelled row up to its group (disagreement set is complete;
+        # agreements are a sample), so the estimate covers the whole stratum.
+        counts = {g: sum(1 for k in ks if k["group"] == g) for g in ("disagree", "agree")}
+        totals = {k["group"]: k["group_total"] for k in ks}
+        weight = {g: totals[g] / counts[g] for g in counts if counts[g]}
+        n_listings = sum(totals.values())
+        print(f"\n== {stratum}: {n_listings} listings; labelled {counts['disagree']}/{totals.get('disagree', 0)} "
+              f"disagreement/review, {counts['agree']} of {totals.get('agree', 0)} agreements")
+        for code in CODES:
+            truth_n = sum(weight[k["group"]] for k in ks if labels[k["id"]][code])
+            print(f"  {code}: est. {truth_n:.0f} true of {n_listings} ({truth_n / n_listings:.1%})")
+            preds = [("regex, production inputs", lambda r, c=code: r["regex"]["prod"].get(c, False)),
+                     ("regex, all text", lambda r, c=code: r["regex"]["all_text"][c])]
+            preds += [(f"jev@{t}", lambda r, c=code, t=t: r["jev"][c] >= t) for t in (0.3, 0.5, 0.7)]
+            preds += [("regex OR jev@0.7", lambda r, c=code: r["regex"]["all_text"][c] or r["jev"][c] >= 0.7)]
+            for name, pred in preds:
+                tp = fp = fn = 0.0
+                for k in ks:
+                    w, p, t = weight[k["group"]], pred(rows[k["item_id"]]), labels[k["id"]][code]
+                    tp += w * (p and t)
+                    fp += w * (p and not t)
+                    fn += w * (not p and t)
+                prec = f"{tp / (tp + fp):.3f}" if tp + fp else "  -  "
+                rec = f"{tp / (tp + fn):.3f}" if tp + fn else "  -  "
+                print(f"    {name:>26}: precision {prec}  recall {rec}  flags {tp + fp:.0f}")
+        review = sum(weight[k["group"]] for k in ks
+                     if any(0.3 <= rows[k["item_id"]]["jev"][c] <= 0.7 for c in CODES))
+        print(f"  listings with any code in Jev's 0.3-0.7 review band: est. {review:.0f} ({review / n_listings:.1%})")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    c = sub.add_parser("collect")
+    c.add_argument("--wish-keywords", type=int, default=60)
+    c.add_argument("--per-keyword", type=int, default=5)
+    c.add_argument("--per-enrich", type=int, default=15)
+    c.add_argument("--seed", type=int, default=985)
+    r = sub.add_parser("run")
+    r.add_argument("--workers", type=int, default=8)
+    s = sub.add_parser("sheet")
+    s.add_argument("--agree-sample", type=int, default=40)
+    s.add_argument("--seed", type=int, default=985)
+    sub.add_parser("score")
+    args = ap.parse_args()
+    {"collect": cmd_collect, "run": cmd_run, "sheet": cmd_sheet, "score": cmd_score}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()
