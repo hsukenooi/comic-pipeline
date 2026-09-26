@@ -5,7 +5,7 @@ Loaded by the `/em-batch` skill (`~/.claude/skills/em-batch/SKILL.md`). The doct
 ## Repo shape & conventions
 
 - Python/uv monorepo (`apps/*`, `packages/*`, `plugins/*`, `server/`), ~60k lines. This is the repo the doctrine's evidence was gathered in (the BUI-299..500 batches).
-- New tickets → Linear **BUI** team.
+- New tickets → Linear **BUI** team, always with `-l comics`. The nightly selector picks only `comics`-labeled tickets, so an unlabeled follow-up is never worked (BUI-981, filed by the 2026-09-25 run without it).
 - Linear identity (BUI-877): plain `linear …` writes as the "Claude Code" app
   user, so autonomous merges and closes are attributed to the agent, not to
   Hsu Ken. Never pass `--workspace` from a run.
