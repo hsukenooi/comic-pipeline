@@ -117,6 +117,7 @@ def test_empty_on_fresh_db():
     assert report["overall"]["share_within_10pct"] is None
     assert report["by_month"] == []
     assert report["band_source_counts"] == {}
+    assert report["in_force_source_counts"] == {}
     assert "rows" not in report
 
 
@@ -145,13 +146,14 @@ def test_include_rows_true_returns_expected_fields():
     assert row["low"] == 100.0
     assert row["high"] == 150.0
     assert row["band_source"] == "current_fmv"
+    assert row["in_force_source"] == "current"
     assert row["fmv_history_id"] is None
     assert row["notes"] == "hello"
     assert row["status"] == "WON"
     assert set(row) == {
         "bid_id", "item_id", "comic_id", "title", "issue", "grade", "certifier",
-        "status", "price", "low", "high", "band_source", "fmv_history_id",
-        "confidence", "comps", "notes", "ended",
+        "status", "price", "low", "high", "band_source", "in_force_source",
+        "fmv_history_id", "confidence", "comps", "notes", "ended",
     }
 
 
@@ -169,8 +171,10 @@ def test_falls_back_to_current_fmv_when_no_history_snapshot_exists():
     report = fmv_accuracy_report(conn, include_rows=True)
     row = report["rows"][0]
     assert row["band_source"] == "current_fmv"
+    assert row["in_force_source"] == "current"
     assert row["low"] == 100.0 and row["high"] == 150.0
     assert report["band_source_counts"] == {"current_fmv": 1}
+    assert report["in_force_source_counts"] == {"current": 1}
 
 
 def test_uses_history_snapshot_in_force_when_bid_was_added():
@@ -187,6 +191,7 @@ def test_uses_history_snapshot_in_force_when_bid_was_added():
     report = fmv_accuracy_report(conn, include_rows=True)
     row = report["rows"][0]
     assert row["band_source"] == "history"
+    assert row["in_force_source"] == "at_added"
     assert row["low"] == 100.0 and row["high"] == 150.0
 
 
@@ -223,6 +228,7 @@ def test_picks_the_latest_in_force_snapshot_not_the_earliest():
     report = fmv_accuracy_report(conn, include_rows=True)
     row = report["rows"][0]
     assert row["low"] == 100.0 and row["high"] == 150.0
+    assert row["in_force_source"] == "at_added"
 
 
 def test_timestamp_format_normalization_is_required_for_the_match():
@@ -280,6 +286,123 @@ def test_history_snapshot_with_null_high_is_ignored():
     report = fmv_accuracy_report(conn, include_rows=True)
     row = report["rows"][0]
     assert row["band_source"] == "current_fmv"
+
+
+# ---------------------------------------------------------------------------
+# Pre-end fallback tier (BUI-981)
+# ---------------------------------------------------------------------------
+#
+# 99 resolved auctions got their first fmv_history snapshot after the bid was
+# added but before the auction ended — no snapshot existed at-or-before
+# added_at, so the old two-tier fallback (at-added snapshot, else the live
+# fmv row) jumped straight to current_fmv, which can already carry the very
+# auction's own price. These rows must instead use the earliest snapshot
+# recorded before the auction ended: leakage-free for that auction (it
+# hadn't resolved yet when the snapshot was recorded) without needing to be
+# on file before the bid was even placed.
+
+
+def test_uses_pre_end_snapshot_when_no_at_added_snapshot_exists():
+    """The only snapshot on file was recorded AFTER the bid was added but
+    BEFORE the auction ended — BUI-981 requires this to be used in preference
+    to the current_fmv fallback."""
+    conn = _db()
+    comic_id, fmv_id = _comic_and_fmv(conn, grade=9.0, high=999.0, low=900.0)
+    bid_id = _bid(conn, "1", winning_bid=125.0, added_at="2026-03-01 00:00:00",
+                  auction_end_at="2026-03-15 12:00:00")
+    _link(conn, bid_id, fmv_id)
+    # Recorded after added_at, before auction_end_at.
+    _history(conn, comic_id, 9.0, low=100.0, high=150.0,
+             recorded_at="2026-03-10T00:00:00.000000+00:00")
+
+    report = fmv_accuracy_report(conn, include_rows=True)
+    row = report["rows"][0]
+    assert row["low"] == 100.0 and row["high"] == 150.0
+    assert row["band_source"] == "history"
+    assert row["in_force_source"] == "pre_end"
+    assert report["band_source_counts"] == {"history": 1}
+    assert report["in_force_source_counts"] == {"pre_end": 1}
+
+
+def test_falls_back_to_current_fmv_when_only_snapshot_is_after_auction_end():
+    """The only snapshot on file was recorded AFTER the auction ended — not
+    usable as a pre-end snapshot, so the current_fmv fallback must still
+    apply, exactly as before BUI-981."""
+    conn = _db()
+    comic_id, fmv_id = _comic_and_fmv(conn, grade=9.0, high=150.0, low=100.0)
+    bid_id = _bid(conn, "1", winning_bid=125.0, added_at="2026-03-01 00:00:00",
+                  auction_end_at="2026-03-15 12:00:00")
+    _link(conn, bid_id, fmv_id)
+    # Recorded after the auction ended — must not be used.
+    _history(conn, comic_id, 9.0, low=200.0, high=250.0,
+             recorded_at="2026-04-01T00:00:00.000000+00:00")
+
+    report = fmv_accuracy_report(conn, include_rows=True)
+    row = report["rows"][0]
+    assert row["low"] == 100.0 and row["high"] == 150.0
+    assert row["band_source"] == "current_fmv"
+    assert row["in_force_source"] == "current"
+    assert report["in_force_source_counts"] == {"current": 1}
+
+
+def test_pre_end_uses_earliest_snapshot_in_window_not_latest():
+    """Two snapshots both land between added_at and auction_end_at — the
+    EARLIEST one (closest to added_at) must be used, not the latest, per the
+    ticket's "earliest snapshot recorded before the auction ended" rule."""
+    conn = _db()
+    comic_id, fmv_id = _comic_and_fmv(conn, grade=9.0, high=999.0, low=900.0)
+    bid_id = _bid(conn, "1", winning_bid=125.0, added_at="2026-03-01 00:00:00",
+                  auction_end_at="2026-03-15 12:00:00")
+    _link(conn, bid_id, fmv_id)
+    _history(conn, comic_id, 9.0, low=100.0, high=150.0,
+             recorded_at="2026-03-05T00:00:00.000000+00:00")
+    _history(conn, comic_id, 9.0, low=300.0, high=350.0,
+             recorded_at="2026-03-12T00:00:00.000000+00:00")
+
+    report = fmv_accuracy_report(conn, include_rows=True)
+    row = report["rows"][0]
+    assert row["low"] == 100.0 and row["high"] == 150.0
+    assert row["in_force_source"] == "pre_end"
+
+
+def test_at_added_snapshot_still_preferred_over_pre_end_snapshot():
+    """When BOTH an at-added snapshot and a later pre-end snapshot exist, the
+    at-added one wins — BUI-981 only widens the fallback, it never changes
+    the priority of the ideal case."""
+    conn = _db()
+    comic_id, fmv_id = _comic_and_fmv(conn, grade=9.0, high=999.0, low=900.0)
+    bid_id = _bid(conn, "1", winning_bid=125.0, added_at="2026-03-01 00:00:00",
+                  auction_end_at="2026-03-15 12:00:00")
+    _link(conn, bid_id, fmv_id)
+    _history(conn, comic_id, 9.0, low=50.0, high=75.0,
+             recorded_at="2026-02-01T00:00:00.000000+00:00")
+    _history(conn, comic_id, 9.0, low=300.0, high=350.0,
+             recorded_at="2026-03-10T00:00:00.000000+00:00")
+
+    report = fmv_accuracy_report(conn, include_rows=True)
+    row = report["rows"][0]
+    assert row["low"] == 50.0 and row["high"] == 75.0
+    assert row["in_force_source"] == "at_added"
+
+
+def test_pre_end_snapshot_scoped_to_same_certifier_and_label():
+    """A pre-end snapshot at the wrong certifier/label must not be picked —
+    same identity scoping as the at-added lookup."""
+    conn = _db()
+    comic_id, fmv_id = _comic_and_fmv(conn, grade=9.0, high=150.0, low=100.0,
+                                       certifier="none", label="universal")
+    bid_id = _bid(conn, "1", winning_bid=125.0, added_at="2026-03-01 00:00:00",
+                  auction_end_at="2026-03-15 12:00:00")
+    _link(conn, bid_id, fmv_id)
+    _history(conn, comic_id, 9.0, low=500.0, high=600.0,
+             recorded_at="2026-03-05T00:00:00.000000+00:00",
+             certifier="cgc", label="universal")
+
+    report = fmv_accuracy_report(conn, include_rows=True)
+    row = report["rows"][0]
+    assert row["band_source"] == "current_fmv"
+    assert row["in_force_source"] == "current"
+    assert row["low"] == 100.0 and row["high"] == 150.0
 
 
 # ---------------------------------------------------------------------------
@@ -749,7 +872,7 @@ def test_new_slices_are_additive_existing_keys_unchanged():
     report = fmv_accuracy_report(conn)
     assert set(report) == {
         "days", "overall", "by_month", "band_source_counts",
-        "by_width_bucket", "by_prepost_bui528",
+        "in_force_source_counts", "by_width_bucket", "by_prepost_bui528",
     }
     assert set(report["overall"]) == {
         "n", "share_within_10pct", "share_within_20pct", "mdape_pct",

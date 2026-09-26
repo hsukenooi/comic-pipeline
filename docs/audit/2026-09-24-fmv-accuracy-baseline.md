@@ -31,3 +31,28 @@ Band source: 445 auctions score against the `fmv_history` snapshot at or before 
 - The main miss is above the band: 35% of all auctions and 49% of lost ones cleared above it. BUI-978 diagnoses those.
 - Won auctions sit below the midpoint on average (−19.5%), which is expected: we win when the market clears low.
 - Won auctions carry wider bands (67% vs 40%), so their in-band rate reads higher partly because of width.
+
+## 2026-09-27 update (BUI-981): pre-end snapshot for 99 late-first-snapshot auctions
+
+BUI-979 found 99 resolved auctions whose first `fmv_history` snapshot was recorded after the bid was added but before the auction ended. `_fmv_accuracy_rows`'s at-added lookup found nothing at or before `added_at` for these and fell back to the current `fmv` row, which can already carry the auction's own price (see the leakage note above). Fixed: when no at-added snapshot exists, use the earliest snapshot recorded before the auction ended instead — still leakage-free for that auction, since it hadn't resolved when the snapshot was recorded. Each row now also reports `in_force_source` (`at_added` | `pre_end` | `current`), tallied in `in_force_source_counts`; `band_source` keeps its original `history`/`current_fmv` shape (`at_added` and `pre_end` both count as `history`).
+
+Re-run against a 2026-09-27 backup of the live DB, the same snapshot scored with the old and new code (`days=None`, n=586 both times):
+
+| Metric | Before | After |
+|---|---|---|
+| In band | 43.5% | 43.5% |
+| Above | 35.3% | 35.3% |
+| Below | 21.2% | 21.2% |
+| Within ±10% | 27.8% | 27.6% |
+| Within ±20% | 46.8% | 46.6% |
+| MdAPE | 23.0% | 23.1% |
+| Mean signed error | +15.6% | +15.6% |
+| Median band width | 40% | 40% |
+
+(These figures are 0.1-0.2pp off the 2026-09-24 table above because the live DB moved in the three days between runs — normal auction resolution, not this fix. The before/after pair here is the load-bearing comparison; both columns are drawn from the same backup.)
+
+`in_force_source_counts` after the fix: 445 `at_added`, 99 `pre_end`, 42 `current` — under the old two-tier fallback this was 445 `history` / 141 `current_fmv`; the 99 `pre_end` rows are exactly the ones that moved off `current_fmv`.
+
+The stricter no-leakage subset (`band_source == 'history'`, called out above as the tighter baseline) grows from n=445 (40.0% in band, 37.5% above, 22.5% below, MdAPE 24.2%) to n=544 (43.4% in band, 35.1% above, 21.5% below, MdAPE 22.8%).
+
+**Why the headline barely moves:** 97 of the 99 `pre_end` rows have a band numerically identical to the current `fmv` row they'd otherwise have fallen back to — these are books priced once and never repriced since, so the fallback's target value didn't actually change, only its provenance (a pinned snapshot instead of a mutable live row that could drift later). Only 2 rows' `fmv` row had since drifted from the pre-end snapshot, and those are the only two whose in/above/below bucket changed (one above→in, one in→above), which is why the aggregate coverage split is bit-for-bit unchanged. This fix closes a formal leakage risk more than it moves the current numbers — most of the 99 rows were already scoring against the right values, just without anything guaranteeing that.
