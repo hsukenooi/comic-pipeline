@@ -4344,6 +4344,20 @@ _ASM50_SLABS = [
 ]
 
 
+def _certified(comps, certifier="cgc"):
+    """The `certifier`-stamped shape `_slab_comps_only` returns (BUI-993) —
+    build expectations against THIS, not the raw un-stamped fixture, for any
+    assertion comparing to that function's output or to what `_post_comps`
+    received from it. `comps` here simulate ebay-sold-comps' raw pool from
+    an include_graded-only fetch, which never runs `parse_slab_fields` (see
+    `_slab_comps_only`'s docstring) — so the fixtures themselves stay
+    unstamped and this helper mirrors the stamp `_slab_comps_only` adds."""
+    return [{**c, "certifier": certifier} for c in comps]
+
+
+_ASM50_SLABS_CERTIFIED = _certified(_ASM50_SLABS)
+
+
 class TestSlabCompsOnly:
     def test_keeps_cgc_and_cbcs_drops_raw(self):
         comps = [
@@ -4362,6 +4376,40 @@ class TestSlabCompsOnly:
             {"grade": 6.5, "price": None, "title": "ASM 50 CGC 6.5"},
         ]
         assert fmv_runner._slab_comps_only(comps) == []
+
+    def test_stamps_certifier_from_the_matched_title(self):
+        """BUI-993: comps reaching this function came off an include_graded
+        -only fetch, which never routes through sold_comps.parse_slab_fields
+        (that only fires for the BUI-524 inclusive tier / a graded_target
+        base tier — see the docstring above). Before this fix the returned
+        comp carried no `certifier` key at all, so `_comp_to_ledger_item`
+        posted `certifier: null` and the comps ledger's CompItem model
+        coerced that to `'none'` — a genuine CGC/CBCS slab comp silently
+        landing on the raw-market sentinel (comp 16410)."""
+        comps = [
+            {"grade": 6.5, "price": 1200, "title": "ASM 50 CGC 6.5"},
+            {"grade": 6.0, "price": 700, "title": "ASM 50 CBCS 6.0"},
+        ]
+        out = fmv_runner._slab_comps_only(comps)
+        by_price = {c["price"]: c["certifier"] for c in out}
+        assert by_price == {1200: "cgc", 700: "cbcs"}
+
+    def test_double_space_between_certifier_and_grade_still_stamps_cgc(self):
+        """BUI-993 regression: comp 16410's exact title (Batman #227, two
+        spaces between "CGC" and the grade). The premise-check for this
+        ticket found the double space was NOT what dropped the certifier —
+        grade_tokens.resolve_certifier_token and sold_comps._SLAB_TITLE_RE
+        already match "CGC" regardless of surrounding whitespace, since
+        neither requires certifier/grade adjacency. The real defect was this
+        function never stamping `certifier` on the comps it selects (see
+        test_stamps_certifier_from_the_matched_title above); this case pins
+        the exact reported title against that fix."""
+        comps = [
+            {"grade": 6.5, "price": 1275.0,
+             "title": "Batman #227 CGC  6.5 - Fresh From CGC!"},
+        ]
+        out = fmv_runner._slab_comps_only(comps)
+        assert out[0]["certifier"] == "cgc"
 
 
 class TestIsUnpricedRaw:
@@ -4444,7 +4492,7 @@ class TestCgcProxyRescue:
         # the ledger, using the comic_id ALREADY present from the primary
         # pass (5) — not the proxy re-upsert's comic_id (7), which hasn't
         # happened yet at post time. Never posts pool='raw'.
-        post_mock.assert_called_once_with(server_url, 5, [], _ASM50_SLABS)
+        post_mock.assert_called_once_with(server_url, 5, [], _ASM50_SLABS_CERTIFIED)
         # Result replaced with a proxy band, re-upserted, ids refreshed.
         assert fresh[0]["source"] == "cgc-proxy"
         assert fresh[0]["fmv"]["cgc_proxy"] is True
@@ -4635,7 +4683,7 @@ class TestCgcProxyRescue:
         # single slab comp it fetched was still a genuine market observation —
         # post it to the ledger (using the comic_id the primary raw pass
         # already resolved) even though no proxy band or re-upsert happens.
-        post_mock.assert_called_once_with(server_url, 5, [], thin)
+        post_mock.assert_called_once_with(server_url, 5, [], _certified(thin))
         assert fresh[0]["comps_posted"] is True
 
 
@@ -4692,7 +4740,7 @@ class TestCgcCrossCheckApply:
         assert fresh[0]["fmv"]["cgc_cross_check"] is not None
         # BUI-676: this second fetch's slab-filtered subset is posted, using
         # the comic_id the primary pass already resolved.
-        post_mock.assert_called_once_with(server_url, 1, [], _ASM50_SLABS)
+        post_mock.assert_called_once_with(server_url, 1, [], _ASM50_SLABS_CERTIFIED)
         assert fresh[0]["comps_posted"] is True
 
     def test_skips_book_already_rescued_by_proxy(self, server_url):
@@ -4786,7 +4834,7 @@ class TestCgcCrossCheckApply:
         assert fresh[0]["fmv"].get("cgc_cross_check") is None
         # BUI-676 / trap 2 companion: a ladder too thin to FLAG a divergence
         # still means these comps were genuinely observed — posted anyway.
-        post_mock.assert_called_once_with(server_url, 5, [], thin_ladder)
+        post_mock.assert_called_once_with(server_url, 5, [], _certified(thin_ladder))
         assert fresh[0]["comps_posted"] is True
 
     def test_rescue_pricing_for_unpriced_books_is_byte_identical(self, server_url):
@@ -4865,6 +4913,12 @@ _BATMAN227_SLABS = [
 _BATMAN227_CLEAN = [c for c in _BATMAN227_SLABS
                     if c["title"] != _BATMAN227_LOT_TITLE]
 
+# BUI-993: this is the same book (Batman #227 (1970)) and the same
+# CGC-proxy/cross-check fetch path that produced comp 16410's missing
+# certifier — see `_certified`'s docstring above for why the raw fixture
+# stays unstamped and expectations use this derived constant instead.
+_BATMAN227_CLEAN_CERTIFIED = _certified(_BATMAN227_CLEAN)
+
 
 def _batman227_thin_priced_row():
     """A vintage book the raw math DID price, thinly — the cross-check's
@@ -4942,7 +4996,8 @@ class TestCgcLadderIgnoresMultibookLot:
              patch("fmv_runner._post_comps", return_value=True) as post_mock:
             fmv_runner._apply_cgc_cross_check(
                 fresh, _BATMAN227_BOOKS, server_url=server_url, force=False)
-        post_mock.assert_called_once_with(server_url, 1021, [], _BATMAN227_CLEAN)
+        post_mock.assert_called_once_with(
+            server_url, 1021, [], _BATMAN227_CLEAN_CERTIFIED)
         assert fresh[0]["comps_posted"] is True
 
     def test_graded_second_fetch_is_visible_on_the_emitted_row(self, server_url):
@@ -4961,7 +5016,7 @@ class TestCgcLadderIgnoresMultibookLot:
                 fresh, _BATMAN227_BOOKS, server_url=server_url, force=False)
         assert [q["nkw"] for q in fresh[0]["queries_used"]] == [
             "raw -cgc -cbcs", "graded-only"]
-        assert fresh[0]["slab_comps"] == _BATMAN227_CLEAN
+        assert fresh[0]["slab_comps"] == _BATMAN227_CLEAN_CERTIFIED
 
     def test_all_error_graded_trail_never_invents_a_fetch_err(self, server_url):
         """The fold must not let a graded pass's failure be read as the RAW
@@ -5045,7 +5100,7 @@ class TestCgcLadderIgnoresMultibookLot:
         assert ladder["slab_price"] == 900.0 and 4.0 not in ladder["ladder"]
         assert fresh[0]["fmv"]["confidence"] == "MEDIUM-LOW"
         # Reporting fold applies to the rescue tier too.
-        assert fresh[0]["slab_comps"] == _BATMAN227_CLEAN
+        assert fresh[0]["slab_comps"] == _BATMAN227_CLEAN_CERTIFIED
 
 
 class TestRunCrossChecksAThinPricedVintageBook:
@@ -5110,7 +5165,7 @@ class TestRunCrossChecksAThinPricedVintageBook:
         assert len(nkws) == 2
         assert "-cgc -cbcs -graded -slab" in nkws[0]
         assert "-cgc -cbcs -graded -slab" not in nkws[1]   # the graded-only pass
-        assert row["slab_comps"] == _BATMAN227_CLEAN
+        assert row["slab_comps"] == _BATMAN227_CLEAN_CERTIFIED
         check = row["fmv"]["cgc_cross_check"]
         assert check is not None
         assert check["diverges"] is True

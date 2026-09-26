@@ -3152,10 +3152,40 @@ def _slab_comps_only(comps: list[dict]) -> list[dict]:
     certifier in title). ebay-sold-comps' own `admits_graded`-gated guards
     (BUI-922/938/961) already dropped the ampersand multi-book lot and any
     cross-title/store-variant contamination before returning these comps —
-    see the block comment above."""
-    return [c for c in comps
-            if c.get("grade") is not None and c.get("price") is not None
-            and _SLAB_TITLE_RE.search(c.get("title") or "")]
+    see the block comment above.
+
+    BUI-993: `comps` here is the RAW pool of an `include_graded`-only fetch
+    (the CGC-proxy rescue / cross-check tiers below) — ebay-sold-comps only
+    calls `parse_slab_fields` (which sets `certifier`/`label`/`page_quality`)
+    for a comp that its OWN `route_slabs` branch routes into `slab_comps`,
+    and that branch only fires for the BUI-524 vintage-inclusive tier or a
+    `graded_target` base tier (see `sold_comps._run`'s docstring) — neither
+    of which this include_graded-only call ever reaches. So every comp this
+    function selects arrives with no `certifier` key at all. Left alone,
+    `_comp_to_ledger_item` posts `certifier: null`, and the comps ledger's
+    `CompItem` model coerces an absent certifier to `'none'` — the RAW-market
+    sentinel — for a comp this very function just confirmed names CGC/CBCS in
+    its title (comp 16410, BUI-993: `certifier='none'` stored for a genuine
+    "CGC 6.5" sale). Stamp `certifier` from the SAME match this filter used
+    to admit the comp, so the certifier that gets posted can never disagree
+    with the certifier that got it into this pool. (`label`/`page_quality`
+    are left at `CompItem`'s own defaults, `'universal'`/`'unknown'` — the
+    same values `parse_slab_fields` would fall back to for a title with no
+    explicit label/page-quality token; a title that DOES name one, e.g.
+    Signature Series or White Pages, still loses that detail here — tracked
+    as a follow-up, out of this ticket's scope.)
+    """
+    result = []
+    for c in comps:
+        if c.get("grade") is None or c.get("price") is None:
+            continue
+        m = _SLAB_TITLE_RE.search(c.get("title") or "")
+        if not m:
+            continue
+        comp = dict(c)
+        comp["certifier"] = m.group(0).lower()
+        result.append(comp)
+    return result
 
 
 def _record_graded_pass(row: dict, result: dict, ladder: list[dict]) -> None:

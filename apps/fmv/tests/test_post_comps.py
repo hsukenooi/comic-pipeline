@@ -110,6 +110,22 @@ _ASM50_SLABS = [
 ]
 
 
+def _certified(comps, certifier="cgc"):
+    """The `certifier`-stamped shape `_slab_comps_only` returns (BUI-993) —
+    build expectations against THIS, not the raw un-stamped fixture, for any
+    assertion comparing to what `_post_comps` received from it. `comps` here
+    simulate ebay-sold-comps' raw pool from an include_graded-only fetch,
+    which never runs `parse_slab_fields` (see `_slab_comps_only`'s
+    docstring in fmv_runner.py) — so the fixtures stay unstamped and this
+    helper mirrors the stamp `_slab_comps_only` adds. Duplicated from
+    test_fmv_runner.py per this file's own module docstring convention
+    (fixtures duplicated locally, not imported)."""
+    return [{**c, "certifier": certifier} for c in comps]
+
+
+_ASM50_SLABS_CERTIFIED = _certified(_ASM50_SLABS)
+
+
 def _graded_result(req_id, ladder_comps):
     return {"input": {"_req_id": req_id}, "comps": ladder_comps, "queries_used": []}
 
@@ -639,7 +655,7 @@ class TestCgcProxyRescuePostsGenuinelyNewSlabComps:
         assert args[0] == server_url
         assert args[1] == 5  # pre-existing comic_id, not the re-upsert's 7
         assert args[2] == []  # never pool='raw' from this pass
-        assert args[3] == _ASM50_SLABS  # only the certified-slab subset
+        assert args[3] == _ASM50_SLABS_CERTIFIED  # only the certified-slab subset
 
     def test_posts_even_when_ladder_too_thin_to_price(self, server_url):
         """Trap 2: `proxy is None` (ladder too thin/non-monotonic) means no
@@ -660,7 +676,7 @@ class TestCgcProxyRescuePostsGenuinelyNewSlabComps:
                 server_url=server_url, force=False)
         upsert_mock.assert_not_called()  # ladder never priced the book
         assert fresh[0]["source"] == "fresh"  # not promoted
-        post_mock.assert_called_once_with(server_url, 5, [], thin_ladder)
+        post_mock.assert_called_once_with(server_url, 5, [], _certified(thin_ladder))
         assert fresh[0]["comps_posted"] is True
 
     def test_rescue_post_failure_is_counted_even_though_pricing_succeeded(
@@ -790,7 +806,7 @@ class TestCgcCrossCheckPostsGenuinelyNewSlabComps:
         assert args[0] == server_url
         assert args[1] == 5  # the primary pass's pre-existing comic_id
         assert args[2] == []  # never pool='raw' from this pass
-        assert args[3] == _ASM50_SLABS  # only the certified-slab subset
+        assert args[3] == _ASM50_SLABS_CERTIFIED  # only the certified-slab subset
 
     def test_never_reposts_a_reused_bui524_ladder(self, server_url):
         """Trap 2 — the distinction this whole ticket turns on, asserted
@@ -826,7 +842,7 @@ class TestCgcCrossCheckPostsGenuinelyNewSlabComps:
                 fresh, self._books(), server_url=server_url, force=False)
         upsert_mock.assert_not_called()  # nothing to flag, no re-upsert
         assert fresh[0]["fmv"].get("cgc_cross_check") is None
-        post_mock.assert_called_once_with(server_url, 5, [], thin_ladder)
+        post_mock.assert_called_once_with(server_url, 5, [], _certified(thin_ladder))
         assert fresh[0]["comps_posted"] is True
 
     def test_post_failure_is_counted_even_though_the_flag_succeeded(
