@@ -2763,9 +2763,11 @@ class TestComputeOne:
 
         body = post_mock.call_args.kwargs["json"]
         assert body["fmv_flag_reason"] is None       # cleared → server keeps price
-        assert body["fmv_high"] == 180 and body["fmv_low"] == 180
+        # BUI-990: the $180 point is floored to a 40% band ($140-$225).
+        assert body["fmv_high"] == 225 and body["fmv_low"] == 140
         assert body["fmv_confidence"] == "low"       # §7: confidence reduced
         assert "interpolated=grade 5→9" in body["fmv_notes"]
+        assert "width_floor=0.40" in body["fmv_notes"]
         assert out["fmv"]["interpolated"] is True
 
     def test_unrecognized_grade_string_errors(self, server_url):
@@ -3776,7 +3778,8 @@ class TestRunEndToEnd:
         fmv = json.loads(out_path.read_text())[0]["fmv"]
         assert fmv["interpolated"] is True
         assert fmv["interpolation"]["target_price"] == 180.0
-        assert fmv["fmv_high"] == 180 and fmv["flag_reason"] is None
+        # BUI-990: the $180 point is floored to $140-$225 around it.
+        assert fmv["fmv_high"] == 225 and fmv["flag_reason"] is None
 
     def test_no_server_url_fails(self, tmp_path):
         batch_path = tmp_path / "b.json"
@@ -5427,6 +5430,34 @@ class TestCgcCrossCheckNotes:
         fmv = {"cv_pct": "20%", "confidence": "HIGH"}
         notes = fmv_runner._build_notes(fmv)
         assert "cgc_cross_check" not in notes
+
+
+class TestWidthFloorNotes:
+    """BUI-990: a floored band is marked in fmv_notes so band_compare can tell
+    it apart, and the flag survives a cache hit."""
+
+    def test_fresh_floored_band_writes_token(self):
+        comps = [_make_comp(p, 9.0) for p in [85, 90, 95, 100, 105, 110, 115]]
+        fmv = fmv_math.compute_fmv(comps, target_grade=9.0)
+        assert fmv["width_floored"] is True
+        notes = fmv_runner._build_notes(fmv)
+        assert "width_floor=0.40" in notes.split(" | ")
+
+    def test_unfloored_band_writes_no_token(self):
+        comps = [_make_comp(p, 9.0) for p in [50, 75, 100, 125, 150, 175]]
+        fmv = fmv_math.compute_fmv(comps, target_grade=9.0)
+        assert fmv["width_floored"] is False
+        assert "width_floor" not in fmv_runner._build_notes(fmv)
+
+    def test_cached_row_recovers_flag_and_bids_off_stored_high(self):
+        row = {"fmv_low": 80, "fmv_high": 120, "fmv_comps": 7,
+               "fmv_confidence": "high",
+               "fmv_notes": "window=±0.5 | cv=10% | label=HIGH | width_floor=0.40"}
+        out = fmv_runner._fmv_from_db_row(row)
+        assert out["width_floored"] is True
+        assert out["max_bid"] == fmv_math.clean_round(0.80 * 120)
+        row["fmv_notes"] = "window=±0.5 | cv=10% | label=HIGH"
+        assert fmv_runner._fmv_from_db_row(row)["width_floored"] is False
 
 
 class TestAnchorDivergesNotes:

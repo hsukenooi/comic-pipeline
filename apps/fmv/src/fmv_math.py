@@ -985,6 +985,7 @@ def cgc_proxy_fmv(graded_comps: list[dict], target_grade: float,
         "interpolated": False,
         "interpolation": None,
         "suspect_buckets": [],
+        "width_floored": False,  # BUI-990: the floor is raw-auto-math only
         # BUI-348 markers: distinguish a proxy band from a real raw range and
         # carry the ladder anchor for the "CGC proxy" notes token.
         "cgc_proxy": True,
@@ -1194,6 +1195,61 @@ def _widen_collapsed_range(
     return v, up
 
 
+# ─── Minimum band-width floor (BUI-990) ──────────────────────────────────────
+#
+# BUI-982 replayed a width floor against the 586 resolved auctions' in-force
+# bands (docs/audit/2026-09-26-width-floor-replay.md): a 40% floor had the
+# best median Winkler/price in every cut, and the replayed max_bid never
+# exceeded the highest real comp on a post-BUI-528 band. So every band the raw
+# auto-math publishes narrower than this fraction of its midpoint (width =
+# (high - low) / midpoint) is widened to it around the SAME midpoint; wider
+# bands are unchanged, and max_bid still rides the (now floored) fmv_high.
+#
+# Scope — applied in `compute_fmv` only, i.e. the raw-copy auto-math: the
+# weighted-quartile band (after BUI-528's collapse split), degenerate
+# identical-price pools, and §7 interpolated points. NOT applied to the
+# CGC-proxy band (its width is the calibrated 0.50-0.55 raw/slab factor spread,
+# and a 40% band would put fmv_high at 0.63x slab, above the 0.53-0.58 ratio
+# the factor was anchored on) nor to the graded slab tiers (direct / lone_sale
+# / ladder — shipped 2026-09-21, after the replay's evidence window, so the
+# floor has no measurement behind it there). Hand-priced rows never reach
+# `compute_fmv` (fmv_runner skips them), so they are untouched.
+MIN_BAND_WIDTH = 0.40
+
+
+def apply_width_floor(fmv_low: int, fmv_high: int,
+                      floor: float | None = None) -> tuple[int, int, bool]:
+    """Widen a clean-rounded band to at least ``floor`` of its midpoint.
+
+    Returns ``(fmv_low, fmv_high, floored)``. A band already at or above the
+    floor (or a zero-midpoint band, which has no width to measure) comes back
+    unchanged with ``floored`` False.
+
+    Otherwise each side of the target band ``mid × (1 ± floor/2)`` is
+    clean-rounded to the nearest step, so fmv_high (and therefore max_bid)
+    lands on the target, never a whole step past it. If rounding leaves the
+    band under the floor, the LOW side is lowered a step at a time — the
+    money-safe side, which never lifts the bid cap (BUI-528's precedent) —
+    until the floor holds or fmv_low reaches 0. Only a band whose low is
+    already 0 and still under the floor (not reachable at real prices) raises
+    fmv_high a step. The result never narrows the input band, fmv_low is never
+    below 0, and the published midpoint moves by at most about one clean step.
+    """
+    if floor is None:
+        floor = MIN_BAND_WIDTH  # read at call time, not bound at def time
+    mid = (fmv_low + fmv_high) / 2
+    if mid <= 0 or (fmv_high - fmv_low) / mid >= floor:
+        return fmv_low, fmv_high, False
+    half = mid * floor / 2
+    new_low = min(fmv_low, clean_round(max(0.0, mid - half)))
+    new_high = max(fmv_high, clean_round(mid + half))
+    while (new_high - new_low) / mid < floor and new_low > 0:
+        new_low = max(0, new_low - _clean_step(new_low))
+    while (new_high - new_low) / mid < floor:
+        new_high += _clean_step(new_high)
+    return new_low, new_high, True
+
+
 # ─── End-to-end: comps → FMV summary ─────────────────────────────────────────
 
 def compute_fmv(comps: list[dict], target_grade: float,
@@ -1257,9 +1313,13 @@ def compute_fmv(comps: list[dict], target_grade: float,
     between the nearest bracketing bucket medians instead of being punted to
     manual. When that happens `interpolated` is True, `flag_reason` is CLEARED
     (the book now emits a bid-able number, so the upsert must not wipe it as
-    needs_manual), fmv_low == fmv_high == median == the interpolated point
-    (a single estimate, no dispersion), and confidence is forced to LOW (§7:
-    "confidence is reduced").
+    needs_manual), median == the interpolated point (a single estimate, no
+    dispersion) with fmv_low/fmv_high widened around it by the BUI-990 width
+    floor, and confidence is forced to LOW (§7: "confidence is reduced").
+
+    BUI-990: every priced band here passes through `apply_width_floor` before
+    max_bid is derived, so a band narrower than MIN_BAND_WIDTH of its midpoint
+    publishes at that width and `width_floored` is True.
 
     BUI-318 money-safety hardening of §7: (a) a bracket may only be anchored on
     a bucket holding ≥ MIN_BRACKET_COMPS comps — a single-comp bracket is one
@@ -1376,13 +1436,22 @@ def compute_fmv(comps: list[dict], target_grade: float,
     fmv_high: int | None
     med: int | None
     max_bid: int | None
+    width_floored = False  # BUI-990: set by apply_width_floor on a priced band
+    # BUI-990: the band as the pool priced it, before the width floor. The
+    # floor adds no market evidence, so the anchor-divergence flag below reads
+    # this one — otherwise widening a band would mask a real divergence.
+    pool_low: int | None = None
+    pool_high: int | None = None
     if interpolation is not None:
         # Priced by §7 interpolation: a single point estimate (no dispersion),
         # so fmv_low == fmv_high == median. Clearing flag_reason is REQUIRED —
         # a non-null flag makes the upsert wipe this price as needs_manual.
         price = clean_round(interpolation["target_price"])
         fmv_low = fmv_high = med = price
-        max_bid = clean_round(price * factor)
+        # BUI-990: a point is a zero-width band — floor it like any other.
+        pool_low, pool_high = fmv_low, fmv_high
+        fmv_low, fmv_high, width_floored = apply_width_floor(fmv_low, fmv_high)
+        max_bid = clean_round(fmv_high * factor)
         flag_reason = None
     elif flag_reason is not None or n == 0:
         fmv_low = fmv_high = med = max_bid = None
@@ -1402,13 +1471,18 @@ def compute_fmv(comps: list[dict], target_grade: float,
         if cv_val is not None and cv_val > 0 and fmv_low == fmv_high:
             fmv_low, fmv_high = _widen_collapsed_range(
                 med_raw, cv_val, window, n, min(trimmed), max(trimmed))
+        # BUI-990: the published band is fixed here, before max_bid is derived
+        # from it, so the cap rides the floored fmv_high.
+        pool_low, pool_high = fmv_low, fmv_high
+        fmv_low, fmv_high, width_floored = apply_width_floor(fmv_low, fmv_high)
         max_bid = clean_round(fmv_high * factor)
 
     # BUI-534: flag-only pool-vs-anchor divergence — computed from fields
     # already resolved above (fmv_low/fmv_high, the anchor from BUI-522),
     # never altering them. False for any flagged/no-comps book (fmv_low/high
     # are None there) without a separate flag_reason check.
-    diverges = anchor_diverges(fmv_low, fmv_high, anchor)
+    # BUI-990: judged on the pre-floor band (see pool_low/pool_high above).
+    diverges = anchor_diverges(pool_low, pool_high, anchor)
 
     return {
         "n": n,
@@ -1432,6 +1506,10 @@ def compute_fmv(comps: list[dict], target_grade: float,
         "interpolated": interpolation is not None,
         "interpolation": interpolation,
         "suspect_buckets": suspect_buckets,
+        # BUI-990: True when apply_width_floor widened the published band to
+        # MIN_BAND_WIDTH. _build_notes writes a `width_floor=0.40` token for it
+        # so a later band_compare can tell floored bands apart.
+        "width_floored": width_floored,
         # BUI-348: shape parity with cgc_proxy_fmv. A raw-pool result is never a
         # proxy; the CGC-proxy tier (fmv_runner) only fires on a raw result that
         # produced no bid-able number, replacing this dict wholesale.
@@ -1804,6 +1882,7 @@ def _graded_result(**over) -> dict:
         "interpolated": False,
         "interpolation": None,
         "suspect_buckets": [],
+        "width_floored": False,  # BUI-990: the floor is raw-auto-math only
         "cgc_proxy": False,
         "cgc_ladder": None,
         "ungraded_anchor": None,
