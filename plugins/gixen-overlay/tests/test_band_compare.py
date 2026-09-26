@@ -163,6 +163,24 @@ def test_successive_snapshots_skip_single_snapshot_and_current_fmv_rows():
     assert successive_snapshot_band_sets(conn) == ({}, {})
 
 
+def test_successive_snapshots_skip_pre_end_rows_too():
+    """BUI-981: a row whose in-force band comes from the pre-end fallback
+    tier (no snapshot at-or-before `added_at`, only one recorded afterward
+    but before the auction ended) still reports `band_source == 'history'`
+    (unchanged two-value contract), but must NOT be treated as an at-added
+    row here — there is by construction no earlier snapshot to pair it with,
+    so it must be excluded exactly like a single-snapshot row is above."""
+    conn = _db()
+    comic, fmv_id = _comic_and_fmv(conn, low=10, high=20)
+    bid = _bid(conn, "1", status="LOST", winning_bid=55,
+               added_at="2026-03-01 00:00:00", auction_end_at="2026-03-15 12:00:00")
+    _link(conn, bid, fmv_id)
+    # Only a pre-end snapshot exists — recorded after added_at, before the
+    # auction ended.
+    _history(conn, comic, 9.0, low=30, high=40, recorded_at="2026-03-05T00:00:00+00:00")
+    assert successive_snapshot_band_sets(conn) == ({}, {})
+
+
 # ---------------------------------------------------------------------------
 # CLI (read-only)
 # ---------------------------------------------------------------------------

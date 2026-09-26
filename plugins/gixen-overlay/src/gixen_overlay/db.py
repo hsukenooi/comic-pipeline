@@ -4019,24 +4019,59 @@ def _fmv_accuracy_rows(
             b.winning_bid                  AS price,
             b.notes                        AS notes,
             COALESCE(b.auction_end_at, b.resolved_at) AS ended,
-            mh.id                          AS fmv_history_id,
-            CASE WHEN mh.id IS NOT NULL THEN mh.low ELSE f.low END AS low,
-            CASE WHEN mh.id IS NOT NULL THEN mh.high ELSE f.high END AS high,
-            CASE WHEN mh.id IS NOT NULL THEN mh.confidence ELSE f.confidence END AS confidence,
-            CASE WHEN mh.id IS NOT NULL THEN mh.comps ELSE f.comps END AS comps,
-            CASE WHEN mh.id IS NOT NULL THEN 'history' ELSE 'current_fmv' END AS band_source,
+            COALESCE(mh.id, mh2.id)        AS fmv_history_id,
+            CASE WHEN mh.id IS NOT NULL THEN mh.low
+                 WHEN mh2.id IS NOT NULL THEN mh2.low
+                 ELSE f.low END AS low,
+            CASE WHEN mh.id IS NOT NULL THEN mh.high
+                 WHEN mh2.id IS NOT NULL THEN mh2.high
+                 ELSE f.high END AS high,
+            CASE WHEN mh.id IS NOT NULL THEN mh.confidence
+                 WHEN mh2.id IS NOT NULL THEN mh2.confidence
+                 ELSE f.confidence END AS confidence,
+            CASE WHEN mh.id IS NOT NULL THEN mh.comps
+                 WHEN mh2.id IS NOT NULL THEN mh2.comps
+                 ELSE f.comps END AS comps,
+            -- band_source keeps its pre-BUI-981 two-value contract ('history'
+            -- | 'current_fmv') — both the at-added snapshot (mh) and the
+            -- pre-end fallback snapshot (mh2) come from fmv_history, so both
+            -- report 'history' here. `successive_snapshot_band_sets`
+            -- (band_compare.py) filters on this value and then looks for a
+            -- snapshot strictly before `added_at`; a mh2 row correctly finds
+            -- none (by construction — mh2 only fires when mh found nothing at
+            -- or before added_at) and is dropped there, so folding mh2 into
+            -- 'history' cannot leak a pre_end row into that function's output.
+            CASE WHEN mh.id IS NOT NULL OR mh2.id IS NOT NULL THEN 'history'
+                 ELSE 'current_fmv' END AS band_source,
+            -- BUI-981: finer-grained than band_source — which of the three
+            -- tiers actually priced this row. 'at_added' (mh): the ideal,
+            -- leakage-free case, a snapshot on file at-or-before the bid was
+            -- placed. 'pre_end' (mh2): no at-added snapshot existed, but one
+            -- was recorded between added_at and the auction's end — still
+            -- leakage-free for THIS auction (it hadn't resolved yet when the
+            -- snapshot was recorded) even though it postdates the bid.
+            -- 'current': neither exists, so the live fmv row is used, which
+            -- CAN already have been pulled toward this auction's own price
+            -- (see the leakage note on fmv_accuracy_report). Reported so a
+            -- reader can weigh/count how many rows lean on each tier.
+            CASE WHEN mh.id IS NOT NULL THEN 'at_added'
+                 WHEN mh2.id IS NOT NULL THEN 'pre_end'
+                 ELSE 'current' END AS in_force_source,
             -- BUI-983: when THIS band was written, not when the auction
-            -- ended/was added — `mh.recorded_at` for a 'history' row (the
-            -- snapshot itself), else `f.updated_at` for a 'current_fmv' row
-            -- (no snapshot exists, so the live row's own last write is the
-            -- closest available signal). Both columns are always populated
-            -- by `datetime.now(timezone.utc).isoformat()` (append_fmv_history
-            -- copies recorded_at straight from fmv.updated_at — see that
-            -- function's docstring), so they compare lexicographically as
-            -- the same ISO-8601 UTC format; NULL (a row written by some path
-            -- that never stamped a timestamp) is handled downstream as an
-            -- explicit "unknown" bucket, never dropped.
-            CASE WHEN mh.id IS NOT NULL THEN mh.recorded_at ELSE f.updated_at END AS band_written_at
+            -- ended/was added — `mh.recorded_at`/`mh2.recorded_at` for a
+            -- 'history' row (the snapshot itself), else `f.updated_at` for a
+            -- 'current_fmv' row (no snapshot exists, so the live row's own
+            -- last write is the closest available signal). All three columns
+            -- are always populated by `datetime.now(timezone.utc).isoformat()`
+            -- (append_fmv_history copies recorded_at straight from
+            -- fmv.updated_at — see that function's docstring), so they
+            -- compare lexicographically as the same ISO-8601 UTC format; NULL
+            -- (a row written by some path that never stamped a timestamp) is
+            -- handled downstream as an explicit "unknown" bucket, never
+            -- dropped.
+            CASE WHEN mh.id IS NOT NULL THEN mh.recorded_at
+                 WHEN mh2.id IS NOT NULL THEN mh2.recorded_at
+                 ELSE f.updated_at END AS band_written_at
         FROM bids b
         JOIN bid_fmvs bf ON bf.bid_id = b.id
         JOIN fmv f       ON f.id = bf.fmv_id
@@ -4051,6 +4086,29 @@ def _fmv_accuracy_rows(
               AND fh.high IS NOT NULL AND fh.high > 0
               AND substr(fh.recorded_at, 1, 19) <= replace(b.added_at, ' ', 'T')
             ORDER BY fh.recorded_at DESC
+            LIMIT 1
+        )
+        -- BUI-981: when no snapshot exists at-or-before added_at (mh is
+        -- NULL), fall back to the EARLIEST snapshot recorded before the
+        -- auction ended (i.e. between added_at, exclusive by construction —
+        -- mh already ruled those out — and `ended`, inclusive) rather than
+        -- jumping straight to the live, leakage-prone fmv row. Ordered ASC
+        -- (oldest first) rather than DESC like mh's lookup: the earliest
+        -- such snapshot sits closest to added_at, minimizing how much the
+        -- band could have drifted from what was actually in force when the
+        -- bid went out, while a later one in the same window risks having
+        -- been nudged by other auctions' comps in the interim.
+        LEFT JOIN fmv_history mh2 ON mh.id IS NULL AND mh2.id = (
+            SELECT fh.id
+            FROM fmv_history fh
+            WHERE fh.comic_id = f.comic_id
+              AND fh.grade = f.grade
+              AND fh.certifier = f.certifier
+              AND fh.label = f.label
+              AND fh.high IS NOT NULL AND fh.high > 0
+              AND substr(fh.recorded_at, 1, 19)
+                  <= replace(COALESCE(b.auction_end_at, b.resolved_at), ' ', 'T')
+            ORDER BY fh.recorded_at ASC
             LIMIT 1
         )
         WHERE {where}
@@ -4093,22 +4151,38 @@ def fmv_accuracy_report(
     **The band scored is the one in force when the bid was added, not the
     current `fmv` row.** For each row this looks up the latest `fmv_history`
     snapshot for the same `(comic_id, grade, certifier, label)` with a
-    positive `high` and `recorded_at <= bids.added_at`, falling back to the
-    current `fmv` row only when no such snapshot exists. `band_source`
+    positive `high` and `recorded_at <= bids.added_at`. `band_source`
     ('history' | 'current_fmv') is reported per row and tallied in
     `band_source_counts`.
+
+    **Three-tier fallback (BUI-981) — `in_force_source`:** when no snapshot
+    exists at-or-before `added_at`, this does NOT fall straight to the current
+    `fmv` row. It first looks for the earliest `fmv_history` snapshot recorded
+    between `added_at` and the auction's `ended` time — a snapshot the bid
+    itself couldn't have influenced (it postdates the bid) but that also
+    predates the auction's own resolution, so it carries none of that
+    auction's own price either. Only when neither exists does the live `fmv`
+    row get used. Each row's `in_force_source` says which tier fired:
+    `'at_added'` (the ideal case), `'pre_end'` (BUI-981's addition), or
+    `'current'` (the leakage-prone fallback) — tallied in
+    `in_force_source_counts`. `band_source` keeps its original two-value
+    shape: both `'at_added'` and `'pre_end'` rows report `band_source ==
+    'history'` (both come from `fmv_history`), so existing consumers of
+    `band_source`/`band_source_counts` are unaffected by this tier split.
 
     **Why the fallback matters (leakage):** `get_first_party_outcomes` feeds
     a user's own resolved auctions straight into the comp pool that prices
     later `fmv` rows, so a book's `fmv` row recorded *after* an auction ended
-    can already have been pulled toward that very auction's own price. Only a
-    fixed history snapshot from at-or-before the bid's `added_at` is free of
-    that leakage; scoring against the live `fmv` row would flatter the report
-    by partly grading the band against itself. The `current_fmv` fallback
-    only fires when no such snapshot exists at all (e.g. a book added and
-    priced once, never repriced since) — those rows are still scored (an
-    accuracy report that silently drops them would undercount), but their
-    `band_source` says so, so a reader can weigh the difference.
+    can already have been pulled toward that very auction's own price. A
+    fixed history snapshot recorded at any point before the auction ended —
+    whether at-or-before the bid was added or only afterward but still
+    pre-resolution — is free of that leakage; scoring against the live `fmv`
+    row would flatter the report by partly grading the band against itself.
+    The `current` fallback only fires when neither snapshot exists at all
+    (e.g. a book added and priced once, never repriced since) — those rows
+    are still scored (an accuracy report that silently drops them would
+    undercount), but their `in_force_source` says so, so a reader can weigh
+    the difference.
 
     **Timestamp trap:** `bids.added_at` is stored `'YYYY-MM-DD HH:MM:SS'`
     (space separator, no offset) while `fmv_history.recorded_at` is ISO
@@ -4133,9 +4207,9 @@ def fmv_accuracy_report(
 
     With `include_rows=True`, also returns one row per scored auction: `bid_id`,
     `item_id`, `comic_id`, `title`, `issue`, `grade`, `certifier`, `status`,
-    `price`, `low`, `high`, `band_source`, `fmv_history_id`, `confidence`,
-    `comps`, `notes`, `ended` — so a later analysis ticket can consume the raw
-    rows instead of only the aggregates.
+    `price`, `low`, `high`, `band_source`, `in_force_source`, `fmv_history_id`,
+    `confidence`, `comps`, `notes`, `ended` — so a later analysis ticket can
+    consume the raw rows instead of only the aggregates.
 
     **`by_width_bucket` (BUI-983):** the same metric set as `overall`, sliced
     by band width `(high-low)/midpoint` into `zero` (`low == high` — the
@@ -4157,8 +4231,12 @@ def fmv_accuracy_report(
     all_rows = _fmv_accuracy_rows(conn, days=days)
 
     band_source_counts: dict[str, int] = {}
+    in_force_source_counts: dict[str, int] = {}
     for r in all_rows:
         band_source_counts[r["band_source"]] = band_source_counts.get(r["band_source"], 0) + 1
+        in_force_source_counts[r["in_force_source"]] = (
+            in_force_source_counts.get(r["in_force_source"], 0) + 1
+        )
 
     by_month: dict[str, list[dict[str, Any]]] = {}
     for r in all_rows:
@@ -4182,6 +4260,7 @@ def fmv_accuracy_report(
         "overall": overall,
         "by_month": by_month_report,
         "band_source_counts": band_source_counts,
+        "in_force_source_counts": in_force_source_counts,
         "by_width_bucket": _fmv_accuracy_split_by_width(all_rows),
         "by_prepost_bui528": _fmv_accuracy_split_by_prepost_bui528(all_rows),
     }
@@ -4200,6 +4279,7 @@ def fmv_accuracy_report(
                 "low": r["low"],
                 "high": r["high"],
                 "band_source": r["band_source"],
+                "in_force_source": r["in_force_source"],
                 "fmv_history_id": r["fmv_history_id"],
                 "confidence": r["confidence"],
                 "comps": r["comps"],
