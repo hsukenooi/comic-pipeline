@@ -30,12 +30,24 @@ def _iso_in(hours):
 
 
 def _printed_tier(line):
-    """The tier token from a grade-photos line, without BUI-917's reason.
+    """The tier token from a grade-photos line, without BUI-917's reason or
+    BUI-992's trailing `est_close` field.
 
     This is exactly what grade.md Step 2 is told to read: the token after
-    `tier: `, ignoring any trailing `(...)`.
+    `tier: `, ignoring any trailing `(...)` and stopping before the
+    ` — est_close: ` marker that now always follows (which can itself contain
+    a "(" — e.g. `unbounded — vintage 1964, 4d left` doesn't, but a naive
+    `.split(" (")` without isolating the tier segment first would still be
+    fragile against a future reason that does).
     """
-    return line.rsplit("— tier: ", 1)[1].split(" (")[0].strip()
+    tier_segment = line.rsplit("— tier: ", 1)[1].split(" — est_close:", 1)[0]
+    return tier_segment.split(" (")[0].strip()
+
+
+def _printed_est_close(line):
+    """The `est_close` field's raw text (BUI-992) — everything after the
+    ` — est_close: ` marker, which is always the last field on the line."""
+    return line.rsplit("— est_close: ", 1)[1].strip()
 
 
 # ============================================================
@@ -396,12 +408,14 @@ class TestMainStdoutContract:
         # Everything up to the tier is the historical contract, byte for byte.
         # BUI-917 appends the estimate that produced the tier; the exact
         # minutes-left text is clock-dependent, so match its shape, not its
-        # digits.
+        # digits. BUI-992 appends est_close last — here it's the same number
+        # as the tier's own estimate (there's only one live-auction dollar
+        # projection, shared by both).
         assert out.startswith(
             "comic-1: Fantastic Four #52 — 1 images — current bid $5.00 (1 bids) — "
             "tier: cheap (estimated: close ≤ $7.50 ($5.00 ×1.5, "
         )
-        assert out.endswith("m left, modern 2019))")
+        assert out.endswith("m left, modern 2019)) — est_close: $7.50")
 
     def test_fetch_failed_line_format(self, tmp_path, capsys):
         """BUI-147: a fetch failure must print FETCH FAILED, never a
@@ -476,14 +490,18 @@ class TestValueTier:
 
     def test_price_at_threshold_is_not_cheap(self, tmp_path, capsys):
         """The gate is inclusive at the boundary: current_price >= VALUE_THRESHOLD
-        is not-cheap, matching grade.md's escalation trigger 1 ("at or above")."""
+        is not-cheap, matching grade.md's escalation trigger 1 ("at or above").
+        est_close is unaffected by the tier's threshold short-circuit (BUI-992)
+        — it's still projected from the live auction's own headroom."""
         assert grade_photos.VALUE_THRESHOLD == 25.0
         out = self._run(tmp_path, self._item_with_price("25.00"), capsys)
-        assert out.endswith("— tier: not-cheap")
+        assert _printed_tier(out) == "not-cheap"
+        assert out.endswith("— tier: not-cheap — est_close: $37.50")
 
     def test_price_above_threshold_is_not_cheap(self, tmp_path, capsys):
         out = self._run(tmp_path, self._item_with_price("42.50"), capsys)
-        assert out.endswith("— tier: not-cheap")
+        assert _printed_tier(out) == "not-cheap"
+        assert out.endswith("— tier: not-cheap — est_close: $63.75")
 
     def test_unknown_price_is_not_cheap(self, tmp_path, capsys):
         """BUI-917 flips BUI-165's "absent price = below threshold = cheap".
@@ -499,7 +517,7 @@ class TestValueTier:
         }
         out = self._run(tmp_path, item, capsys)
         assert "current bid n/a" in out
-        assert out.endswith("— tier: not-cheap (price unknown)")
+        assert out.endswith("— tier: not-cheap (price unknown) — est_close: unbounded — price unknown")
 
 
 # ============================================================
@@ -634,6 +652,112 @@ class TestEstimatedCloseTier:
         assert _tier(None) == ("not-cheap", "price unknown")
 
 
+# ============================================================
+# BUI-992: estimated_close() — the numeric estimate printed as its own
+# `est_close` field and read by grade.md's decision-sensitivity gate instead
+# of current_price. Shares its projection with decide_tier() (see that
+# function's own why-string tests above), but is queried independently and
+# for every row, not only the ones that trip the not-cheap tier.
+# ============================================================
+
+
+def _est(price, *, is_auction=True, hours_left=96.5, bid_count=0,
+         age="modern", age_label="2019"):
+    """estimated_close() with the same young-auction defaults as _tier()
+    above, so the two helpers stay easy to compare side by side."""
+    return grade_photos.estimated_close(
+        price, is_auction=is_auction, hours_left=hours_left,
+        bid_count=bid_count, age=age, age_label=age_label,
+    )
+
+
+class TestEstimatedClose:
+    def test_no_price_is_unbounded(self):
+        assert _est(None) == (None, "price unknown")
+
+    def test_bin_returns_the_price_itself_no_reason(self):
+        """A fixed-price listing's price IS its close — nothing to project,
+        and no reason needed since there's no ambiguity to explain."""
+        assert _est(10.00, is_auction=False) == (10.00, None)
+
+    def test_bin_returns_the_price_even_for_a_young_vintage_book(self):
+        """The vintage/young-auction veto only applies to a LIVE auction whose
+        price can still move — a BIN price is already final regardless of the
+        book's age or how much time is nominally left on the listing."""
+        assert _est(10.00, is_auction=False, hours_left=96.5,
+                    age="vintage", age_label="1964") == (10.00, None)
+
+    def test_unknown_end_time_is_unbounded(self):
+        assert _est(4.25, hours_left=None) == (None, "end time unknown")
+
+    def test_vintage_young_auction_is_unbounded_however_early_graded(self):
+        """Mirrors decide_tier()'s own FF #29 case: no multiple of a young
+        bid is trustworthy for a pre-Modern book, so there is no number to
+        print — not even a generous upper bound."""
+        est, reason = _est(4.25, hours_left=96.5, bid_count=2,
+                            age="vintage", age_label="1964")
+        assert est is None
+        assert reason == "vintage 1964, 4d left"
+
+    def test_unknown_age_young_auction_is_unbounded(self):
+        est, reason = _est(4.25, age="unknown", age_label=None)
+        assert est is None
+        assert reason == "age unknown, 4d left"
+
+    def test_vintage_inside_the_final_hour_falls_back_to_the_projection(self):
+        """The age veto lifts inside _PRICE_NEARLY_FINAL_HOURS, same as the
+        tier — the bid IS the evidence that close to the end."""
+        est, reason = _est(4.25, hours_left=0.5, bid_count=2,
+                            age="vintage", age_label="1964")
+        assert reason is None
+        assert est == pytest.approx(4.25 * 1.5)
+
+    def test_modern_young_auction_projects_price_times_headroom(self):
+        est, reason = _est(4.00, hours_left=96.5, bid_count=0)
+        assert reason is None
+        assert est == pytest.approx(12.00)
+
+    def test_a_price_already_over_threshold_still_projects_when_vintage(self):
+        """BUI-992's point: unlike decide_tier() (which stops needing an
+        estimate once price crosses VALUE_THRESHOLD), estimated_close() has no
+        threshold shortcut — a $42.50 current bid on a 4-day-old vintage
+        auction is JUST as unbounded as a $4.25 one, because the veto is about
+        trusting a multiple of a young bid at all, not about which side of $25
+        it lands on."""
+        est, reason = _est(42.50, hours_left=96.5, bid_count=2,
+                            age="vintage", age_label="1964")
+        assert est is None
+        assert reason == "vintage 1964, 4d left"
+
+    def test_reason_is_none_exactly_when_est_close_is_not(self):
+        """Contract check across every branch: the two return values are never
+        both set and never both absent."""
+        cases = [
+            _est(None),
+            _est(10.00, is_auction=False),
+            _est(4.25, hours_left=None),
+            _est(4.25, age="vintage", age_label="1964"),
+            _est(4.25, age="unknown", age_label=None),
+            _est(4.25, hours_left=0.5),
+            _est(4.00),
+        ]
+        for est, reason in cases:
+            assert (est is None) != (reason is None)
+
+    def test_agrees_with_decide_tiers_own_dollar_estimate(self):
+        """Where decide_tier() computes a dollar figure at all, it must be the
+        exact number estimated_close() reports — one projection, two callers."""
+        price, hours_left, bid_count, age, age_label = 6.00, 48.0, 1, "modern", "2020"
+        tier, why = grade_photos.decide_tier(
+            price, is_auction=True, hours_left=hours_left, bid_count=bid_count,
+            age=age, age_label=age_label,
+        )
+        est, reason = _est(price, hours_left=hours_left, bid_count=bid_count,
+                            age=age, age_label=age_label)
+        assert reason is None
+        assert f"${est:.2f}" in why
+
+
 class TestAgeSignal:
     """The age signal reads the listing only — no FMV exists yet at grade time
     (in /comic:buy the grade step runs BEFORE fmv)."""
@@ -738,7 +862,13 @@ class TestEstimatedCloseTierEndToEnd:
         out = self._run(tmp_path, item, capsys)
         assert "current bid $4.25 (2 bids)" in out
         assert _printed_tier(out) == "not-cheap"
-        assert out.endswith("— tier: not-cheap (estimated: vintage 1964, 4d left)")
+        # BUI-992: the age-veto branch that decides the tier has no trustworthy
+        # dollar figure either — est_close is unbounded with the same reason.
+        assert out.endswith(
+            "— tier: not-cheap (estimated: vintage 1964, 4d left) "
+            "— est_close: unbounded — vintage 1964, 4d left"
+        )
+        assert _printed_est_close(out) == "unbounded — vintage 1964, 4d left"
 
     def test_modern_listing_closing_soon_prints_cheap(self, tmp_path, capsys):
         item = {
@@ -756,8 +886,10 @@ class TestEstimatedCloseTierEndToEnd:
         assert "estimated: close ≤ $6.24 ($4.99 ×1.25," in out
 
     def test_bin_listing_line_carries_no_estimate(self, tmp_path, capsys):
-        """A vintage BIN under the threshold: the price is final, so the line is
-        exactly what it was before BUI-917."""
+        """A vintage BIN under the threshold: the price is final, so the tier
+        stays exactly what it was before BUI-917 (bare, no parenthetical). BUI-992
+        still appends `est_close`, but the number is the BIN price itself — there
+        is nothing to project when the price already IS the close."""
         item = {
             "title": "Fantastic Four #29 (1964) Marvel Comics",
             "image": {"imageUrl": "https://example.com/main.jpg"},
@@ -768,7 +900,8 @@ class TestEstimatedCloseTierEndToEnd:
             "localizedAspects": [{"name": "Publication Year", "value": "1964"}],
         }
         out = self._run(tmp_path, item, capsys)
-        assert out.endswith("current bid $9.99 (None bids) — tier: cheap")
+        assert out.endswith("current bid $9.99 (None bids) — tier: cheap — est_close: $9.99")
+        assert _printed_est_close(out) == "$9.99"
 
     def test_auction_without_buying_options_is_still_treated_as_an_auction(self, tmp_path, capsys):
         """A response missing buyingOptions must not be mistaken for a BIN whose
@@ -823,6 +956,35 @@ class TestEstimatedCloseTierEndToEnd:
         out = self._run(tmp_path, item, capsys)
         assert _printed_tier(out) == "not-cheap"
         assert "estimated: vintage 1964" in out
+
+    def test_price_over_threshold_and_vintage_prints_bare_tier_but_unbounded_est_close(
+        self, tmp_path, capsys,
+    ):
+        """BUI-992's trickiest case for a line-format reader: the tier's own
+        threshold shortcut (price >= VALUE_THRESHOLD) means `why` is None, so
+        `tier: not-cheap` prints bare with no parenthetical — same as any other
+        already-over-threshold row. But estimated_close() has no such
+        shortcut, so `est_close` still comes back unbounded (a $42.50 bid on a
+        4-day-old vintage auction is no more trustworthy than a $4.25 one).
+        The printed line therefore has NO "(" at all before ` — est_close:` —
+        the exact shape that would break a `_printed_tier` helper naive about
+        where the tier segment ends."""
+        item = {
+            "title": "Fantastic Four #29 (1964) Marvel Comics Silver Age",
+            "image": {"imageUrl": "https://example.com/main.jpg"},
+            "additionalImages": [],
+            "buyingOptions": ["AUCTION"],
+            "currentBidPrice": {"value": "42.50"},
+            "bidCount": 2,
+            "itemEndDate": _iso_in(96.5),
+            "localizedAspects": [{"name": "Publication Year", "value": "1964"}],
+        }
+        out = self._run(tmp_path, item, capsys)
+        assert _printed_tier(out) == "not-cheap"
+        assert out.endswith(
+            "— tier: not-cheap — est_close: unbounded — vintage 1964, 4d left"
+        )
+        assert _printed_est_close(out) == "unbounded — vintage 1964, 4d left"
 
 
 # ============================================================

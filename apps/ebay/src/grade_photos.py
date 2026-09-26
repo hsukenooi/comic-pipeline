@@ -77,7 +77,7 @@ Labels each item comic-1, comic-2, ... in input order (matches the
 item:
 
     comic-1: FETCH FAILED — <error>
-    comic-1: <title> — <N> images — current bid $12.34 (3 bids) — tier: cheap
+    comic-1: <title> — <N> images — current bid $12.34 (3 bids) — tier: cheap — est_close: $12.34
 
 BUI-511: the trailing `tier: cheap|not-cheap` is this script's value-gate
 verdict (see VALUE_THRESHOLD below); grade.md's Step 2 reads this field
@@ -89,12 +89,25 @@ where it closes, so a low one graded early said `cheap` about a book worth far
 more. When the price is not yet final the tier comes from an estimated close
 instead (see decide_tier() below), and the line carries the reason:
 
-    comic-1: <title> — 6 images — current bid $4.25 (2 bids) — tier: not-cheap (estimated: vintage 1964, 4d left)
+    comic-1: <title> — 6 images — current bid $4.25 (2 bids) — tier: not-cheap (estimated: vintage 1964, 4d left) — est_close: unbounded — vintage 1964, 4d left
 
 A row the price alone decides — at/above the threshold, or a fixed-price (BIN)
 listing below it — prints the bare `tier: cheap|not-cheap` with no
 parenthetical, exactly as it did before. So a reader (or a parser) takes the
-token after `tier: ` and ignores any trailing `(...)`.
+token after `tier: `, ignores any trailing `(...)`, and stops at the
+` — est_close: ` marker that now always follows it.
+
+BUI-992: every line also carries its own `est_close` field, printed after the
+tier — a dollar figure (`est_close: $25.50`) or `est_close: unbounded —
+<reason>` when no trustworthy number exists (see estimated_close() below).
+grade.md's decision-sensitivity gate reads this field instead of
+`current_price` when comparing a bid cap against where the auction will
+land — the same not-yet-final number BUI-917 stopped the *tier* from trusting
+is no safer for a caller doing that comparison one layer up. Printed on every
+comic, including a BIN listing or a nearly-final auction where it equals the
+current price outright:
+
+    comic-1: <title> — 8 images — current bid $42.50 (5 bids) — tier: not-cheap — est_close: $42.50
 
 BUI-440: when --workdir is not given, each run gets its own fresh directory
 under /tmp/comic-grading (via tempfile.mkdtemp) instead of writing straight
@@ -178,6 +191,13 @@ VALUE_THRESHOLD = 25.0
 # left printed `cheap`, so a Silver Age Marvel that closes well above $25 got
 # one thin grader instead of a panel — the rigor a book received depended on
 # WHEN in its auction it happened to be graded rather than on what it is worth.
+#
+# BUI-992 reuses these same two constants (_PRICE_NEARLY_FINAL_HOURS and
+# _CLOSE_HEADROOM) for estimated_close() — the numeric estimate printed as its
+# own `est_close` field on every comic and read by grade.md's
+# decision-sensitivity gate. They are still the one knob to turn: tightening
+# them tightens both the tier's threshold call and the gate's comparison
+# point together, since both read the same projection.
 #
 # The asymmetry that sets every constant here: over-rigor costs one extra
 # grader agent; under-rigor puts a single thin grade on a book worth real money
@@ -330,6 +350,56 @@ def _close_headroom(hours_left, bid_count):
     return _CLOSE_HEADROOM[-1][2]  # unreachable (last bound is inf); safe default
 
 
+def estimated_close(price, *, is_auction, hours_left, bid_count, age, age_label):
+    """BUI-992: the numeric estimated close — what this auction is believed to
+    settle at — printed as its own `est_close` field on every comic and read by
+    grade.md's decision-sensitivity gate in place of `current_price`. The same
+    not-yet-final number BUI-917 stopped the *tier* from trusting is no safer
+    for a caller comparing a bid cap against where the auction will land.
+
+    Returns ``(est_close, reason)``. ``est_close`` is a float, or ``None`` when
+    no number can be trusted — ``reason`` then says why, and a caller must treat
+    the row as unbounded: never claim a decision can't move against a number
+    that doesn't exist. ``reason`` is ``None`` exactly when ``est_close`` isn't.
+
+    ``est_close`` is ``None`` for the same three cases decide_tier() already
+    treats as too ambiguous to call `cheap`:
+
+      - no price at all,
+      - a live auction with an unknown end time — nothing bounds how much room
+        the price still has,
+      - a live auction with more than `_PRICE_NEARLY_FINAL_HOURS` left on a
+        vintage or age-unknown book. decide_tier()'s own docstring says why:
+        for a pre-Modern book "no multiple of a young auction's bid is a
+        trustworthy estimate of the close" — `_CLOSE_HEADROOM`'s multipliers
+        are generous upper bounds calibrated to how a *modern* book's bidding
+        typically moves, and a Silver/Golden Age key can blow through any of
+        them in its closing minutes. Printing a dollar figure here would hand
+        the decision-sensitivity gate a number that looks precise but isn't a
+        bound — BUI-917's failure, one layer up.
+
+    Otherwise: a final price (BIN, or a live auction already inside
+    `_PRICE_NEARLY_FINAL_HOURS` of closing) returns that price itself — there
+    is nothing left to project. A modern/age-known book still early in its
+    auction returns `price x _close_headroom(hours_left, bid_count)` — the same
+    generous-upper-bound projection decide_tier() uses for its own dollar
+    estimate, so using it to prove a grade range can't move the buy call only
+    ever costs one extra grader, never under-covers real money.
+    """
+    if price is None:
+        return None, "price unknown"
+    if not is_auction:
+        return price, None
+    if hours_left is None:
+        return None, "end time unknown"
+    if hours_left > _PRICE_NEARLY_FINAL_HOURS and age in ("vintage", "unknown"):
+        remaining = _format_remaining(hours_left)
+        if age == "vintage":
+            return None, f"vintage {age_label}, {remaining}"
+        return None, f"age unknown, {remaining}"
+    return price * _close_headroom(hours_left, bid_count), None
+
+
 def decide_tier(price, *, is_auction, hours_left, bid_count, age, age_label):
     """The value gate: return ``(tier, why)`` for one listing.
 
@@ -348,20 +418,17 @@ def decide_tier(price, *, is_auction, hours_left, bid_count, age, age_label):
       3. Not a live auction (fixed-price/BIN) → cheap. Unchanged: a BIN price
          IS the close price, so there is nothing to estimate.
       4. A live auction below the threshold — the BUI-917 case. Its price is
-         not yet final, so:
-           a. End time unknown → not-cheap. We can't tell how much room the
-              price has left; ambiguous resolves to rigor.
-           b. More than _PRICE_NEARLY_FINAL_HOURS left, and the book is
-              vintage or its age is unknown → not-cheap. This is the FF #29
-              class: for a pre-Modern book no multiple of a young auction's
-              bid is a trustworthy estimate of the close, and a book whose age
-              we cannot read gets the same benefit of the doubt.
-           c. Otherwise compare an estimated close — price x the
-              _CLOSE_HEADROOM multiplier for the time left and the bid count —
-              against VALUE_THRESHOLD. At/above it, not-cheap; below it,
-              cheap. Inside the nearly-final window that multiplier is small,
-              so a modern book minutes from close at a low price with no bids
-              stays cheap, which is the whole point of keeping a cheap tier.
+         not yet final, so it defers to estimated_close() (BUI-992, above) for
+         the dollar figure — see that function for what "no trustworthy
+         estimate" means and why:
+           a. estimated_close() returns no number (unknown end time, or a
+              vintage/age-unknown book more than _PRICE_NEARLY_FINAL_HOURS from
+              closing) → not-cheap, carrying that function's reason verbatim.
+           b. Otherwise compare its estimate against VALUE_THRESHOLD. At/above
+              it, not-cheap; below it, cheap. Inside the nearly-final window
+              that estimate sits close to the current price, so a modern book
+              minutes from close at a low price with no bids stays cheap,
+              which is the whole point of keeping a cheap tier.
 
     Note what is NOT used: `bid_count` only ever says whether the auction is
     contested (>=1 bid), never how fast it is moving — the Browse API gives no
@@ -394,25 +461,23 @@ def decide_tier(price, *, is_auction, hours_left, bid_count, age, age_label):
         return "not-cheap", None
     if not is_auction:
         return "cheap", None
-    if hours_left is None:
-        return "not-cheap", "estimated: end time unknown"
-    remaining = _format_remaining(hours_left)
-    if hours_left > _PRICE_NEARLY_FINAL_HOURS:
-        if age == "vintage":
-            return "not-cheap", f"estimated: vintage {age_label}, {remaining}"
-        if age == "unknown":
-            return "not-cheap", f"estimated: age unknown, {remaining}"
+    est, unbounded_reason = estimated_close(
+        price, is_auction=is_auction, hours_left=hours_left,
+        bid_count=bid_count, age=age, age_label=age_label,
+    )
+    if est is None:
+        return "not-cheap", f"estimated: {unbounded_reason}"
     headroom = _close_headroom(hours_left, bid_count)
-    projected = price * headroom
+    remaining = _format_remaining(hours_left)
     # The age is named even though the projection doesn't use it: a wrong
     # `cheap` hides behind a wrong age read, so put it on the line where a
     # human reviewing the run can see it.
     age_note = f", {age} {age_label}" if age_label else f", age {age}"
     why = (
-        f"estimated: close ≤ ${projected:.2f} "
+        f"estimated: close ≤ ${est:.2f} "
         f"(${price:.2f} ×{headroom:g}, {remaining}{age_note})"
     )
-    return ("not-cheap" if projected >= VALUE_THRESHOLD else "cheap"), why
+    return ("not-cheap" if est >= VALUE_THRESHOLD else "cheap"), why
 
 
 class TokenExpiredError(RuntimeError):
@@ -701,6 +766,10 @@ def main(argv=None):
         consecutive_post_refresh_401s = 0
         price = result["current_price"]
         price_str = f"${price:.2f}" if price is not None else "n/a"
+        # BUI-917/BUI-992: computed once and shared by decide_tier() and
+        # estimated_close() so the tier's reason and the printed est_close
+        # field always agree on how much time is left within one run.
+        hours_left = _hours_remaining(result["end_date_iso"])
         # BUI-511: the tier is printed here so grade.md's Step 2 value gate
         # reads it directly instead of re-deriving the split from
         # current_price. BUI-917: it is now decide_tier()'s verdict — an
@@ -709,15 +778,33 @@ def main(argv=None):
         tier, why = decide_tier(
             price,
             is_auction=result["is_auction"],
-            hours_left=_hours_remaining(result["end_date_iso"]),
+            hours_left=hours_left,
             bid_count=result["bid_count"],
             age=result["age"],
             age_label=result["age_label"],
         )
+        # BUI-992: est_close is its own field, printed on every comic —
+        # grade.md's decision-sensitivity gate reads it instead of
+        # current_price. `unbounded — <reason>` means no trustworthy number
+        # exists (see estimated_close()); the gate must not suppress
+        # escalation against an unbounded row.
+        est_close, unbounded_reason = estimated_close(
+            price,
+            is_auction=result["is_auction"],
+            hours_left=hours_left,
+            bid_count=result["bid_count"],
+            age=result["age"],
+            age_label=result["age_label"],
+        )
+        est_str = (
+            f"${est_close:.2f}" if est_close is not None
+            else f"unbounded — {unbounded_reason}"
+        )
         print(
             f"{label}: {result['title']} — {result['image_count']} images — "
             f"current bid {price_str} ({result['bid_count']} bids) — "
-            f"tier: {tier}{f' ({why})' if why else ''}"
+            f"tier: {tier}{f' ({why})' if why else ''} — "
+            f"est_close: {est_str}"
         )
     return 0
 

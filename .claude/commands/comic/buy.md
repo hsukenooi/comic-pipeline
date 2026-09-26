@@ -164,7 +164,7 @@ candidates.
 
 - Pass only the ungraded item IDs — already-graded comics skip this step
 - The skill downloads photos via the eBay Browse API and dispatches the **`comic-grader` subagent** by type per comic (value-gated: 1 grader for cheap/unambiguous lots, a 3-grader panel for high-value or boundary-ambiguous ones). The grader persona + OUTPUT FORMAT contract lives in `.claude/agents/comic-grader.md` (scoped `Read, Bash`); grade.md passes it only the dynamic per-comic inputs
-- **Decision-sensitivity gate:** grade.md's Step 2 owns this rule (it's written to anticipate exactly this caller) — `/comic:buy` is the flow that *has* the current price and can compute FMV, so it can short-circuit grade.md's escalation to the 3-grader panel by probing FMV at the grade range's endpoints and comparing bid caps within `CAP_DECISION_TOLERANCE`. See grade.md Step 2 for the trigger conditions and constants.
+- **Decision-sensitivity gate:** grade.md's Step 2 owns this rule (it's written to anticipate exactly this caller) — `/comic:buy` is the flow that can compute FMV, so it can short-circuit grade.md's escalation to the 3-grader panel by probing FMV at the grade range's endpoints and comparing bid caps against grade.md Step 1's printed `est_close` (BUI-992 — never `current_price`) within `CAP_DECISION_TOLERANCE`. See grade.md Step 2 for the trigger conditions and constants.
 - Use the consensus grade output as the grade for Step 3 — and carry the **Confidence** column forward as `grade_confidence` (FMV uses it to haircut the bid cap when grade confidence is low)
 
 Present the photo-assessed grades to the user before proceeding:
