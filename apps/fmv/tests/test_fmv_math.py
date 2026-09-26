@@ -242,16 +242,20 @@ class TestPriceabilityGuards:
         # 4 grade points. It used to flag too_wide (no price); now it is priced
         # by interpolation between the 5.0 bucket (median $50) and the 9.0 bucket
         # (median $310): 50 + (7-5)/(9-5)*(310-50) = $180. BUI-318: BOTH brackets
-        # carry ≥2 comps (a lone-comp bracket now suppresses), and the max_bid is
-        # the interpolated-LOW haircut clean_round(180 × 0.60) = 110, not 0.80×.
+        # carry ≥2 comps (a lone-comp bracket now suppresses). BUI-990: the $180
+        # point is floored to a 40% band around it — $144-$216, clean-rounded
+        # to $140-$225 ($25 step above $200) — and the max_bid is the
+        # interpolated-LOW haircut on the floored high: clean_round(225 × 0.60)
+        # = 140, not 0.80×.
         comps = [_comp(40, 5.0), _comp(60, 5.0), _comp(300, 9.0), _comp(320, 9.0)]
         out = fm.compute_fmv(comps, target_grade=7.0)
         assert out["interpolated"] is True
         assert out["flag_reason"] is None      # cleared: now emits a bid-able number
         assert out["grade_span"] == 4.0
-        assert out["fmv_low"] == 180 and out["fmv_high"] == 180
+        assert out["fmv_low"] == 140 and out["fmv_high"] == 225
         assert out["median"] == 180
-        assert out["max_bid"] == 110           # clean_round(180 * 0.60) haircut
+        assert out["width_floored"] is True
+        assert out["max_bid"] == 140           # clean_round(225 * 0.60) haircut
         assert out["confidence"] == "LOW"      # §7: confidence reduced
 
     def test_too_sparse_flags_single_comp(self):
@@ -466,7 +470,9 @@ class TestDegenerateBackCompat:
 
     _PRICES = [100, 110, 120, 130, 140, 150, 160, 170, 180]
 
-    def test_no_date_pool_matches_unweighted_math_exactly(self):
+    def test_no_date_pool_matches_unweighted_math_exactly(self, monkeypatch):
+        # Pool math only: the BUI-990 width floor would widen this 28% band.
+        monkeypatch.setattr(fm, "MIN_BAND_WIDTH", 0.0)
         comps = [_comp(p, 8.0) for p in self._PRICES]
         out = fm.compute_fmv(comps, target_grade=8.0)
         assert out["effective_n"] == out["n"] == 9
@@ -791,16 +797,17 @@ class TestInterpolationInComputeFmv:
     def test_too_wide_bracketed_interpolates_with_exact_value(self):
         # target 6.0, grades 4.0(median $100) & 8.0(median $200): span 4.0 →
         # too_wide, but bracketed → 100 + (6-4)/(8-4)*(200-100) = $150. Both
-        # brackets carry ≥2 comps (BUI-318), so it interpolates. max_bid is the
-        # interpolated-LOW haircut: clean_round(0.60×150) = 90 (not 0.80×=120).
+        # brackets carry ≥2 comps (BUI-318), so it interpolates. BUI-990 floors
+        # the $150 point to $120-$180, and max_bid is the interpolated-LOW
+        # haircut on the floored high: clean_round(0.60×180) = 110.
         comps = [_comp(90, 4.0), _comp(110, 4.0), _comp(190, 8.0), _comp(210, 8.0)]
         out = fm.compute_fmv(comps, target_grade=6.0)
         assert out["interpolated"] is True
         assert out["flag_reason"] is None
-        assert out["fmv_low"] == 150 and out["fmv_high"] == 150
+        assert out["fmv_low"] == 120 and out["fmv_high"] == 180
         assert out["median"] == 150
         assert out["bid_factor"] == fm.INTERPOLATED_BID_FACTOR
-        assert out["max_bid"] == 90
+        assert out["max_bid"] == 110
         assert out["confidence"] == "LOW"
         assert out["interpolation"]["grade_below"] == 4.0
         assert out["interpolation"]["grade_above"] == 8.0
@@ -902,7 +909,8 @@ class TestInterpolationInComputeFmv:
         assert out["confidence"] == "LOW"
         assert out["bid_factor"] == fm.INTERPOLATED_BID_FACTOR
         assert out["bid_factor"] < fm.BASE_BID_FACTOR
-        assert out["max_bid"] == fm.clean_round(150 * fm.INTERPOLATED_BID_FACTOR)
+        # BUI-990: the haircut applies to the floored high ($150 point → $180).
+        assert out["max_bid"] == fm.clean_round(180 * fm.INTERPOLATED_BID_FACTOR)
 
     def test_haircut_is_interpolation_specific_not_generic_low(self):
         # Contrast to the above: a NON-interpolated LOW-confidence book with no
@@ -1625,15 +1633,19 @@ class TestMinRangeWidth:
         assert out["fmv_low"] < out["fmv_high"]
         assert out["fmv_low"] is not None
 
-    def test_identical_prices_stay_a_true_point(self):
-        # Genuinely degenerate (cv==0): the carve-out — no fabricated range.
+    def test_identical_prices_stay_a_true_point(self, monkeypatch):
+        # Genuinely degenerate (cv==0): the BUI-528 carve-out — no fabricated
+        # range. (BUI-990's width floor widens it afterwards; isolated here.)
+        monkeypatch.setattr(fm, "MIN_BAND_WIDTH", 0.0)
         out = fm.compute_fmv([_comp(50, 9.0), _comp(50, 9.0), _comp(50, 9.0)],
                              target_grade=9.0)
         assert out["fmv_low"] == out["fmv_high"] == 50
 
-    def test_healthy_ranged_pool_is_untouched(self):
+    def test_healthy_ranged_pool_is_untouched(self, monkeypatch):
         # A pool with a real (non-collapsed) range must be byte-identical to the
         # pre-BUI-528 behavior — the guard only ever fires on a zero-width band.
+        # (Its 9% band is below BUI-990's width floor; isolated here.)
+        monkeypatch.setattr(fm, "MIN_BAND_WIDTH", 0.0)
         out = fm.compute_fmv(
             [_comp(p, 9.0) for p in [100, 105, 110, 115, 120, 125, 130]],
             target_grade=9.0)
@@ -1720,7 +1732,7 @@ class TestForcedFlagReason:
         interpolated = fm.compute_fmv(comps, target_grade=6.0)
         assert interpolated["interpolated"] is True
         assert interpolated["flag_reason"] is None
-        assert interpolated["max_bid"] == 90
+        assert interpolated["max_bid"] == 110  # 0.60 × the BUI-990-floored $180
 
         forced = fm.compute_fmv(comps, target_grade=6.0,
                                 forced_flag_reason="variant_dropped")
@@ -2802,3 +2814,84 @@ class TestGradedNeverTouchesTheRawMachinery:
                        _slab_comp(900, 9.2, age=3),
                        _slab_comp(1400, 9.6, age=4)], 9.4)
         assert out["fmv_high"] is not None
+
+
+# ─── Minimum band-width floor (BUI-990) ──────────────────────────────────────
+
+class TestWidthFloor:
+    _NARROW = [85, 90, 95, 100, 105, 110, 115]   # pool band $90-$110 (20%)
+
+    def test_narrow_band_widens_to_floor_at_same_midpoint(self, monkeypatch):
+        comps = [_comp(p, 9.0) for p in self._NARROW]
+        out = fm.compute_fmv(comps, target_grade=9.0)
+        # $90-$110 → mid $100 × (1 ± 0.20) = $80-$120: exactly 40% wide.
+        assert (out["fmv_low"], out["fmv_high"]) == (80, 120)
+        assert (out["fmv_high"] - out["fmv_low"]) / 100 == fm.MIN_BAND_WIDTH
+        assert out["median"] == 100
+        assert out["width_floored"] is True
+        # max_bid rides the FLOORED high: clean_round(0.80 × 120) = 100.
+        assert out["max_bid"] == fm.clean_round(out["bid_factor"] * 120) == 100
+        # Same midpoint as the pool's own band.
+        monkeypatch.setattr(fm, "MIN_BAND_WIDTH", 0.0)
+        unfloored = fm.compute_fmv(comps, target_grade=9.0)
+        assert (unfloored["fmv_low"], unfloored["fmv_high"]) == (90, 110)
+        assert unfloored["width_floored"] is False
+        assert (out["fmv_low"] + out["fmv_high"]) == (
+            unfloored["fmv_low"] + unfloored["fmv_high"])
+
+    @pytest.mark.parametrize("prices", [
+        [60, 80, 100, 120, 140],        # exactly 40% ($80-$120) — at the floor
+        [50, 75, 100, 125, 150, 175],   # well above it
+    ])
+    def test_wide_band_is_unchanged(self, prices, monkeypatch):
+        comps = [_comp(p, 9.0) for p in prices]
+        out = fm.compute_fmv(comps, target_grade=9.0)
+        monkeypatch.setattr(fm, "MIN_BAND_WIDTH", 0.0)
+        base = fm.compute_fmv(comps, target_grade=9.0)
+        assert out["width_floored"] is False
+        for key in ("fmv_low", "fmv_high", "median", "max_bid"):
+            assert out[key] == base[key], key
+
+    def test_helper_exact_and_noop_cases(self):
+        assert fm.apply_width_floor(90, 110) == (80, 120, True)
+        assert fm.apply_width_floor(100, 100) == (80, 120, True)   # a point
+        assert fm.apply_width_floor(80, 120) == (80, 120, False)   # at floor
+        assert fm.apply_width_floor(50, 150) == (50, 150, False)
+        assert fm.apply_width_floor(0, 0) == (0, 0, False)         # no midpoint
+
+    def test_helper_invariants_over_every_clean_band(self):
+        """Over every clean-rounded band up to $3,000: the floored band is at
+        least MIN_BAND_WIDTH of the original midpoint, never narrower than the
+        input, never negative, and its high never exceeds the target
+        mid × 1.2 by more than half a clean step (plain nearest rounding)."""
+        grid = sorted({fm.clean_round(v) for v in range(0, 3001)})
+        for i, low in enumerate(grid):
+            for high in grid[i:i + 12]:
+                new_low, new_high, floored = fm.apply_width_floor(low, high)
+                mid = (low + high) / 2
+                assert new_low >= 0
+                assert new_low <= low and new_high >= high
+                if mid == 0:
+                    continue
+                assert (new_high - new_low) / mid >= fm.MIN_BAND_WIDTH - 1e-9
+                if floored:
+                    target = mid * (1 + fm.MIN_BAND_WIDTH / 2)
+                    assert new_high <= target + fm._clean_step(target) / 2
+                else:
+                    assert (new_low, new_high) == (low, high)
+
+    def test_anchor_divergence_is_judged_on_the_pool_band(self):
+        """The floor adds no market evidence, so widening must not mask a
+        pool-vs-anchor divergence (BUI-534)."""
+        graded = [_comp(390, 5.0), _comp(400, 5.0), _comp(405, 5.0),
+                  _comp(415, 6.0), _comp(425, 6.0), _comp(430, 6.0)]
+        grade_less = [_comp(220 + (i % 3) * 5) for i in range(36)]
+        out = fm.compute_fmv(graded + grade_less, target_grade=5.5)
+        assert out["width_floored"] is True
+        assert out["anchor_diverges"] is True
+
+    def test_cgc_proxy_band_is_not_floored(self):
+        # The 0.50-0.55 factor spread is a calibrated constant, out of scope.
+        out = fm.cgc_proxy_fmv(_ASM50_LADDER, target_grade=6.5)
+        assert (out["fmv_low"], out["fmv_high"]) == (600, 650)
+        assert out["width_floored"] is False

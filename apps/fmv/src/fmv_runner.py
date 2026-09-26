@@ -3069,6 +3069,10 @@ def _graded_ledger_advisory(server_url: str, *, inp: dict,
 
 # ─── Step 3b — CGC-proxy rescue (BUI-348) ─────────────────────────────────────
 
+# BUI-990: the notes key for a band widened by fmv_math.apply_width_floor.
+_WIDTH_FLOOR_NOTE_KEY = "width_floor"
+
+
 # The literal notes marker for a CGC-proxy band. Shared by `_build_notes`
 # (writer) and `_cgc_proxy_from_notes` (cache-reuse reader) so the round-trip
 # can't drift on a reword — a mismatch would silently drop the proxy bid-cap
@@ -4373,6 +4377,11 @@ def _build_notes(fmv: dict) -> str:
             f"(median ${interp['median_below']:g}→${interp['median_above']:g}); "
             "confidence reduced"
         )
+    # BUI-990: mark a band the minimum-width floor widened, naming the floor
+    # applied, so a later band_compare can tell floored bands from organic ones
+    # (and the cached path can recover the flag — see _width_floored_from_notes).
+    if fmv.get("width_floored"):
+        parts.append(f"{_WIDTH_FLOOR_NOTE_KEY}={fmv_math.MIN_BAND_WIDTH:.2f}")
     # BUI-306 §5: surface any grade-curve monotonicity violation so a suspect
     # bucket is flagged for review rather than silently blended into the pool.
     suspect = fmv.get("suspect_buckets")
@@ -4572,6 +4581,15 @@ def _cgc_proxy_from_notes(notes: str | None) -> bool:
     return notes is not None and _CGC_PROXY_NOTE_TOKEN in notes
 
 
+def _width_floored_from_notes(notes: str | None) -> bool:
+    """Recover the BUI-990 width-floor flag from a cached row's fmv_notes.
+
+    Same lossy recovery as ``_anchor_diverges_from_notes``: there is no column,
+    but `_build_notes` writes a `width_floor=<floor>` token on a floored band.
+    """
+    return notes is not None and f"{_WIDTH_FLOOR_NOTE_KEY}=" in notes
+
+
 def _anchor_diverges_from_notes(notes: str | None) -> bool:
     """Recover the BUI-534 anchor-divergence flag from persisted fmv_notes.
 
@@ -4724,6 +4742,8 @@ def _fmv_from_db_row(row: dict, grade_confidence: str | None = None) -> dict:
         "interpolated": interpolated,
         "interpolation": None,
         "suspect_buckets": [],
+        # BUI-990: recovered from the `width_floor=` notes token.
+        "width_floored": _width_floored_from_notes(row.get("fmv_notes")),
         # BUI-348: shape parity + recovered proxy marker so a re-displayed /
         # re-served cached row still reads as a proxy band, not a raw range. The
         # full ladder detail isn't reconstructed (same lossy projection as
