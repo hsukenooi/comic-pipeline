@@ -18,7 +18,13 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from gixen_overlay.db import create_tables, get_comps, upsert_comic, upsert_comps
+from gixen_overlay.db import (
+    _migrate_restamp_comps_certifier_bui997,
+    create_tables,
+    get_comps,
+    upsert_comic,
+    upsert_comps,
+)
 
 # `api` fixture: see conftest.py (BUI-630 de-duplicated the three hand-copies).
 
@@ -345,6 +351,153 @@ def test_upsert_comps_deleting_comic_orphans_comps_not_deletes(db):
     row = db.execute("SELECT * FROM comps").fetchone()
     assert row is not None
     assert row["comic_id"] is None
+
+
+# ---------------------------------------------------------------------------
+# _migrate_restamp_comps_certifier_bui997 — the one-time restamp
+# ---------------------------------------------------------------------------
+#
+# BUI-993 fixed the writer (an `include_graded` slab comp reaching
+# `upsert_comps` with no `certifier` key landed on the 'none' default), but
+# left existing rows wrong. `_migrate_backfill_comps_certifier` (BUI-924) is
+# marker-gated and already ran on the Mac Mini before BUI-993's bug started
+# writing `none` rows, so it will never see them. These tests pin the second,
+# independently-marked pass that does.
+
+
+def _slab_no_certifier_key(db, comic_id, **overrides) -> None:
+    """Reproduce the BUI-993 writer bug: an `include_graded` slab comp POSTed
+    with no `certifier` key at all, landing on `upsert_comps`'s 'none'
+    default — never a comp dict that explicitly asks for 'none'."""
+    comp = _comp(pool="slab", **overrides)
+    comp.pop("certifier", None)
+    upsert_comps(db, comic_id, [comp])
+
+
+def _reset_restamp_marker(db) -> None:
+    """The `db` fixture's own `create_tables` call already ran this migration
+    once, against zero rows, so its marker is set before any test seeds data
+    — exactly mirroring the Mac Mini, where v1 (and v2, once deployed) ran
+    against the DB shape at the time. Clearing the marker here re-arms the
+    migration against the contaminated rows a test then seeds, mirroring
+    `test_fmv_provenance.py`'s `_seed` helper for the same reason."""
+    db.execute("DELETE FROM migration_state "
+               "WHERE migration='restamp_comps_certifier_bui997'")
+
+
+def test_restamp_claims_cgc_and_cbcs_titles(db):
+    comic_id = _comic(db)
+    _slab_no_certifier_key(
+        db, comic_id, product_id="16410",
+        title="Batman #227 CGC  6.5 - Fresh From CGC! (DC Comics December 1970)",
+    )
+    _slab_no_certifier_key(
+        db, comic_id, product_id="cbcs1", title="Amazing Spider-Man #300 CBCS 9.6",
+    )
+    _reset_restamp_marker(db)
+    _migrate_restamp_comps_certifier_bui997(db)
+    rows = {r["product_id"]: r["certifier"] for r in
+            db.execute("SELECT product_id, certifier FROM comps")}
+    assert rows["16410"] == "cgc"
+    assert rows["cbcs1"] == "cbcs"
+
+
+def test_restamp_leaves_unmatched_slab_titles_alone(db):
+    """Done-when only covers titles naming CGC or CBCS — a slab comp whose
+    title names neither grader must NOT be stamped 'other' (that was v1's
+    rule for a differently-scoped input set; see the function's docstring)."""
+    comic_id = _comic(db)
+    _slab_no_certifier_key(
+        db, comic_id, product_id="mystery1", title="Batman #227 9.0 slabbed",
+    )
+    _reset_restamp_marker(db)
+    _migrate_restamp_comps_certifier_bui997(db)
+    row = db.execute(
+        "SELECT certifier FROM comps WHERE product_id='mystery1'"
+    ).fetchone()
+    assert row["certifier"] == "none"
+
+
+def test_restamp_leaves_raw_pool_rows_alone(db):
+    comic_id = _comic(db)
+    upsert_comps(db, comic_id, [_comp(
+        product_id="raw1", pool="raw", title="Batman #227 CGC 6.5",
+    )])
+    _reset_restamp_marker(db)
+    _migrate_restamp_comps_certifier_bui997(db)
+    row = db.execute(
+        "SELECT certifier FROM comps WHERE product_id='raw1'"
+    ).fetchone()
+    assert row["certifier"] == "none"
+
+
+def test_restamp_leaves_already_certified_slab_rows_alone(db):
+    """A slab row v1 already stamped (e.g. 'other', or a genuine CGC hit)
+    must not be touched — the WHERE clause is scoped to certifier='none'."""
+    comic_id = _comic(db)
+    upsert_comps(db, comic_id, [_comp(
+        product_id="other1", pool="slab", certifier="other",
+        title="Some Comic PGX 9.0",
+    )])
+    _reset_restamp_marker(db)
+    _migrate_restamp_comps_certifier_bui997(db)
+    row = db.execute(
+        "SELECT certifier FROM comps WHERE product_id='other1'"
+    ).fetchone()
+    assert row["certifier"] == "other"
+
+
+def test_restamp_is_idempotent_and_one_time(db):
+    for _ in range(3):
+        _migrate_restamp_comps_certifier_bui997(db)  # must not raise
+
+    comic_id = _comic(db)
+    _slab_no_certifier_key(
+        db, comic_id, product_id="later1", title="Later Book CGC 9.8",
+    )
+    _migrate_restamp_comps_certifier_bui997(db)
+    # Marker already set by the loop above (a fresh DB runs this at
+    # create_tables time) — a row written AFTER that first pass stays
+    # unrestamped, proving this is genuinely one-time, not re-armed on
+    # every call.
+    row = db.execute(
+        "SELECT certifier FROM comps WHERE product_id='later1'"
+    ).fetchone()
+    assert row["certifier"] == "none"
+
+
+def test_restamp_safe_on_a_fresh_db(db):
+    """create_tables already called this during fixture setup with zero rows
+    present — must not raise, and the marker must be set."""
+    _migrate_restamp_comps_certifier_bui997(db)  # second call, still safe
+    marker = db.execute(
+        "SELECT 1 FROM migration_state "
+        "WHERE migration='restamp_comps_certifier_bui997'"
+    ).fetchone()
+    assert marker is not None
+
+
+def test_restamp_still_fires_on_a_db_where_v1_already_ran(db):
+    """The core scenario: v1's marker is set (as it is on the Mac Mini) —
+    this migration must still restamp what v1 could never have seen."""
+    assert db.execute(
+        "SELECT 1 FROM migration_state WHERE migration='backfill_comps_certifier'"
+    ).fetchone() is not None  # v1 already ran at create_tables time
+
+    comic_id = _comic(db)
+    _slab_no_certifier_key(
+        db, comic_id, product_id="post_bui993", title="X-Men #1 CGC 9.4",
+    )
+    # Clear v2's own marker so this test exercises it fresh, mirroring how
+    # every row above actually reached certifier='none' on the Mac Mini:
+    # v1's marker is already set from create_tables, and the BUI-993 bug
+    # wrote 'none' rows afterward.
+    _reset_restamp_marker(db)
+    _migrate_restamp_comps_certifier_bui997(db)
+    row = db.execute(
+        "SELECT certifier FROM comps WHERE product_id='post_bui993'"
+    ).fetchone()
+    assert row["certifier"] == "cgc"
 
 
 # ---------------------------------------------------------------------------

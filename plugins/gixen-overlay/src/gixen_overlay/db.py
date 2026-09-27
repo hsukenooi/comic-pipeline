@@ -481,6 +481,13 @@ def create_tables(conn: sqlite3.Connection) -> None:
     # PRAGMA-guarded ALTER pattern as `flag_reason`/`provenance` above.
     _migrate_add_comps_certifier_columns(conn)
     _migrate_backfill_comps_certifier(conn)
+    # BUI-997: v1 above already ran on the Mac Mini (its marker is set, so it
+    # never fires again) BEFORE BUI-993 fixed the writer that let
+    # `include_graded` slab comps reach the ledger with no certifier key —
+    # those rows landed as `certifier='none'` afterward, invisible to v1's
+    # one-time pass. A second, independently-marked one-time pass catches
+    # what v1 could not have seen.
+    _migrate_restamp_comps_certifier_bui997(conn)
     # BUI-947: additive for the same reason, and with no backfill of its own —
     # NULL already means "never stamped", which is the truth for every row
     # that existed before this column did. Ordered after the certifier pair
@@ -1203,6 +1210,67 @@ def _migrate_backfill_comps_certifier(conn: sqlite3.Connection) -> None:
     if counts:
         logger.info("_migrate_backfill_comps_certifier: %s", counts)
     _set_migration_marker(conn, "backfill_comps_certifier")
+
+
+def _migrate_restamp_comps_certifier_bui997(conn: sqlite3.Connection) -> None:
+    """One-time restamp of `comps.certifier` for slab rows v1 never saw (BUI-997).
+
+    BUI-993 (PR #595) fixed the writer: an `include_graded` slab comp reached
+    `upsert_comps` with no certifier key and was stored as `certifier='none'`
+    — wrong for a `pool='slab'` row by definition (see `_COMPS_SLAB_CERTIFIER_RE`
+    above). `upsert_comps` keeps the FIRST answer on a re-observe (KTD4), and
+    no endpoint ever rewrites `certifier`, so those rows stay wrong forever
+    without a migration. `_migrate_backfill_comps_certifier` (BUI-924, just
+    above) already ran its one-time pass on the Mac Mini before the BUI-993
+    bug started writing `none` rows, so its marker is set and it will never
+    fire again on the very rows this ticket is about — hence a second,
+    independently-marked one-time pass rather than clearing v1's marker
+    (which would also re-run v1's own `other` fallback over anything a human
+    has since touched).
+
+    Deliberately narrower than v1: a row whose title names neither grader is
+    left at `certifier='none'` rather than stamped `other`. v1's `other`
+    fallback was correct for its own scope (every `pool='slab'` row existed
+    only because the writer had already classified it as a slab), but here
+    the input set is differently contaminated — BUI-997's done-when is only
+    "every slab comp whose title names CGC or CBCS carries that certifier";
+    inventing `other` for the rest would overreach past what evidence
+    actually supports for this batch, and a fresh `none` slab row remains
+    visibly wrong (rather than silently plausible) for a future pass to find.
+
+    Not a collision risk: `idx_comps_identity` is
+    `(provider, product_id, COALESCE(comic_id, -1), pool)` — `certifier` is
+    not part of the key (see the comment on that index), so restamping one
+    row's certifier can never collide with another row already stamped the
+    same way.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM migration_state "
+        "WHERE migration='restamp_comps_certifier_bui997'"
+    ).fetchone()
+    if row is not None:
+        return
+
+    counts: dict[str, int] = {}
+    unmatched = 0
+    for r in conn.execute(
+        "SELECT id, title FROM comps WHERE pool='slab' AND certifier='none'"
+    ).fetchall():
+        match = _COMPS_SLAB_CERTIFIER_RE.search(r["title"] or "")
+        if match is None:
+            unmatched += 1
+            continue
+        certifier = match.group(1).lower()
+        conn.execute(
+            "UPDATE comps SET certifier=? WHERE id=?", (certifier, r["id"])
+        )
+        counts[certifier] = counts.get(certifier, 0) + 1
+    if counts or unmatched:
+        logger.info(
+            "_migrate_restamp_comps_certifier_bui997: restamped=%s "
+            "left_unmatched_as_none=%d", counts, unmatched
+        )
+    _set_migration_marker(conn, "restamp_comps_certifier_bui997")
 
 
 def _migrate_add_fmv_history_certifier_columns(conn: sqlite3.Connection) -> None:
