@@ -43,6 +43,18 @@ COMPS_EXCLUSION_CODES = (
 )
 COMPS_EXCLUSION_CODE_MANUAL = "manual"
 
+# BUI-998/BUI-1008: the columns a compare-and-set restamp
+# (`POST /api/comics/comps/restamp`) may touch. Deliberately NOT `certifier`
+# — BUI-997 already restamped every `certifier='none'` slab row via its own
+# one-line-regex migration, so there is nothing left in that column for this
+# generic endpoint to fix. `grade` carries no CHECK (any REAL is legal), so
+# it is validated only for type, not vocabulary; `label`/`page_quality` are
+# additionally checked against `FMV_LABELS`/`COMP_PAGE_QUALITIES` — the same
+# tuples the table's own CHECK constraints enforce — both here (defense in
+# depth behind `models.CompsRestampItem`, the same belt-and-suspenders
+# posture `stamp_comps_excluded` takes on `COMPS_EXCLUSION_CODES`) and there.
+COMPS_RESTAMP_FIELDS = ("grade", "label", "page_quality")
+
 # BUI-659: the fmv_history closed vocabulary. 'upsert' marks a row appended
 # by the live POST /api/comics path (api_upsert_comic); 'backfill' marks a
 # row seeded once by the one-time migration from pre-existing `fmv` rows.
@@ -4790,6 +4802,179 @@ def unstamp_comps_excluded(
         "unstamped": unstamped,
         "not_stamped": not_stamped,
         "not_found": not_found,
+    }
+
+
+DEFAULT_COMPS_ALL_LIMIT = 500
+MAX_COMPS_ALL_LIMIT = 2000
+
+
+def list_all_comps(
+    conn: sqlite3.Connection,
+    *,
+    pool: str | None = None,
+    after_id: int = 0,
+    limit: int = DEFAULT_COMPS_ALL_LIMIT,
+) -> list[sqlite3.Row]:
+    """Page through the WHOLE `comps` ledger by id — READ-ONLY, DIAGNOSTIC/
+    AUDIT ONLY (BUI-1008).
+
+    Every other comps read (`get_comps`) resolves ONE book first
+    (`comic_id`, or `(title, issue[, year])`) and cannot enumerate the
+    archive without already knowing every book identity in it — exactly the
+    gap a restamp sweep (`POST /api/comics/comps/restamp`'s client) needs
+    closed: it must walk every stored row to recompute `grade`/`label`/
+    `page_quality` against the current parser and diff. This is the
+    smallest read path that closes it: a plain cursor over `id`, no book
+    resolution, no join.
+
+    `after_id` (default 0, i.e. start from the beginning — every `id` is a
+    positive autoincrement primary key) is the page cursor: a caller passes
+    the previous page's last row's `id` to get the next page, so paging is
+    stable under concurrent inserts (a new row always sorts after every id
+    already paged past) the way an OFFSET-based page would not be. `limit`
+    is capped at `MAX_COMPS_ALL_LIMIT` server-side — a caller cannot request
+    an unbounded single-query read of the largest table in the schema.
+
+    **Never call this from the pricing path** — same scope boundary as
+    `get_comps`/`get_fmv_history` (see their docstrings): this returns
+    stored history, never something to price a book from.
+    """
+    limit = min(limit, MAX_COMPS_ALL_LIMIT)
+    clauses = ["id > ?"]
+    params: list[Any] = [after_id]
+    if pool is not None:
+        clauses.append("pool = ?")
+        params.append(pool)
+    where = " AND ".join(clauses)
+    return conn.execute(
+        f"SELECT * FROM comps WHERE {where} ORDER BY id LIMIT ?",
+        (*params, limit),
+    ).fetchall()
+
+
+def restamp_comps(
+    conn: sqlite3.Connection,
+    items: list[dict[str, Any]],
+    *,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """Compare-and-set restamp of `comps.grade`/`label`/`page_quality`
+    (BUI-998/BUI-1008).
+
+    The GENERIC counterpart to BUI-997's one-off `certifier='none'`
+    migration. BUI-997 could get away with a startup migration because its
+    rule was a one-line regex the server itself could re-run against every
+    row. BUI-1008's rule is `sold_comps.parse_grade` — a large, `apps/ebay`
+    -only function this server cannot import (apps/fmv shells out to it;
+    the overlay is not even in that dependency chain) — so the recompute has
+    to happen CLIENT-side (the `apps/ebay` restamp script), and only the
+    DIFF is posted here. BUI-998's label/page_quality rows are cheap enough
+    to recompute the same way, so one endpoint serves both rather than
+    growing a second near-identical migration.
+
+    COMPARE-AND-SET, not blind write: each item names the row (`id`, the
+    `comps` table's own primary key — same addressing as
+    `unstamp_comps_excluded`, for the same reason: an operator/script already
+    holds it from a prior read, and it is the one identity nothing else about
+    the row can get wrong) plus `expected` (what the caller's read of the row
+    believed the field held) and `new` (what the freshly-recomputed parser
+    says it should hold). A row is written only when its CURRENT stored value
+    still equals `expected` — if some other writer already changed it since
+    the caller's read (a live re-fetch upserting a fresher grade, another
+    restamp call, a hand correction), the row is reported `skipped_stale` and
+    left untouched rather than overwritten blind. This is the same
+    read-diff-then-conditionally-write shape `derive_pricing_basis` already
+    protects the *live* upsert path with (BUI-952) — here it protects a
+    *batch* one against racing the live path instead of against a stale
+    caller re-running the same idea.
+
+    `field` is one of `COMPS_RESTAMP_FIELDS` — re-checked here (defense in
+    depth behind `models.CompsRestampItem`) so a direct-Python caller cannot
+    supply a column name the API would refuse, the same posture
+    `stamp_comps_excluded` takes on `code`. Because `field` selects a SQL
+    identifier, not a bound parameter, it MUST be validated against this
+    closed tuple before ever reaching an f-string — done unconditionally,
+    before any row is touched.
+
+    An unknown `id` is reported in `not_found`, never a 404/500 — a restamp
+    call is a BATCH of independent items, and one stale id must not fail the
+    rest of the batch (the same "report, don't obey" posture
+    `stamp_comps_excluded`'s `not_found` bucket already takes on an id that
+    resolves to no row, or the wrong pool).
+
+    ONE TRANSACTION PER CALL: every compare-and-set UPDATE below runs before
+    the single `conn.commit()` at the end (or not at all, under
+    `dry_run=True`) — Python's sqlite3 module opens an implicit transaction
+    before the first UPDATE and holds it open across the whole loop, exactly
+    the pattern `stamp_comps_excluded` already relies on for the same
+    guarantee. NEVER deletes — a restamp corrects a stored field in place,
+    the row itself is never at risk.
+
+    Returns `{dry_run, matched, changed, skipped_stale, not_found, results}`.
+    `matched` is rows this call actually found (`changed + skipped_stale`) —
+    the complement of `not_found` within `len(items)` — reported separately
+    from `changed` because "I found 40 of the 42 you named" is a different
+    fact from "I changed 40". `results` carries one entry per item so a
+    caller can act on (or just log) exactly which id landed in which bucket,
+    the same granularity `stamp_comps_excluded`'s `not_found` id list gives.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    matched = changed = skipped_stale = not_found = 0
+    results: list[dict[str, Any]] = []
+    for item in items:
+        field = item["field"]
+        if field not in COMPS_RESTAMP_FIELDS:
+            raise ValueError(
+                f"unknown restamp field {field!r} "
+                f"(expected one of {COMPS_RESTAMP_FIELDS})"
+            )
+        row_id = item["id"]
+        row = conn.execute(
+            f"SELECT {field} AS current_value FROM comps WHERE id = ?",
+            (row_id,),
+        ).fetchone()
+        if row is None:
+            not_found += 1
+            results.append({
+                "id": row_id, "field": field, "status": "not_found",
+            })
+            continue
+        matched += 1
+        current = row["current_value"]
+        expected = item["expected"]
+        if current != expected:
+            skipped_stale += 1
+            results.append({
+                "id": row_id, "field": field, "status": "skipped_stale",
+                "current": current, "expected": expected,
+            })
+            continue
+        new_value = item["new"]
+        if not dry_run:
+            conn.execute(
+                f"UPDATE comps SET {field} = ? WHERE id = ?",
+                (new_value, row_id),
+            )
+        changed += 1
+        results.append({
+            "id": row_id, "field": field, "status": "changed",
+            "from": current, "to": new_value,
+        })
+    if not dry_run and changed:
+        conn.commit()
+        logger.info(
+            "restamp_comps: matched=%d changed=%d skipped_stale=%d "
+            "not_found=%d at=%s",
+            matched, changed, skipped_stale, not_found, now,
+        )
+    return {
+        "dry_run": dry_run,
+        "matched": matched,
+        "changed": changed,
+        "skipped_stale": skipped_stale,
+        "not_found": not_found,
+        "results": results,
     }
 
 

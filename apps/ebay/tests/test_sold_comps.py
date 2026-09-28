@@ -5816,6 +5816,35 @@ class TestGradedIdentityGuardsInFetch:
         by_id = {d["product_id"]: d["code"] for d in out["graded_identity_dropped_ids"]}
         assert by_id == {"j0": "multibook_lot", "j1": "cross_title", "j2": "store_variant"}
 
+    def test_include_graded_raw_target_stamps_slab_identity_in_comps(
+            self, tmp_path, monkeypatch):
+        """BUI-998: before this fix, a slab-titled comp surviving THIS same
+        include_graded-only raw-target pass (route_slabs=False, so it lands
+        in `comps` rather than `slab_comps`) carried no `certifier`/`label`/
+        `page_quality` at all — `_run` only ever called `parse_slab_fields`
+        inside the `route_slabs`-gated branch a few lines below, which this
+        pass never reaches. comic-fmv's `_slab_comps_only` patched in a bare
+        certifier of its own afterward, but had no way to recover label/
+        page_quality (see its docstring — those two are corpus-tuned tables
+        it cannot duplicate). This pins the fix at the source: every
+        slab-titled comp in `comps`, not just ones routed to `slab_comps`,
+        now carries all three fields — including a page-quality token the
+        title names."""
+        genuine_white = (
+            "Batman #227 1970 CGC 4.5 White Pages Neal Adams Cover", 700.0)
+        self._wire(tmp_path, monkeypatch, [[self._comp("good", *genuine_white)]])
+        out = sc.fetch_book_comps(
+            {"title": "Batman", "issue": "227", "year": 1970, "grade": 4.5,
+             "include_graded": True},
+            "key",
+        )
+        assert out["slab_comps"] == []
+        by_title = {c["title"]: c for c in out["comps"]}
+        stamped = by_title[genuine_white[0]]
+        assert stamped["certifier"] == "cgc"
+        assert stamped["label"] == "universal"
+        assert stamped["page_quality"] == "white"
+
     def test_a_variant_target_keeps_its_own_variant_comps(self, tmp_path, monkeypatch):
         self._wire(tmp_path, monkeypatch, self._results())
         out = sc.fetch_book_comps(
