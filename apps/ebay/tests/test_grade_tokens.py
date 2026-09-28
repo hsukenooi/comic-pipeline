@@ -51,6 +51,26 @@ class TestLetterPatterns:
                 return
         pytest.fail("no pattern matched VF/NM")
 
+    # BUI-1003: the same "first match in list order wins" guarantee, pinned
+    # for the split-grade combos this ticket added/widened — each must
+    # resolve via its own Tier-1 combo entry, not a Tier-2/3 component.
+    @pytest.mark.parametrize("title,expected", [
+        ("F/VF copy", 7.0),
+        ("VF-NM copy", 9.0),
+        ("G/VG copy", 3.0),
+        ("VG-FN copy", 5.0),
+        ("FN-VF copy", 7.0),
+        ("Very Fine+ copy", 8.5),
+        ("Very Fine- copy", 7.5),
+        ("VFN copy", 8.0),
+    ])
+    def test_split_grade_entries_resolve_first(self, title, expected):
+        for pattern, value in gt._LETTER_PATTERNS:
+            if pattern.search(title):
+                assert value == expected
+                return
+        pytest.fail(f"no pattern matched {title!r}")
+
 
 # ─── Certifier resolution ───────────────────────────────────────────────────
 
