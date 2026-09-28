@@ -326,6 +326,24 @@ class TestHardExclude:
         # either — the ordinal token catches it regardless of the "1st Print".
         "GHOST RIDER #15 (1991) 1st Print & Gold 2nd Print Glow in the Dark Cover NM",
         "Marvel The Incredible Hulk #377 (1991) direct 1st & 2nd print",
+        # BUI-1009: "facsimile" misspellings. Real corpus listings that
+        # survived hard_exclude before this rule (BUI-1004's Wolverine #1/
+        # X-Men #101 finding). "facsimlie" and "facimile" were also candidate
+        # spellings but measured ZERO hits over the live comps corpus and were
+        # not added — see docs/audit/2026-09-29-bui-1009-ledger-matches.json.
+        "X-MEN #101 FACSIMILIE NM/M HIGH GRADE - UNREAD [RM]",
+        "[FOIL] X-MEN #101 / FACSIMILIE ED. / UNKNOWN COMICS / DAVE COCKRUM EXCLUSIVE VAR",
+        "AMAZING SPIDER-MAN #300 FIRST APP VENOM **FOIL** FASCIMILE",
+        "DC Comics Detective Comics #400 Batman Robin Batgirl Man-Bat Challenge FASCIMILE",
+        # BUI-1009: an "X2"/"2X" copy-count token — a multi-COPY sale of one
+        # issue that _LOT_RE/_FMV_LOT_RE miss (no issue LIST, no "lot"/"set"/
+        # "run" word). Real corpus listings that survived hard_exclude before
+        # this rule.
+        "Uncanny X-Men #239 X2 - 1st Print Mr. Sinister Cover Marvel Comics 1988 9.0,8.5",
+        "SUPERMAN THE MAN OF STEEL 18 X2 BOTH VF NEWSSTAND V1 DC 1992! 1ST FULL DOOMSDAY",
+        "Ghost Rider #15 Marvel 1991 NM 9.4 First glow-in-the-dark comic cover x2",
+        "K.O. Red Hood vs The Joker #1 Guillem March Var(x2) & 1 Bermejo Variant 2026",
+        "X-Men #1 (B cover) & #2 (Marvel 1991) 2 x VF- comics.",
     ])
     def test_excludes(self, title):
         assert sc.hard_exclude(title)
@@ -426,6 +444,21 @@ class TestHardExclude:
         "Tales to Astonish 60 Giant Man Includes Reprint of Hulk 6 Silver Age 1964",
         "Nick Fury Agent of SHIELD #17 (1971)- Bronze Age, 52-Pg Giant, Reprints",
         "X-Men #66 Marvel 1970 Last Original Story Before Reprints Silver Age",
+        # ── BUI-1009 negative controls ──────────────────────────────────────
+        # A real corpus listing where "X2" means two SIGNATURES on one book
+        # ("SS" = Signature Series), not two copies — the `(?<!ss\s)`
+        # lookbehind keeps this single signed issue in the comp pool.
+        "Uncanny X-Men #212 newsstand 9.4 WP SS X2 Claremont Leonardi",
+        # A real corpus listing where "X 2.5" is a decimal GRADE fragment
+        # ("Professor X", then grade "2.5"), not a copy-count token — the
+        # `(?!\.\d)` lookahead (same construct _LOT_MEMBER uses) keeps it.
+        "X-Men #90 1974 Marvel Appearance Grotesk Death of Professor X 2.5 LOW GRADE KEY",
+        # The ticket's named false-positive risk: "X2" as the 2003 X-Men
+        # movie ("X2: X-Men United"), not a copy count. Zero hits in the live
+        # corpus, but guarded defensively since the shape is unambiguous —
+        # "X2" immediately followed by "X-Men"/":".
+        "X2: X-Men United Movie Poster",
+        "X2 X-Men United DVD 2003",
     ])
     def test_keeps(self, title):
         assert not sc.hard_exclude(title)

@@ -458,6 +458,16 @@ def publication_year_mismatch(
 
 _REPRINT_MARKERS: frozenset[str] = frozenset({
     "facsimile",
+    "facsimilie",  # BUI-1009: common misspelling (seen on a real Wolverine #1
+    # / X-Men #101 comp listing — extra "i"). Kept in sync with
+    # comic_identity_year._FACSIMILE_MARKERS, same convention as "retold"/
+    # "anniversary edition" above. "facsimlie" and "facimile" were also
+    # candidate spellings but measured ZERO hits over the live
+    # ~/.comics-server/db.sqlite comps corpus (16,825 rows) and were dropped
+    # rather than added on inference — see docs/audit/2026-09-29-bui-1009-
+    # ledger-matches.json for the measurement.
+    "fascimile",  # BUI-1009: transposed-letter misspelling (2 corpus hits:
+    # a Detective Comics #400 and an ASM #300 listing, both FOIL facsimiles).
     "true believers",
     "marvel tales",
     "epic collection",
@@ -1233,6 +1243,60 @@ def _fmv_spaced_number_run_lot(title: str) -> bool:
     return False
 
 
+# ─── Copy-count comp exclusion (BUI-1009) ───────────────────────────────────
+# A seller lists N copies of the SAME issue under one sale and reports one
+# price for the lot — "Uncanny X-Men #239 X2 - 1st Print Mr. Sinister Cover"
+# (grades "9.0,8.5"), "SUPERMAN THE MAN OF STEEL 18 X2 BOTH VF". Neither shape
+# is caught by _LOT_RE/_FMV_LOT_RE/_fmv_run_range_lot/_fmv_spaced_number_run_lot
+# above: there is no issue LIST and no "lot"/"set"/"run" word, just a bare
+# copy-count token next to a single issue number. Comp-only (BUI-269
+# convention, same as _FMV_LOT_RE): buying an "X2" listing still gets you the
+# book(s) named, so the purchase-decision path (should_reject/_LOT_RE) is
+# deliberately left untouched — only the FMV comp pool, where a 2-copy price
+# would otherwise price ONE copy at a 2-copy sum, is affected.
+#
+# Corpus measurement (BUI-1009, live ~/.comics-server/db.sqlite comps table,
+# 16,825 rows, docs/audit/2026-09-29-bui-1009-ledger-matches.json): a bare
+# `\bx\s?2\b` token fires on 2 titles that are NOT copy-count and that the
+# guards below exist to exclude —
+#   "Uncanny X-Men #212 ... WP SS X2 Claremont Leonardi" — Signature Series
+#     double-SIGNED (one book, two autographs, not two copies) — excluded via
+#     the `(?<!ss\s)` lookbehind.
+#   "... Death of Professor X 2.5 LOW GRADE KEY" — a decimal GRADE fragment
+#     ("X" the letter, then "2.5") — excluded via `(?!\.\d)`, the same
+#     construct _LOT_MEMBER uses above for the identical reason.
+# A third false-positive class named in the ticket — "X2"/"X2: X-Men United"
+# as a MOVIE reference — has zero hits in this corpus but is structurally
+# distinct (the token is immediately followed by "X-Men"/":"), so it is
+# guarded defensively via `(?!\s*[:\-]?\s*x-?men)` even though unmeasured.
+# After those three guards, every remaining corpus hit (8 rows, all pool=raw,
+# all excluded_code IS NULL) is a genuine multi-copy sale: 3x "Uncanny X-Men
+# #239 X2", "18 X2 BOTH", 2x "... cover x2", "Var(x2) & 1 Bermejo Variant"
+# (3 copies), and the reversed "2 x" form on "#1 ... & #2 ... 2 x VF- comics."
+# (two DIFFERENT issues sold as one lot — still a multi-book sale a single
+# comp pool must not absorb).
+_FMV_COPY_COUNT_LOT_RE = re.compile(
+    r"""
+    \(\s*x\s?2\s*\)                          # "(x2)" parenthetical copy count
+    | (?<!ss\s)\bx\s?2\b(?!\.\d)(?!\s*[:\-]?\s*x-?men)
+                                              # bare "X2"/"X 2": not preceded
+                                              # by "SS " (signature count), not
+                                              # a decimal-grade fragment, not
+                                              # the "X2"/"X2: X-Men United"
+                                              # movie reference
+    | \b2\s?x\b(?!\.\d)                      # reversed "2x"/"2 x"
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _fmv_copy_count_lot(title: str) -> bool:
+    """True if *title* names a multi-COPY sale of one issue via an "X2"/"2X"
+    token rather than an issue list (BUI-1009). Comp-only — see block comment
+    above."""
+    return bool(_FMV_COPY_COUNT_LOT_RE.search(title or ""))
+
+
 # ─── Later-printing comp exclusion (BUI-645) ─────────────────────────────────
 # is_comp_excluded ran _reprint_reject but never _second_print_reject, so a
 # later pressing entered an FMV comp pool priced as if it were a first print.
@@ -1355,6 +1419,8 @@ def is_comp_excluded(title: str) -> bool:
     if _fmv_run_range_lot(title or ""):  # BUI-598: bare issue range + "run"/"set"
         return True
     if _fmv_spaced_number_run_lot(title or ""):  # BUI-637: "#655 656 657 658"
+        return True
+    if _fmv_copy_count_lot(title or ""):  # BUI-1009: "#239 X2", "18 X2 BOTH"
         return True
     if _reprint_reject(title):
         return True
