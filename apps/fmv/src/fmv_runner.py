@@ -1649,7 +1649,7 @@ def _fetch_comps(books: list[dict], *, force: bool,
     #
     # BUI-315: the passthrough forwards every book field except _idx — crucially
     # `publisher` — so ebay-sold-comps' build_query can activate the Marvel
-    # "marvel comics" qualifier (DC/indie handled by _publisher_qualifier). Keep
+    # "marvel" qualifier (BUI-1004; DC/indie handled by _publisher_qualifier). Keep
     # publisher in the payload; dropping it silently disables the qualifier.
     payload = [
         {**{k: v for k, v in b.items() if k != "_idx"}, "_req_id": b["_idx"]}
