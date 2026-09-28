@@ -218,7 +218,12 @@ _KING_SIZE_RE = re.compile(r"\bking[\s-]size\b", re.IGNORECASE)
 _COLLECTED_EDITION_MARKERS: frozenset[str] = frozenset({
     "omnibus", "trade paperback", "tpb", "epic collection",
 })
-_FACSIMILE_MARKERS: frozenset[str] = frozenset({"facsimile"})
+_FACSIMILE_MARKERS: frozenset[str] = frozenset({
+    "facsimile",
+    "facsimilie",  # BUI-1009: kept in sync with comic_identity._REPRINT_MARKERS
+    # — same misspellings, same convention as "retold"/"anniversary edition".
+    "fascimile",
+})
 _PROMO_REPRINT_MARKERS: frozenset[str] = frozenset({
     "true believers", "marvel tales", "2nd printing", "second printing",
     "retold",  # BUI-253 PR-review fix (S1): also added to _REPRINT_MARKERS

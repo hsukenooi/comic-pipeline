@@ -264,6 +264,28 @@ class TestIdentifyComicFacsimileAndReprint:
         # not an extraction-confidence signal.
         assert ident.confidence == 1.0
 
+    def test_facsimilie_misspelling_classified_as_facsimile(self):
+        """BUI-1009: "facsimilie" (extra "i") is a real corpus misspelling
+        (seen on an X-Men #101 listing) that _FACSIMILE_MARKERS must
+        recognize the same as the correct spelling, in sync with
+        comic_identity._REPRINT_MARKERS."""
+        ident = ci.identify_comic("Amazing Spider-Man #1 Facsimilie Edition")
+        assert ident.edition == "facsimile"
+        assert "facsimile" in ident.reject_reasons[0].lower()
+
+    def test_fascimile_misspelling_classified_as_facsimile(self):
+        """BUI-1009: "fascimile" (transposed letters) is a real corpus
+        misspelling (seen on a Detective Comics #400 and an ASM #300
+        listing)."""
+        ident = ci.identify_comic("Amazing Spider-Man #1 Fascimile Edition")
+        assert ident.edition == "facsimile"
+        assert "facsimile" in ident.reject_reasons[0].lower()
+
+    def test_facsimilie_misspelling_rejected_by_should_reject(self):
+        assert ci.should_reject(
+            "Amazing Spider-Man #1 Facsimilie Edition", "Amazing Spider-Man", "1"
+        ) is True
+
     def test_second_printing_classified_as_reprint(self):
         ident = ci.identify_comic("Batman: Vengeance of Bane #1 2nd Printing")
         assert ident.edition == "reprint"

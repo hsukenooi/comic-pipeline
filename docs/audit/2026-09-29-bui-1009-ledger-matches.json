@@ -1,0 +1,118 @@
+{
+  "ticket": "BUI-1009",
+  "measured_at": "2026-09-29",
+  "corpus": {
+    "source": "~/.comics-server/db.sqlite table comps (live, not the offline provider cache)",
+    "total_rows": 16825,
+    "distinct_titles": 13899
+  },
+  "rules_implemented": {
+    "facsimile_misspellings": {
+      "location": "apps/ebay/src/comic_identity.py:_REPRINT_MARKERS (feeds _reprint_reject, called by is_comp_excluded), synced into apps/ebay/src/comic_identity_year.py:_FACSIMILE_MARKERS (feeds _classify_edition_kind)",
+      "spellings_added": ["facsimilie", "fascimile"],
+      "spellings_measured_and_dropped": {
+        "facsimlie": "0 corpus hits",
+        "facimile": "0 corpus hits"
+      },
+      "corpus_hits_by_spelling_as_implemented": {
+        "facsimile (existing, unchanged)": 3,
+        "facsimilie": 2,
+        "fascimile": 2
+      },
+      "note": "3 existing 'facsimile' hits are digit-glued ('2024FACSIMILE', '1facsimile') and were already excluded from matching before this ticket (BUI-770 case C, deliberately not fixed — see _marker_hit's docstring); they are NOT newly matched by this change and are out of scope here."
+    },
+    "x2_copy_count": {
+      "location": "apps/ebay/src/comic_identity.py:_FMV_COPY_COUNT_LOT_RE / _fmv_copy_count_lot, wired into is_comp_excluded (comp-only, not merged into the shared _LOT_RE)",
+      "forms_matched": ["(x2) parenthetical", "bare X2 (glued, no internal space)", "reversed 2x / 2 x"],
+      "corpus_hits_as_implemented": 8,
+      "false_positives_excluded_by_guard": {
+        "SS X2 Claremont Leonardi (2 signatures, 1 book)": "(?<!ss\\s) lookbehind",
+        "Death of Professor X 2.5 (decimal grade fragment)": "(?!\\.\\d) lookahead",
+        "X2: X-Men United / X2 X-Men United (movie reference, 0 corpus hits, guarded defensively)": "(?!\\s*[:\\-]?\\s*x-?men) lookahead"
+      },
+      "em_review_round": {
+        "reason": "EM review found the first cut's bare form allowed an internal space (x\\s?2) and the reversed form had no guard on trailing context, so both false-fired on an issue number sitting next to an X-titled series or a standalone series-ending 'X'.",
+        "reported_false_positives": [
+          "Giant-Size X-Men #2 X-Men 1975",
+          "X-Factor #2 X-Force",
+          "X-Men 2 X-Men Legends",
+          "Generation X 2 CGC",
+          "Malcolm X 2"
+        ],
+        "verified_not_in_live_corpus": "confirmed 0 rows matching any of the 5 reported titles (or 'Generation X'/'Malcolm X' substrings) in ~/.comics-server/db.sqlite — these were EM-constructed stress cases, not a live production miss, so the 12 ledger-matched rows below are unchanged by the fix.",
+        "fix": {
+          "bare_form": "dropped the optional internal space (now literal 'x2', not 'x\\s?2') — none of the 8 real corpus hits for this branch needed the space, all are glued 'X2'; a spaced 'X 2' is now left alone entirely, which is what 'Generation X 2'/'Malcolm X 2' needed",
+          "both_forms": "added (?![a-zA-Z-]) immediately after the token so it cannot continue into a hyphen or another letter — 'X-Men'/'X-Force'/'X-Factor'/'X-O' after the token no longer match; the real 'X-Men #1 ... 2 x VF- comics.' positive is unaffected because a space, not a hyphen, follows its 'x'"
+        },
+        "re_measured": "corpus hits after tightening: still 8 for x2_copy_count, still 12 combined unique ledger rows, still 0 slab — identical set of ids to the pre-tightening measurement"
+      }
+    }
+  },
+  "ledger_rows_matched": {
+    "total": 12,
+    "by_pool": {
+      "raw": 12,
+      "slab": 0
+    },
+    "all_excluded_code_is_null": true,
+    "by_comic_id": [
+      {
+        "comic_id": null,
+        "note": "orphan comps, not linked to any tracked comic_id — cannot be addressed by POST /api/comics/comps/exclude regardless of pool, since comic_id is a required non-nullable field on CompsExcludeRequest",
+        "rows": [
+          {"id": 8373, "pool": "raw", "product_id": "800045339564", "rule": "fascimile", "title": "DC Comics Detective Comics #400 Batman Robin Batgirl Man-Bat Challenge FASCIMILE"},
+          {"id": 10864, "pool": "raw", "product_id": "317639052679", "rule": "fascimile", "title": "AMAZING SPIDER-MAN #300 FIRST APP VENOM **FOIL** FASCIMILE"}
+        ]
+      },
+      {
+        "comic_id": 291,
+        "rows": [
+          {"id": 16752, "pool": "raw", "product_id": "800547063868", "rule": "x2_copy_count", "title": "Uncanny X-Men #239 X2 First Mr. Sinister Cover App Marvel Comics 1988 8.0-8.5"},
+          {"id": 16762, "pool": "raw", "product_id": "800542605291", "rule": "x2_copy_count", "title": "Uncanny X-Men #239 X2 - 1st Print Mr. Sinister Cover Marvel Comics 1988 9.0,8.5"},
+          {"id": 16764, "pool": "raw", "product_id": "800542617592", "rule": "x2_copy_count", "title": "Uncanny X-Men #239 X2 1st Mr. Sinister Cover App Marvel Comics 1988 9.2,9.4"}
+        ]
+      },
+      {
+        "comic_id": 609,
+        "rows": [
+          {"id": 11077, "pool": "raw", "product_id": "366547353961", "rule": "x2_copy_count", "title": "Ghost Rider #15 Marvel 1991 NM 9.4 First glow-in-the-dark comic cover x2"},
+          {"id": 11097, "pool": "raw", "product_id": "278132195308", "rule": "x2_copy_count", "title": "Ghost Rider #15 Marvel 1991 NM 9.4 First glow-in-the-dark comic cover x2"}
+        ]
+      },
+      {
+        "comic_id": 690,
+        "rows": [
+          {"id": 6195, "pool": "raw", "product_id": "286426312979", "rule": "x2_copy_count", "title": "SUPERMAN THE MAN OF STEEL 18 X2 BOTH VF NEWSSTAND V1 DC 1992! 1ST FULL DOOMSDAY"}
+        ]
+      },
+      {
+        "comic_id": 746,
+        "rows": [
+          {"id": 10455, "pool": "raw", "product_id": "318599380346", "rule": "x2_copy_count", "title": "K.O. Red Hood vs The Joker #1 Guillem March Var(x2) & 1 Bermejo Variant 2026"}
+        ]
+      },
+      {
+        "comic_id": 783,
+        "rows": [
+          {"id": 10713, "pool": "raw", "product_id": "198386969820", "rule": "facsimilie", "title": "[FOIL] X-MEN #101 / FACSIMILIE ED. / UNKNOWN COMICS / DAVE COCKRUM EXCLUSIVE VAR"},
+          {"id": 10724, "pool": "raw", "product_id": "206245860899", "rule": "facsimilie", "title": "X-MEN #101 FACSIMILIE NM/M HIGH GRADE - UNREAD [RM]"}
+        ]
+      },
+      {
+        "comic_id": 1002,
+        "rows": [
+          {"id": 15086, "pool": "raw", "product_id": "178204676563", "rule": "x2_copy_count", "title": "X-Men #1 (B cover) & #2 (Marvel 1991) 2 x VF- comics."}
+        ]
+      }
+    ]
+  },
+  "exclude_endpoint_assessment": {
+    "endpoint": "POST /api/comics/comps/exclude",
+    "request_model": "plugins/gixen-overlay/src/gixen_overlay/models.py:CompsExcludeRequest",
+    "code_that_would_fit": "hard_exclude",
+    "code_source": "sold_comps.HARD_EXCLUDE_CODE = 'hard_exclude' — both new rules run inside is_comp_excluded, which folds into hard_exclude's single reported code (see sold_comps.py's HARD_EXCLUDE_CODE docstring: 'single-sourced here so ... the offline sweep can emit the identical string')",
+    "can_stamp_the_matched_rows": false,
+    "reason": "plugins/gixen-overlay/src/gixen_overlay/routes.py's api_comics_comps_exclude docstring states by design: 'A RAW row is never stamped by this endpoint, whatever is sent: every code in the vocabulary comes from a GRADED-mode-only guard ... A product_id that resolves to a raw row comes back in not_found — reported, not obeyed.' All 12 matched ledger rows are pool='raw'; 0 are pool='slab'. Additionally, comic_id is a required (non-nullable) field on CompsExcludeRequest, so the 2 orphan rows (comic_id NULL) could not be addressed even if they were slab rows.",
+    "conclusion": "None of the 12 currently-matched ledger rows can be stamped via the existing exclude endpoint. There is currently no slab-pool match to stamp either (0 of 16,825 comps rows). This is a real gap against the ticket's Done-when clause ('stamped excluded on the Mini') for the raw pool specifically — the endpoint's raw-refusal is a deliberate BUI-947 design choice ('silently thinning the raw pool is the expensive direction'), not a bug, so widening it was out of scope for this ticket (plugins/gixen-overlay was off-limits) and is flagged here as a follow-up decision for the EM rather than something this change attempts to fix."
+  }
+}
