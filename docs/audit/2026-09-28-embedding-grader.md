@@ -27,6 +27,8 @@
 
 That leaves 2,798 training rows for L-14 (raw 2,049, slab 749). By band (raw / slab): ≤3.5 137/49, 4.0–5.5 343/140, 6.0–7.5 392/208, 8.0–8.5 335/78, 9.0–9.2(9.4) 329/114, 9.4(9.6)+ 513/150.
 
+**Listing identity:** an ended eBay listing's web URL can redirect to a different listing of the same book, so a separate probe checked that the Browse API returns the listing that was asked for. For 85 fetched comps (30 holdout, 30 training, 25 ledger rows aged 121 to 341 days) the response's `legacyItemId` equalled the requested `product_id` and its `title` equalled the ledger title in every case that returned 200 (69 of 85; the rest were 404). The API returns the exact listing or nothing, never a substitute, so every training and holdout image belongs to the comp it is labeled with. The listings that still serve photos past 240 days are the same listings, most likely multi-quantity fixed-price listings that stayed live after one copy sold.
+
 **Same-issue sensitivity:** `--strict-issue` also drops every training comp that shares a `comic_id` with a holdout comp (730 rows, 397 of them slabs). Combined falls to 57%, raw holds at 63%, and slab drops to 46%. The slab result depends partly on other copies of the same key issues in training. That is either legitimate (production grades comps of issues it has seen) or a shortcut on cover identity, or the same physical slab resold with a different photo. Either way the strict bound is further from 80%.
 
 ## Fetch failures
