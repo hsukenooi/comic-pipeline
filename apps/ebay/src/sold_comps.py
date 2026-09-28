@@ -662,7 +662,10 @@ def _capture_raw_response(
 
 # ─── Query construction ──────────────────────────────────────────────────────
 
-_MARVEL_QUALIFIER = "marvel comics"
+# BUI-1004: one token, not "marvel comics". Vintage sellers write "Marvel 1968"
+# without "Comics", and eBay requires every query token, so the two-token form
+# silently dropped those sales. See _publisher_qualifier for the measurement.
+_MARVEL_QUALIFIER = "marvel"
 
 # BUI-321: known DC/Marvel imprints → their PARENT publisher's gate. Without
 # this table these imprints don't match \bmarvel\b/\bdc\b, so they fall through
@@ -685,7 +688,7 @@ _IMPRINT_PARENT_GATE = {
     "timely": "marvel",
     "timely comics": "marvel",
     # NOTE: Malibu is deliberately NOT mapped — it published independently
-    # (1986–1994) before Marvel acquired it, so a year-less "marvel comics"
+    # (1986–1994) before Marvel acquired it, so a year-less Marvel
     # qualifier would over-narrow pre-acquisition titles (Ultraverse, Men in
     # Black). It falls to indie passthrough, appending "Malibu" — correct for
     # both eras, since those listings say "Malibu", not "Marvel". (BUI-321)
@@ -723,7 +726,7 @@ def _normalize_publisher_key(publisher: str) -> str:
 def _publisher_qualifier(publisher: str | None) -> str | None:
     """Normalize a publisher into the query qualifier keyword to append.
 
-    BUI-304 (issue 2): for Marvel we emit the canonical "marvel comics" — a
+    BUI-304 (issue 2): for Marvel we emitted the canonical "marvel comics" — a
     cheap disambiguator that keeps the *year-less* base query (per /comic:buy's
     convention of omitting year to dodge the BUI-129 collection-check
     false-negative) from colliding with modern media that reuses the issue
@@ -736,6 +739,18 @@ def _publisher_qualifier(publisher: str | None) -> str | None:
     None) — the base query passes through untouched rather than regressing. Any
     "DC Comics" raw passthrough would reintroduce the same two-token narrowing,
     so DC must short-circuit to None, not fall to the indie branch.
+
+    BUI-1004 (2026-09-28) — Marvel qualifier is now the single token "marvel".
+    Measured on sold-comps.com over 26 vintage (pre-1985) and 10 modern Marvel
+    books (docs/audit/2026-09-28-marvel-query-recall.md): graded comps went
+    90 -> 215 vintage and 91 -> 223 modern (ASM 300 14 -> 33; dated X-Men 97
+    (1976) 2 -> 9), with 5 wrong-book graded comps among the 267 added, a
+    rate no higher than the baseline pool's own. The BUI-304 collision rationale
+    above did NOT hold on today's data: the year-less "X-Men 97" query was
+    already about 95% "X-Men '97" show comics under "marvel comics" (21 of 22
+    graded comps), because those tie-ins are published by Marvel Comics too.
+    Only `year` separates the 1976 book from them; neither form of the
+    qualifier does.
 
     BUI-321: known DC/Marvel imprints (Vertigo, Wildstorm, Epic, …) map to their
     parent's gate via _IMPRINT_PARENT_GATE instead of falling to indie
@@ -1020,7 +1035,7 @@ def build_query(title: str, issue: str, year: int | str | None = None,
     if variant:
         parts.append(variant)
     # BUI-304 (issue 2): the publisher qualifier — indie passes through, Marvel
-    # normalizes to "marvel comics"; DC gets none (BUI-315). See
+    # normalizes to "marvel" (BUI-1004); DC gets none (BUI-315). See
     # _publisher_qualifier.
     qualifier = _publisher_qualifier(publisher)
     if qualifier:
@@ -2435,6 +2450,20 @@ def _default_fetch_description(comp: dict) -> "str | None":
 
 # ─── Per-book pipeline (three-tier query strategy) ───────────────────────────
 
+def _should_broaden(comps: list[dict], year: int | None) -> bool:
+    """Tier-2 gate: drop the year from the query when the pool is thin.
+
+    Counts ALL comps, grade-less included. BUI-1004 measured gating on the
+    GRADED-comp count instead (so a 7-comp / 1-graded book would broaden) and
+    rejected it: 32 of the 41 graded comps it added were wrong books, because
+    a year-less query on a key reaches its reprints (Marvel Milestone, Wizard
+    Ace, Lion's Gate, Special Edition X-Men for Giant-Size X-Men #1) and, for
+    X-Men 97, the 2024 "X-Men '97" series. Once the Marvel qualifier dropped
+    "comics" the same gate added only 2 graded comps across the whole sample.
+    """
+    return len(comps) < THIN_RESULTS_THRESHOLD and bool(year)
+
+
 def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
                      ttl_sec: int = DEFAULT_CACHE_TTL_SEC,
                      breaker: "_CircuitBreaker | None" = None,
@@ -2818,7 +2847,7 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
             # BUI-347 exclusion terms — this applies to the CGC-proxy graded
             # pass (`include_graded=True`) just as much as the ordinary raw
             # pass, since both share this same tier.
-            if len(comps) < THIN_RESULTS_THRESHOLD and year:
+            if _should_broaden(comps, year):
                 broader_nkw = build_query(title, issue, year=None, publisher=publisher,
                                           variant=variant, exclude_graded=exclude_graded,
                                           vintage_year=year)

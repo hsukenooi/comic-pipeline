@@ -1112,11 +1112,15 @@ class TestBuildQuery:
         assert "Direct" in q
         assert "image comics" in q
 
-    # ── BUI-304 (issue 2): Marvel publisher normalized to "marvel comics" ──
+    # ── BUI-304 (issue 2) / BUI-1004: Marvel publisher normalized to "marvel" ──
     def test_marvel_publisher_qualifier(self):
+        # BUI-1004: the single token "marvel", never "marvel comics" — eBay
+        # requires every query token, and vintage sellers write "Marvel 1968"
+        # without "Comics" (graded comps 90 -> 215 on 26 vintage books).
         for pub in ("Marvel", "marvel", "Marvel Comics"):
             q = sc.build_query("Amazing Spider-Man", "300", publisher=pub)
-            assert "marvel comics" in q
+            assert q == '"Amazing Spider-Man 300" marvel -cgc -cbcs -graded -slab'
+            assert "comics" not in q.lower()
 
     # ── BUI-315: DC is Marvel-only gated — DC gets NO qualifier appended ──
     def test_dc_publisher_gets_no_qualifier(self):
@@ -1139,7 +1143,7 @@ class TestBuildQuery:
         assert sc._publisher_qualifier(None) is None
         assert sc._publisher_qualifier("") is None
         assert sc._publisher_qualifier("   ") is None
-        assert sc._publisher_qualifier("Marvel") == "marvel comics"
+        assert sc._publisher_qualifier("Marvel") == "marvel"
         # BUI-315: DC recognized publishers get no qualifier (Marvel-only).
         assert sc._publisher_qualifier("DC") is None
         assert sc._publisher_qualifier("dc") is None
@@ -1152,9 +1156,9 @@ class TestBuildQuery:
         # indie branch and append the imprint name as a recall-noise keyword.
         for pub in ("Epic", "Epic Comics", "Icon", "MAX", "Marvel Knights",
                     "Star Comics", "Timely"):
-            assert sc._publisher_qualifier(pub) == "marvel comics", pub
+            assert sc._publisher_qualifier(pub) == "marvel", pub
             q = sc.build_query("Moon Knight", "1", publisher=pub)
-            assert "marvel comics" in q
+            assert "marvel" in q.split()
             assert pub not in q  # imprint name is NOT appended as a keyword
 
     def test_malibu_is_not_gated_to_marvel(self):
@@ -1171,7 +1175,7 @@ class TestBuildQuery:
         for key, gate in sc._IMPRINT_PARENT_GATE.items():
             result = sc._publisher_qualifier(key)
             if gate == "marvel":
-                assert result == "marvel comics", key
+                assert result == "marvel", key
             elif gate == "dc":
                 assert result is None, key
             else:  # pragma: no cover - guards against an unknown gate value
@@ -2453,6 +2457,19 @@ class TestTieredStrategy:
         out = sc.fetch_book_comps({"title": "X", "issue": "1", "year": 1990, "grade": 9.2},
                                   "key")
         assert len(calls) == 2  # base + broader (grade-targeted may also fire)
+
+    def test_broaden_gate_counts_all_comps_not_graded(self, tmp_path, monkeypatch):
+        # BUI-1004 measured gating the broader tier on the GRADED count (so
+        # 7 comps / 1 graded would broaden) and rejected it: a year-less query
+        # on a key pulls its reprints and same-numbered modern series in as
+        # graded comps. 7 comps, 1 graded, vintage year → base tier only.
+        ungraded = [self._comp(str(i), title="X #1 Marvel 1968") for i in range(6)]
+        graded = [self._comp("g1", title="X #1 FN 6.0 Marvel 1968")]
+        calls = self._wire(tmp_path, monkeypatch, [ungraded + graded])
+        out = sc.fetch_book_comps({"title": "X", "issue": "1", "year": 1968}, "key")
+        assert len(out["comps"]) == 7
+        assert [q["tier"] for q in out["queries_used"]] == ["base"]
+        assert len(calls) == 1
 
     def test_grade_targeted_when_few_grade_tagged(self, tmp_path, monkeypatch):
         # 8 results from base but only 2 have grades parsed — should fire grade-targeted
@@ -5070,7 +5087,7 @@ class TestBuildQueryGraded:
                            publisher="Marvel", graded_target="cgc")
         assert '"Amazing Spider-Man 50"' in q
         assert "1967" in q
-        assert "marvel comics" in q
+        assert "marvel" in q.split()
 
     def test_graded_target_absent_or_unrecognized_keeps_default_behavior(self):
         base = sc.build_query("Amazing Spider-Man", "50", year=1967)
