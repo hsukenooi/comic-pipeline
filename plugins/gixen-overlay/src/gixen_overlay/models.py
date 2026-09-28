@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from gixen_overlay.db import (
     COMP_PAGE_QUALITIES,
@@ -11,6 +11,7 @@ from gixen_overlay.db import (
     COMPS_EXCLUSION_CODES,
     COMPS_POOLS,
     COMPS_PROVENANCES,
+    COMPS_RESTAMP_FIELDS,
     FMV_CERTIFIER_NONE,
     FMV_CERTIFIERS,
     FMV_LABEL_UNIVERSAL,
@@ -830,6 +831,88 @@ class CompsUnstampRequest(BaseModel):
     def _non_empty_ids(cls, v: list[int]) -> list[int]:
         if not v:
             raise ValueError("ids must be a non-empty list")
+        return v
+
+
+class CompsRestampItem(BaseModel):
+    """One compare-and-set write within a
+    `POST /api/comics/comps/restamp` batch (BUI-998/BUI-1008).
+
+    `id` is the `comps` table's own primary key — the same addressing
+    `CompsUnstampRequest.ids` uses, for the same reason (a row a caller
+    already read is already uniquely named by it). `field` is one of
+    `COMPS_RESTAMP_FIELDS` (`grade`/`label`/`page_quality` — deliberately
+    NOT `certifier`, which BUI-997's own migration already restamped).
+
+    `expected`/`new` are typed loosely (`float | str | None`) because the
+    field they describe is polymorphic: a `grade` item's values are numeric,
+    a `label`/`page_quality` item's are closed-vocabulary strings. The
+    `_validate_value_shape` model validator below narrows each by `field` —
+    `label`/`page_quality` values are checked against `FMV_LABELS`/
+    `COMP_PAGE_QUALITIES`, the SAME tuples the `comps` table's own CHECK
+    constraints enforce (`gixen_overlay.db`'s `create_tables`), so an
+    unrecognized value 422s the whole call before anything is written rather
+    than dying on an `IntegrityError` partway through the batch. `grade`
+    values are checked only for type — the column carries no CHECK.
+    """
+
+    id: int
+    field: str
+    expected: float | str | None = None
+    new: float | str | None = None
+
+    @field_validator("field")
+    @classmethod
+    def _validate_field(cls, v: str) -> str:
+        if v not in COMPS_RESTAMP_FIELDS:
+            raise ValueError(
+                f"field must be one of: {', '.join(COMPS_RESTAMP_FIELDS)}"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _validate_value_shape(self) -> "CompsRestampItem":
+        if self.field == "grade":
+            for name, v in (("expected", self.expected), ("new", self.new)):
+                if v is not None and not isinstance(v, (int, float)):
+                    raise ValueError(f"grade {name} must be numeric or null")
+        else:
+            vocab = FMV_LABELS if self.field == "label" else COMP_PAGE_QUALITIES
+            for name, v in (("expected", self.expected), ("new", self.new)):
+                if v is None or v not in vocab:
+                    raise ValueError(
+                        f"{self.field} {name} must be one of: {', '.join(vocab)}"
+                    )
+        return self
+
+
+class CompsRestampRequest(BaseModel):
+    """POST /api/comics/comps/restamp — compare-and-set restamp of
+    `grade`/`label`/`page_quality` on already-stored `comps` rows
+    (BUI-998/BUI-1008).
+
+    The generic counterpart to BUI-997's one-off `certifier` migration — see
+    `restamp_comps`'s docstring in `gixen_overlay.db` for the full design
+    (why compare-and-set, why `id`-addressed, why not `certifier`). This
+    model is deliberately thin: everything that can 422 the WHOLE call lives
+    in `CompsRestampItem`'s own validators, so a single bad item in a large
+    batch is refused before a single row is touched, the same
+    all-or-nothing-at-validation-time posture `CompsIngestRequest` takes.
+
+    `dry_run` defaults to `True` (mirrors `CompsUnstampRequest`): the safe
+    default previews the exact same `{matched, changed, skipped_stale,
+    not_found, results}` partition an apply call would return, without
+    writing. Pass `dry_run: false` to commit.
+    """
+
+    dry_run: bool = True
+    items: list[CompsRestampItem]
+
+    @field_validator("items")
+    @classmethod
+    def _non_empty_items(cls, v: list[CompsRestampItem]) -> list[CompsRestampItem]:
+        if not v:
+            raise ValueError("items must be a non-empty list")
         return v
 
 

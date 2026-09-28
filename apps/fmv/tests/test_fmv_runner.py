@@ -4411,6 +4411,40 @@ class TestSlabCompsOnly:
         out = fmv_runner._slab_comps_only(comps)
         assert out[0]["certifier"] == "cgc"
 
+    def test_passes_through_label_and_page_quality_already_stamped(self):
+        """BUI-998: sold_comps._run now stamps certifier/label/page_quality
+        on every slab-titled comp at the source, including ones that land in
+        the raw `comps` pool (an include_graded-only pass). This function
+        must pass those through unchanged rather than dropping them the way
+        it did when it only ever knew about `certifier`."""
+        comps = [
+            {"grade": 6.5, "price": 1200, "title": "ASM 50 CGC 6.5 White Pages",
+             "certifier": "cgc", "label": "universal", "page_quality": "white"},
+            {"grade": 9.8, "price": 3000,
+             "title": "ASM 50 CGC 9.8 Signature Series Stan Lee",
+             "certifier": "cgc", "label": "signature_series",
+             "page_quality": "unknown"},
+        ]
+        out = fmv_runner._slab_comps_only(comps)
+        by_price = {c["price"]: (c["certifier"], c["label"], c["page_quality"])
+                    for c in out}
+        assert by_price == {
+            1200: ("cgc", "universal", "white"),
+            3000: ("cgc", "signature_series", "unknown"),
+        }
+
+    def test_local_certifier_stamp_never_overrides_an_upstream_value(self):
+        """The local regex fallback (`setdefault`) must defer to whatever
+        sold_comps already stamped — it exists only for a stale
+        ebay-sold-comps install that predates BUI-998, not to second-guess a
+        fixed one."""
+        comps = [
+            {"grade": 6.5, "price": 1200, "title": "ASM 50 CGC 6.5",
+             "certifier": "cgc"},
+        ]
+        out = fmv_runner._slab_comps_only(comps)
+        assert out[0]["certifier"] == "cgc"
+
 
 class TestIsUnpricedRaw:
     def test_n0_no_number_is_candidate(self):

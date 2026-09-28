@@ -48,6 +48,8 @@ from gixen_overlay.db import (
     get_fmv_history,
     stamp_comps_excluded,
     unstamp_comps_excluded,
+    list_all_comps,
+    restamp_comps,
     list_comics_for_slab_watch,
     set_comic_slab_watch,
     DEFAULT_OUTCOME_GRADE_WINDOW,
@@ -55,6 +57,7 @@ from gixen_overlay.db import (
     DEFAULT_CALIBRATION_MIN_LOSSES,
     DEFAULT_COMPS_READ_LIMIT,
     DEFAULT_FMV_HISTORY_READ_LIMIT,
+    DEFAULT_COMPS_ALL_LIMIT,
     SLAB_WATCH_DEFAULT_MIN_FMV,
 )
 from gixen_overlay.ledger import LedgerRoute
@@ -65,6 +68,7 @@ from gixen_overlay.models import (
     CompsIngestRequest,
     CompsExcludeRequest,
     CompsUnstampRequest,
+    CompsRestampRequest,
     LocgLinkRequest,
     LinkFmvRequest,
     VerifyRequest,
@@ -795,6 +799,73 @@ async def api_comics_comps_unstamp(req: CompsUnstampRequest, request: Request):
     """
     db = request.app.state.db
     return unstamp_comps_excluded(db, req.ids, dry_run=req.dry_run)
+
+
+@router.get("/api/comics/comps/all")
+async def api_comics_comps_all(
+    request: Request,
+    pool: str | None = None,
+    after_id: int = 0,
+    limit: int = DEFAULT_COMPS_ALL_LIMIT,
+):
+    """BUI-1008: page through the WHOLE comps ledger by id — READ-ONLY,
+    DIAGNOSTIC/AUDIT ONLY, never scoped to one book.
+
+    Every other comps read (`GET /api/comics/comps` above) resolves ONE book
+    first and cannot enumerate the archive without already knowing every
+    book identity in it. This is the smallest path that closes that gap —
+    added for exactly one sanctioned caller, the `apps/ebay` restamp script
+    that recomputes `parse_grade`/label/page-quality over every stored row
+    and diffs against what is on file, so it can post only the rows that
+    actually changed to `POST /api/comics/comps/restamp`.
+
+    `after_id` is a cursor, not a page number — pass the previous page's
+    last row's `id` to continue; stable under concurrent inserts, unlike an
+    OFFSET. `pool` optionally narrows to `'raw'` or `'slab'`. `limit` is
+    capped server-side (see `list_all_comps`'s `MAX_COMPS_ALL_LIMIT`).
+
+    **Never call this from the pricing path** — same scope boundary as
+    `GET /api/comics/comps`/`GET /api/comics/fmv-history`; see their
+    docstrings.
+    """
+    db = request.app.state.db
+    rows = list_all_comps(db, pool=pool, after_id=after_id, limit=limit)
+    return [dict(r) for r in rows]
+
+
+@router.post("/api/comics/comps/restamp")
+async def api_comics_comps_restamp(req: CompsRestampRequest, request: Request):
+    """BUI-998/BUI-1008: compare-and-set restamp of `comps.grade`/`label`/
+    `page_quality` for specific, already-computed rows.
+
+    The write half of the generic restamp path — see `restamp_comps`'s
+    docstring in `gixen_overlay.db` for the full design (compare-and-set
+    semantics, why this covers both BUI-998's label/page_quality slab rows
+    and BUI-1008's raw grade rows in one endpoint, and why `certifier` is
+    excluded). Every 422-worthy condition (unknown `field`, an
+    out-of-vocabulary `label`/`page_quality`, a non-numeric `grade`, an
+    empty `items` list) lives in `CompsRestampRequest`/`CompsRestampItem`'s
+    own validators, so a malformed batch is refused before any row is
+    touched — no partial write from a bad item buried in a large batch.
+
+    An unknown `id` never 404s the call — a restamp is a BATCH of
+    independent items, so it is reported in the response's `not_found`
+    bucket instead, the same posture `POST /api/comics/comps/unstamp` takes.
+
+    `dry_run` (default `true`) computes and returns the exact partition an
+    apply call would, without writing — preview, then repeat with
+    `dry_run: false` to commit.
+
+    Returns `{dry_run, matched, changed, skipped_stale, not_found, results}`
+    — 200 always; "nothing here needed restamping" is a legitimate outcome
+    for a caller re-running a diff over an already-fixed archive.
+    """
+    db = request.app.state.db
+    return restamp_comps(
+        db,
+        [item.model_dump() for item in req.items],
+        dry_run=req.dry_run,
+    )
 
 
 @router.get("/api/comics/fmv-history")

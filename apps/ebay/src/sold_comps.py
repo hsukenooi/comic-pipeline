@@ -2770,19 +2770,53 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
                 comp["query"] = nkw
                 comp["from_cache"] = cache_hit
                 comp["observed_at"] = response_fetched_at
-                # BUI-524: only the inclusive tier passes route_slabs=True —
-                # every other tier's behavior (add every non-excluded comp to
-                # `comps`) is byte-for-byte unchanged. A slab comp is counted
-                # toward `added` (queries_used stays an honest "how many new
-                # things this query found" signal) but never joins the raw
-                # `comps` pool.
-                if route_slabs and _is_slab_comp(comp):
-                    # BUI-929: certifier/label/page_quality parsed from the
-                    # title here — every slab comp this function returns
-                    # carries them, regardless of which route_slabs-passing
-                    # tier found it (the BUI-929 graded_target base tier, or
-                    # the pre-existing BUI-524 vintage inclusive tier).
+                # BUI-998: stamp certifier/label/page_quality on every
+                # genuinely slab-titled comp THIS PASS ADMITS, not only the
+                # ones a route_slabs-passing tier routes into `slab_comps`
+                # below. An include_graded-only pass (comic-fmv's CGC-proxy
+                # rescue / cross-check, BUI-348/BUI-529) sets
+                # route_slabs=False even though its pool can admit
+                # slab-titled comps (admits_graded=True) — those stay in
+                # `comps` and fmv_runner's `_slab_comps_only` (BUI-993) picks
+                # them back out by title. Before this fix that picker got no
+                # certifier/label/page_quality at all (comps here never
+                # called `parse_slab_fields`), so it patched together its own
+                # certifier from a bare regex and left label/page_quality at
+                # `CompItem`'s defaults — silently wrong for a title naming
+                # e.g. White Pages. `parse_slab_fields` is built on
+                # grade_tokens' corpus-tuned resolvers (~250 lines, BUI-923),
+                # too large to duplicate outside this package (apps/fmv
+                # shells out to this console script and never imports it —
+                # CLAUDE.md's "FMV pipeline shells out across package
+                # boundaries"), so this is the one and only place any comp's
+                # identity gets parsed; downstream just reads what's already
+                # on the dict.
+                #
+                # Gated on `admits_graded`, same as the graded-identity
+                # guards above — NOT on `route_slabs` alone. An ordinary raw
+                # pass (exclude_graded=True, route_slabs=False) queries with
+                # "-cgc -cbcs -graded -slab", but that is a keyword
+                # exclusion on eBay's side, not a content filter: a raw
+                # listing can still slip through with "CGC" incidentally in
+                # its title (the same reason `_SLAB_TITLE_RE`-style guards
+                # elsewhere only ever run under `admits_graded`). Stamping
+                # unconditionally regressed exactly this case — a genuinely
+                # raw-pool comp from a plain exclusion-tier fetch got
+                # `certifier='cgc'` written onto a `pool='raw'` ledger row,
+                # caught by `test_replay_proves_the_backfill_shape_matches_
+                # the_live_pool`'s shape-parity check against the offline
+                # backfill script, which never stamps outside admits_graded
+                # either.
+                is_slab = admits_graded and _is_slab_comp(comp)
+                if is_slab:
                     comp.update(parse_slab_fields(comp["title"]))
+                # BUI-524: only the inclusive tier passes route_slabs=True —
+                # every other tier's ROUTING (add every non-excluded comp to
+                # `comps`) is byte-for-byte unchanged; only the stamping
+                # above is new. A slab comp is counted toward `added`
+                # (queries_used stays an honest "how many new things this
+                # query found" signal) but never joins the raw `comps` pool.
+                if route_slabs and is_slab:
                     slab_comps.append(comp)
                     added += 1
                     continue

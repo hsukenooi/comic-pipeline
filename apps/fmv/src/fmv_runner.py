@@ -3154,26 +3154,32 @@ def _slab_comps_only(comps: list[dict]) -> list[dict]:
     cross-title/store-variant contamination before returning these comps —
     see the block comment above.
 
-    BUI-993: `comps` here is the RAW pool of an `include_graded`-only fetch
-    (the CGC-proxy rescue / cross-check tiers below) — ebay-sold-comps only
-    calls `parse_slab_fields` (which sets `certifier`/`label`/`page_quality`)
-    for a comp that its OWN `route_slabs` branch routes into `slab_comps`,
-    and that branch only fires for the BUI-524 vintage-inclusive tier or a
-    `graded_target` base tier (see `sold_comps._run`'s docstring) — neither
-    of which this include_graded-only call ever reaches. So every comp this
-    function selects arrives with no `certifier` key at all. Left alone,
-    `_comp_to_ledger_item` posts `certifier: null`, and the comps ledger's
-    `CompItem` model coerces an absent certifier to `'none'` — the RAW-market
-    sentinel — for a comp this very function just confirmed names CGC/CBCS in
-    its title (comp 16410, BUI-993: `certifier='none'` stored for a genuine
-    "CGC 6.5" sale). Stamp `certifier` from the SAME match this filter used
-    to admit the comp, so the certifier that gets posted can never disagree
-    with the certifier that got it into this pool. (`label`/`page_quality`
-    are left at `CompItem`'s own defaults, `'universal'`/`'unknown'` — the
-    same values `parse_slab_fields` would fall back to for a title with no
-    explicit label/page-quality token; a title that DOES name one, e.g.
-    Signature Series or White Pages, still loses that detail here — tracked
-    as a follow-up, out of this ticket's scope.)
+    BUI-993/BUI-998: `comps` here is the RAW pool of an `include_graded`-only
+    fetch (the CGC-proxy rescue / cross-check tiers below). Before BUI-998,
+    ebay-sold-comps only called `parse_slab_fields` (which sets
+    `certifier`/`label`/`page_quality`) for a comp that its OWN `route_slabs`
+    branch routes into `slab_comps` — a branch this include_graded-only call
+    never reaches — so every comp this function selected arrived with none
+    of those three fields, and `_comp_to_ledger_item` posted the RAW-market
+    sentinels (`certifier='none'`/`label='universal'`/`page_quality='unknown'`)
+    for comps that plainly named a certifier, and sometimes a label/page
+    quality, in their own titles (comp 16410, BUI-993: `certifier='none'`
+    stored for a genuine "CGC 6.5" sale).
+
+    BUI-998 fixed this at the SOURCE instead of porting a second copy here:
+    `sold_comps._run` (apps/ebay) now calls `parse_slab_fields` on every
+    slab-titled comp regardless of `route_slabs`, so by the time a comp
+    reaches this function it already carries all three fields. `label`/
+    `page_quality` are corpus-tuned regex tables (`grade_tokens.py`, ~250
+    lines) apps/fmv cannot import (it shells out to ebay-sold-comps, never
+    imports it — CLAUDE.md's "FMV pipeline shells out across package
+    boundaries") and must not duplicate, so there is no local fallback parse
+    for those two. `certifier` keeps its own local regex stamp as a
+    defensive floor only — via `setdefault`, so it never overrides a value
+    ebay-sold-comps already set, and only fires if this ran against a stale
+    ebay-sold-comps install that predates BUI-998 (apps/ebay and apps/fmv
+    are deployed together, so this should be unreachable in practice; see
+    BUI-27 on a stale wrapper shadowing the installed console script).
     """
     result = []
     for c in comps:
@@ -3183,7 +3189,7 @@ def _slab_comps_only(comps: list[dict]) -> list[dict]:
         if not m:
             continue
         comp = dict(c)
-        comp["certifier"] = m.group(0).lower()
+        comp.setdefault("certifier", m.group(0).lower())
         result.append(comp)
     return result
 
