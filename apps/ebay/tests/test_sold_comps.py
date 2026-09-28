@@ -162,6 +162,82 @@ class TestParseGrade:
     def test_spelled_out_slash_combos(self, title, expected):
         assert sc.parse_grade(title) == expected
 
+    # ── BUI-1003: split-grade mis-reads ──────────────────────────────────────
+    #
+    # Six phrasings, counted over 19,038 cached sold-comp titles at ticket
+    # time, resolved to the wrong grade because no Tier 1 combo entry existed
+    # for them and the parser fell through to a bare-component or Tier 3
+    # pattern. Titles below are verbatim (or lightly trimmed) corpus titles
+    # with any embedded numeric grade removed — `parse_grade` checks the
+    # numeric regex before any letter pattern, so a title that also states
+    # "7.0" would pass via the numeric path regardless of whether the
+    # letter-pattern fix is present, and not actually exercise it.
+
+    @pytest.mark.parametrize("title,expected", [
+        # F/VF (58 titles at ticket time) — was 8.0 (bare VF), should be 7.0.
+        ("Amazing Spider-Man #300 F/VF, 1st full Venom, Todd McFarlane", 7.0),
+        ("The X-Men #73 1st App Of El Tigre ( F-VF) Marvel Comics", 7.0),
+        # VF-NM (55) — was 9.4 (bare NM, since the trailing N blocked the
+        # `vf-(?!\w)` minus pattern), should be 9.0.
+        ("Age of Apocalypse #10 VF-NM Marvel Comic Book X-Force X-Men", 9.0),
+        # G/VG (35) — was 4.0 (bare VG), should be 3.0.
+        ("Amazing Spider-Man #194 1979 1st App Black Cat Marvel Comics G/VG", 3.0),
+        ("1967 Marvel Comics The Mighty Thor #138 (G-VG)", 3.0),
+        # VG-FN (8) — was 6.0 (bare FN), should be 5.0.
+        ("Bronze Age The Uncanny X-Men Annual #6 & #7 Lot of 2 VG-FN", 5.0),
+        # FN-VF (6) — was 8.0 (bare VF), should be 7.0.
+        ("Astonishing X-Men #20 Comics FN-VF Marvel Comics Group", 7.0),
+        # Bare "Very Fine" (~14) — was 6.0 (bare Fine, matching the "Fine"
+        # substring inside "Very Fine"), should be 8.0.
+        ("Classic X-Men #5 newsstand very fine condition Marvel Comics", 8.0),
+        ("Captain America #111 1969 Marvel Comics Fine to Very Fine", 8.0),
+        # "Very Fine+"/"Very Fine-" must read 8.5/7.5 (the VF+/VF- values),
+        # not fall through to the generic "Fine+"/"Fine-" entries (6.5/5.5).
+        ("Amazing Spider-Man #82 Classic Romita Electro Cover Hi Grade Very Fine+", 8.5),
+        ("Daredevil #167 Very Fine- Nov 1980 Marvel Comics", 7.5),
+        ("Captain America #110 Steranko Cover and Art Very Fine +", 8.5),
+    ])
+    def test_split_grade_phrasings(self, title, expected):
+        assert sc.parse_grade(title) == expected
+
+    def test_very_fine_dash_separator_not_read_as_minus(self):
+        """Regression: a seller's " - " field separator right after a bare
+        "Very Fine" grade must not be misread as the "Very Fine-" minus
+        modifier (7.5) — the minus reading only applies when the hyphen is
+        glued directly onto "Fine" with no space, matching every genuine
+        corpus minus ("Very Fine- (Grade 7.5)"). Verbatim corpus title."""
+        title = "X - Force #1 - Marvel Comics - Aug 1991 - Very Fine - Bagged & Boarded"
+        assert sc.parse_grade(title) == 8.0
+
+    @pytest.mark.parametrize("title,expected", [
+        # A hyphen followed by a letter grade is a combo; a hyphen followed
+        # by a non-word character is the minus modifier. Both meanings must
+        # survive the BUI-1003 separator widening unchanged.
+        ("Uncanny X-Men #185 NM-", 9.2),
+        ("Amazing Spider-Man #300 VF- copy", 7.5),
+        ("Age of Apocalypse #9 VF-NM Marvel Comic Book X-Force X-Men", 9.0),
+    ])
+    def test_minus_vs_combo_hyphen_distinction(self, title, expected):
+        assert sc.parse_grade(title) == expected
+
+    # ── BUI-1003 optional: VG/F and the VFN synonym ──────────────────────────
+    #
+    # VG/F (27 corpus titles) reads unambiguously as VG/FN in this corpus —
+    # most pair it with an explicit "5.0" in the same title. VFN (17) is a
+    # seller shorthand for "Very Fine" on the VF scale, confirmed by corpus
+    # titles that self-report the grade ("VFN- (7.5)", "VFN+ (8.5)").
+
+    @pytest.mark.parametrize("title,expected", [
+        ("Amazing Spider-Man 308 VG/F Marvel Comics 1988 Mary Jane", 5.0),
+        ("X-Men # 108 VFN John Byrne's Art on New X-Men Begins", 8.0),
+        ("Batman # 422 VFN+", 8.5),
+        ("Avengers #87 VFN- Marvel Vol 1 1971 Origin Black Panther", 7.5),
+        ("Marvel Comics Uncanny X-Men #238 VFN/NM", 9.0),
+        ("Uncanny X-Men #101 Marvel 1976 FN/VFN First Phoenix", 7.0),
+    ])
+    def test_vg_f_and_vfn_synonym(self, title, expected):
+        assert sc.parse_grade(title) == expected
+
 
 # ─── Hard excludes ────────────────────────────────────────────────────────────
 

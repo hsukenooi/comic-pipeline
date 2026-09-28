@@ -85,12 +85,42 @@ _NUMERIC_GRADE_RE = re.compile(
 # inflated value off its least reliable signal.
 _LETTER_PATTERNS = [
     # Tier 1 — slash combos (longest first)
+    #
+    # BUI-1003: the separator class widened from `[/\\]` to `[/\\-]` on the
+    # VF/NM, FN/VF, and VG/FN(+) entries below (measured over the offline
+    # corpus — comps table + ~/.cache/ebay-sold-comps — both a slash and a
+    # hyphen form exist for each: 571 "VF/NM" + 52 "VF-NM", 186 "FN/VF" + 7
+    # "FN-VF", 163 "VG/FN" + 12 "VG-FN"). A hyphen here is safe as a combo
+    # separator because these entries require a *letter grade* immediately
+    # after it ("nm", "fn", "vg"…) — the minus-modifier reading in Tier 2
+    # only fires when the character after the hyphen is a non-word boundary
+    # (`(?!\w)`), and Tier 1 is checked first regardless, so "VF-NM" resolves
+    # here as the combo (9.0) before Tier 2's `vf-(?!\w)` (7.5, a different
+    # token) is ever reached.
+    #
+    # Three entries below are new: F/VF (73 slash + 2 hyphen), G/VG (49 slash
+    # + 2 hyphen) — sellers' single-letter shorthand for Fine/Good in a
+    # combo, same value as the FN/GD spelling — and VG/F (53 corpus titles,
+    # most pairing it with an explicit "5.0" in the same title, confirming
+    # it means VG/FN, not some other reading). The VF/NM and FN/VF entries
+    # also gained an optional trailing "n" (`vfn?`) to recognize "VFN" as a
+    # spelled-shorthand synonym for "VF" (see the bare-VFN entry in Tier 3
+    # for the corpus evidence — e.g. "VFN- (7.5)", "VFN+ (8.5)" — that
+    # confirms VFN reads on the VF scale, not as "VF/NM").
     (re.compile(r'\bnm[/\\]m\b', re.I), 9.6),
-    (re.compile(r'\bvf[/\\]nm\b', re.I), 9.0),
-    (re.compile(r'\bfn[/\\]vf\b|\bfine[/\\]vf\b|\bfvf\b', re.I), 7.0),
-    (re.compile(r'\bvg[/\\]fn\+(?!\w)', re.I), 5.5),
-    (re.compile(r'\bvg[/\\]fn\b', re.I), 5.0),
-    (re.compile(r'\bgd[/\\]vg\b', re.I), 3.0),
+    (re.compile(r'\bvfn?[/\\-]nm\b', re.I), 9.0),  # VF/NM, VF-NM, VFN/NM, VFN-NM
+    (re.compile(r'\bfn[/\\-]vfn?\b|\bfine[/\\-]vf\b|\bfvf\b', re.I), 7.0),  # FN/VF, FN-VF, FN/VFN
+    # F/VF+ (2 corpus titles) follows the same "combo + modifier on the
+    # second half" reading the pre-existing VG/FN+ entry below already
+    # establishes for this table (bare combo value +0.5) — must precede the
+    # bare F/VF entry, or the modifier is silently dropped.
+    (re.compile(r'\bf[/\\-]vf\+(?!\w)', re.I), 7.5),
+    (re.compile(r'\bf[/\\-]vf\b', re.I), 7.0),  # F/VF, F-VF — "F" as shorthand for Fine
+    (re.compile(r'\bvg[/\\-]fn\+(?!\w)', re.I), 5.5),
+    (re.compile(r'\bvg[/\\-]fn\b', re.I), 5.0),
+    (re.compile(r'\bvg[/\\-]f\b', re.I), 5.0),  # VG/F — corpus titles pair it with an explicit "5.0"
+    (re.compile(r'\bg[/\\-]vg\b', re.I), 3.0),  # G/VG, G-VG — "G" as shorthand for Good
+    (re.compile(r'\bgd[/\\-]vg\b', re.I), 3.0),
     (re.compile(r'\bfr[/\\]gd\b', re.I), 1.5),
 
     # Tier 1b — the same slash combos SPELLED OUT. These must sit in Tier 1
@@ -124,6 +154,35 @@ _LETTER_PATTERNS = [
     (re.compile(r'(?<![a-z0-9])near[\s_-]+mint[\s_-]+minus(?![a-z0-9])', re.I), 9.2),
     (re.compile(r'\bvf\+(?!\w)', re.I), 8.5),
     (re.compile(r'\bvf-(?!\w)', re.I), 7.5),
+    # BUI-1003: word-form "Very Fine" and its "VFN" synonym, both with a
+    # trailing +/- modifier. Must precede the bare "Very Fine"/"VFN" Tier 3
+    # entries (that pattern also matches the "Very Fine+"/"Very Fine-"
+    # prefix, and the loop returns on first hit) and the generic Tier 2
+    # `fine+`/`fine-` entries just below (else "Very Fine+" falls to plain
+    # "Fine+" = 6.5, and "Very Fine-" to "Fine-" = 5.5 — the exact mis-read
+    # the ticket named, confirmed by corpus titles that state their own
+    # grade: "Very Fine+ (Grade 8.5)", "Very Fine- (Grade 7.5)"). `(?![a-z0-
+    # 9])` (not `(?!\w)`) on the trailing boundary for the word-form pair,
+    # matching the "near mint minus" convention above, because the corpus's
+    # underscore-delimited titles put a "_" right after the modifier (e.g.
+    # "VERY FINE+_THE RETURN…") and `_` is a word character that would
+    # otherwise block `(?!\w)`.
+    #
+    # "+" tolerates whitespace before it (`[\s_]*\+`) — the corpus has a
+    # genuine "Very Fine +" (space, no punctuation after) that must read
+    # 8.5. "-" does NOT (`fine-`, glued) — sellers in this corpus use " - "
+    # as a bare field separator throughout a title ("X - FORCE #1 - ... -
+    # Very Fine - Bagged & Boarded"), and a spaced `[\s_]*-` here matched
+    # that separator, misreading a plain "Very Fine" grade as "Very Fine-"
+    # (7.5 instead of 8.0). Every genuine minus in the corpus glues the
+    # hyphen straight onto "Fine" ("Very Fine- (Grade 7.5)"), so requiring
+    # that glue (no `[\s_]*` before the `-`) keeps the true minus reading and
+    # drops the false one; the bare "Very Fine" Tier 3 entry below still
+    # catches the now-unmatched spaced-dash title correctly at 8.0.
+    (re.compile(r'(?<![a-z0-9])very[\s_]*fine[\s_]*\+(?![a-z0-9])', re.I), 8.5),
+    (re.compile(r'(?<![a-z0-9])very[\s_]*fine-(?![a-z0-9])', re.I), 7.5),
+    (re.compile(r'\bvfn\+(?!\w)', re.I), 8.5),
+    (re.compile(r'\bvfn-(?!\w)', re.I), 7.5),
     (re.compile(r'\bfn\+(?!\w)|\bfine\+(?!\w)', re.I), 6.5),
     (re.compile(r'\bfn-(?!\w)|\bfine-(?!\w)', re.I), 5.5),
     (re.compile(r'\bvg\+(?!\w)', re.I), 4.5),
@@ -134,6 +193,14 @@ _LETTER_PATTERNS = [
     (re.compile(r'\bnm\b(?![+\-/\\])', re.I), 9.4),
     (re.compile(r'(?<![a-z0-9])near[\s_-]+mint(?![a-z0-9])', re.I), 9.4),
     (re.compile(r'\bvf\b(?![+\-/\\])', re.I), 8.0),
+    # BUI-1003: bare word-form "Very Fine" and its "VFN" synonym. Must
+    # precede the bare "Fine" entry just below — "Very Fine" contains "Fine"
+    # as a substring, so without this entry ahead of it, "Very Fine" resolved
+    # to plain "Fine" = 6.0 (the ticket's own mis-read; corpus title
+    # confirmation: "Very Fine (Grade 8.0)"). Same trailing-boundary style as
+    # the modifier pair above.
+    (re.compile(r'(?<![a-z0-9])very[\s_]*fine(?![a-z0-9])', re.I), 8.0),
+    (re.compile(r'\bvfn\b(?![+\-/\\])', re.I), 8.0),
     (re.compile(r'\bfn\b(?![+\-/\\])|\bfine\b(?![+\-/\\])', re.I), 6.0),
     (re.compile(r'\bvg\b(?![+\-/\\])|\bvery good\b', re.I), 4.0),
     (re.compile(r'\bgd\b(?![+\-/\\])|\bgood\b', re.I), 2.0),
