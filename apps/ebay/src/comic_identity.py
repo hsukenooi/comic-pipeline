@@ -1269,22 +1269,49 @@ def _fmv_spaced_number_run_lot(title: str) -> bool:
 # as a MOVIE reference — has zero hits in this corpus but is structurally
 # distinct (the token is immediately followed by "X-Men"/":"), so it is
 # guarded defensively via `(?!\s*[:\-]?\s*x-?men)` even though unmeasured.
-# After those three guards, every remaining corpus hit (8 rows, all pool=raw,
-# all excluded_code IS NULL) is a genuine multi-copy sale: 3x "Uncanny X-Men
-# #239 X2", "18 X2 BOTH", 2x "... cover x2", "Var(x2) & 1 Bermejo Variant"
-# (3 copies), and the reversed "2 x" form on "#1 ... & #2 ... 2 x VF- comics."
-# (two DIFFERENT issues sold as one lot — still a multi-book sale a single
-# comp pool must not absorb).
+#
+# EM REVIEW ROUND (still BUI-1009): the first cut above allowed an internal
+# space in the bare form (`x\s?2`) and had no guard on what follows the
+# reversed form's "x" — both false-fire on an ISSUE NUMBER that merely sits
+# next to an X-titled series, which is common and unrelated to copy count:
+#   "Giant-Size X-Men #2 X-Men 1975" / "X-Factor #2 X-Force" / "X-Men 2
+#     X-Men Legends" — the REVERSED form read "#2 X-Men"/"2 X-Force" as
+#     "2x", because \b sits between "X" and the following "-" just fine.
+#     Fixed with `(?![a-zA-Z-])` after the reversed form: a genuine "2x"/
+#     "2 x" copy count is never itself followed immediately by a hyphen or
+#     another letter — "2 x VF- comics" (the one real corpus case) has a
+#     SPACE there, so the guard leaves it untouched.
+#   "Generation X 2 CGC" / "Malcolm X 2" — the BARE form's optional internal
+#     space let a standalone series-ending "X" ("Generation X", "Malcolm X",
+#     same shape as "Professor X" above) plus a separate issue/sequel number
+#     read as "X 2". None of the 8 real corpus hits for this branch ever
+#     needed the space (they are all glued "X2"), so the fix is simply to
+#     require it: the bare form is now `\bx2\b` (no `\s?`), which drops the
+#     "X 2" shape entirely rather than trying to distinguish it further.
+#     `(?![a-zA-Z-])` is also added here for the same "X2-Men"/"X2-Force"-
+#     style continuation the reversed form guards against, even though \b
+#     already blocks a directly-glued letter — kept explicit for parity.
+# Re-measured after tightening: the 8 true-positive corpus rows are
+# unchanged (see docs/audit/2026-09-29-bui-1009-ledger-matches.json).
 _FMV_COPY_COUNT_LOT_RE = re.compile(
     r"""
     \(\s*x\s?2\s*\)                          # "(x2)" parenthetical copy count
-    | (?<!ss\s)\bx\s?2\b(?!\.\d)(?!\s*[:\-]?\s*x-?men)
-                                              # bare "X2"/"X 2": not preceded
-                                              # by "SS " (signature count), not
-                                              # a decimal-grade fragment, not
-                                              # the "X2"/"X2: X-Men United"
-                                              # movie reference
-    | \b2\s?x\b(?!\.\d)                      # reversed "2x"/"2 x"
+    | (?<!ss\s)\bx2\b(?!\.\d)(?![a-zA-Z-])(?!\s*[:\-]?\s*x-?men)
+                                              # bare "X2" (glued, no internal
+                                              # space): not preceded by "SS "
+                                              # (signature count), not a
+                                              # decimal-grade fragment, not
+                                              # continuing into another letter
+                                              # or hyphen, not the "X2"/"X2:
+                                              # X-Men United" movie reference
+    | \b2\s?x\b(?!\.\d)(?![a-zA-Z-])         # reversed "2x"/"2 x": not a
+                                              # decimal-grade fragment, not
+                                              # continuing into another letter
+                                              # or hyphen ("#2 X-Men", "#2
+                                              # X-Force" are issue 2 of THIS
+                                              # book followed by a different
+                                              # series mentioned afterward,
+                                              # not a copy count)
     """,
     re.IGNORECASE | re.VERBOSE,
 )

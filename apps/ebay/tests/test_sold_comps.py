@@ -459,6 +459,23 @@ class TestHardExclude:
         # "X2" immediately followed by "X-Men"/":".
         "X2: X-Men United Movie Poster",
         "X2 X-Men United DVD 2003",
+        # EM review round: an issue number "2" sitting next to an X-titled
+        # series is common and unrelated to copy count. The REVERSED form
+        # ("#2 X-Men", "#2 X-Force") used to read as "2x" because \b is
+        # satisfied between "X" and the following hyphen — fixed with
+        # `(?![a-zA-Z-])` so the token cannot continue into a hyphen/letter.
+        "Giant-Size X-Men #2 X-Men 1975",
+        "X-Factor #2 X-Force",
+        "X-Men 2 X-Men Legends",
+        # The BARE form used to allow an internal space ("X 2"), which let a
+        # standalone series-ending "X" ("Generation X", "Malcolm X" — same
+        # shape as "Professor X 2.5" above) plus a separate issue/sequel
+        # number read as a copy count. Fixed by requiring the bare form be
+        # glued ("X2", no space) — none of the real corpus hits needed the
+        # space.
+        "Generation X 2 CGC",
+        "Generation X 2",
+        "Malcolm X 2",
     ])
     def test_keeps(self, title):
         assert not sc.hard_exclude(title)

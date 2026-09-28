@@ -23,12 +23,28 @@
     },
     "x2_copy_count": {
       "location": "apps/ebay/src/comic_identity.py:_FMV_COPY_COUNT_LOT_RE / _fmv_copy_count_lot, wired into is_comp_excluded (comp-only, not merged into the shared _LOT_RE)",
-      "forms_matched": ["(x2) parenthetical", "bare X2 / X 2", "reversed 2x / 2 x"],
+      "forms_matched": ["(x2) parenthetical", "bare X2 (glued, no internal space)", "reversed 2x / 2 x"],
       "corpus_hits_as_implemented": 8,
       "false_positives_excluded_by_guard": {
         "SS X2 Claremont Leonardi (2 signatures, 1 book)": "(?<!ss\\s) lookbehind",
         "Death of Professor X 2.5 (decimal grade fragment)": "(?!\\.\\d) lookahead",
         "X2: X-Men United / X2 X-Men United (movie reference, 0 corpus hits, guarded defensively)": "(?!\\s*[:\\-]?\\s*x-?men) lookahead"
+      },
+      "em_review_round": {
+        "reason": "EM review found the first cut's bare form allowed an internal space (x\\s?2) and the reversed form had no guard on trailing context, so both false-fired on an issue number sitting next to an X-titled series or a standalone series-ending 'X'.",
+        "reported_false_positives": [
+          "Giant-Size X-Men #2 X-Men 1975",
+          "X-Factor #2 X-Force",
+          "X-Men 2 X-Men Legends",
+          "Generation X 2 CGC",
+          "Malcolm X 2"
+        ],
+        "verified_not_in_live_corpus": "confirmed 0 rows matching any of the 5 reported titles (or 'Generation X'/'Malcolm X' substrings) in ~/.comics-server/db.sqlite — these were EM-constructed stress cases, not a live production miss, so the 12 ledger-matched rows below are unchanged by the fix.",
+        "fix": {
+          "bare_form": "dropped the optional internal space (now literal 'x2', not 'x\\s?2') — none of the 8 real corpus hits for this branch needed the space, all are glued 'X2'; a spaced 'X 2' is now left alone entirely, which is what 'Generation X 2'/'Malcolm X 2' needed",
+          "both_forms": "added (?![a-zA-Z-]) immediately after the token so it cannot continue into a hyphen or another letter — 'X-Men'/'X-Force'/'X-Factor'/'X-O' after the token no longer match; the real 'X-Men #1 ... 2 x VF- comics.' positive is unaffected because a space, not a hyphen, follows its 'x'"
+        },
+        "re_measured": "corpus hits after tightening: still 8 for x2_copy_count, still 12 combined unique ledger rows, still 0 slab — identical set of ids to the pre-tightening measurement"
       }
     }
   },
