@@ -712,7 +712,7 @@ async def api_comics_comps(
 
 @router.post("/api/comics/comps/exclude")
 async def api_comics_comps_exclude(req: CompsExcludeRequest, request: Request):
-    """BUI-947: stamp `pool='slab'` comps of one book as excluded from pools.
+    """BUI-947/BUI-1018: stamp one pool's comps of one book as excluded.
 
     The write half of the exclusion stamp, and the residual BUI-946 could not
     close. BUI-946 drops a ledger row at MERGE time when this run's live fetch
@@ -728,7 +728,8 @@ async def api_comics_comps_exclude(req: CompsExcludeRequest, request: Request):
     existed — and a wrong exclusion has to be discoverable and reversible,
     which a DELETE would make neither.
 
-    Body: `{comic_id, product_ids: [...], code}`. Exactly one `code` per call
+    Body: `{comic_id, product_ids: [...], code, pool?}` (`pool` is 'slab' by
+    default, or 'raw' — BUI-1018). Exactly one `code` per call
     — group by code caller-side rather than sending a mixed batch, so the
     reason on every stamped row is the reason that call carried.
 
@@ -739,21 +740,26 @@ async def api_comics_comps_exclude(req: CompsExcludeRequest, request: Request):
       * 422 — an unknown `code`, an empty `product_ids`, or a missing field
         (`CompsExcludeRequest`). The whole call is refused before anything is
         stamped, and `LedgerRoute` persists the refusal to `rejected_writes`.
-      * 200 — `{comic_id, code, stamped, already_stamped, not_found}`.
+      * 200 — `{comic_id, pool, code, stamped, already_stamped, not_found}`.
 
-    A RAW row is never stamped by this endpoint, whatever is sent: every code
-    in the vocabulary comes from a GRADED-mode-only guard, so it has no
-    meaning for a raw comp, and this project's standing lesson is that
-    silently thinning the raw pool is the expensive direction. A product_id
-    that resolves to a raw row comes back in `not_found` — reported, not
-    obeyed.
+    RAW rows (BUI-1018): pass `pool: 'raw'`. BUI-947 refused them because the
+    codes came from graded-mode guards, but raw rows now have evidence of the
+    same kinds (facsimile reprints, copy-count lots, wrong-volume fetches).
+    Same stamp-not-delete, first-stamp-wins semantics and code vocabulary;
+    `GET /api/comics/comps` hides a stamped raw row by default exactly as it
+    does a slab one (the `excluded_code IS NULL` filter is pool-agnostic). A
+    product_id is unique per (provider, pool), not across pools, so only the
+    NAMED pool's row is stamped; an id that lives only in the other pool comes
+    back in `not_found`. An unknown `pool` 422s.
 
     IDEMPOTENT: a row already stamped is counted in `already_stamped` and
     left exactly as it was, so re-running the BUI-947 sweep over an
     already-swept archive writes nothing and changes no `excluded_at`.
     """
     db = request.app.state.db
-    result = stamp_comps_excluded(db, req.comic_id, req.product_ids, req.code)
+    result = stamp_comps_excluded(
+        db, req.comic_id, req.product_ids, req.code, req.pool
+    )
     if result is None:
         raise HTTPException(
             status_code=404, detail=f"comic_id {req.comic_id} not in DB"
