@@ -37,6 +37,9 @@ _comps_provenances_sql = ", ".join(f"'{p}'" for p in COMPS_PROVENANCES)
 # schema. The enforcement point is `models.CompsExcludeRequest`, which imports
 # this tuple, plus `stamp_comps_excluded` below, which re-checks it so a
 # direct-Python caller cannot write a code the API would refuse.
+# Pools `stamp_comps_excluded` may stamp (BUI-1018). 'slab' first = the default.
+COMPS_EXCLUSION_POOLS = ("slab", "raw")
+
 COMPS_EXCLUSION_CODES = (
     "multibook_lot", "cross_title", "store_variant", "hard_exclude",
     "printing", "manual",
@@ -4619,8 +4622,9 @@ def stamp_comps_excluded(
     comic_id: int,
     product_ids: list[str],
     code: str,
+    pool: str = "slab",
 ) -> dict[str, Any] | None:
-    """Stamp `pool='slab'` comps of one book as excluded (BUI-947).
+    """Stamp one pool's comps of one book as excluded (BUI-947, BUI-1018).
 
     Write path for `POST /api/comics/comps/exclude`. Returns None when
     `comic_id` names no known book — the route 404s on that, the same
@@ -4629,13 +4633,17 @@ def stamp_comps_excluded(
 
     THREE narrowings, each of which is a guard rather than a filter:
 
-    * `pool='slab'` — a raw row is NEVER stamped here, whatever the caller
-      sends. Every code in `COMPS_EXCLUSION_CODES` comes from a guard that
-      runs in GRADED mode only (`fetch_book_comps` runs them under
-      `graded_target`), so a code has no meaning for a raw comp; and the raw
-      pool is the one this project has been burned for silently thinning.
-      A product_id that resolves to a raw row is reported in `not_found`,
-      not stamped.
+    * `pool` (BUI-1018) — `'slab'` (the default, so every pre-BUI-1018 caller
+      is unchanged) or `'raw'`, never both in one call. A product_id is
+      unique per (provider, pool), so the SAME id can exist in both pools of
+      one book; the caller names the pool its evidence is about and only
+      that pool's row is stamped. BUI-947 refused raw outright because every
+      code came from a graded-mode guard; BUI-1009/994/1010 now hold
+      evidence about raw rows (facsimile reprints, X2 copy-count lots,
+      wrong-volume fetches), and `get_comps`' `excluded_code IS NULL` filter
+      is pool-agnostic, so a stamped raw row leaves the raw pool too. A
+      product_id that resolves to no row of the NAMED pool is reported in
+      `not_found`, not stamped in the other pool.
     * `comic_id` — a product_id is unique per (provider, pool) but NOT across
       books, and the caller's evidence is always about one book's pool.
     * `excluded_code IS NULL` — the first stamp wins, so `excluded_at` stays
@@ -4649,8 +4657,8 @@ def stamp_comps_excluded(
     same normalization `_merge_slab_pool`'s `dropped_ids` uses.
 
     Returns `{comic_id, code, stamped, already_stamped, not_found}` where
-    `not_found` lists every id that matched no un-stamped slab row of this
-    book, for either reason (no such comp, or it is a raw row). The caller
+    `not_found` lists every id that matched no row of the named pool of this
+    book (no such comp, or it lives in the other pool). The caller
     gets counts AND the ids, because "I stamped 4 of the 5 I sent" is a
     different fact from "I stamped 4".
 
@@ -4674,6 +4682,10 @@ def stamp_comps_excluded(
         "SELECT 1 FROM comics WHERE id = ?", (comic_id,)
     ).fetchone() is None:
         return None
+    if pool not in COMPS_EXCLUSION_POOLS:
+        raise ValueError(
+            f"unknown pool {pool!r} (expected one of {COMPS_EXCLUSION_POOLS})"
+        )
     if code not in COMPS_EXCLUSION_CODES:
         # Defense in depth behind `models.CompsExcludeRequest`: the column
         # carries no CHECK (see COMPS_EXCLUSION_CODES), so this is the only
@@ -4692,8 +4704,8 @@ def stamp_comps_excluded(
         pid = str(raw_pid)
         row = conn.execute(
             "SELECT id, excluded_code FROM comps "
-            "WHERE comic_id = ? AND pool = 'slab' AND product_id = ?",
-            (comic_id, pid),
+            "WHERE comic_id = ? AND pool = ? AND product_id = ?",
+            (comic_id, pool, pid),
         ).fetchone()
         if row is None:
             not_found.append(pid)
@@ -4709,12 +4721,13 @@ def stamp_comps_excluded(
     conn.commit()
     if stamped:
         logger.info(
-            "stamp_comps_excluded: comic_id=%s code=%s stamped=%d "
+            "stamp_comps_excluded: comic_id=%s pool=%s code=%s stamped=%d "
             "already=%d not_found=%d",
-            comic_id, code, stamped, already, len(not_found),
+            comic_id, pool, code, stamped, already, len(not_found),
         )
     return {
         "comic_id": comic_id,
+        "pool": pool,
         "code": code,
         "stamped": stamped,
         "already_stamped": already,

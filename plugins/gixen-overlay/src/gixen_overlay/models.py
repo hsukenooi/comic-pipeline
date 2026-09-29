@@ -9,6 +9,7 @@ from gixen_overlay.db import (
     COMP_PAGE_QUALITIES,
     COMP_PAGE_QUALITY_UNKNOWN,
     COMPS_EXCLUSION_CODES,
+    COMPS_EXCLUSION_POOLS,
     COMPS_POOLS,
     COMPS_PROVENANCES,
     COMPS_RESTAMP_FIELDS,
@@ -760,7 +761,7 @@ class CompsIngestRequest(BaseModel):
 
 
 class CompsExcludeRequest(BaseModel):
-    """POST /api/comics/comps/exclude — stamp slab comps as excluded (BUI-947).
+    """POST /api/comics/comps/exclude — stamp slab or raw comps as excluded (BUI-947, BUI-1018).
 
     Unlike `CompsIngestRequest` above, `comic_id` is REQUIRED and not
     nullable. An exclusion is always a judgement about ONE book's pool — the
@@ -784,6 +785,18 @@ class CompsExcludeRequest(BaseModel):
     comic_id: int
     product_ids: list[str]
     code: str
+    # BUI-1018: which pool the product_ids live in. Default 'slab' keeps every
+    # pre-existing caller (comic-fmv's BUI-947 stamp) byte-identical.
+    pool: str = "slab"
+
+    @field_validator("pool")
+    @classmethod
+    def _validate_pool(cls, v: str) -> str:
+        if v not in COMPS_EXCLUSION_POOLS:
+            raise ValueError(
+                f"pool must be one of: {', '.join(COMPS_EXCLUSION_POOLS)}"
+            )
+        return v
 
     @field_validator("product_ids")
     @classmethod

@@ -318,10 +318,9 @@ def test_get_comps_ordering_is_unchanged_by_the_new_clause(db):
 # ---------------------------------------------------------------------------
 
 
-def test_stamp_only_touches_slab_rows(db):
-    """A raw row is NEVER stamped by this path, whatever the caller sends —
-    every code comes from a guard that only ever runs in graded mode, and
-    silently thinning the raw pool is the expensive direction."""
+def test_stamp_defaults_to_slab_and_leaves_raw_rows_alone(db):
+    """No `pool` argument keeps the pre-BUI-1018 behavior: a raw row with the
+    same product_id is not touched and is reported in `not_found`."""
     comic_id = upsert_comic(db, "Invincible", "1", 2003)
     upsert_comps(db, comic_id, [_comp(product_id="raw-1", pool="raw",
                                       certifier="none")])
@@ -333,6 +332,85 @@ def test_stamp_only_touches_slab_rows(db):
     assert db.execute(
         "SELECT excluded_code FROM comps WHERE product_id='raw-1'"
     ).fetchone()[0] is None
+
+
+def test_stamp_raw_pool_stamps_and_get_comps_hides_the_row(db):
+    """BUI-1018: pool='raw' stamps a raw row; the default read skips it and
+    include_excluded still shows it (stamp, never delete)."""
+    comic_id = upsert_comic(db, "Uncanny X-Men", "239", 1988)
+    upsert_comps(db, comic_id, [
+        _comp(product_id="x2", pool="raw", certifier="none"),
+        _comp(product_id="keep", pool="raw", certifier="none"),
+    ])
+
+    result = stamp_comps_excluded(db, comic_id, ["x2"], "multibook_lot",
+                                  pool="raw")
+
+    assert result["stamped"] == 1 and result["not_found"] == []
+    assert result["pool"] == "raw"
+    served = get_comps(db, comic_id=comic_id, pool="raw")
+    assert [r["product_id"] for r in served] == ["keep"]
+    audit = get_comps(db, comic_id=comic_id, pool="raw", include_excluded=True)
+    assert {r["product_id"]: r["excluded_code"] for r in audit} == {
+        "x2": "multibook_lot", "keep": None}
+
+
+def test_stamp_raw_is_first_stamp_wins_and_idempotent(db):
+    comic_id = upsert_comic(db, "Uncanny X-Men", "239", 1988)
+    upsert_comps(db, comic_id, [_comp(product_id="x2", pool="raw",
+                                      certifier="none")])
+    stamp_comps_excluded(db, comic_id, ["x2"], "printing", pool="raw")
+    first = db.execute(
+        "SELECT excluded_code, excluded_at FROM comps").fetchone()
+
+    again = stamp_comps_excluded(db, comic_id, ["x2"], "manual", pool="raw")
+
+    assert again["stamped"] == 0 and again["already_stamped"] == 1
+    assert tuple(db.execute(
+        "SELECT excluded_code, excluded_at FROM comps").fetchone()) == tuple(first)
+
+
+def test_stamp_pool_is_exclusive_when_a_product_id_exists_in_both_pools(db):
+    """A product_id is unique per (provider, pool): naming one pool must not
+    stamp the other pool's row of the same id."""
+    comic_id = upsert_comic(db, "Invincible", "1", 2003)
+    upsert_comps(db, comic_id, [
+        _comp(product_id="dup", pool="raw", certifier="none"),
+        _comp(product_id="dup", pool="slab"),
+    ])
+
+    stamp_comps_excluded(db, comic_id, ["dup"], "manual", pool="raw")
+
+    codes = {r["pool"]: r["excluded_code"] for r in db.execute(
+        "SELECT pool, excluded_code FROM comps WHERE product_id='dup'")}
+    assert codes == {"raw": "manual", "slab": None}
+
+
+def test_stamp_raw_id_named_against_slab_pool_is_not_found(db):
+    comic_id = upsert_comic(db, "Invincible", "1", 2003)
+    upsert_comps(db, comic_id, [_comp(product_id="only-slab")])
+
+    result = stamp_comps_excluded(db, comic_id, ["only-slab"], "manual",
+                                  pool="raw")
+
+    assert result["stamped"] == 0 and result["not_found"] == ["only-slab"]
+
+
+def test_stamp_refuses_an_unknown_pool(db):
+    comic_id = upsert_comic(db, "Invincible", "1", 2003)
+    with pytest.raises(ValueError):
+        stamp_comps_excluded(db, comic_id, ["x"], "manual", pool="both")
+
+
+def test_unstamp_clears_a_raw_row_too(db):
+    comic_id = upsert_comic(db, "Uncanny X-Men", "239", 1988)
+    upsert_comps(db, comic_id, [_comp(product_id="x2", pool="raw",
+                                      certifier="none")])
+    stamp_comps_excluded(db, comic_id, ["x2"], "manual", pool="raw")
+    row_id = db.execute("SELECT id FROM comps").fetchone()[0]
+
+    assert unstamp_comps_excluded(db, [row_id])["unstamped"] == [row_id]
+    assert len(get_comps(db, comic_id=comic_id, pool="raw")) == 1
 
 
 def test_stamp_never_reaches_another_books_pool(db):
@@ -363,7 +441,8 @@ def test_restamping_keeps_the_first_stamps_time_and_code(db):
 
     again = stamp_comps_excluded(db, comic_id, ["15719"], "manual")
 
-    assert again == {"comic_id": comic_id, "code": "manual", "stamped": 0,
+    assert again == {"comic_id": comic_id, "pool": "slab", "code": "manual",
+                     "stamped": 0,
                      "already_stamped": 1, "not_found": []}
     now = db.execute(
         "SELECT excluded_code, excluded_at FROM comps WHERE product_id='15719'"
@@ -578,11 +657,55 @@ def test_exclude_endpoint_stamps_and_the_read_stops_serving_the_row(api):
         "code": "store_variant",
     })
     assert r.status_code == 200, r.text
-    assert r.json() == {"comic_id": comic_id, "code": "store_variant",
-                        "stamped": 1, "already_stamped": 0, "not_found": []}
+    assert r.json() == {"comic_id": comic_id, "pool": "slab",
+                        "code": "store_variant", "stamped": 1, "already_stamped": 0, "not_found": []}
 
     served = api.get("/api/comics/comps", params={"comic_id": comic_id}).json()
     assert [row["product_id"] for row in served] == ["15712"]
+
+
+def test_exclude_endpoint_stamps_a_raw_row_and_the_raw_read_drops_it(api):
+    comic_id = _create_comic(api)
+    _ingest(api, comic_id,
+            _comp(product_id="r1", pool="raw", certifier="none"),
+            _comp(product_id="r2", pool="raw", certifier="none"))
+
+    r = api.post("/api/comics/comps/exclude", json={
+        "comic_id": comic_id, "product_ids": ["r1"], "code": "printing",
+        "pool": "raw",
+    })
+    assert r.status_code == 200, r.text
+    assert r.json() == {"comic_id": comic_id, "pool": "raw",
+                        "code": "printing", "stamped": 1,
+                        "already_stamped": 0, "not_found": []}
+    served = api.get("/api/comics/comps",
+                     params={"comic_id": comic_id, "pool": "raw"}).json()
+    assert [row["product_id"] for row in served] == ["r2"]
+    audit = api.get("/api/comics/comps", params={
+        "comic_id": comic_id, "pool": "raw", "include_excluded": "true",
+    }).json()
+    assert {row["product_id"]: row["excluded_code"] for row in audit} == {
+        "r1": "printing", "r2": None}
+
+
+def test_exclude_endpoint_without_pool_does_not_touch_raw(api):
+    comic_id = _create_comic(api)
+    _ingest(api, comic_id, _comp(product_id="r1", pool="raw",
+                                 certifier="none"))
+    r = api.post("/api/comics/comps/exclude", json={
+        "comic_id": comic_id, "product_ids": ["r1"], "code": "printing",
+    })
+    assert r.status_code == 200
+    assert r.json()["stamped"] == 0 and r.json()["not_found"] == ["r1"]
+
+
+def test_exclude_endpoint_422s_an_unknown_pool(api):
+    comic_id = _create_comic(api)
+    r = api.post("/api/comics/comps/exclude", json={
+        "comic_id": comic_id, "product_ids": ["r1"], "code": "manual",
+        "pool": "both",
+    })
+    assert r.status_code == 422
 
 
 def test_the_stamp_is_persisted_to_the_real_db(api):
