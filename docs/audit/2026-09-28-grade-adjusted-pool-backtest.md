@@ -1,3 +1,11 @@
+---
+title: "Grade-adjusted pool backtest (BUI-1005)"
+date: 2026-09-28
+status: corrected
+superseded_by: "BUI-1019: the fresh-batch 'no bid yet' claim used a NULL column; via the FMV link 2 of the 24 books had a post-batch bid (see Correction 2026-09-30). The cancel decision is unchanged."
+superseded_date: 2026-09-30
+---
+
 # Grade-adjusted pool backtest (BUI-1005)
 
 **Date:** 2026-09-28. **Source:** `uv run --project plugins/gixen-overlay python docs/audit/2026-09-28-grade-adjusted-pool-backtest.py`, against the live comics DB opened read-only. No provider calls and no `comic-fmv` runs. The comps ledger is the only input.
@@ -51,7 +59,7 @@ The ticket's inputs differ from these: it had 2,647 held-out sales, 52% refused,
 
 ## Fresh batch (2026-09-26)
 
-The batch left 24 books unpriced (21 flagged, 3 with no comps). Re-priced from ledger comps known on 2026-09-26 and sold in the 90 days before it, the adjusted pool prices 6. No book has a later ledger sale or a bid yet, and the batch stored no active asks, so the bands are compared against the ungraded anchor (grade-less sales, typically lower grade).
+The batch left 24 books unpriced (21 flagged, 3 with no comps). Re-priced from ledger comps known on 2026-09-26 and sold in the 90 days before it, the adjusted pool prices 6. No book has a later ledger sale (two books did get a bid; see the correction below), and the batch stored no active asks, so the bands are compared against the ungraded anchor (grade-less sales, typically lower grade).
 
 | Book | Grade | Batch flag | Adjusted +15% | Ungraded anchor |
 |---|---|---|---|---|
@@ -76,3 +84,14 @@ The other 18 have fewer than 3 ledger comps within ±2.0. The ticket's 16 of 24 
 ## Out of scope
 
 - On the 2,113 accepted sales both methods price, the +15% adjusted pool beats the current pool: 1.020 against 1.132, and 588 against 445 in a paired comparison, with 1,080 ties. That's a replacement for the accepted path, not a rescue of refusals. It needs its own ticket and a live re-run before anyone acts on it.
+
+## Correction 2026-09-30 (BUI-1019)
+
+The claim that no fresh-batch book had a bid came from `FROM bids WHERE comic_id = ?`. `bids.comic_id` is NULL on all 812 rows, so that query could never match. Recomputed through the FMV link, reading both paths directly (`bid_fmvs` bid to fmv, and `bids.fmv_id`, each joined to `fmv.comic_id`). Neither path has dangling links, and both return the same 21 bids on 12 of the 24 books.
+
+- **Bids since the batch (`added_at >= 2026-09-26`):** 2 of 24 books. Avengers #87 (bid 799, PENDING, max $28, grade 6.0) and Thor #175 (bid 802, ENDED, no winning bid, max $14, grade 7.0). Both were added 2026-09-28, after this run.
+- **Bids before the batch:** 10 of the 24 books had a non-tombstone bid at some point (mostly LOST). Books 306 and 575 have only REMOVED tombstones, which are reported here but not counted as "had a bid".
+
+**What it changes:** the fresh-batch sentence only. Thor #175 is one of the two warning-sign books above, so it now has a real outcome to compare against (bid 802 ended with no win at a $14 max). The cancel decision rests on the 4,114-sale Winkler backtest, not on the fresh batch, so it stands.
+
+Reproduce: the script's `fresh_batch` query now reads both link paths through `fmv.comic_id`.
