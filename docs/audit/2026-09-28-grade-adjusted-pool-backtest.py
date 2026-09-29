@@ -330,9 +330,20 @@ def fresh_batch(conn: sqlite3.Connection, comps: list[dict], slopes: dict[str, f
         known = [c for c in cs if (c["first_seen_at"] or "") <= cutoff]
         train = [c for c in known if day - timedelta(days=WINDOW_DAYS) <= c["d"] <= day]
         later = [c for c in cs if c["d"] > day]
-        bids = conn.execute(
-            "SELECT status, winning_bid, grade, max_bid FROM bids WHERE comic_id = ? "
-            "AND added_at >= ?", (b["comic_id"], BATCH_DAY)).fetchall()
+        # bids.comic_id is NULL on every row (BUI-1014), so reach a book through
+        # the FMV link: bid_fmvs (bid -> fmv) and bids.fmv_id, then fmv.comic_id.
+        # Two separate reads, deduped by bid id, never one JOIN that hides dangling links.
+        bids_by_id = {}
+        for q in (
+            "SELECT d.id, d.status, d.winning_bid, d.grade, d.max_bid FROM bid_fmvs bf "
+            "JOIN bids d ON d.id = bf.bid_id JOIN fmv f ON f.id = bf.fmv_id "
+            "WHERE f.comic_id = ? AND d.added_at >= ?",
+            "SELECT d.id, d.status, d.winning_bid, d.grade, d.max_bid FROM bids d "
+            "JOIN fmv f ON f.id = d.fmv_id WHERE f.comic_id = ? AND d.added_at >= ?",
+        ):
+            for x in conn.execute(q, (b["comic_id"], BATCH_DAY)).fetchall():
+                bids_by_id[x["id"]] = x
+        bids = list(bids_by_id.values())
         anchor = None
         for tok in (b["notes"] or "").split(" | "):
             if tok.startswith("ungraded_anchor="):
@@ -343,7 +354,7 @@ def fresh_batch(conn: sqlite3.Connection, comps: list[dict], slopes: dict[str, f
                "train": [(c["grade"], c["price"]) for c in sorted(train, key=lambda c: c["grade"])],
                "current": price_current(train, b["grade"]),
                "later": [(c["grade"], c["price"], c["sold_date"]) for c in later],
-               "bids": [dict(x) for x in bids]}
+               "bids": [{k: x[k] for k in ("status", "winning_bid", "grade", "max_bid")} for x in bids]}
         for name, s in slopes.items():
             row[name] = price_adjusted(train, b["grade"], s)
         out.append(row)
