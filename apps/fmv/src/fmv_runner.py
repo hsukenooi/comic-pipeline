@@ -550,6 +550,13 @@ def run(*, batch_path: str | None, out_path: str | None,
             fresh_fmvs, books, server_url=server_url, force=force,
         )
 
+        # 3c'. BUI-1028: the ceiling cap, behind FMV_CEILING_CAP (default off:
+        # no row carries a `ceiling` candidate and this loop does nothing).
+        # After the rescue and the cross-check, for the same reason the
+        # rescue's "never changes a priced book" rule exists: a row either tier
+        # priced is not a refusal any more.
+        _apply_ceiling_cap(fresh_fmvs, server_url=server_url)
+
     # 3d. BUI-930: the pre-fetch graded punts. Written AFTER the two rescue
     # tiers above so they can never see a graded row (both already refuse one
     # via `_is_unpriced_raw`/`_is_thin_or_low_confidence_priced`; ordering
@@ -1248,6 +1255,15 @@ def _hand_price_candidates(server_url: str, book: dict, *,
                                   **price_identity)
 
 
+def _ceiling_cap_enabled() -> bool:
+    """BUI-1028: is the ceiling-cap rule on? `FMV_CEILING_CAP=1` (also
+    true/yes/on). Read on EVERY call, never cached, so flipping the env var
+    takes effect on the next run with no deploy. Unset or anything else means
+    OFF, and OFF is byte-identical to the pre-BUI-1028 output."""
+    return os.environ.get("FMV_CEILING_CAP", "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 def _demote_empty_pool_flag_on_priced_row(server_url: str, inp: dict,
                                           fmv: dict) -> None:
     """BUI-1029: undo `compute_fmv`'s empty-pool `too_sparse` flag when the
@@ -1273,6 +1289,63 @@ def _demote_empty_pool_flag_on_priced_row(server_url: str, inp: dict,
             priced = True
     if priced or grade is None:
         fmv["flag_reason"] = None
+
+
+def _ceiling_applicable(result: dict) -> bool:
+    """BUI-1028: may this FINAL fresh result take its ceiling cap? Only a raw
+    row that is still a `one_sided`/`too_wide` refusal with no price after the
+    rescue and cross-check tiers ran, carrying a usable positive cap."""
+    if result.get("source") != "fresh":
+        return False
+    fmv = result.get("fmv") or {}
+    c = fmv.get("ceiling") or {}
+    cap = c.get("cap")
+    return (c.get("reason") == "capped"
+            and isinstance(cap, int) and not isinstance(cap, bool) and cap > 0
+            and fmv.get("flag_reason") in ("one_sided", "too_wide")
+            and fmv.get("fmv_high") is None and fmv.get("max_bid") is None
+            and not fmv.get("graded") and not fmv.get("interpolated")
+            and not fmv.get("cgc_proxy")
+            and isinstance((result.get("input") or {}).get("grade"),
+                           (int, float)))
+
+
+def _apply_ceiling_cap(fresh_fmvs: dict[int, dict], *, server_url: str) -> None:
+    """BUI-1028: give each still-refused raw one_sided/too_wide row its ceiling
+    cap (`fmv_math.ceiling_cap`, recorded on `fmv["ceiling"]` by
+    `_compute_and_upsert_one` when FMV_CEILING_CAP is on).
+
+    Mutates ``fresh_fmvs`` in place. The row STAYS refused (`flag_reason` set,
+    `fmv_low`/`fmv_high` null): the cap is stored in its own column with
+    `pricing_basis='ceiling'`, and `max_bid` becomes the cap. Keeping low/high
+    null is the point — every reader that treats them as a fair value
+    (calibration, accuracy, unrealized gain, slab watch, the dashboard)
+    ignores the row by construction. Soft: a failed write (a server that
+    predates the `ceiling` basis 422s it) leaves the row refused exactly as it
+    was, and says so.
+    """
+    for idx, result in fresh_fmvs.items():
+        if not _ceiling_applicable(result):
+            continue
+        fmv = result["fmv"]
+        c = fmv["ceiling"]
+        cap = int(c["cap"])
+        capped = {**fmv, "max_bid": cap, "ceiling_cap": cap,
+                  "pricing_basis": _CEILING_BASIS}
+        inp = result.get("input") or {}
+        upserted = _upsert_fmv(server_url, inp, capped, hard_fail=False)
+        if upserted is None:
+            click.echo(
+                f"Note: ceiling-cap upsert failed for {inp.get('title')} "
+                f"#{inp.get('issue')}; left refused ({fmv['flag_reason']}).",
+                err=True,
+            )
+            continue
+        comic_id, fmv_id = _extract_ids(upserted)
+        result["fmv"] = capped
+        result["db_row"] = upserted
+        result["comic_id"] = comic_id
+        result["fmv_id"] = fmv_id
 
 
 def _variant_key(value: object) -> str | None:
@@ -2627,6 +2700,16 @@ def _compute_and_upsert_one(result: dict, original_book: dict, *,
     fmv["variant_dropped"] = dropped_variant
     fmv["masthead_swapped_to"] = result.get("masthead_swapped_to")
     _demote_empty_pool_flag_on_priced_row(server_url, inp, fmv)
+    # BUI-1028: with the flag on, record the ceiling candidate for a raw
+    # one_sided/too_wide refusal. Only RECORDED here: the cap is applied by
+    # `_apply_ceiling_cap` AFTER the CGC-proxy rescue and cross-check have had
+    # their say, so a book either of them prices is never capped instead. Never
+    # for a `variant_dropped` book: its pool priced the BASE cover, and a cap
+    # built off it is exactly the variant-blind number that flag withholds.
+    # With the flag off no key is added, so the result dict is unchanged.
+    if _ceiling_cap_enabled() and not dropped_variant:
+        fmv["ceiling"] = fmv_math.ceiling_cap(
+            pool_comps, target_grade, fmv.get("flag_reason"), grade_window)
     # BUI-678: comps ebay-sold-comps' BUI-675 currency gate rejected for this
     # book (0 for the common case — `.get(...)` with a default, never `[...]`,
     # since a deployed ebay-sold-comps that predates BUI-678 won't emit this
@@ -3812,6 +3895,14 @@ def _upsert_fmv(server_url: str, inp: dict, fmv: dict,
         body["certifier"] = fmv.get("certifier") or _RAW_CERTIFIER
         body["label"] = fmv.get("label") or _RAW_LABEL
         body["pricing_basis"] = fmv.get("pricing_basis")
+    elif fmv.get("pricing_basis") == _CEILING_BASIS:
+        # BUI-1028: a refused raw row's bid cap. Stays FLAGGED with
+        # fmv_low/fmv_high null (a cap in `fmv_high` would be read as a fair
+        # value by every calibration/accuracy/dashboard reader); the server
+        # stores it in its own `ceiling_cap` column. An older server 422s the
+        # unknown basis, which `_apply_ceiling_cap` treats as "left refused".
+        body["pricing_basis"] = _CEILING_BASIS
+        body["fmv_ceiling_cap"] = fmv["ceiling_cap"]
     if inp.get("locg_id"):
         body["locg_id"] = inp["locg_id"]
     if inp.get("locg_variant_id"):
@@ -4379,6 +4470,15 @@ def _build_notes(fmv: dict) -> str:
     flag = fmv.get("flag_reason")
     if flag:
         parts.append(f"manual_review={flag}")
+    # BUI-1028: the row is STILL refused; this says what bid cap it carries and
+    # how it was built, in words that cannot be read as a fair value.
+    if flag and fmv.get("pricing_basis") == _CEILING_BASIS and fmv.get("ceiling"):
+        c = fmv["ceiling"]
+        parts.append(
+            f"ceiling_cap=${c['cap']:g} ({c['factor']:.2f} x ceiling "
+            f"${c['ceiling']:g}, lowest at-or-above rung {c['rung_grade']:g} "
+            f"n={c['rung_n']}, {c['n_above']} comps at or above target); "
+            "a cap, not an FMV")
     # BUI-954: the active-ask ceiling — display only, set by
     # `_maybe_attach_active_ask_ceiling` and read nowhere else. Placed
     # immediately after `manual_review=` so a reader hits WHY the row is
@@ -4711,6 +4811,11 @@ _PRICING_BASIS_BID_FACTORS: dict[str, float] = {
 # as 'low' — so the stored label cannot be trusted to carry the distinction
 # back, which is exactly the trap this column was added to replace.
 _PRICING_BASIS_FORCES_LOW = ("ladder", "interpolated", "lone_sale")
+# BUI-1028: a refused raw row carrying a bid cap. Not in either table above: it
+# has no fmv_low/fmv_high for a factor to multiply (the cap IS the final bid
+# and lives in its own column), and a flagged row is never a cache hit, so
+# `_fmv_from_db_row` never sees one.
+_CEILING_BASIS = "ceiling"
 
 
 def _fmv_from_db_row(row: dict, grade_confidence: str | None = None) -> dict:
@@ -5054,6 +5159,10 @@ def _provenance(r: dict) -> str:
         ask_n = fmv.get("active_ask_n")
         if ask_n:
             cell += f" — asks from ${fmv['active_ask_low']:g} (n{ask_n})"
+        if fmv.get("pricing_basis") == _CEILING_BASIS:
+            # BUI-1028: still refused, but it carries a bid cap. Named as a
+            # cap so the cell can't be read as a price.
+            cell += f", ceiling cap ${fmv.get('max_bid')}"
         return cell
     if fmv.get("ledger_advisory"):
         return "ledger-advisory"
@@ -5232,7 +5341,13 @@ def _print_table(rows: list[dict]) -> None:
             if evidence:
                 fmv_str += " " + " ".join(evidence)
             med_str = "—"
-            mb_str = "manual"
+            if fmv.get("pricing_basis") == _CEILING_BASIS:
+                # BUI-1028: refused, but carrying a ceiling cap — the one
+                # number on a refused row a snipe may use. Worded "cap" so it
+                # is never read as an FMV.
+                mb_str = f"${fmv.get('max_bid')} cap"
+            else:
+                mb_str = "manual"
         elif fmv.get("ledger_advisory"):
             # BUI-663: a degraded-mode band priced from STORED comps after both
             # providers failed. Checked here — above every branch that renders

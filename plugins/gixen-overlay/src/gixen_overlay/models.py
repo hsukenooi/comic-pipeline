@@ -174,6 +174,10 @@ class UpsertComicRequest(BaseModel):
     # caller never made, and 'direct' is precisely the value that means "no
     # haircut" — the expensive direction.
     pricing_basis: str | None = None
+    # BUI-1028: the bid cap of a refused raw row. Only valid alongside
+    # `fmv_flag_reason` and `pricing_basis='ceiling'`, with no fmv_low/high —
+    # see `upsert_fmv` for why it is its own column and not a price.
+    fmv_ceiling_cap: float | None = None
     locg_id: int | None = None
     locg_variant_id: int | None = None
 
@@ -241,6 +245,30 @@ class UpsertComicRequest(BaseModel):
                 "pricing_basis must be one of: " + ", ".join(FMV_PRICING_BASES)
             )
         return v
+
+    @model_validator(mode="after")
+    def validate_ceiling_cap_shape(self) -> "UpsertComicRequest":
+        # BUI-1028: a ceiling cap is the bid cap of a REFUSED row, so the
+        # three fields that make one must arrive together, with no price
+        # beside it. Rejecting here (422) rather than in `upsert_fmv` keeps a
+        # malformed write a loud client error instead of a 500 from the db
+        # layer, and discards the WHOLE upsert the way every other validator
+        # here does.
+        cap, basis = self.fmv_ceiling_cap, self.pricing_basis
+        if cap is None and basis != "ceiling":
+            return self
+        if cap is None or basis != "ceiling":
+            raise ValueError(
+                "fmv_ceiling_cap and pricing_basis='ceiling' must be sent "
+                "together")
+        if not cap > 0:
+            raise ValueError("fmv_ceiling_cap must be positive")
+        if not self.fmv_flag_reason:
+            raise ValueError("fmv_ceiling_cap requires fmv_flag_reason")
+        if self.fmv_low is not None or self.fmv_high is not None:
+            raise ValueError(
+                "fmv_ceiling_cap cannot be sent with fmv_low/fmv_high")
+        return self
 
 
 class LocgLinkRequest(BaseModel):

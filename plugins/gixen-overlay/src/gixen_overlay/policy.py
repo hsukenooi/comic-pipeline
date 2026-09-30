@@ -292,8 +292,28 @@ def _resolve_identities(conn: sqlite3.Connection, intent: Any) -> tuple[list[dic
     return _resolve_post_identities(conn, identities)
 
 
+def _effective_high(r: dict) -> float | None:
+    """The number a bid is measured against: the row's `high`, or, on a
+    refused row carrying a BUI-1028 ceiling cap, that cap. A ceiling row keeps
+    low/high NULL on purpose (so no FMV reader mistakes the cap for a fair
+    value), which means `high` alone would call it unpriced."""
+    if r.get("high") is not None:
+        return r["high"]
+    return r.get("ceiling_cap")
+
+
+def _factor(r: dict) -> float:
+    """The rung applied to `_effective_high`. A ceiling cap already carries
+    its 0.60 haircut (it is the FINAL cap), so no confidence rung applies on
+    top: the stored-'low' rung (0.70) would advise on a bid exactly at the
+    cap, every time."""
+    if r.get("high") is None and r.get("ceiling_cap") is not None:
+        return 1.0
+    return _rung_for_confidence(r.get("confidence"))
+
+
 def _priceable(rows: list[dict]) -> list[dict]:
-    return [r for r in rows if r.get("high") is not None]
+    return [r for r in rows if _effective_high(r) is not None]
 
 
 # ---------------------------------------------------------------------------
@@ -337,7 +357,7 @@ def _check_over_fmv(conn: sqlite3.Connection, intent: Any) -> dict | None:
     if err is not None:
         return err
 
-    summed_high = sum(r["high"] for r in priceable)
+    summed_high = sum(_effective_high(r) for r in priceable)
     cap = multiple * summed_high
     ratio = (intent.target_max_bid / summed_high) if summed_high else None
     data = {
@@ -376,9 +396,9 @@ def _check_recomputed_cap(conn: sqlite3.Connection, intent: Any) -> dict | None:
         {
             "fmv_id": r.get("id"),
             "confidence": r.get("confidence"),
-            "high": r["high"],
-            "factor": _rung_for_confidence(r.get("confidence")),
-            "cap": _rung_for_confidence(r.get("confidence")) * r["high"],
+            "high": _effective_high(r),
+            "factor": _factor(r),
+            "cap": _factor(r) * _effective_high(r),
         }
         for r in priceable
     ]

@@ -59,6 +59,8 @@ If the user hasn't set max bids manually, default to the **base rung**: `max_bid
 
 Round to a clean number (e.g., $136 → $135). User can override per comic.
 
+**A `pricing_basis: "ceiling"` row (BUI-1028) is already a final cap.** Its `max_bid` is 0.60 x a sold-comp ceiling rounded down, on a book `comic-fmv` still refused (`flag_reason` set, no FMV). Use the approved `max_bid` as given: never apply a rung above, never raise it toward an FMV (there is none), and never add a snipe for it the user has not approved by number.
+
 ## Pre-flight Check
 
 **1. Server health**

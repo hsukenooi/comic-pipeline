@@ -129,7 +129,12 @@ COMP_PAGE_QUALITY_UNKNOWN = "unknown"
 # schema of every DB that already ran, so `_migrate_fmv_pricing_basis_check`
 # has to widen it or the first `lone_sale` upsert dies on an IntegrityError
 # five frames down and the whole row is discarded (the BUI-593 class).
-FMV_PRICING_BASES = ("direct", "interpolated", "ladder", "proxy", "lone_sale")
+#
+# BUI-1028 added 'ceiling' (a raw one_sided/too_wide refusal given a
+# conservative cap instead of a punt; `low == high == the cap`, factor 1.0).
+# Same trap, same remedy: the migration below widens the stored CHECK.
+FMV_PRICING_BASES = ("direct", "interpolated", "ladder", "proxy", "lone_sale",
+                     "ceiling")
 FMV_PRICING_BASIS_DIRECT = "direct"
 
 _fmv_certifiers_sql = ", ".join(f"'{c}'" for c in FMV_CERTIFIERS)
@@ -271,6 +276,14 @@ def create_tables(conn: sqlite3.Connection) -> None:
             -- one-shot backfill plus every omitting upsert derive it from the
             -- notes tokens — see FMV_PRICING_BASES.
             pricing_basis      TEXT CHECK(pricing_basis IN ({_fmv_pricing_bases_sql}) OR pricing_basis IS NULL),
+            -- BUI-1028: the bid CAP of a refused raw row (pricing_basis
+            -- 'ceiling'). Deliberately its own column and NOT low/high: a
+            -- flagged row keeps low/high NULL, so every reader that treats
+            -- low/high as a fair value (calibration, accuracy, unrealized
+            -- gain, slab watch, the dashboard) ignores it by construction,
+            -- where a cap stored in `high` would be read as an FMV by all of
+            -- them. Only the two consumers that mean "cap" read this.
+            ceiling_cap        REAL CHECK(ceiling_cap IS NULL OR ceiling_cap > 0),
             updated_at         TEXT,
             UNIQUE(comic_id, grade, certifier, label)
         )
@@ -484,6 +497,11 @@ def create_tables(conn: sqlite3.Connection) -> None:
     # `pricing_basis` — an ALTER is additive and cannot hurt.
     _migrate_add_fmv_pricing_basis_column(conn)
     _migrate_backfill_fmv_pricing_basis(conn)
+    # BUI-1028: the additive `ceiling_cap` column. An ALTER, so it needs none
+    # of the rebuild machinery; ordered BEFORE the CHECK widen below because
+    # that rebuild reads its column list off the live table, and a column the
+    # table already has is carried across it.
+    _migrate_add_fmv_ceiling_cap_column(conn)
     # BUI-952: widen the `pricing_basis` CHECK to today's vocabulary. Ordered
     # after the two above for both of their reasons — it needs the column to
     # exist to have a CHECK to inspect, and it rebuilds the table, so running
@@ -973,6 +991,14 @@ def _rebuild_fmv_table(conn: sqlite3.Connection, *, marker: str,
             certifier          TEXT NOT NULL DEFAULT 'none' CHECK(certifier IN ({_fmv_certifiers_sql})),
             label              TEXT NOT NULL DEFAULT 'universal' CHECK(label IN ({_fmv_labels_sql})),
             pricing_basis      TEXT CHECK(pricing_basis IN ({_fmv_pricing_bases_sql}) OR pricing_basis IS NULL),
+            -- BUI-1028: the bid CAP of a refused raw row (pricing_basis
+            -- 'ceiling'). Deliberately its own column and NOT low/high: a
+            -- flagged row keeps low/high NULL, so every reader that treats
+            -- low/high as a fair value (calibration, accuracy, unrealized
+            -- gain, slab watch, the dashboard) ignores it by construction,
+            -- where a cap stored in `high` would be read as an FMV by all of
+            -- them. Only the two consumers that mean "cap" read this.
+            ceiling_cap        REAL CHECK(ceiling_cap IS NULL OR ceiling_cap > 0),
             updated_at         TEXT,
             UNIQUE(comic_id, grade, certifier, label)
         )
@@ -1042,6 +1068,20 @@ def _migrate_add_fmv_pricing_basis_column(conn: sqlite3.Connection) -> None:
             "ALTER TABLE fmv ADD COLUMN pricing_basis TEXT "
             f"CHECK(pricing_basis IN ({_fmv_pricing_bases_sql}) "
             "OR pricing_basis IS NULL)"
+        )
+
+
+def _migrate_add_fmv_ceiling_cap_column(conn: sqlite3.Connection) -> None:
+    """Add the nullable `ceiling_cap` column to fmv if absent (BUI-1028).
+
+    Additive and idempotent, same PRAGMA guard as every other additive
+    migration here. Existing rows get NULL, which is exactly "no cap".
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(fmv)")}
+    if cols and "ceiling_cap" not in cols:
+        conn.execute(
+            "ALTER TABLE fmv ADD COLUMN ceiling_cap REAL "
+            "CHECK(ceiling_cap IS NULL OR ceiling_cap > 0)"
         )
 
 
@@ -2675,8 +2715,16 @@ def upsert_fmv(
     certifier: str | None = None,
     label: str | None = None,
     pricing_basis: str | None = None,
+    ceiling_cap: float | None = None,
 ) -> int:
     """Upsert a per-identity FMV row. Returns the fmv id.
+
+    `ceiling_cap` (BUI-1028) is the bid cap of a refused raw row. It is only
+    meaningful ON a flagged row with `pricing_basis='ceiling'` and low/high
+    NULL — a cap beside a price, or without a refusal to stand in for, is a
+    contradiction and raises. A flagged upsert overwrites it (so a re-run
+    without the cap clears a stale one), a priced upsert clears it, and a bare
+    n=0 stub leaves it, exactly like `flag_reason` beside it.
 
     `flag_reason` (BUI-132) carries the BUI-86 needs_manual state as a structured
     column (one_sided / too_wide / too_sparse, or NULL for not-flagged). The
@@ -2791,6 +2839,17 @@ def upsert_fmv(
             f"unknown pricing_basis {pricing_basis!r} "
             f"(expected one of {FMV_PRICING_BASES})"
         )
+    if ceiling_cap is not None:
+        if isinstance(ceiling_cap, bool) or not ceiling_cap > 0:
+            raise ValueError(f"ceiling_cap must be positive, got {ceiling_cap!r}")
+        if flag_reason is None or low is not None or high is not None:
+            raise ValueError(
+                "ceiling_cap belongs on a flagged row with no low/high "
+                "(a cap beside a price is read as two different numbers)")
+        if pricing_basis != "ceiling":
+            raise ValueError("ceiling_cap requires pricing_basis='ceiling'")
+    elif pricing_basis == "ceiling":
+        raise ValueError("pricing_basis='ceiling' requires a ceiling_cap")
     pricing_basis = pricing_basis or derive_pricing_basis(notes)
     has_value = any(
         v is not None for v in (low, high, comps, confidence, notes, flag_reason)
@@ -2801,8 +2860,8 @@ def upsert_fmv(
         INSERT INTO fmv (comic_id, grade, low, high, comps, confidence, notes,
                           flag_reason, ungraded_anchor, ungraded_anchor_n,
                           provenance, certifier, label, pricing_basis,
-                          updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                          ceiling_cap, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(comic_id, grade, certifier, label) DO UPDATE SET
             -- A flagged incoming row clears the stale auto-priced number; an
             -- unflagged incoming row (a fresh price OR a bare n=0 stub)
@@ -2866,15 +2925,26 @@ def upsert_fmv(
             -- otherwise the incoming (possibly derived) value wins. Nothing
             -- here can conflict on certifier/label: they ARE the key.
             pricing_basis = CASE WHEN excluded.flag_reason IS NOT NULL THEN excluded.pricing_basis
+                               -- BUI-1028: a bare stub leaves a stored cap's
+                               -- basis alone, or the row would read 'direct'
+                               -- beside a live ceiling_cap.
+                               WHEN excluded.low IS NULL AND ceiling_cap IS NOT NULL THEN pricing_basis
                                WHEN excluded.low IS NULL AND low IS NOT NULL THEN pricing_basis
                                ELSE COALESCE(excluded.pricing_basis, pricing_basis) END,
+            -- BUI-1028: rides `flag_reason`'s treatment — a flagged row takes
+            -- whatever cap it posted (NULL when it posted none, which is how a
+            -- stale cap is cleared), a priced row has no refusal left to cap,
+            -- and a bare stub leaves both alone.
+            ceiling_cap = CASE WHEN excluded.flag_reason IS NOT NULL THEN excluded.ceiling_cap
+                               WHEN excluded.low IS NOT NULL THEN NULL
+                               ELSE ceiling_cap END,
             updated_at  = CASE WHEN excluded.low IS NOT NULL OR excluded.flag_reason IS NOT NULL
                                THEN excluded.updated_at
                                ELSE updated_at END
         """,
         (comic_id, grade, low, high, comps, confidence, notes, flag_reason,
          ungraded_anchor, ungraded_anchor_n, provenance, certifier, label,
-         pricing_basis, now),
+         pricing_basis, ceiling_cap, now),
     )
     conn.commit()
     row = conn.execute(
@@ -3723,6 +3793,9 @@ def list_comics(
                -- it writes anything, because an old server would silently
                -- drop the field and upsert a slab price onto the raw row.
                f.certifier, f.label, f.pricing_basis,
+               -- BUI-1028: the bid cap of a refused row (pricing_basis
+               -- 'ceiling'); NULL on every other row.
+               f.ceiling_cap AS fmv_ceiling_cap,
                -- BUI-769: `comic-fmv`'s hand-priced guard reads this to decide
                -- whether a default run may overwrite the row. It must be
                -- served on EVERY row this endpoint returns, not just the ones

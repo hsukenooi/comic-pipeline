@@ -4315,6 +4315,54 @@ def test_upsert_comic_accepts_every_pricing_basis(api, basis):
     assert rows and rows[0]["pricing_basis"] == basis
 
 
+def _ceiling_body(**over):
+    body = {"title": "Ceiling Book", "issue": "1", "year": 1970, "grade": 6.0,
+            "fmv_flag_reason": "one_sided", "pricing_basis": "ceiling",
+            "fmv_ceiling_cap": 60.0, "fmv_confidence": "low"}
+    body.update(over)
+    return body
+
+
+def test_upsert_comic_stores_and_serves_a_ceiling_cap(api):
+    """BUI-1028: the cap rides its own column on a FLAGGED row. low/high stay
+    NULL, so every reader that treats them as a fair value ignores it."""
+    r = api.post("/api/comics", json=_ceiling_body())
+    assert r.status_code == 200, r.text
+    rows = api.get("/api/comics", params={"title": "Ceiling Book"}).json()
+    (row,) = rows
+    assert row["fmv_ceiling_cap"] == 60.0
+    assert row["pricing_basis"] == "ceiling"
+    assert row["fmv_flag_reason"] == "one_sided"
+    assert row["fmv_low"] is None and row["fmv_high"] is None
+    # A later flagged write with no cap clears it; a priced write has none.
+    api.post("/api/comics", json=_ceiling_body(
+        fmv_ceiling_cap=None, pricing_basis=None))
+    (row,) = api.get("/api/comics", params={"title": "Ceiling Book"}).json()
+    assert row["fmv_ceiling_cap"] is None and row["pricing_basis"] != "ceiling"
+
+
+def test_every_row_serves_the_ceiling_cap_key_as_null_when_absent(api):
+    api.post("/api/comics", json={
+        "title": "Plain Book", "issue": "1", "year": 1970, "grade": 6.0,
+        "fmv_low": 10.0, "fmv_high": 20.0})
+    (row,) = api.get("/api/comics", params={"title": "Plain Book"}).json()
+    assert "fmv_ceiling_cap" in row and row["fmv_ceiling_cap"] is None
+
+
+@pytest.mark.parametrize("over", [
+    {"fmv_ceiling_cap": None},                      # basis without a cap
+    {"pricing_basis": None},                        # cap without the basis
+    {"fmv_flag_reason": None},                      # cap with no refusal
+    {"fmv_low": 50.0, "fmv_high": 80.0},            # cap beside a price
+    {"fmv_ceiling_cap": 0},
+    {"fmv_ceiling_cap": -10},
+])
+def test_upsert_comic_rejects_a_malformed_ceiling_row(api, over):
+    r = api.post("/api/comics", json=_ceiling_body(**over))
+    assert r.status_code == 422, r.text
+    assert api.get("/api/comics", params={"title": "Ceiling Book"}).json() == []
+
+
 def test_upsert_comic_unknown_pricing_basis_returns_422(api):
     r = api.post("/api/comics", json={
         "title": "Basis vibes", "issue": "1", "year": 1970, "grade": 4.5,
