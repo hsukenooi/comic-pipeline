@@ -203,7 +203,7 @@ def test_vocabularies_are_the_documented_closed_sets():
     # stored schema of every DB that already ran, so see
     # `test_the_pricing_basis_check_is_widened_on_an_existing_db` below.
     assert FMV_PRICING_BASES == (
-        "direct", "interpolated", "ladder", "proxy", "lone_sale")
+        "direct", "interpolated", "ladder", "proxy", "lone_sale", "ceiling")
 
 
 # ---------------------------------------------------------------------------
@@ -660,6 +660,171 @@ def test_the_pricing_basis_check_widen_is_a_no_op_once_current():
     assert conn.execute(
         "SELECT pricing_basis FROM fmv WHERE id=?", (fmv_id,)
     ).fetchone()[0] == "lone_sale"
+
+
+def _narrow_the_pricing_basis_check_to(conn: sqlite3.Connection,
+                                       kept: tuple[str, ...]) -> None:
+    """Like `_narrow_the_pricing_basis_check`, but to an arbitrary earlier
+    vocabulary (BUI-1028: the five-value CHECK the Mac Mini runs today)."""
+    sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='fmv'"
+    ).fetchone()[0]
+    current = ", ".join(f"'{b}'" for b in FMV_PRICING_BASES)
+    old = ", ".join(f"'{b}'" for b in kept)
+    assert current in sql
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute("DROP TABLE fmv")
+    conn.execute(sql.replace(current, old))
+    conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _drop_the_ceiling_cap_column(conn: sqlite3.Connection) -> None:
+    """Rewind to the pre-BUI-1028 table: five-value CHECK AND no
+    `ceiling_cap` column — what the Mac Mini runs today. Built from the
+    table's own stored DDL, like `_narrow_the_pricing_basis_check`."""
+    sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='fmv'"
+    ).fetchone()[0]
+    current = ", ".join(f"'{b}'" for b in FMV_PRICING_BASES)
+    old = ", ".join(f"'{b}'" for b in
+                    ("direct", "interpolated", "ladder", "proxy", "lone_sale"))
+    assert current in sql
+    lines = [ln for ln in sql.splitlines()
+             if "ceiling_cap" not in ln and not ln.strip().startswith("--")]
+    sql = "\n".join(lines).replace(current, old)
+    assert "ceiling_cap" not in sql
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute("DROP TABLE fmv")
+    conn.execute(sql)
+    conn.execute("PRAGMA foreign_keys=ON")
+
+
+def test_a_pre_bui1028_db_gains_the_column_and_the_basis_on_migration():
+    """BUI-1028 (the BUI-952 precedent): a DB built with the OLD schema — five
+    basis values, no `ceiling_cap` — rejects a ceiling write outright;
+    `create_tables` adds the column and widens the CHECK, keeps existing rows
+    and their bid links, and the ceiling row then lands. A fresh-schema test
+    cannot see any of this."""
+    conn = _fresh_db()
+    _drop_the_ceiling_cap_column(conn)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(fmv)")}
+    assert "ceiling_cap" not in cols
+    conn.execute(
+        "INSERT INTO comics (id, title, issue, year) VALUES (1, 'X', '1', 1963)"
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO fmv (comic_id, grade, flag_reason, pricing_basis) "
+            "VALUES (1, 4.5, 'one_sided', 'ceiling')"
+        )
+    conn.execute(
+        "INSERT INTO fmv (id, comic_id, grade, low, high, comps, certifier, "
+        "label, pricing_basis) VALUES "
+        "(11, 1, 6.0, 700, 900, 3, 'cgc', 'universal', 'lone_sale')"
+    )
+    conn.execute(
+        "INSERT INTO bids (id, item_id, max_bid, fmv_id) "
+        "VALUES (5, 'i5', 420, 11)"
+    )
+    conn.execute(
+        "INSERT INTO bid_fmvs (bid_id, fmv_id, is_primary) VALUES (5, 11, 1)"
+    )
+    conn.commit()
+
+    create_tables(conn)
+    conn.commit()
+
+    assert "ceiling_cap" in {r[1] for r in conn.execute("PRAGMA table_info(fmv)")}
+    sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='fmv'"
+    ).fetchone()[0]
+    assert "'ceiling'" in sql
+    fmv_id = upsert_fmv(conn, 1, 4.5, flag_reason="one_sided",
+                        pricing_basis="ceiling", ceiling_cap=60)
+    row = conn.execute("SELECT * FROM fmv WHERE id=?", (fmv_id,)).fetchone()
+    assert (row["pricing_basis"], row["ceiling_cap"], row["low"], row["high"],
+            row["flag_reason"]) == ("ceiling", 60, None, None, "one_sided")
+    # Nothing lost by the migration.
+    old = conn.execute("SELECT * FROM fmv WHERE id=11").fetchone()
+    assert old["low"] == 700 and old["pricing_basis"] == "lone_sale"
+    assert old["ceiling_cap"] is None
+    assert conn.execute("SELECT fmv_id FROM bids WHERE id=5").fetchone()[0] == 11
+    assert conn.execute(
+        "SELECT is_primary FROM bid_fmvs WHERE bid_id=5 AND fmv_id=11"
+    ).fetchone()[0] == 1
+    # Idempotent: a second pass neither re-adds nor rebuilds.
+    create_tables(conn)
+    assert conn.execute(
+        "SELECT ceiling_cap FROM fmv WHERE id=?", (fmv_id,)
+    ).fetchone()[0] == 60
+
+
+def test_a_pre_bui1028_db_with_only_the_old_check_is_widened_too():
+    """The column already present (created by a half-migrated build) but the
+    CHECK still on five values: the widen rebuild must CARRY `ceiling_cap`."""
+    conn = _fresh_db()
+    _narrow_the_pricing_basis_check_to(
+        conn, ("direct", "interpolated", "ladder", "proxy", "lone_sale"))
+    conn.execute(
+        "INSERT INTO comics (id, title, issue, year) VALUES (1, 'X', '1', 1963)"
+    )
+    conn.execute(
+        "INSERT INTO fmv (id, comic_id, grade, flag_reason, ceiling_cap) "
+        "VALUES (3, 1, 6.0, 'one_sided', 40)"
+    )
+    conn.commit()
+    create_tables(conn)
+    assert conn.execute(
+        "SELECT ceiling_cap FROM fmv WHERE id=3").fetchone()[0] == 40
+    upsert_fmv(conn, 1, 4.5, flag_reason="too_wide",
+               pricing_basis="ceiling", ceiling_cap=25)
+
+
+def test_ceiling_cap_lifecycle_on_upsert():
+    conn = _fresh_db()
+    conn.execute(
+        "INSERT INTO comics (id, title, issue, year) VALUES (1, 'X', '1', 1963)"
+    )
+    fid = upsert_fmv(conn, 1, 6.0, flag_reason="one_sided",
+                     pricing_basis="ceiling", ceiling_cap=60, confidence="low")
+
+    def cap():
+        return conn.execute(
+            "SELECT ceiling_cap, pricing_basis, flag_reason, low, high "
+            "FROM fmv WHERE id=?", (fid,)).fetchone()
+
+    assert tuple(cap()) == (60, "ceiling", "one_sided", None, None)
+    # A bare n=0 stub leaves the refusal AND its cap alone.
+    upsert_fmv(conn, 1, 6.0, comps=0)
+    assert tuple(cap()) == (60, "ceiling", "one_sided", None, None)
+    # A flagged re-run WITHOUT a cap (flag off, or the cap no longer applies)
+    # clears it: a stale cap must not outlive the evidence.
+    upsert_fmv(conn, 1, 6.0, flag_reason="one_sided", confidence="low")
+    assert cap()["ceiling_cap"] is None and cap()["pricing_basis"] == "direct"
+    upsert_fmv(conn, 1, 6.0, flag_reason="one_sided",
+               pricing_basis="ceiling", ceiling_cap=60)
+    # A freshly PRICED row has no refusal left to cap.
+    upsert_fmv(conn, 1, 6.0, low=50, high=80, confidence="medium")
+    assert tuple(cap()) == (None, "direct", None, 50, 80)
+
+
+@pytest.mark.parametrize("kwargs", [
+    dict(ceiling_cap=60, pricing_basis="ceiling"),                # no flag
+    dict(ceiling_cap=60, pricing_basis="ceiling", flag_reason="one_sided",
+         low=50, high=80),                                        # beside a price
+    dict(ceiling_cap=60, flag_reason="one_sided"),                # no basis
+    dict(pricing_basis="ceiling", flag_reason="one_sided"),       # no cap
+    dict(ceiling_cap=0, pricing_basis="ceiling", flag_reason="one_sided"),
+    dict(ceiling_cap=-5, pricing_basis="ceiling", flag_reason="one_sided"),
+])
+def test_upsert_refuses_a_malformed_ceiling_row(kwargs):
+    conn = _fresh_db()
+    conn.execute(
+        "INSERT INTO comics (id, title, issue, year) VALUES (1, 'X', '1', 1963)"
+    )
+    with pytest.raises(ValueError):
+        upsert_fmv(conn, 1, 6.0, **kwargs)
+    assert conn.execute("SELECT COUNT(*) FROM fmv").fetchone()[0] == 0
 
 
 def test_upsert_accepts_the_lone_sale_basis_on_a_fresh_db():

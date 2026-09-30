@@ -368,6 +368,12 @@ A row that ends the run refused — `flag_reason` set and no band, on **either**
 
 The last of those cases is the one the exit code cannot carry (BUI-971). `ebay-fetch --active-asks` exits 0 when the Browse search fails — an HTTP status, a rate limit that outlasts the retry budget, a transport error — because the subprocess still produced valid JSON. That JSON therefore carries the diagnosis instead: an errored search prints `{"low": null, "n": null, "error": "<message>"}`, with **`n` null rather than 0** so a consumer that ignores the `error` key still cannot read an outage as a book with no live asks. Before that, an outage and a genuine zero were byte-identical, so a refused row showed no ceiling and printed no warning either way — the BUI-565 shape (an errored fetch reading as a clean zero) on a display-only path, where it costs no money but hides an outage. A genuine zero is unchanged and stays **silent**: warning on every ask-less book would drown the one line that means the search is down.
 
+### 7d. Ceiling cap on a raw shape refusal (BUI-1028, behind `FMV_CEILING_CAP`, default off)
+
+A raw `one_sided` or `too_wide` refusal whose pool (`build_pool`, untrimmed, the pool `_classify_pool` judged) holds at least two comps at or above the target grade gets a bid cap: `CEILING_BID_FACTOR` (0.60) x the **median sale price of the lowest grade rung** in that at-or-above pool, rounded **down** with `floor_clean` (never `clean_round`, which rounds to nearest and can land above the value it came from). `one_sided` needs the pool entirely above the target; a pool with one comp at or above, or a cap that floors to $0, gets no cap. Never for a `variant_dropped` book. Measured on 131 out-of-sample and 752 in-sample capped sales (`docs/audit/2026-10-01-sold-comp-ceiling-oos.md`): mean overpay $3.90 against the accepted path's $8.44, at the cost of losing about three auctions in four. It is a cap, not a fair value.
+
+It is applied **after** the CGC-proxy rescue and cross-check (a row either prices is no longer a refusal) and stored as `fmv.ceiling_cap` with `pricing_basis='ceiling'` on the still-**flagged** row (`flag_reason` kept, `fmv_low`/`fmv_high` null) so no reader that treats low/high as an FMV can mistake it for one. `max_bid` equals the cap with `bid_factor` 1.0; the policy checks measure a bid against it with no further rung.
+
 ### 8. Confidence rubric
 
 | n (trimmed pool) | CV | Confidence |

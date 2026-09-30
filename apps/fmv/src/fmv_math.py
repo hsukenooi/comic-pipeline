@@ -698,6 +698,73 @@ def clean_round(value: float) -> int:
     return int(round(value / step) * step)
 
 
+# ─── Sold-comp ceiling cap (BUI-1028) ─────────────────────────────────────────
+#
+# A raw `one_sided` / `too_wide` refusal whose pool still holds at least two
+# comps AT OR ABOVE the target grade gets a conservative bid cap instead of a
+# punt: CEILING_BID_FACTOR x the median sale price of the LOWEST grade rung in
+# that at-or-above pool (variant B of BUI-1025), rounded DOWN to the clean step.
+# Measured out of sample in docs/audit/2026-10-01-sold-comp-ceiling-oos.md: the
+# 0.60 arm is the only one that beats the accepted path's own caps on mean and
+# P90 dollar overpay on both halves. It is a CAP, not a fair value.
+CEILING_BID_FACTOR = INTERPOLATED_BID_FACTOR  # 0.60
+CEILING_MIN_POOL = MIN_PRICEABLE_POOL         # 2: a lone comp above gets no cap
+
+
+def floor_clean(value: float) -> int:
+    """Round DOWN to the clean step (`_clean_step`), never up.
+
+    `clean_round` rounds to NEAREST, so a cap built with it can land above the
+    value that produced it (0.60 x $24 = $14.40 -> $15). A cap must never
+    exceed its own arithmetic, so the money path floors. Returns 0 for a value
+    under one step; callers treat that as "no cap".
+    """
+    if value <= 0:
+        return 0
+    step = _clean_step(value)
+    return int(math.floor(value / step) * step)
+
+
+def ceiling_cap(comps: Iterable[dict], target_grade: float, flag_reason: str | None,
+                max_window: float | None = None) -> dict:
+    """The BUI-1028 ceiling cap for a refused raw pool, or the reason there is none.
+
+    Returns ``{"cap": int | None, "reason": str, ...}``. ``cap`` is set only
+    when ``reason == "capped"``. Pure: reads nothing but its arguments.
+
+    Rules, copied from BUI-1025's ``ceiling_pool``/``ceilings`` (variant B):
+      * only a ``one_sided`` or ``too_wide`` flag qualifies;
+      * the pool is ``build_pool``'s UNTRIMMED pool for the target (the one
+        ``_classify_pool`` judged), restricted to grade >= target;
+      * ``one_sided``: a comp BELOW the target means the pool is not entirely
+        above it, so there is no ceiling (``one_sided_below``);
+      * fewer than CEILING_MIN_POOL comps at/above the target gets no cap;
+      * ceiling = median price of the lowest grade rung of that pool;
+      * cap = floor_clean(CEILING_BID_FACTOR x ceiling); a cap flooring to $0
+        is ``zero_cap`` and the row stays refused.
+    """
+    if flag_reason not in ("one_sided", "too_wide"):
+        return {"cap": None, "reason": "not_shape_refusal"}
+    if max_window is None:
+        max_window = MAX_GRADE_WINDOW
+    pool, _ = build_pool(comps, target_grade, max_window=max_window)
+    if flag_reason == "one_sided" and any(c["grade"] < target_grade for c in pool):
+        return {"cap": None, "reason": "one_sided_below"}
+    above = [c for c in pool if c["grade"] >= target_grade]
+    if len(above) < CEILING_MIN_POOL:
+        return {"cap": None,
+                "reason": "one_comp_above" if len(above) == 1 else "none_above"}
+    lowest = min(c["grade"] for c in above)
+    rung = [c["price"] for c in above if c["grade"] == lowest]
+    ceiling = statistics.median(rung)
+    cap = floor_clean(CEILING_BID_FACTOR * ceiling)
+    detail = {"ceiling": ceiling, "rung_grade": lowest, "rung_n": len(rung),
+              "n_above": len(above), "factor": CEILING_BID_FACTOR}
+    if cap <= 0:
+        return {"cap": None, "reason": "zero_cap", **detail}
+    return {"cap": cap, "reason": "capped", **detail}
+
+
 # ─── CGC-proxy tier (BUI-348) ─────────────────────────────────────────────────
 #
 # For a vintage KEY, genuine raw sold comps are sparse and rarely carry a

@@ -314,6 +314,49 @@ def test_recomputed_cap_stored_low_caps_at_070(conn):
     assert r["data"]["recomputed_cap"] == pytest.approx(70.0)
 
 
+def _ceiling_setup(conn, item_id, bid_amount):
+    """BUI-1028: a refused row carrying a ceiling cap (low/high NULL)."""
+    comic_id, fmv_id = _insert_comic_fmv(
+        conn, low=None, high=None, confidence="low")
+    conn.execute(
+        "UPDATE fmv SET flag_reason='one_sided', pricing_basis='ceiling', "
+        "ceiling_cap=60 WHERE id=?", (fmv_id,))
+    conn.commit()
+    bid = _insert_bid(conn, item_id, bid_amount)
+    _link(conn, bid["id"], fmv_id)
+    return _intent(item_id=item_id, max_bid=bid_amount, trigger="edit",
+                   prior_row=bid)
+
+
+def test_ceiling_row_passes_every_check_for_a_bid_at_the_cap(conn):
+    """The cap already carries its 0.60 haircut: a bid AT the cap is not
+    advised by any check (the stored-'low' 0.70 rung would have advised it
+    every time), and the row counts as priced."""
+    results = policy.check_bid_write(conn, _ceiling_setup(conn, "900100070", 60.0))
+    assert _by_code(results, "unpriced_entry")["outcome"] == "pass"
+    r = _by_code(results, "recomputed_cap")
+    assert r["outcome"] == "pass"
+    assert r["data"]["recomputed_cap"] == pytest.approx(60.0)
+    assert _by_code(results, "over_fmv")["outcome"] == "pass"
+
+
+def test_bid_above_a_ceiling_cap_is_advised(conn):
+    results = policy.check_bid_write(conn, _ceiling_setup(conn, "900100071", 65.0))
+    assert _by_code(results, "recomputed_cap")["outcome"] == "advise"
+    assert _by_code(results, "over_fmv")["outcome"] == "advise"
+
+
+def test_a_refused_row_without_a_cap_is_still_unpriced(conn):
+    _comic_id, fmv_id = _insert_comic_fmv(conn, low=None, high=None)
+    conn.execute("UPDATE fmv SET flag_reason='one_sided' WHERE id=?", (fmv_id,))
+    conn.commit()
+    bid = _insert_bid(conn, "900100072", 40.0)
+    _link(conn, bid["id"], fmv_id)
+    results = policy.check_bid_write(conn, _intent(
+        item_id="900100072", max_bid=40.0, trigger="edit", prior_row=bid))
+    assert _by_code(results, "unpriced_entry")["outcome"] == "advise"
+
+
 def test_recomputed_cap_stored_medium_passes_at_standard_080_bid(conn):
     """A stored 'medium' row was bid at 0.80 by the brief path (bid_factor
     pays BASE for MEDIUM and above; _confidence_to_db_label stores both
