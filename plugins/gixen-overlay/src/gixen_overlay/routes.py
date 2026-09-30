@@ -47,6 +47,10 @@ from gixen_overlay.db import (
     get_comps,
     get_fmv_history,
     stamp_comps_excluded,
+    stamp_comps_excluded_by_id,
+    unlink_fmv_from_bid,
+    retire_fmv_stub,
+    FmvRemediationRefused,
     unstamp_comps_excluded,
     list_all_comps,
     restamp_comps,
@@ -67,6 +71,9 @@ from gixen_overlay.models import (
     UpsertComicRequest,
     CompsIngestRequest,
     CompsExcludeRequest,
+    CompsExcludeByIdRequest,
+    UnlinkFmvRequest,
+    RetireFmvRequest,
     CompsUnstampRequest,
     CompsRestampRequest,
     LocgLinkRequest,
@@ -767,6 +774,33 @@ async def api_comics_comps_exclude(req: CompsExcludeRequest, request: Request):
     return result
 
 
+@router.post("/api/comics/comps/exclude-by-id")
+async def api_comics_comps_exclude_by_id(
+    req: CompsExcludeByIdRequest, request: Request
+):
+    """BUI-1023: stamp comps rows as excluded by ledger `id`, no `comic_id`.
+
+    `POST /api/comics/comps/exclude` addresses rows by `(comic_id, pool,
+    product_id)`, so it cannot reach a row whose `comic_id` is NULL. This is
+    the id-addressed sibling: same code vocabulary, same stamp-never-delete,
+    first-stamp-wins compare-and-set (`excluded_code IS NULL`), and the same
+    `dry_run` (default `true`) as `POST /api/comics/comps/unstamp`.
+
+    Body: `{ids: [...], code, pool?, dry_run}`. `pool`, when given, is a
+    guard: a row in the other pool lands in `wrong_pool` untouched.
+
+    Returns `{dry_run, code, pool, stamped, already_stamped, wrong_pool,
+    not_found}`; every bucket but `not_found` lists the row's identifying
+    fields (id, comic_id, pool, provider, product_id, title, price,
+    sold_date), so the dry-run is the audit. 200 always.
+    """
+    async with _write_locked():
+        with write_transaction(_get_db_path()) as wconn:
+            return stamp_comps_excluded_by_id(
+                wconn, req.ids, req.code, pool=req.pool, dry_run=req.dry_run
+            )
+
+
 @router.post("/api/comics/comps/unstamp")
 async def api_comics_comps_unstamp(req: CompsUnstampRequest, request: Request):
     """BUI-962: correct an exclusion stamp — clear `excluded_code`/
@@ -1085,6 +1119,56 @@ def _resolve_fmv_for_link(db, req: LinkFmvRequest) -> tuple[Any | None, list[str
     return None, attempted
 
 
+@router.post("/api/bids/{item_id}/unlink-fmv")
+async def api_unlink_fmv(item_id: str, req: UnlinkFmvRequest, request: Request):
+    """BUI-1023: remove one bid -> fmv link; the inverse of link-fmv.
+
+    Body: `{fmv_id, bid_id?, dry_run}`. `fmv_id` is an `fmv.id` (NOT a comic
+    id); `dry_run` defaults `true` (preview, then repeat with `false`).
+    `item_id` is not unique across bid rows: the rows carrying the link are
+    the candidates; several -> 409 until `bid_id` names one. No such link ->
+    404, whose detail lists the bid's current links. See
+    `unlink_fmv_from_bid` for the legacy `bids.fmv_id` repoint rule.
+
+    Returns `{dry_run, item_id, bid, removed_link, legacy_fmv_id_before,
+    legacy_fmv_id_after, promoted_fmv_id, remaining_links}`.
+    """
+    if not re.match(r"^\d+$", item_id):
+        raise HTTPException(status_code=422, detail="item_id must be numeric")
+    try:
+        async with _write_locked():
+            with write_transaction(_get_db_path()) as wconn:
+                return unlink_fmv_from_bid(
+                    wconn, item_id, req.fmv_id,
+                    bid_id=req.bid_id, dry_run=req.dry_run,
+                )
+    except FmvRemediationRefused as e:
+        raise HTTPException(status_code=e.status, detail=e.detail)
+
+
+@router.post("/api/comics/fmv/{fmv_id}/retire")
+async def api_retire_fmv(fmv_id: int, req: RetireFmvRequest, request: Request):
+    """BUI-1030: retire an orphaned, unpriced fmv stub onto its replacement.
+
+    Body: `{replacement_fmv_id, dry_run}` (`dry_run` defaults `true`). The
+    stub is stamped `flag_reason='superseded'` (never deleted) after every
+    inbound reference is repointed, all in one transaction. The response
+    reports each inbound path, queried directly (never via JOIN), the
+    identity check against the replacement, and the reference columns
+    scanned. 404: stub or replacement missing. 409 `{reasons: [...], ...}`:
+    priced or flagged stub, identity mismatch, or a reference this route
+    cannot repoint. See `retire_fmv_stub`.
+    """
+    try:
+        async with _write_locked():
+            with write_transaction(_get_db_path()) as wconn:
+                return retire_fmv_stub(
+                    wconn, fmv_id, req.replacement_fmv_id, dry_run=req.dry_run
+                )
+    except FmvRemediationRefused as e:
+        raise HTTPException(status_code=e.status, detail=e.detail)
+
+
 @router.post("/api/bids/{item_id}/comics/locg")
 async def api_link_locg(item_id: str, req: LocgLinkRequest, request: Request):
     """Persist a resolved LOCG ID against a specific comic in a bid's set.
@@ -1336,6 +1420,11 @@ _NEEDS_MANUAL_REASON_ADVICE: dict[str, str] = {
     "graded_mode_unavailable": (
         "certified books are not auto-priced yet (the graded FMV mode has not "
         "shipped) — hand-price it from slab comps at this certifier and grade"
+    ),
+    # BUI-1030: server-written only (retire_fmv_stub), never posted by a producer.
+    "superseded": (
+        "this row is a retired duplicate stub (see its `superseded_by` note); "
+        "relink the bid to the live row for this book instead of pricing it"
     ),
 }
 
