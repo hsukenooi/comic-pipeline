@@ -2702,9 +2702,9 @@ class TestComputeOne:
         assert body["fmv_high"] is None
         assert body["fmv_comps"] == 0
         assert body["fmv_confidence"] == "low"
-        # BUI-132: an n=0 stub is NOT flagged — it posts a null flag_reason so the
-        # server's COALESCE keeps any prior real price (the n=0 stub guard).
-        assert body["fmv_flag_reason"] is None
+        # BUI-1029: a never-priced n=0 row now says why (too_sparse). The
+        # priced-row case stays a null-flag stub; see TestEmptyPoolFlag.
+        assert body["fmv_flag_reason"] == "too_sparse"
 
         assert out["source"] == "fresh"
         assert out["fmv"]["n"] == 0
@@ -5973,16 +5973,15 @@ class TestNonUsdDroppedSignal:
         assert out["fmv"]["flag_reason"] is None
         assert out["fmv"]["max_bid"] is not None
 
-    def test_currency_emptied_pool_stays_unflagged_and_unpriced(self, server_url):
-        """An empty pool is BUI-44's existing no-comps stub — deliberately
-        NOT a new flag_reason (this is a diagnostic count, not a pricing
-        verdict), so flag_reason stays None exactly as a genuine no-comps
-        book's does (see fmv_math._classify_pool's own "n=0 → (None, None)"
-        rule). The count is what tells the two apart, not the flag."""
+    def test_currency_emptied_pool_is_flagged_and_unpriced(self, server_url):
+        """BUI-1029: an empty pool is flagged too_sparse like any n=0 row (no
+        new reason for the currency case). The non_usd_dropped count, not the
+        flag, still tells a currency-emptied pool from a genuine no-comps
+        book."""
         with patch("fmv_runner._upsert_fmv", return_value={"id": 1}):
             out = fmv_runner._compute_and_upsert_one(
                 self._empty_result(26), self._book(), server_url=server_url)
-        assert out["fmv"]["flag_reason"] is None
+        assert out["fmv"]["flag_reason"] == "too_sparse"
         assert out["fmv"]["fmv_low"] is None
         assert out["fmv"]["max_bid"] is None
         assert out["fmv"]["non_usd_dropped"] == 26
@@ -8713,3 +8712,52 @@ class TestSlabWatchCollectRun:
         assert code == 0
         dropped_rows_arg = exclusions.call_args.args[1]
         assert [r["product_id"] for r in dropped_rows_arg] == ["L1"]
+
+
+class TestEmptyPoolFlag:
+    """BUI-1029: an n=0 row ends with a flag_reason, except where a flagged
+    upsert would wipe an existing price."""
+
+    def _post(self, server_url, comps):
+        result = {"input": {"title": "Thor .5", "issue": "137", "grade": 8.0},
+                  "comps": comps}
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {"comic_id": 7, "fmv_id": 3, "id": 7}
+        with patch("fmv_runner.requests.post", return_value=mock_resp) as post:
+            fmv_runner._compute_and_upsert_one(
+                result, {"title": "Thor .5", "issue": "137", "grade": 8.0},
+                server_url=server_url)
+        return post.call_args.kwargs["json"]
+
+    def test_zero_raw_comps_posts_flag(self, server_url):
+        assert self._post(server_url, [])["fmv_flag_reason"] == "too_sparse"
+
+    def test_comps_present_none_in_window_posts_flag(self, server_url):
+        comps = [_make_comp(p, 1.0) for p in (10, 11, 12, 13, 14, 15)]
+        body = self._post(server_url, comps)
+        assert body["fmv_comps"] == 0
+        assert body["fmv_flag_reason"] == "too_sparse"
+        assert body["fmv_high"] is None
+
+    def test_priced_row_keeps_null_flag_stub(self, server_url, monkeypatch):
+        monkeypatch.setattr(fmv_runner, "_db_lookup_by_identity",
+                            lambda *a, **k: [{"fmv_low": 10, "fmv_high": 20}])
+        assert self._post(server_url, [])["fmv_flag_reason"] is None
+
+    def test_lookup_failure_keeps_null_flag_stub(self, server_url, monkeypatch):
+        def boom(*a, **k):
+            raise fmv_runner._DbLookupFailed("down")
+        monkeypatch.setattr(fmv_runner, "_db_lookup_by_identity", boom)
+        assert self._post(server_url, [])["fmv_flag_reason"] is None
+
+    def test_print_table_renders_flagged_n0_row(self, capsys):
+        rows = [{"input": {"title": "Thor .5", "issue": "137", "grade": 8.0},
+                 "fmv": {"flag_reason": "too_sparse", "fmv_low": None,
+                         "fmv_high": None, "median": None, "max_bid": None,
+                         "n": 0, "cv_pct": "n/a", "confidence": "LOW"},
+                 "source": "fresh"}]
+        fmv_runner._print_table(rows)
+        out = capsys.readouterr().out
+        assert "manual:too_sparse" in out
+        assert "Thor .5" in out

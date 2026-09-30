@@ -205,8 +205,19 @@ class TestComputeFmv:
         assert out["n"] == 0
         assert out["fmv_low"] is None
         assert out["confidence"] == "LOW"
-        assert out["flag_reason"] is None  # n=0 is no-comps, not a manual flag
+        assert out["flag_reason"] == "too_sparse"  # BUI-1029: n=0 says why
+        assert out["fmv_high"] is None and out["max_bid"] is None
         assert out["grade_span"] is None
+
+    def test_comps_present_none_in_window_is_flagged(self):
+        # BUI-1029: raw comps exist but every one sits outside the grade
+        # window, so the pool ends empty. Must be flagged, not a silent stub.
+        comps = [_comp(p, 1.0) for p in (10, 11, 12, 13, 14, 15)]
+        out = fm.compute_fmv(comps, target_grade=9.0)
+        assert out["n"] == 0
+        assert out["flag_reason"] == "too_sparse"
+        assert out["fmv_low"] is None and out["fmv_high"] is None
+        assert out["max_bid"] is None
 
     def test_widens_window_when_sparse(self):
         # 2 comps at exact target, 4 within ±1.0
@@ -1745,7 +1756,7 @@ class TestForcedFlagReason:
         """The BUI-588 defect state: n=0 with a null flag_reason reads as
         "illiquid" and is invisible to /comic:buy Step 3's guards."""
         plain = fm.compute_fmv([], target_grade=9.0)
-        assert plain["flag_reason"] is None
+        assert plain["flag_reason"] == "too_sparse"  # BUI-1029
         forced = fm.compute_fmv([], target_grade=9.0,
                                 forced_flag_reason="variant_dropped")
         assert forced["flag_reason"] == "variant_dropped"
