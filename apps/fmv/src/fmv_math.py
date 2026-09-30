@@ -76,8 +76,8 @@ def _classify_pool(pool: list[dict], target_grade: float,
     one_sided / too_wide are evaluated on the untrimmed grade-bearing pool (grade
     coverage is a property of the comps we found, not of price-outlier trimming);
     too_sparse is evaluated on the post-IQR-trim count. Precedence when more than
-    one applies: too_sparse → one_sided → too_wide. An empty pool (n=0) is the
-    existing no-comps stub, not a manual flag, so returns (None, None).
+    one applies: too_sparse → one_sided → too_wide. An empty pool returns
+    (None, None) here; `compute_fmv` flags it too_sparse itself (BUI-1029).
     """
     grades = [c["grade"] for c in pool if c.get("grade") is not None]
     if not grades:
@@ -1376,6 +1376,16 @@ def compute_fmv(comps: list[dict], target_grade: float,
     # shape, is the problem.
     if flag_reason is None and forced_flag_reason:
         flag_reason = forced_flag_reason
+
+    # BUI-1029: an EMPTY pool (zero raw comps, or comps present but none inside
+    # the grade window) is refused as too_sparse rather than left as a silent
+    # flag-less stub, so an unpriced row always says why. Nulls the same fields
+    # too_sparse always nulls (no price, no cap), so no bid cap moves. Runs
+    # after the forced/BUI-179 flags so a book that already has a reason keeps
+    # it. The runner demotes this back to a plain stub when a priced row
+    # already exists, because a flagged upsert would wipe that price.
+    if flag_reason is None and n == 0:
+        flag_reason = "too_sparse"
 
     # BUI-306 §5: check the grade-bucket median curve for monotonicity on the
     # widened grade-bearing pool. Violations are surfaced (SUSPECT) but never

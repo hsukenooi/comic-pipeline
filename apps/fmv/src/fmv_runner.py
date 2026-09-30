@@ -1248,6 +1248,33 @@ def _hand_price_candidates(server_url: str, book: dict, *,
                                   **price_identity)
 
 
+def _demote_empty_pool_flag_on_priced_row(server_url: str, inp: dict,
+                                          fmv: dict) -> None:
+    """BUI-1029: undo `compute_fmv`'s empty-pool `too_sparse` flag when the
+    write could land on a row that already holds a price.
+
+    `upsert_fmv` clears a stored price whenever the incoming row is flagged,
+    while a flag-less n=0 stub preserves it (BUI-599). An empty re-fetch of a
+    book that priced before (comps aged out of the window, a thin provider
+    response) must not wipe that price and its bid cap, so this restores the
+    stub behavior there. Only a never-priced row gets the flag. Fails closed:
+    a failed or undecidable lookup also keeps the stub, since "don't know"
+    must not be read as "never priced". Mutates `fmv` in place.
+    """
+    if fmv.get("n") != 0 or fmv.get("flag_reason") != "too_sparse":
+        return
+    grade = inp.get("grade")
+    priced = True
+    if grade is not None:
+        try:
+            rows = _hand_price_candidates(server_url, inp, grade=grade)
+            priced = any(r.get("fmv_low") is not None for r in rows)
+        except _DbLookupFailed:
+            priced = True
+    if priced or grade is None:
+        fmv["flag_reason"] = None
+
+
 def _variant_key(value: object) -> str | None:
     """Normalize a `variant` the way `upsert_comic` does before it becomes row
     identity: `(variant or "").strip() or None`.
@@ -2599,6 +2626,7 @@ def _compute_and_upsert_one(result: dict, original_book: dict, *,
     # this book under the other name its series carried.
     fmv["variant_dropped"] = dropped_variant
     fmv["masthead_swapped_to"] = result.get("masthead_swapped_to")
+    _demote_empty_pool_flag_on_priced_row(server_url, inp, fmv)
     # BUI-678: comps ebay-sold-comps' BUI-675 currency gate rejected for this
     # book (0 for the common case — `.get(...)` with a default, never `[...]`,
     # since a deployed ebay-sold-comps that predates BUI-678 won't emit this
