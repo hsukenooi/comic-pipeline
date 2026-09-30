@@ -1143,7 +1143,7 @@ async def api_unlink_fmv(item_id: str, req: UnlinkFmvRequest, request: Request):
                     bid_id=req.bid_id, dry_run=req.dry_run,
                 )
     except FmvRemediationRefused as e:
-        raise HTTPException(status_code=e.status, detail=e.detail)
+        raise HTTPException(status_code=e.status, detail=e.detail) from e
 
 
 @router.post("/api/comics/fmv/{fmv_id}/retire")
@@ -1166,7 +1166,7 @@ async def api_retire_fmv(fmv_id: int, req: RetireFmvRequest, request: Request):
                     wconn, fmv_id, req.replacement_fmv_id, dry_run=req.dry_run
                 )
     except FmvRemediationRefused as e:
-        raise HTTPException(status_code=e.status, detail=e.detail)
+        raise HTTPException(status_code=e.status, detail=e.detail) from e
 
 
 @router.post("/api/bids/{item_id}/comics/locg")
