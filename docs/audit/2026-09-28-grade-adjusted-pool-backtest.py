@@ -191,6 +191,11 @@ def price_adjusted(train: list[dict], g: float, slope: float) -> dict:
 
 
 def training(book: list[dict], target: dict) -> tuple[list[dict], int]:
+    # NOTE (BUI-1020/1022): the same-grade / price-within-$0.01 / 7-day drop below
+    # is APPROXIMATE. It matched 61 pairs against ~28 expected by chance, so about
+    # half the dropped "near-duplicates" are distinct sales. It shifts training
+    # pools in BUI-1005, BUI-1007, and BUI-1014, not production (which dedups on
+    # title too). Left unchanged so the published audits stay reproducible.
     lo = target["d"] - timedelta(days=WINDOW_DAYS)
     out, dropped = [], 0
     for c in book:

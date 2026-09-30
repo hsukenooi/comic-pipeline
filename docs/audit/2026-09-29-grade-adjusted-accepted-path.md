@@ -58,6 +58,6 @@ Re-parsing titles with the fixed `parse_grade` changes 174 of 5,276 stored grade
 
 ## Review notes
 
-- **Leakage:** training comps and every fitted slope use only sales strictly before the held-out sale. The held-out sale's near-duplicates (same grade, price within $0.01, within 7 days) are dropped from both. Two exceptions: the +15% constant and the empirical-Bayes prior weight come from the whole ledger. The pooled slope also uses comps first seen after the sale date, which production wouldn't have.
+- **Leakage:** training comps and every fitted slope use only sales strictly before the held-out sale. The held-out sale's near-duplicates (same grade, price within $0.01, within 7 days) are dropped from both (this rule is approximate: 61 matches vs about 28 expected by chance, so about half are distinct sales; it shifts the training pool, not production; BUI-1020, BUI-1022). Two exceptions: the +15% constant and the empirical-Bayes prior weight come from the whole ledger. The pooled slope also uses comps first seen after the sale date, which production wouldn't have.
 - **Same set:** every row of the slope table scores the same 2,113 sales against the same current band.
 - **Population:** ledger-only pools with no first-party comps, as in BUI-1005. Wrong-book pollution (ASM #50) hits both methods, but it dominates any mean, so the decision relies on the trimmed mean and win share.

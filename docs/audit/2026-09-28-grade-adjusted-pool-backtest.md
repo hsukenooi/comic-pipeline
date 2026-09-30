@@ -95,3 +95,7 @@ The claim that no fresh-batch book had a bid came from `FROM bids WHERE comic_id
 **What it changes:** the fresh-batch sentence only. Thor #175 is one of the two warning-sign books above, so it now has a real outcome to compare against (bid 802 ended with no win at a $14 max). The cancel decision rests on the 4,114-sale Winkler backtest, not on the fresh batch, so it stands.
 
 Reproduce: the script's `fresh_batch` query now reads both link paths through `fmv.comic_id`.
+
+## Note 2026-09-30 (BUI-1020, BUI-1022)
+
+The harness's same-grade near-duplicate rule (price within $0.01, within 7 days) is approximate: 61 matches against about 28 expected by chance, so about half the dropped comps are distinct sales. It shifts training pools here and in BUI-1007 and BUI-1014, not production. The rule is unchanged so these audits reproduce.
