@@ -3203,6 +3203,398 @@ def get_primary_fmv_for_bid(conn: sqlite3.Connection, bid_id: int) -> sqlite3.Ro
 
 
 # ---------------------------------------------------------------------------
+# fmv remediation: unlink a bid's link, retire an orphaned stub (BUI-1023/1030)
+# ---------------------------------------------------------------------------
+
+FMV_FLAG_SUPERSEDED = "superseded"
+"""`fmv.flag_reason` of a retired stub (BUI-1030). Written ONLY by
+`retire_fmv_stub`; it is deliberately NOT in `models.FMV_FLAG_REASONS` (the
+vocabulary `comic-fmv` may POST), so a producer can never emit it. `fmv.
+flag_reason` has no CHECK constraint, and every reader treats any non-NULL
+value as "flagged, not an FMV" (routes `_guidance_for` falls back to generic
+needs_manual advice; the dashboard shows the flag marker with the raw value)."""
+
+
+class FmvRemediationRefused(Exception):
+    """A remediation precondition failed; the route maps it to a 4xx."""
+
+    def __init__(self, status: int, detail: Any) -> None:
+        super().__init__(str(detail))
+        self.status = status
+        self.detail = detail
+
+
+def _fmv_brief(conn: sqlite3.Connection, fmv_id: int) -> dict[str, Any] | None:
+    """fmv row + its comic, read as two plain queries (never a JOIN, so a row
+    whose comic vanished still reports)."""
+    f = conn.execute(
+        "SELECT id, comic_id, grade, certifier, label, low, high, comps, "
+        "flag_reason, notes FROM fmv WHERE id = ?",
+        (fmv_id,),
+    ).fetchone()
+    if f is None:
+        return None
+    out = dict(f)
+    c = conn.execute(
+        "SELECT id, title, issue, year, variant FROM comics WHERE id = ?",
+        (f["comic_id"],),
+    ).fetchone()
+    out["comic"] = dict(c) if c is not None else None
+    return out
+
+
+def unlink_fmv_from_bid(
+    conn: sqlite3.Connection,
+    item_id: str,
+    fmv_id: int,
+    *,
+    bid_id: int | None = None,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """Remove one `bid_fmvs` link (bid -> fmv) (BUI-1023).
+
+    `link_fmv_to_bid` only adds or demotes; a wrong link could never be taken
+    off without a DB write. `fmv_id` is an `fmv.id`, not a comic id.
+
+    `item_id` is NOT unique across `bids` rows (re-adds, tombstones), so every
+    row with that item_id is examined and the ones carrying the link are the
+    candidates: exactly one -> act on it; several -> refuse 409 unless the
+    caller names `bid_id`. A row "carries the link" when it has a `bid_fmvs`
+    row for `fmv_id` OR its legacy `bids.fmv_id` equals `fmv_id` (the latter
+    alone is a dangling pointer, still cleared). No candidate -> 404, whose
+    detail lists each bid row's current links so a wrong-id mistake (a comic
+    id passed as an fmv id) is visible.
+
+    Legacy `bids.fmv_id` choice: if the removed link was the primary (or the
+    legacy column equals `fmv_id`), the column is REPOINTED to the remaining
+    primary; with no remaining primary the lowest-`fmv_id` remaining link is
+    promoted to primary (a bid with links and no primary blanks the
+    dashboard's grade/FMV aggregates, see `link_fmv_to_bid`); with nothing
+    remaining it is set NULL. Otherwise the column is left alone.
+
+    Does not commit; the caller owns the transaction.
+    """
+    bids = conn.execute(
+        "SELECT id, item_id, status, fmv_id FROM bids WHERE item_id = ? "
+        "ORDER BY id",
+        (item_id,),
+    ).fetchall()
+    if not bids:
+        raise FmvRemediationRefused(404, f"Item {item_id} not in DB")
+    if bid_id is not None:
+        bids = [b for b in bids if b["id"] == bid_id]
+        if not bids:
+            raise FmvRemediationRefused(
+                404, f"bid row {bid_id} is not a row of item {item_id}"
+            )
+
+    def _links(b_id: int) -> list[dict[str, Any]]:
+        return [
+            dict(r) for r in conn.execute(
+                "SELECT fmv_id, is_primary FROM bid_fmvs WHERE bid_id = ? "
+                "ORDER BY fmv_id",
+                (b_id,),
+            ).fetchall()
+        ]
+
+    candidates = []
+    for b in bids:
+        links = _links(b["id"])
+        if b["fmv_id"] == fmv_id or any(l["fmv_id"] == fmv_id for l in links):
+            candidates.append((b, links))
+    if not candidates:
+        raise FmvRemediationRefused(404, {
+            "message": f"no link from item {item_id} to fmv {fmv_id}",
+            "bid_rows": [
+                {"bid_id": b["id"], "status": b["status"],
+                 "legacy_fmv_id": b["fmv_id"],
+                 "links": [
+                     {**l, "comic_id": (_fmv_brief(conn, l["fmv_id"]) or {}).get("comic_id")}
+                     for l in _links(b["id"])
+                 ]}
+                for b in bids
+            ],
+        })
+    if len(candidates) > 1:
+        raise FmvRemediationRefused(409, {
+            "message": "item_id matches several bid rows carrying this link; "
+                       "pass bid_id to choose one",
+            "candidate_bid_ids": [b["id"] for b, _ in candidates],
+        })
+
+    bid, links = candidates[0]
+    removed = next((l for l in links if l["fmv_id"] == fmv_id), None)
+    remaining = [l for l in links if l["fmv_id"] != fmv_id]
+    was_primary = bool(removed and removed["is_primary"])
+    legacy_before = bid["fmv_id"]
+    legacy_after = legacy_before
+    promoted: int | None = None
+    if was_primary or legacy_before == fmv_id:
+        primaries = [l["fmv_id"] for l in remaining if l["is_primary"]]
+        if primaries:
+            legacy_after = primaries[0]
+        elif remaining:
+            promoted = remaining[0]["fmv_id"]
+            legacy_after = promoted
+        else:
+            legacy_after = None
+
+    report = {
+        "dry_run": dry_run,
+        "item_id": item_id,
+        "bid": {"bid_id": bid["id"], "status": bid["status"]},
+        "removed_link": {
+            "fmv_id": fmv_id,
+            "was_primary": was_primary,
+            "bid_fmvs_row_existed": removed is not None,
+            "fmv": _fmv_brief(conn, fmv_id),
+        },
+        "legacy_fmv_id_before": legacy_before,
+        "legacy_fmv_id_after": legacy_after,
+        "promoted_fmv_id": promoted,
+        "remaining_links": [
+            {**l, "is_primary": 1 if l["fmv_id"] == promoted else l["is_primary"]}
+            for l in remaining
+        ],
+    }
+    if not dry_run:
+        conn.execute(
+            "DELETE FROM bid_fmvs WHERE bid_id = ? AND fmv_id = ?",
+            (bid["id"], fmv_id),
+        )
+        if promoted is not None:
+            conn.execute(
+                "UPDATE bid_fmvs SET is_primary = 1 WHERE bid_id = ? AND fmv_id = ?",
+                (bid["id"], promoted),
+            )
+        if legacy_after != legacy_before:
+            conn.execute(
+                "UPDATE bids SET fmv_id = ? WHERE id = ?", (legacy_after, bid["id"])
+            )
+        logger.info(
+            "unlink_fmv_from_bid: item=%s bid=%s fmv=%s legacy %s->%s promoted=%s",
+            item_id, bid["id"], fmv_id, legacy_before, legacy_after, promoted,
+        )
+    return report
+
+
+# Columns known to hold an fmv id, and how `retire_fmv_stub` repoints them.
+_KNOWN_FMV_REFS = {("bid_fmvs", "fmv_id"), ("bids", "fmv_id")}
+
+
+def _fmv_referencing_columns(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+    """Every (table, column) that stores an fmv id, discovered from the live
+    schema: any column named `fmv_id`, or declared as a foreign key to
+    `fmv`. Schema-driven so a future referencing column cannot be silently
+    skipped by the retire route's inbound check."""
+    found: set[tuple[str, str]] = set()
+    tables = [r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name NOT LIKE 'sqlite_%'"
+    ).fetchall()]
+    for t in tables:
+        for col in conn.execute(f'PRAGMA table_info("{t}")').fetchall():
+            if col[1] == "fmv_id":
+                found.add((t, "fmv_id"))
+        for fk in conn.execute(f'PRAGMA foreign_key_list("{t}")').fetchall():
+            if fk[2] == "fmv":
+                found.add((t, fk[3]))
+    return sorted(found)
+
+
+_ARTICLE_RE = re.compile(r"^(?:the|a|an)\s+", re.IGNORECASE)
+
+
+def _identity_title(title: str | None, issue: str | None) -> str:
+    """Same normalization as apps/fmv `_normalize_book_title` (strip a leading
+    article, then an embedded `#<issue>`/trailing issue token), then casefolded
+    with whitespace collapsed. Mirrored here because apps/fmv is not importable
+    from the server."""
+    t = _ARTICLE_RE.sub("", title or "").strip()
+    issue_str = str(issue).strip() if issue else ""
+    if t and issue_str:
+        t = re.sub(rf"#\s*{re.escape(issue_str)}\b", "", t, flags=re.IGNORECASE)
+        t = re.sub(rf"(?<!\d){re.escape(issue_str)}\s*$", "", t.strip())
+    return re.sub(r"\s+", " ", t).strip().casefold()
+
+
+def _retire_identity_check(stub: dict[str, Any], repl: dict[str, Any]) -> dict[str, Any]:
+    """Compare two fmv briefs field by field; returns per-field results plus
+    `ok`. Title/issue/variant/grade/certifier/label must match; year must
+    match when BOTH are known (an X-Men #2 of 1963 and of 1991 are different
+    books) and is reported `skipped_null` when either is NULL."""
+    sc, rc = stub["comic"], repl["comic"]
+    checks: dict[str, Any] = {}
+    if sc is None or rc is None:
+        return {"ok": False, "comic_missing": True, "checks": checks}
+    checks["title"] = {
+        "stub": sc["title"], "replacement": rc["title"],
+        "match": _identity_title(sc["title"], sc["issue"])
+        == _identity_title(rc["title"], rc["issue"]),
+    }
+    checks["issue"] = {
+        "stub": sc["issue"], "replacement": rc["issue"],
+        "match": str(sc["issue"]).strip() == str(rc["issue"]).strip(),
+    }
+    sv = (sc["variant"] or "").strip().casefold()
+    rv = (rc["variant"] or "").strip().casefold()
+    checks["variant"] = {"stub": sc["variant"], "replacement": rc["variant"],
+                         "match": sv == rv}
+    checks["grade"] = {"stub": stub["grade"], "replacement": repl["grade"],
+                       "match": float(stub["grade"]) == float(repl["grade"])}
+    for k in ("certifier", "label"):
+        checks[k] = {"stub": stub[k], "replacement": repl[k],
+                     "match": stub[k] == repl[k]}
+    if sc["year"] is None or rc["year"] is None:
+        checks["year"] = {"stub": sc["year"], "replacement": rc["year"],
+                          "match": True, "skipped_null": True}
+    else:
+        checks["year"] = {"stub": sc["year"], "replacement": rc["year"],
+                          "match": sc["year"] == rc["year"]}
+    return {"ok": all(c["match"] for c in checks.values()), "checks": checks}
+
+
+def retire_fmv_stub(
+    conn: sqlite3.Connection,
+    stub_id: int,
+    replacement_id: int,
+    *,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """Retire an orphaned, unpriced fmv stub onto its replacement (BUI-1030).
+
+    Raises `FmvRemediationRefused` (404 missing row; 409 with a `reasons`
+    list otherwise) when the stub is the replacement, is priced, carries a
+    flag other than `superseded`, fails the identity check against the
+    replacement, or is referenced from a column this function does not know
+    how to repoint. All failing reasons are reported together.
+
+    INBOUND paths are queried DIRECTLY, each a plain single-table SELECT,
+    never through a JOIN (BUI-626: `bids.fmv_id` has no enforced FK, so a
+    JOIN returns empty for exactly the dangling reference): `bid_fmvs.fmv_id`,
+    `bids.fmv_id`, plus every other referencing column found in the live
+    schema (`_fmv_referencing_columns`). A reference in an unknown column
+    refuses the retire rather than being ignored.
+
+    Apply (one transaction, caller-owned; verified by a post-check that
+    raises, rolling back, if any inbound reference to the stub survives):
+    each `bid_fmvs` row is repointed to the replacement (when the bid already
+    links the replacement the stub row is dropped and the replacement takes
+    over primary if the stub's row was primary); `bids.fmv_id` equal to the
+    stub is repointed (a dangling pointer with no junction row is repointed,
+    not turned into a new link); the stub is stamped
+    `flag_reason='superseded'` with a `superseded_by=<id>` note token. The row
+    is never DELETEd, so the audit trail stays and cascades cannot fire.
+    """
+    if stub_id == replacement_id:
+        raise FmvRemediationRefused(409, "replacement_fmv_id equals the stub")
+    stub = _fmv_brief(conn, stub_id)
+    if stub is None:
+        raise FmvRemediationRefused(404, f"stub fmv {stub_id} not in DB")
+    repl = _fmv_brief(conn, replacement_id)
+    if repl is None:
+        raise FmvRemediationRefused(404, f"replacement fmv {replacement_id} not in DB")
+
+    reasons: list[str] = []
+    if stub["high"] is not None or stub["low"] is not None:
+        reasons.append("stub is priced (low/high not NULL); only unpriced stubs retire")
+    if stub["flag_reason"] not in (None, FMV_FLAG_SUPERSEDED):
+        reasons.append(f"stub carries flag_reason {stub['flag_reason']!r}; not retired over a flag")
+    identity = _retire_identity_check(stub, repl)
+    if not identity["ok"]:
+        failed = [k for k, v in identity["checks"].items() if not v["match"]]
+        reasons.append("identity mismatch: " + (", ".join(failed) or "comic row missing"))
+    if repl["flag_reason"] == FMV_FLAG_SUPERSEDED:
+        # A retired row is not a home for links. (A replacement flagged for
+        # another reason, e.g. too_sparse, is fine: it is the live row, and
+        # its flag is visible in the report.)
+        reasons.append("replacement is itself superseded")
+
+    def _inbound() -> dict[str, Any]:
+        bf = [dict(r) for r in conn.execute(
+            "SELECT bid_id, fmv_id, is_primary FROM bid_fmvs WHERE fmv_id = ? "
+            "ORDER BY bid_id", (stub_id,)).fetchall()]
+        for row in bf:
+            b = conn.execute(
+                "SELECT id, item_id, status FROM bids WHERE id = ?",
+                (row["bid_id"],)).fetchone()
+            row["bid"] = dict(b) if b is not None else None
+            row["bid_row_missing"] = b is None
+            row["bid_already_links_replacement"] = conn.execute(
+                "SELECT 1 FROM bid_fmvs WHERE bid_id = ? AND fmv_id = ?",
+                (row["bid_id"], replacement_id)).fetchone() is not None
+        bids_ptr = [dict(r) for r in conn.execute(
+            "SELECT id, item_id, status, fmv_id FROM bids WHERE fmv_id = ? "
+            "ORDER BY id", (stub_id,)).fetchall()]
+        linked = {r["bid_id"] for r in bf}
+        for row in bids_ptr:
+            row["dangling"] = row["id"] not in linked
+        other = []
+        for t, c in _fmv_referencing_columns(conn):
+            if (t, c) in _KNOWN_FMV_REFS:
+                continue
+            n = conn.execute(
+                f'SELECT COUNT(*) FROM "{t}" WHERE "{c}" = ?', (stub_id,)
+            ).fetchone()[0]
+            other.append({"table": t, "column": c, "count": n})
+        return {"bid_fmvs": bf, "bids_fmv_id": bids_ptr, "other": other}
+
+    inbound = _inbound()
+    unknown = [o for o in inbound["other"] if o["count"]]
+    if unknown:
+        reasons.append(f"references in columns this route cannot repoint: {unknown}")
+
+    report: dict[str, Any] = {
+        "dry_run": dry_run,
+        "stub": stub,
+        "replacement": repl,
+        "identity_check": identity,
+        "inbound": inbound,
+        "scanned_reference_columns": [
+            {"table": t, "column": c} for t, c in _fmv_referencing_columns(conn)
+        ],
+    }
+    if reasons:
+        raise FmvRemediationRefused(409, {"reasons": reasons, **report})
+
+    report["retired"] = False
+    if dry_run:
+        return report
+
+    for row in inbound["bid_fmvs"]:
+        if row["bid_already_links_replacement"]:
+            conn.execute(
+                "DELETE FROM bid_fmvs WHERE bid_id = ? AND fmv_id = ?",
+                (row["bid_id"], stub_id))
+            if row["is_primary"]:
+                conn.execute(
+                    "UPDATE bid_fmvs SET is_primary = 1 "
+                    "WHERE bid_id = ? AND fmv_id = ?",
+                    (row["bid_id"], replacement_id))
+        else:
+            conn.execute(
+                "UPDATE bid_fmvs SET fmv_id = ? WHERE bid_id = ? AND fmv_id = ?",
+                (replacement_id, row["bid_id"], stub_id))
+    conn.execute(
+        "UPDATE bids SET fmv_id = ? WHERE fmv_id = ?", (replacement_id, stub_id))
+    token = f"superseded_by={replacement_id}"
+    note = stub["notes"]
+    new_notes = token if not note else (note if token in note else f"{note} | {token}")
+    conn.execute(
+        "UPDATE fmv SET flag_reason = ?, notes = ? WHERE id = ?",
+        (FMV_FLAG_SUPERSEDED, new_notes, stub_id))
+
+    left = _inbound()
+    if left["bid_fmvs"] or left["bids_fmv_id"]:
+        raise RuntimeError(
+            f"retire_fmv_stub post-check: references to fmv {stub_id} survived"
+        )
+    logger.info("retire_fmv_stub: stub=%s -> replacement=%s", stub_id, replacement_id)
+    report["retired"] = True
+    return report
+
+
+# ---------------------------------------------------------------------------
 # Read path
 # ---------------------------------------------------------------------------
 
@@ -4814,6 +5206,91 @@ def unstamp_comps_excluded(
         "dry_run": dry_run,
         "unstamped": unstamped,
         "not_stamped": not_stamped,
+        "not_found": not_found,
+    }
+
+
+def stamp_comps_excluded_by_id(
+    conn: sqlite3.Connection,
+    ids: list[int],
+    code: str,
+    *,
+    pool: str | None = None,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """Stamp comps rows as excluded by ledger `id` (BUI-1023).
+
+    The id-addressed counterpart to `stamp_comps_excluded`, which needs a
+    `comic_id` and so cannot reach a row whose `comic_id` IS NULL. Same
+    stamp-never-delete, first-stamp-wins semantics: the UPDATE is guarded by
+    `excluded_code IS NULL`, so a stamped row keeps its original
+    `excluded_code`/`excluded_at`.
+
+    Each distinct id lands in exactly one bucket, and every bucket except
+    `not_found` carries the identifying fields of the row (id, comic_id, pool,
+    provider, product_id, title, price, sold_date, excluded_code) so the
+    dry-run is itself the audit:
+
+    * `stamped` -- unstamped, (under `dry_run`, WOULD be) stamped now.
+    * `already_stamped` -- has an `excluded_code`; left exactly as it was.
+    * `wrong_pool` -- `pool` was given and the row lives in the other pool.
+    * `not_found` -- no comps row has that id.
+
+    Does not commit: the caller owns the transaction. Raises ValueError on an
+    unknown `code`/`pool` (defense in depth behind the request model).
+    """
+    if code not in COMPS_EXCLUSION_CODES:
+        raise ValueError(
+            f"unknown exclusion code {code!r} "
+            f"(expected one of {COMPS_EXCLUSION_CODES})"
+        )
+    if pool is not None and pool not in COMPS_EXCLUSION_POOLS:
+        raise ValueError(
+            f"unknown pool {pool!r} (expected one of {COMPS_EXCLUSION_POOLS})"
+        )
+    now = datetime.now(timezone.utc).isoformat()
+    stamped: list[dict[str, Any]] = []
+    already: list[dict[str, Any]] = []
+    wrong_pool: list[dict[str, Any]] = []
+    not_found: list[int] = []
+    for cid in dict.fromkeys(ids):
+        row = conn.execute(
+            "SELECT id, comic_id, pool, provider, product_id, title, price, "
+            "sold_date, excluded_code FROM comps WHERE id = ?",
+            (cid,),
+        ).fetchone()
+        if row is None:
+            not_found.append(cid)
+            continue
+        info = dict(row)
+        if pool is not None and row["pool"] != pool:
+            wrong_pool.append(info)
+        elif row["excluded_code"] is not None:
+            already.append(info)
+        else:
+            if not dry_run:
+                cur = conn.execute(
+                    "UPDATE comps SET excluded_code = ?, excluded_at = ? "
+                    "WHERE id = ? AND excluded_code IS NULL",
+                    (code, now, cid),
+                )
+                if cur.rowcount != 1:  # lost a race since the read
+                    already.append(info)
+                    continue
+            stamped.append(info)
+    if not dry_run and stamped:
+        logger.info(
+            "stamp_comps_excluded_by_id: code=%s stamped=%d already=%d "
+            "wrong_pool=%d not_found=%d",
+            code, len(stamped), len(already), len(wrong_pool), len(not_found),
+        )
+    return {
+        "dry_run": dry_run,
+        "code": code,
+        "pool": pool,
+        "stamped": stamped,
+        "already_stamped": already,
+        "wrong_pool": wrong_pool,
         "not_found": not_found,
     }
 

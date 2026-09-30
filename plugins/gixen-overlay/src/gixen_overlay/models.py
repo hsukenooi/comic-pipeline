@@ -847,6 +847,76 @@ class CompsUnstampRequest(BaseModel):
         return v
 
 
+class CompsExcludeByIdRequest(BaseModel):
+    """POST /api/comics/comps/exclude-by-id -- stamp comps rows by ledger id (BUI-1023).
+
+    The id-addressed sibling of `CompsExcludeRequest`. That route resolves rows
+    by `(comic_id, pool, product_id)` and so can never reach a ledger row whose
+    `comic_id` is NULL (the FK is ON DELETE SET NULL, and an ingest may omit
+    it). `ids` are the `comps` table's own primary keys, exactly as on
+    `POST /api/comics/comps/unstamp`. Same code vocabulary, same first-stamp-
+    wins compare-and-set, and the same `dry_run` default-True safety as the
+    unstamp route. `pool`, when given, is a guard: a row living in the other
+    pool is reported in `wrong_pool` and left alone.
+    """
+
+    ids: list[int]
+    code: str
+    pool: str | None = None
+    dry_run: bool = True
+
+    @field_validator("ids")
+    @classmethod
+    def _non_empty_ids(cls, v: list[int]) -> list[int]:
+        if not v:
+            raise ValueError("ids must be a non-empty list")
+        return v
+
+    @field_validator("pool")
+    @classmethod
+    def _validate_pool(cls, v: str | None) -> str | None:
+        if v is not None and v not in COMPS_EXCLUSION_POOLS:
+            raise ValueError(
+                f"pool must be one of: {', '.join(COMPS_EXCLUSION_POOLS)}"
+            )
+        return v
+
+    @field_validator("code")
+    @classmethod
+    def _validate_code(cls, v: str) -> str:
+        if v not in COMPS_EXCLUSION_CODES:
+            raise ValueError(
+                f"code must be one of: {', '.join(COMPS_EXCLUSION_CODES)}"
+            )
+        return v
+
+
+class UnlinkFmvRequest(BaseModel):
+    """POST /api/bids/{item_id}/unlink-fmv -- remove one bid->fmv link (BUI-1023).
+
+    `fmv_id` is the `fmv.id` (NOT the comic id) whose `bid_fmvs` link should
+    go. `bid_id` (the `bids.id` row id) is optional and only needed when
+    `item_id` resolves to more than one bid row that carries the link.
+    `dry_run` defaults True: preview, then repeat with `dry_run: false`.
+    """
+
+    fmv_id: int
+    bid_id: int | None = None
+    dry_run: bool = True
+
+
+class RetireFmvRequest(BaseModel):
+    """POST /api/comics/fmv/{fmv_id}/retire -- retire an orphaned fmv stub (BUI-1030).
+
+    `replacement_fmv_id` is the live row that supersedes the stub. `dry_run`
+    defaults True: the preview reports every inbound reference and the
+    identity check without writing.
+    """
+
+    replacement_fmv_id: int
+    dry_run: bool = True
+
+
 class CompsRestampItem(BaseModel):
     """One compare-and-set write within a
     `POST /api/comics/comps/restamp` batch (BUI-998/BUI-1008).
