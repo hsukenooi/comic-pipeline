@@ -1,4 +1,14 @@
+---
+title: "Grade oracle bound on raw comps (BUI-1014)"
+date: 2026-09-29
+status: corrected
+superseded_by: "docs/audit/2026-09-30-provider-copy-fold.md (BUI-1020): the 187 'provider copies' are chance price matches, not copies. Verdict unchanged, since it rests on the bound arm."
+superseded_date: 2026-09-30
+---
+
 # Grade oracle bound on raw comps (BUI-1014)
+
+> **Correction 2026-09-30 (BUI-1020, BUI-1022).** The 187 grade-less rows called "provider copies" in the Method section are not copies. They are distinct sales that share a round price with a graded sale of the same book by chance (0 of 187 pairs share a `product_id` or title; see `2026-09-30-provider-copy-fold.md`). The `ceiling` arm therefore dropped 187 real sales, and its numbers are not clean. The verdict rests on the `bound` arm, which does not use that rule, so it stands. The figures below are left as published. The harness's graded near-duplicate rule, which this script imports from BUI-1005, is also about half chance (61 matches vs 28 expected); it shifts training pools, not production.
 
 **Date:** 2026-09-29. **Source:** `docs/audit/2026-09-29-grade-oracle-bound.py` (`where`, `bound --seeds 10`, `curve --seeds 5`, `ceiling`), run with `uv run --python 3.12` against the live comics DB opened read-only and pinned to rows first seen before 2026-09-29T09:00 UTC. The slab watch set and wish-list are read from the comics server. No provider calls, no ledger writes. The pricing math is BUI-1005's harness, imported unchanged.
 
@@ -81,7 +91,7 @@ The resolved share rises with the base, so the proxy likely understates the real
 
 ## Review notes
 
-- **Leakage:** training stays strictly before each sale. The imputation donors are the book's graded comps sold before the sale, excluding the sale and its copies. An earlier draft drew donors from the book's whole history, and that leak inflated imputation to 58% rescued and +0.09 Winkler. The corrected numbers are the ones above. 187 grade-less rows are provider copies of a graded held-out sale (same book, price within $0.01, within 7 days) and are dropped from `ceiling`.
+- **Leakage:** training stays strictly before each sale. The imputation donors are the book's graded comps sold before the sale, excluding the sale and its copies (see the correction above: the graded near-duplicate rule is approximate). An earlier draft drew donors from the book's whole history, and that leak inflated imputation to 58% rescued and +0.09 Winkler. The corrected numbers are the ones above. 187 grade-less rows were labeled provider copies of a graded held-out sale (same book, price within $0.01, within 7 days) and dropped from `ceiling`. That label is wrong; they are chance price matches (see the correction above).
 - **Harness untouched:** the full arm is the harness's own `price_current` call, and `load_comps`, `training`, `metrics`, and `cluster_bootstrap_gap` are imported.
 
 ## Out of scope
