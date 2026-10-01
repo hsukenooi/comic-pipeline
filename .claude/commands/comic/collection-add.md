@@ -324,7 +324,7 @@ Needs manual series canonical: 1 (see .notes.md)
 
 CSV exported to: ~/Downloads/locg-bulk-import-2026-05-23T14:30:00.csv
 
-**Next step:** Upload the CSV at leagueofcomicgeeks.com → My Comics → Import.
+**Next step:** Run `/comic:collection-sync` (it drives the LOCG upload in the browser; you only clear Cloudflare and log in).
 Pending push total: N rows; oldest pending = X days.
 ```
 

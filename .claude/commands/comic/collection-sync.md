@@ -16,9 +16,13 @@ Only re-importing the fresh LOCG export sets `pushed_to_locg_at` and drops a row
 out of "pending" (BUI-122). Skipping the re-import and just re-exporting later
 **re-emits the same rows as duplicate uploads**.
 
-**Two steps are manual and yours alone:** uploading the CSV to LOCG Bulk Import
-and downloading the fresh XLSX afterward both require the LOCG web UI (Playwright
-login). This skill drives everything else and gates hard around them.
+**The LOCG steps run in a user-present browser (BUI-1087).** Uploading the CSV
+to LOCG Bulk Import and downloading the fresh XLSX both need the LOCG web UI, and
+LOCG blocks unattended automation (BUI-257). So the agent drives LOCG through
+`agent-browser` on the automation Chrome, and the user does exactly two things:
+clear the Cloudflare check and log in (Step 2c). Never hand the upload or export
+back as manual steps, and never enter credentials. Every safety gate below
+(backup, probe, abort on "Deleted from Collection.") applies unchanged.
 
 **DATA-LOSS WARNING (BUI-122/BUI-200, read before running):** LOCG Bulk Import is
 **stateful per column**. A wish row carries `In Collection=0`, and LOCG reads
@@ -265,13 +269,41 @@ U2); full model:
 audit and export parse issue tokens slightly differently (BUI-197 is unifying
 this), so the LOCG import preview remains the final gate.
 
-## Step 3: Probe, then upload the wins CSV to LOCG (manual — you)
+## Step 2c: Open LOCG in the automation Chrome (user: Cloudflare + login only)
 
-Open League of Comic Geeks → **My Comics → Bulk Import**. Upload the CSV from
-Step 2 (it is wins-only).
+```bash
+~/.claude/scripts/automation-chrome.sh
+agent-browser --cdp 9222 open https://leagueofcomicgeeks.com/profile/ooihk/import-comics
+agent-browser --cdp 9222 get url
+```
 
-**Probe first.** Before the full upload, take a small mixed batch (≤5 rows) and
-upload it alone. LOCG shows an import **preview/result** — read it row by row:
+The profile (`~/.chrome-automation-profile`) can keep the LOCG session. If
+`get url` stays on `/profile/ooihk/import-comics`, you're logged in; go on. If it
+lands on a Cloudflare check or `/login`, ask the user to clear the check and log
+in **in that Chrome window**, then wait for their go-ahead. Never type
+credentials, and **never run `agent-browser close`** while attached over CDP; it
+closes the user's Chrome window.
+
+## Step 3: Probe, then upload the wins CSV to LOCG
+
+The import page is `https://leagueofcomicgeeks.com/profile/ooihk/import-comics`.
+One upload is:
+
+```bash
+agent-browser --cdp 9222 upload "#list" "<CSV>"        # auto-advances to a "Pending" list
+agent-browser --cdp 9222 snapshot -i | grep 'button "YES'   # ref of "YES. I'M READY. »"
+agent-browser --cdp 9222 click @<ref>
+agent-browser --cdp 9222 get text "#importer"          # poll until no "Pending" remains
+```
+
+Get the button's ref from `snapshot -i`; `find text` fails on the curly
+apostrophe in "I'M". The per-row result renders in `#importer`.
+
+**LOCG rejects a 1-row file** ("Something is wrong with that file"). To upload a
+single row, pad the CSV with one already-owned row (a no-op re-apply).
+
+**Probe first.** Before the full upload, split off a small mixed batch (≤5 rows)
+and upload it alone. Read the `#importer` result row by row:
 
 - Expect every row to be **"Added to Collection"** (or already present).
 - **ABORT immediately on ANY "Deleted from Collection." line** — a win row should
@@ -298,11 +330,29 @@ no-op, never a delete), so retry freely. **Watch the preview/result and abort on
 any "Deleted from Collection."**
 
 **If a complete upload still times out at 0%:** that's a LOCG-side outage, not your
-file. Check DevTools → Network for a `queue_import_comic` XHR showing `(canceled)`
+file. Check the network log (`agent-browser --cdp 9222 network requests`, or DevTools → Network) for a `queue_import_comic` XHR showing `(canceled)`
 and a slow page load — both mean LOCG's import backend is degraded. Wait and retry
 later; nothing to fix on our end.
 
-**This is a manual step. Tell me when the wins upload is done.**
+**"Not Found" rows** usually mean the series name or release date doesn't match
+LOCG's. Look the book up (`/search?keyword=...`, then the comic page's
+"RELEASED" line and publisher), fix the row to LOCG's series and date, and
+re-upload just those rows (padded if only one). Known shapes:
+
+- **Annuals file under the parent series:** `Superman Annual #9` uploads as
+  series `Superman (Vol. 1) (1939 - 1986)`, not a separate Annual series.
+- **A wrong release date alone gives "Not Found"**, even with the right series.
+- **Variants need LOCG's exact variant title** (e.g. `300 #1 Gabriele Dell'Otto
+  25th Anniversary Variant`) and the date LOCG files it under.
+
+**Un-collecting one wrong edition** (e.g. a foreign Panini edition that a past
+push mis-resolved): open that edition's `/comic/<id>/` page, confirm publisher
+and date, then click
+`div.comic-controller[data-comic=<id>][data-list="2"]`. Never un-collect
+through Bulk Import (`In Collection=0` is the BUI-122 data-loss path). Then
+remove the matching local row with
+`POST /api/comics/collection/remediate/delete` (`dry_run: true` first) so the
+Step 5 re-import doesn't flag it.
 
 ## Step 3b: (Optional, opt-in, deferred) Push the wish-list file
 
@@ -330,7 +380,8 @@ python3 -c "import json,os; d=json.load(open('$EXPORT_JSON')); \
   open(p,'w').write(d['csv']); print('wishes csv:', p, '| wish rows:', d['wish_list_count'])"
 ```
 
-Probe it the same way (≤5 rows), reading LOCG's preview:
+Probe it the same way (≤5 rows, same browser commands as Step 3), reading the
+`#importer` result:
 
 - Expect every row to be **"Added to Wish List."**
 - **ABORT on ANY "Deleted from Collection."** — that means a wished book is owned
@@ -349,11 +400,19 @@ Only after a clean probe, upload the rest (complete-and-exact, no row-count limi
 The wishes CSV is owned-safe by construction (BUI-200), but the preview is the last
 line of defense — never skip it.
 
-## Step 4: Re-export from LOCG (manual — you)
+## Step 4: Re-export from LOCG
 
-In LOCG → **My Comics → Export**, download a fresh XLSX (this carries LOCG's
-canonical Series Name / Release Date for the rows you just pushed). Give me the
-path to the downloaded `.xlsx`.
+On the same import page, click **EXPORT MY COMICS** (get its ref from
+`snapshot -i`). After about 20 seconds the file lands at
+`~/Downloads/ComicGeeks-<timestamp>.xlsx`; take the newest one:
+
+```bash
+python3 -c "import glob,os,time; f=max(glob.glob(os.path.expanduser('~/Downloads/ComicGeeks-*.xlsx')), key=os.path.getmtime); \
+  print(f, '| saved', time.ctime(os.path.getmtime(f)))"
+```
+
+It carries LOCG's canonical Series Name / Release Date for the rows you just
+pushed. Check its timestamp is from this run before Step 5.
 
 ## Step 5: Re-import to reconcile and clear pending
 
@@ -586,4 +645,7 @@ win-records cleanup in
 | Trusting the row-count arithmetic alone to prove the import reconciled | It structurally cannot (BUI-548). Each unreconciled duplicate is one `added` row, so the arithmetic balances exactly while books quietly become owned twice — that is precisely what happened on 2026-07-27 (`2902 + 46 - 3 = 2945`, exact, 28 books doubled). Step 6 also asserts `owned_duplicate_identities == 0` |
 | Claiming success without checking `row_count` against `added - auto_healed_duplicates` | Step 6's check is two-sided (BUI-468): `ROWS_AFTER` must equal `ROWS_BEFORE + added - auto_healed_duplicates` exactly. A large `added` means duplicates were inserted instead of reconciled; a shrink beyond `auto_healed_duplicates` means rows vanished for an unaccounted reason. Either way — STOP, investigate, restore the backup if needed (`POST /api/comics/collection/restore`) |
 | Treating `auto_healed_duplicates`/`second_copies_credited` as buried-in-warnings trivia | Both are top-level Step 5 summary counters — report them by name in Step 7, not just via the `warnings` string (BUI-468). `auto_healed_duplicates` deletes rows; `second_copies_credited` silently increments `in_collection` on a survivor. Both are reversible via `import-history.jsonl` (`type=auto_healed_duplicate_win` / `type=second_copy_credited`) |
+| Handing the upload or export back to the user as a manual step | The agent drives both in the automation Chrome (BUI-1087); the user only clears Cloudflare and logs in (Step 2c) |
+| Running `agent-browser close` after the sync | Over CDP it closes the user's Chrome window. Leave the browser open |
+| Uploading a 1-row CSV | LOCG rejects it ("Something is wrong with that file"); pad with an already-owned row |
 | Uploading the `.notes.md` rows | Only the `.csv` files go to LOCG; `.notes.md` lists rows withheld for manual resolution |
