@@ -9,6 +9,7 @@ description = "eBay data tools: live listings (Browse API) and sold comps (SerpA
 requires-python = ">=3.11"
 dependencies = [
     "requests",
+    "pillow",
 ]
 
 [project.scripts]
@@ -18,6 +19,7 @@ seller-scan = "seller_scan:main"
 wishlist-sellers = "wishlist_sellers:main"
 comic-identify = "comic_identify:main"
 grade-photos = "grade_photos:main"
+grade-crops = "grade_crops:main"
 ebay-shipped = "shipped_orders:main"
 
 [tool.hatch.build.targets.wheel]
