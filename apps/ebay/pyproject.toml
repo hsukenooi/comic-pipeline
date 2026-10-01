@@ -20,6 +20,7 @@ wishlist-sellers = "wishlist_sellers:main"
 comic-identify = "comic_identify:main"
 grade-photos = "grade_photos:main"
 grade-crops = "grade_crops:main"
+grade-seats = "grade_seats:main"
 ebay-shipped = "shipped_orders:main"
 
 [tool.hatch.build.targets.wheel]
