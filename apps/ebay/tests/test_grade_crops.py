@@ -49,7 +49,7 @@ def test_two_photos_write_overview_and_two_sheets(tmp_path, capsys):
     with Image.open(dst / "img-01-sheet-1.jpg") as sh:
         assert sh.size == (1024, 1024)  # four corners: 2 x 2
     with Image.open(dst / "img-01-sheet-2.jpg") as sh:
-        assert sh.size == (1024, 1536)
+        assert sh.size == (1024, 2048)
 
 
 def test_landscape_and_tiny_images(tmp_path, capsys):
@@ -66,7 +66,7 @@ def test_landscape_and_tiny_images(tmp_path, capsys):
     with Image.open(dst / "img-02-overview.jpg") as ov:
         assert ov.size == (40, 30)
     with Image.open(dst / "img-02-sheet-2.jpg") as sh:
-        assert sh.size == (1024, 1536)  # six tiles: 2 x 3
+        assert sh.size == (1024, 2048)  # eight tiles: 2 x 4
 
 
 def test_numeric_order_and_deterministic(tmp_path, capsys):
@@ -148,3 +148,21 @@ def test_book_corners_fall_back_to_frame_on_full_bleed_or_tiny():
     assert grade_crops.book_corners(full) == ((0, 0), (1250, 0), (0, 1600), (1250, 1600))
     tiny = Image.new("RGB", (40, 30))
     assert grade_crops.book_corners(tiny) == ((0, 0), (40, 0), (0, 30), (40, 30))
+
+
+def test_sheet_2_covers_both_spine_edges_top_and_bottom():
+    """BUI-1083: a back-cover photo's spine is the right edge, so the right
+    edge needs the same top/bottom tiles as the left (front-cover spine)."""
+    labels = [r[0] for r in grade_crops.SHEET_2]
+    for edge in ("left", "right"):
+        assert f"{edge} edge top" in labels and f"{edge} edge bottom" in labels
+    assert len(labels) == 8
+
+    corners = ((100, 50), (900, 50), (100, 1450), (900, 1450))
+    side = 160
+    centre = {r[0]: grade_crops._region_centre(corners, r[1], r[2], r[3], side)
+              for r in grade_crops.SHEET_2}
+    # right-edge top/bottom sit on the right edge, one region in from the corners
+    assert centre["right edge top"] == (900, 50 + side)
+    assert centre["right edge bottom"] == (900, 1450 - side)
+    assert centre["left edge top"] == (100, 50 + side)

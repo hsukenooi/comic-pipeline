@@ -14,8 +14,9 @@ For every ``img-NN.jpg`` in the image folder it writes into the crop dir:
   edge (never upscaled).
 - ``img-NN-sheet-1.jpg`` -- the four corners (2x2 grid).
 - ``img-NN-sheet-2.jpg`` -- left edge top and bottom (the spine on a front
-  cover), the staple area (left edge at 30% and 70% of the height), the
-  right edge middle (the spine on a back cover), and the center (2x3 grid).
+  cover), the staple area (left edge at 30% and 70% of the height), right
+  edge top, bottom and middle (the spine on a back cover), and the center
+  (2x4 grid).
 
 Tiles are 512 px. Regions are located on the comic itself, not the photo
 frame: on a near-uniform backdrop the four book corners are detected (a
@@ -67,6 +68,8 @@ SHEET_2 = (
     ("left edge bottom", "left", 1.0, -1.0),
     ("left edge upper staple", "left", 0.3, 0.0),
     ("left edge lower staple", "left", 0.7, 0.0),
+    ("right edge top", "right", 0.0, 1.0),
+    ("right edge bottom", "right", 1.0, -1.0),
     ("right edge middle", "right", 0.5, 0.0),
     ("center", "center", 0.0, 0.0),
 )
@@ -243,7 +246,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="grade-crops",
         description="Write a 1024 px overview and two labelled region contact "
-        "sheets (corners; left edge top/bottom, staple area, right edge, center) "
+        "sheets (corners; left edge top/bottom, staple area, right edge top/bottom/middle, center) "
         "for every "
         "img-NN.jpg in IMAGE_FOLDER. Prints only the written paths.",
     )
