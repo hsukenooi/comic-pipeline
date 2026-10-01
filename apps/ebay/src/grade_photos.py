@@ -534,7 +534,7 @@ def _download_image(url, dest, timeout=_DOWNLOAD_TIMEOUT_SECONDS):
 # and reports what it dropped and why so nothing disappears silently. The
 # FIRST image (the listing's main photo, the front cover) is never dropped.
 # Triage is fail-open: a file PIL cannot read is kept, never dropped.
-MAX_PHOTOS = 12              # cap on photos handed to graders; listing order wins
+MAX_PHOTOS = 24              # cap on photos handed to graders; listing order wins. 24 is the most seen in the holdout (BUI-1006), so dedup and view filters do the work; a 12 cap hid Hulk #180's value-stamp photo
 MIN_SIDE_PX = 250            # shorter side below this: thumbnail/icon, not a cover view
 MAX_ASPECT = 3.0             # long/short side above this: banner or strip, not a cover view
 DUP_HAMMING_MAX = 3          # dHash bits (of 64) that may differ and still be a near-duplicate
