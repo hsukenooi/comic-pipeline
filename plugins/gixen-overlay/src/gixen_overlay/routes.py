@@ -1807,6 +1807,10 @@ def _build_comics_row(row):
         "flag_reason": item.get("primary_flag_reason"),
         "ungraded_anchor": item.get("primary_ungraded_anchor"),
         "ungraded_anchor_n": item.get("primary_ungraded_anchor_n"),
+        # BUI-1076: the primary fmv's BUI-1028 ceiling_cap (the bid cap of a
+        # refused raw row). Same contract as the anchor: display only, never
+        # folded into value_pct, deal coloring, sorting, or bid math.
+        "ceiling_cap": item.get("primary_ceiling_cap"),
     }
 
 
@@ -1825,6 +1829,8 @@ _COMICS_AGGREGATES = """
     MAX(CASE WHEN bf.is_primary = 1 THEN f.flag_reason END) AS primary_flag_reason,
     MAX(CASE WHEN bf.is_primary = 1 THEN f.ungraded_anchor END) AS primary_ungraded_anchor,
     MAX(CASE WHEN bf.is_primary = 1 THEN f.ungraded_anchor_n END) AS primary_ungraded_anchor_n,
+    -- BUI-1076: the primary book's BUI-1028 ceiling_cap, same primary-only shape.
+    MAX(CASE WHEN bf.is_primary = 1 THEN f.ceiling_cap END) AS primary_ceiling_cap,
     -- BUI-925: the primary book's certifier and label. Same one-scalar-per-
     -- group shape as primary_grade above, and in this SHARED fragment
     -- precisely so the snipes and history endpoints cannot drift apart on it
