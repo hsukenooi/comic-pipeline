@@ -2174,7 +2174,8 @@ def _set_bid_fields(db_path, item_id, **fields):
 
 def _link_comic(db_path, item_id, *, title, issue, year, grade,
                 fmv_low=None, fmv_high=None, is_primary=True, flag_reason=None,
-                ungraded_anchor=None, ungraded_anchor_n=None):
+                ungraded_anchor=None, ungraded_anchor_n=None,
+                ceiling_cap=None):
     """Create a comic + fmv row and link it to a bid via bid_fmvs."""
     raw = sqlite3.connect(db_path)
     raw.row_factory = sqlite3.Row
@@ -2189,10 +2190,12 @@ def _link_comic(db_path, item_id, *, title, issue, year, grade,
         ).fetchone()["id"]
         raw.execute(
             "INSERT OR REPLACE INTO fmv "
-            "(comic_id, grade, low, high, flag_reason, ungraded_anchor, ungraded_anchor_n) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "(comic_id, grade, low, high, flag_reason, ungraded_anchor, ungraded_anchor_n,"
+            " ceiling_cap, pricing_basis) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (cid, grade, fmv_low, fmv_high, flag_reason,
-             ungraded_anchor, ungraded_anchor_n),
+             ungraded_anchor, ungraded_anchor_n, ceiling_cap,
+             "ceiling" if ceiling_cap is not None else None),
         )
         fid = raw.execute(
             "SELECT id FROM fmv WHERE comic_id=? AND grade=?", (cid, grade)
@@ -2432,6 +2435,25 @@ def test_comics_snipes_exposes_flag_reason_and_ungraded_anchor(api):
     assert row["ungraded_anchor_n"] == 11
     # BUI-522/BUI-713 contract: the anchor must never drive value_pct.
     assert row["value_pct"] is None
+
+
+def test_comics_snipes_exposes_ceiling_cap_display_only(api):
+    """BUI-1076: the dashboard row serves the primary fmv's ceiling_cap, None
+    when absent, and it never drives value_pct."""
+    db_path = os.environ["DB_PATH"]
+    api.post("/api/bids", json={"item_id": "1076000001", "max_bid": 40.0})
+    api.post("/api/bids", json={"item_id": "1076000002", "max_bid": 40.0})
+    for iid in ("1076000001", "1076000002"):
+        _set_bid_fields(db_path, iid, auction_end_at="2099-01-01T00:00:00+00:00")
+    _link_comic(db_path, "1076000001", title="Capped", issue="1", year=1970,
+                grade=6.0, flag_reason="one_sided", ceiling_cap=45.0)
+    _link_comic(db_path, "1076000002", title="Uncapped", issue="1", year=1970,
+                grade=6.0, flag_reason="one_sided")
+    rows = {r["item_id"]: r for r in api.get("/api/comics/snipes").json()}
+    assert rows["1076000001"]["ceiling_cap"] == 45.0
+    assert rows["1076000001"]["value_pct"] is None
+    assert rows["1076000001"]["fmv_low"] is None
+    assert rows["1076000002"]["ceiling_cap"] is None
 
 
 def test_comics_snipes_no_linked_fmv_has_null_anchor_fields(api):
