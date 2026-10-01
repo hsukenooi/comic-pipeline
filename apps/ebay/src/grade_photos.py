@@ -184,7 +184,7 @@ _DEFAULT_WORKDIR_ROOT = Path("/tmp/comic-grading")
 # grade.md just reads it. Keep this in sync with grade.md's escalation value
 # trigger if it ever changes. BUI-917: what the tier COMPARES against this
 # threshold is no longer always `current_price` — see decide_tier() below.
-VALUE_THRESHOLD = 100.0  # was 25.0 until 2026-10-01: at $25 nearly every vintage book paid for a 3-seat panel
+VALUE_THRESHOLD = 25.0
 
 # ─── BUI-917: the estimated-close value gate ────────────────────────────────
 # The bug: a live auction's `current_price` is where bidding has reached, not
