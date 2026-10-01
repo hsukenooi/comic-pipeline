@@ -33,6 +33,9 @@ if step.get("hang"):
 if step.get("garbage"):
     print("not json")
     sys.exit(0)
+if "raw" in step:
+    print(json.dumps({{"result": step["raw"], "num_turns": 2, "modelUsage": {{}}}}))
+    sys.exit(0)
 result = "".join(block(i, g, step.get("cap", "none"), step.get("rationale", "Clean."))
                  for i, g in step.get("grades", {{}}).items())
 usage = {{"m": {{"outputTokens": 10, "cacheReadInputTokens": 100, "cacheCreationInputTokens": 5}},
@@ -123,7 +126,7 @@ def test_agreeing_seats_no_second_pass(env, capsys):
     plan(env, "g1-a", {"grades": {"101": 5.0}})
     plan(env, "g1-b", {"grades": {"101": 5.5}})
     code, rep = run(env, [book()], capsys)
-    assert code == 0 and rep["books"][0]["p2"] is False
+    assert code == 0 and rep["books"][0]["adjudicator"] is None
     assert len(rep["usage"]) == 2 and rep["usage"][0]["cache_read"] == 102
     job = (env / "work/comic-1/job-g1-a.txt").read_text()
     assert "CROP DIRECTORY: " in job and job.rstrip().endswith("write nothing after them.")
@@ -162,43 +165,102 @@ def test_hung_seat_times_out_and_is_retried(env, capsys):
     assert "timeout" in [u for u in rep["usage"] if u["seat"] == "g1-a"][0]["error"]
 
 
-def test_split_triggers_second_pass_with_cross_exam_text(env, capsys):
-    plan(env, "g1-a", {"grades": {"101": 6.0}}, {"grades": {"101": 5.0}})
+def adj_reply(grade, findings=("- g1-a: confirmed nothing; rejected the gloss read because glare",
+                                "- g1-b: confirmed the spine split in xexam/g1-b-crop-01.jpg")):
+    """An adjudicator reply that quotes a seat's block before its own (the ambiguity case)."""
+    quoted = ("Seat g1-a said:\nGRADE: 6.0 (FN)\nGRADE RANGE: 6.0\nCONFIDENCE: HIGH\n\n")
+    return (quoted + "RECONCILED BLOCK\nPHOTO MAP: img-01: front cover\nGRADE: " + str(grade)
+            + " (VG)\nGRADE RANGE: 4.5-5.0\nCONFIDENCE: MEDIUM-LOW: 2 photos\n"
+            "GRADE CAP: spine split caps at 5.0\nRATIONALE: Split confirmed. More.\n"
+            "PHOTO LIMITATIONS: no interior.\nSEAT FINDINGS\n" + "\n".join(findings) + "\n")
+
+
+def split_setup(env, adj_steps):
+    plan(env, "g1-a", {"grades": {"101": 6.0}})
     plan(env, "g1-b", {"grades": {"101": 4.5}, "cap": 'spine split ~1/4" caps at 4.5',
-                       "rationale": "Spine split seen."}, {"grades": {"101": 5.0}})
+                       "rationale": "Spine split seen."})
+    plan(env, "adjudicator", *adj_steps)
     crops = env / "work/comic-1/crops-g1-b"
     crops.mkdir(parents=True)
     (crops / "crop-01.jpg").write_bytes(b"c")
+
+
+def test_split_runs_one_adjudicator_with_every_block_and_crop(env, capsys):
+    split_setup(env, [{"raw": adj_reply(5.0)}])
     code, rep = run(env, [book()], capsys)
     bk = rep["books"][0]
-    assert bk["p2"] and bk["split_before"] == 1.5 and bk["split_after"] == 0.0
-    assert [s["p1"] for s in bk["seats"]] == [6.0, 4.5]
+    assert code == 0 and bk["split"] == 1.5 and bk["adjudicator_failed"] is False
+    adj = bk["adjudicator"]
+    assert adj["grade"] == 5.0 and adj["range"] == "4.5-5.0"  # the reconciled block, not the quote
+    assert len(adj["findings"]) == 2 and adj["findings"][1].startswith("g1-b: confirmed")
+    assert [s["grade"] for s in bk["seats"]] == [6.0, 4.5]  # first-pass grades retained
+    assert all("raw" not in s for s in bk["seats"]) and "raw" not in adj
     assert (env / "work/comic-1/xexam/g1-b-crop-01.jpg").exists()
-    p2 = (env / "work/comic-1/job-g1-a-p2.txt").read_text()
-    assert "CROSS-EXAMINATION (second pass)" in p2 and "- g1-b:" in p2
-    assert "xexam/g1-b-crop-01.jpg" in p2 and "caps at" in p2
-    assert "- g1-a:" not in p2 and "4.5" not in p2  # no own entry, no other seat's grade number
-    assert p2.index("CROSS-EXAMINATION") < p2.index("HARNESS:")
-    assert len([u for u in rep["usage"] if u["pass"] == 2]) == 2
+    job = (env / "work/comic-1/job-adjudicator.txt").read_text()
+    assert "ADJUDICATION:" in job and "CROP DIRECTORY: " in job and "crops-adjudicator" in job
+    for seat, g in (("g1-a", "6.0"), ("g1-b", "4.5")):
+        assert f"=== FIRST-PASS SEAT {seat} ===" in job and f"GRADE: {g} (VF)" in job
+    assert 'GRADE CAP: spine split ~1/4" caps at 4.5' in job and "RATIONALE: Spine split seen." in job
+    assert "xexam/g1-b-crop-01.jpg" in job and "none (this seat made no ad hoc crops)" in job
+    assert job.index("ADJUDICATION:") < job.index("HARNESS:") and "SEAT FINDINGS" in job
+    assert not list((env / "work/comic-1").glob("job-g1-*-p2*.txt"))  # no per-seat re-run
+    rows = [u for u in rep["usage"] if u["pass"] == "adj"]
+    assert len(rows) == 1 and rows[0]["seat"] == "adjudicator" and len(rep["usage"]) == 3
+
+
+def test_adjudicator_text_output(env, capsys):
+    split_setup(env, [{"raw": adj_reply(5.0)}])
+    p = spec(env, [book()])
+    assert grade_seats.main([str(p), "--grader-agent", str(env / "agent.md")]) == 0
+    out = capsys.readouterr().out
+    assert "A g1-a: 6.0 |" in out and "B g1-b: 4.5 |" in out and "ADJ adjudicator: 5.0 |" in out
+    assert "  - g1-b: confirmed the spine split" in out
+    assert "Adjudicated: split 1.5, adjudicator grade 5.0" in out
+    assert "| Comic 1 (1970) | adjudicator | adj |" in out
+
+
+def test_adjudicator_retry_then_double_failure_keeps_first_pass(env, capsys):
+    split_setup(env, [{"exit": 2}, {"raw": adj_reply(5.0)}])
+    code, rep = run(env, [book()], capsys)
+    assert rep["books"][0]["adjudicator"]["grade"] == 5.0
+    assert (env / "work/comic-1/job-adjudicator-retry.txt").exists()
+    assert [u["retry"] for u in rep["usage"] if u["pass"] == "adj"] == [False, True]
+    for f in (env / "fake").glob("*.job.*"):
+        f.unlink()
+    plan(env, "adjudicator", {"garbage": True}, {"is_error": True})
+    p = spec(env, [book()])
+    assert grade_seats.main([str(p), "--grader-agent", str(env / "agent.md")]) == 0
+    out = capsys.readouterr().out
+    assert "adjudicator FAILED twice, first-pass grades kept" in out
+    assert "A g1-a: 6.0 |" in out and "ADJ " not in out
+
+
+def test_parse_adjudication_ambiguity():
+    assert grade_seats.parse_adjudication(adj_reply(3.0))["grade"] == 3.0
+    # no marker but two GRADE: lines: ambiguous, fails (the retry then runs)
+    two = "GRADE: 6.0\nGRADE RANGE: 6.0\nCONFIDENCE: HIGH\nGRADE: 3.0\nGRADE RANGE: 3.0\nCONFIDENCE: LOW\n"
+    assert grade_seats.parse_adjudication(two) is None
+    one = "GRADE: 3.0 (GD/VG)\nGRADE RANGE: 3.0\nCONFIDENCE: LOW\n"
+    assert grade_seats.parse_adjudication(one)["findings"] == []
+    # the LAST marker wins when the reply echoes the instruction's marker first
+    echoed = "RECONCILED BLOCK\n<one block>\n" + adj_reply(2.5)
+    assert grade_seats.parse_adjudication(echoed)["grade"] == 2.5
+    md = adj_reply(3.5).replace("RECONCILED BLOCK", "**RECONCILED BLOCK**").replace(
+        "SEAT FINDINGS", "## SEAT FINDINGS")
+    assert grade_seats.parse_adjudication(md)["grade"] == 3.5
 
 
 def test_split_threshold_boundary(env, capsys):
-    plan(env, "g1-a", {"grades": {"101": 6.0}}, {"grades": {"101": 5.5}})
-    plan(env, "g1-b", {"grades": {"101": 5.0}}, {"grades": {"101": 5.5}})
-    assert run(env, [book()], capsys)[1]["books"][0]["p2"] is True  # exactly 1.0 triggers
+    plan(env, "g1-a", {"grades": {"101": 6.0}})
+    plan(env, "g1-b", {"grades": {"101": 5.0}})
+    plan(env, "adjudicator", {"raw": adj_reply(5.5)})
+    assert run(env, [book()], capsys)[1]["books"][0]["split"] == 1.0  # exactly 1.0 triggers
     for f in (env / "fake").glob("*.job.*"):
         f.unlink()
     plan(env, "g1-b", {"grades": {"101": 5.5}})
-    assert run(env, [book()], capsys)[1]["books"][0]["p2"] is False
-
-
-def test_failed_second_pass_keeps_first_pass_grade(env, capsys):
-    plan(env, "g1-a", {"grades": {"101": 6.0}}, {"garbage": True}, {"garbage": True})
-    plan(env, "g1-b", {"grades": {"101": 4.0}}, {"grades": {"101": 5.0}})
-    code, rep = run(env, [book()], capsys)
-    bk = rep["books"][0]
-    assert bk["p2_failed"] == ["g1-a"] and bk["seats"][0]["grade"] == 6.0 and "p1" not in bk["seats"][0]
-    assert (env / "work/comic-1/job-g1-a-p2-retry.txt").exists()
+    bk = run(env, [book()], capsys)[1]["books"][0]
+    assert bk["split"] is None and bk["adjudicator"] is None
+    assert not (env / "fake" / "adjudicator.job.2").exists()  # no adjudicator on 0.5
 
 
 def test_single_seat_book_and_batch(env, capsys):
@@ -208,8 +270,9 @@ def test_single_seat_book_and_batch(env, capsys):
              {"item_id": "102", "comic": "Two", "folder": "comic-2", "seats": ["gb"], "batch": "x"},
              {"item_id": "103", "comic": "Three", "folder": "comic-3", "seats": ["gb"], "batch": "x"}]
     code, rep = run(env, books, capsys)
-    assert code == 0 and rep["books"][0]["p2"] is False
+    assert code == 0 and all(b["split"] is None and b["adjudicator"] is None for b in rep["books"])
     assert [b["seats"][0]["grade"] for b in rep["books"]] == [7.0, 4.0, 3.0]
+    assert not list((env / "work").glob("*/job-adjudicator*.txt"))  # a batch is never adjudicated
     job = (env / "work/comic-2/job-gb.txt").read_text()
     assert "ITEM ID: 102" in job and "ITEM ID: 103" in job and "crops-gb" in job
 
@@ -220,7 +283,7 @@ def test_text_output_and_version(env, capsys):
     p = spec(env, [book()])
     assert grade_seats.main([str(p), "--grader-agent", str(env / "agent.md")]) == 0
     out = capsys.readouterr().out
-    assert "### Comic 1 (1970) — 101" in out and "| **Total** |" in out and "Cross-examined: no" in out
+    assert "### Comic 1 (1970) — 101" in out and "| **Total** |" in out and "Adjudicated: no" in out
     with pytest.raises(SystemExit):
         grade_seats.main(["--version"])
     assert grade_seats._version_string().startswith("grade-seats ")
