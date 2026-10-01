@@ -90,6 +90,7 @@ Don't fan out 3 graders for every comic — plenty of listings in a seller scan 
 - **Value tier** — `grade-photos` (Step 1) owns `VALUE_THRESHOLD` ($25), the estimated-close rule, and its constants (`_PRICE_NEARLY_FINAL_HOURS`, `_CLOSE_HEADROOM`, `_MODERN_AGE_START_YEAR` — tune them there, not here), and prints `tier: cheap|not-cheap` per comic. Read the printed tier directly; don't re-derive the split from `current_price` here — on a young auction the tier deliberately disagrees with the price beside it (see Step 1). A `not-cheap` tier always gets the full 3-grader panel; a book that will cost real money justifies the rigor. Because BUI-917 pushes an early-graded vintage auction into `not-cheap`, a scan of young vintage listings escalates more than it used to — the decision-sensitivity gate below is the intended damper, not a lower threshold. The same run also prints `est_close` per comic (BUI-992, see Step 1) — read that field, never `current_price`, wherever a bid cap needs comparing against where the auction will land; `_PRICE_NEARLY_FINAL_HOURS`/`_CLOSE_HEADROOM` drive it too, so tuning them tunes both the tier and the gate together.
 - `CAP_BAND = 0.5` — if the single grader's grade sits within this many points of a grade-capping threshold (the spine-split / missing-piece / detached-cover ceilings), treat it as boundary-ambiguous.
 - `BATCH_MAX = 5` — how many cheap-tier books one grader agent grades in a single context before opening another. Caps context bleed / grader fatigue across books.
+- `SEAT_DISPATCH = headless` — how each grader seat runs (BUI-1090). `headless` runs every seat as its own background `claude -p` process (see Headless seats below); `agent` is the fallback, which spawns the `comic-grader` subagent through the Agent tool as before BUI-1090. Use `agent` when `claude` is not on PATH or a headless launch is refused outright; when one headless seat fails twice (see Seat failures), dispatch only that seat through the Agent tool rather than switching the whole run.
 - `CAP_DECISION_TOLERANCE = 10%` — in the decision-sensitivity gate (below), two bid caps computed at the ends of a grade range count as "the same decision" if they're within this much of each other (and the buy/no-buy call doesn't flip).
 
 **Escalate the single-grader result to a full 3-grader panel when ANY of these hold:**
@@ -104,10 +105,65 @@ Don't fan out 3 graders for every comic — plenty of listings in a seller scan 
 **Dispatch mechanics:**
 - Split the candidates by the printed **tier** from Step 1 (`cheap` / `not-cheap`) — a known key always counts as not-cheap regardless of its printed tier.
 - **Cheap books → batch them.** A cheap book only ever earns 1 grade unless a gate trips, so there is no cross-grader independence to preserve — grade several in **one** agent context instead of one agent each. Group the cheap books into batches of up to `BATCH_MAX` and give each batch a single grader agent that grades every book in the group **independently** and returns one full OUTPUT FORMAT block per book (clearly delimited, labelled by item id). This is the main first-pass cost saver on a thin-photo seller scan (e.g. 7 cheap books → 2 agents, not 7).
-- **Not-cheap books → 1 grader each, first pass**, run in parallel (separate agents).
+- **Not-cheap books → 1 grader each, first pass**, run in parallel (separate seats).
 - **Escalation (both kinds).** After the first pass, any book that tripped a gate (Step 2 triggers) gets the **remaining 2** graders as separate, independent agents — dispatched together in one parallel batch. A batched cheap book's first grade counts as grader A; pull it out and add B + C. (The grader prompt and criteria are identical across passes so the panel grades stay independent and comparable.)
 - **Crop directories (BUI-911).** Every dispatched grader agent — a not-cheap single grader, a batched cheap-book agent, or one seat of the escalation panel — gets its own **CROP DIRECTORY** input (see [Grader Agent](#grader-agent) below): that book's `IMAGE FOLDER` plus a subdirectory suffixed with the agent's own distinct name (see Common Mistakes below on naming), e.g. `<workdir>/comic-1/crops-grader-c1-a`. Keying by book alone is not enough — the escalation panel's B and C are dispatched together and grade the **same book concurrently**, so a directory named only after the book would still let them collide on the same generic zone filenames (`f_spine_bot.jpg`, etc.); keying by agent name too is what prevents that. A batched cheap-book agent gets one such subdirectory per book in its batch (same agent name, different `comic-N` parent), so books within a batch never collide with each other or with any other agent's crops.
 - **Shared crop sheets (BUI-1084).** Before the first dispatch, run `grade-crops <workdir>/comic-N <workdir>/comic-N/crops-shared` **once per book** (one Bash call can run all the books), and pass the printed overview and sheet paths to every seat of that book as SHARED CROPS. The crops are a deterministic function of the photos, so every seat would have produced identical files; making them once removes two of the three crop runs and keeps independence intact (seats still never see each other's grades or notes). Each seat keeps its private CROP DIRECTORY for its one ad hoc crop round only. If `grade-crops` is not on PATH, omit SHARED CROPS and the seats fall back to their own procedure.
+- **Headless seats (BUI-1090, `SEAT_DISPATCH = headless`).** Every dispatched grader in this section (a not-cheap single, a batched cheap-book agent, or a panel seat) is one background `claude -p` process, not an Agent tool spawn. A headless seat carries about 15k tokens of fixed prompt per API call; an Agent tool spawn carries about 36k. Run every command below from the repo root.
+  1. Once per run, write the two shared inputs into `<workdir>`: the empty MCP config, and the grader body with its frontmatter stripped (`docs/reference/headless-grader-runs.md`).
+     ```bash
+     printf '{"mcpServers":{}}\n' > <workdir>/empty-mcp.json
+     awk 'NR==1 && /^---$/ {f=1; next} f && /^---$/ {f=0; next} !f' .claude/agents/comic-grader.md > <workdir>/grader-body.md
+     ```
+  2. For each seat, write its job text to `<workdir>/comic-N/job-<seat name>.txt` (a batched seat uses its first book's `comic-N`). The job text is exactly what an Agent tool prompt would carry, the dynamic inputs in [Grader Agent](#grader-agent) (COMIC, IMAGE FOLDER, CROP DIRECTORY, SHARED CROPS, IMAGES, SELLER-STATED GRADE, item id, one block per book for a batch), followed by this harness line verbatim, which overrides the agent body's SendMessage step:
+     `HARNESS: SendMessage is unavailable in this run. Your final message is your report: end with the OUTPUT FORMAT block(s) and write nothing after them.`
+  3. Launch every seat of the pass in **one** Bash call (timeout 600000 ms; a seat takes 2 to 5 minutes), all in the background, then `wait`. The function takes the book folder, the seat name, and a file suffix (empty for the first pass):
+     ```bash
+     seat() {
+       claude -p --model claude-fable-5-1 --system-prompt-file <workdir>/grader-body.md \
+         --tools Read,Bash --strict-mcp-config --mcp-config <workdir>/empty-mcp.json \
+         --max-turns 8 --output-format json \
+         < "$1/job-$2$3.txt" > "$1/seat-$2$3.json" 2> "$1/seat-$2$3.stderr"
+       echo "seat-$2$3 exit=$?"
+     }
+     seat <workdir>/comic-1 grader-c1-a "" &
+     seat <workdir>/comic-2 grader-c2-a "" &
+     wait
+     ```
+     Use `--tools`, never `--allowedTools` (BUI-1089). Never let two seats share a seat name: the name keys the job file, the envelope, and the CROP DIRECTORY.
+  4. Parse the envelopes you just launched, by explicit path, in one call. The script prints one status line per seat (turns, output, cache-read, cache-create, summed across every model in `modelUsage`) and then that seat's `result`, which holds its OUTPUT FORMAT block(s):
+```bash
+python3 - <workdir>/comic-1/seat-grader-c1-a.json <workdir>/comic-2/seat-grader-c2-a.json <<'PY'
+import json, sys
+for path in sys.argv[1:]:
+    try:
+        d = json.load(open(path))
+    except Exception as e:
+        print(f"== {path} FAILED: unreadable envelope ({e})"); continue
+    u = list((d.get("modelUsage") or {}).values())
+    tot = lambda k: sum(m.get(k, 0) for m in u)
+    r = d.get("result") or ""
+    ok = not d.get("is_error") and all(f in r for f in ("GRADE:", "GRADE RANGE:", "CONFIDENCE:"))
+    print(f"== {path} {'OK' if ok else 'FAILED: ' + str(d.get('subtype'))} turns={d.get('num_turns')} "
+          f"out={tot('outputTokens')} cache_read={tot('cacheReadInputTokens')} cache_create={tot('cacheCreationInputTokens')}")
+    if ok:
+        print(r)
+PY
+```
+     Keep each status line for the usage table under **Output**. A failed attempt's usage still counts toward it.
+- **Seat failures (BUI-1090).** A seat has failed when its launch line prints a non-zero exit, its envelope is missing or unreadable, or its envelope is `is_error` or carries no OUTPUT FORMAT block (the parse prints `FAILED`). For a batched seat, also check that the result holds one block per book; a missing book counts as a failure for that book. Re-run a failed seat once: copy the failed attempt's job file to the same name with `-retry` appended (`job-<seat>.txt` to `job-<seat>-retry.txt`, `job-<seat>-p2.txt` to `job-<seat>-p2-retry.txt`) and launch with that suffix, so the failed envelope survives for the usage table. If the retry fails too, dispatch that one seat through the Agent tool (`SEAT_DISPATCH = agent` for that seat only) or report it as a failed seat with its stderr's last line. **Never adjudicate a book with fewer seats than you dispatched without saying so:** the book's block names each failed seat, and the consensus is marked as resting on the seats that returned.
+- **Second-pass cross-examination (BUI-1090).** When a book's panel splits by 1.0 or more after the first pass (the Step 3 item 4 case), run **one** second pass before adjudicating. This is the only cross-examination channel; seats never message each other.
+  1. For each seat, copy its ad hoc crops (`crop-*.jpg` in its CROP DIRECTORY) to `<workdir>/comic-N/xexam/<seat name>-crop-NN.jpg`. The second pass writes into the same CROP DIRECTORIES and can overwrite `crop-01.jpg`, so the copies are what the other seats read.
+  2. For each seat, write `job-<seat>-p2.txt`: its first-pass job text with the harness line kept last, and this block inserted just above it, listing every **other** seat on the book:
+     ```
+     CROSS-EXAMINATION (second pass): other graders of this book saw the defects below. Read their crops, then re-grade from all the evidence. Change your grade only for a defect you can confirm in a photo or crop; printed art, glare, and lint are not defects. Return a full OUTPUT FORMAT block.
+     - <seat name>: <one line naming its grade-determining defects, from its GRADE CAP and RATIONALE, no grade number>. Crops: <xexam paths, or "none">
+     ```
+     Leave the other seats' grade numbers out, so the second pass weighs evidence rather than anchoring on a number.
+     A batched seat that is grader A of an escalated book gets a second-pass job holding only that book's block, written under that book's `comic-N`; the other books in its batch are not re-graded.
+  3. Launch all of the book's seats again with the suffix `-p2` (same `seat` function, same CROP DIRECTORY), parse them as in step 4, and apply the seat-failure rule. Adjudicate in Step 3 on the second-pass grades; a seat whose second pass failed twice keeps its first-pass grade, and the block says so.
+  4. At most one second pass per book. If the second-pass panel still splits by 1.0 or more, Step 3 item 4 classifies the split as usual.
+- **Agent fallback (`SEAT_DISPATCH = agent`).** Spawn the `comic-grader` subagent by type with the same job text minus the harness line; the subagent returns its block through SendMessage (its own step 9). The second pass is a fresh spawn per seat with the step 2 block appended; never cross-examine by messaging the first-pass seats. Agent tool spawns report no per-seat usage, so the usage table marks those rows `n/a`.
 - **Batching guardrails:** keep each book's images and OUTPUT FORMAT block fully separate in the batched prompt; never let one book's defects bleed into another's grade; if a batch would exceed `BATCH_MAX`, open another agent. When in doubt about a specific cheap book (e.g. it looks near a cap), grade it on its own rather than in the batch.
 - **Anti-anchoring:** batched grades must not drift toward the batch's overall quality. The `comic-grader` agent def owns this rule (grade each book on the **absolute** CGC scale; BUI-81) and its own guard enforces it — nothing to restate here.
 
@@ -115,17 +171,17 @@ Don't fan out 3 graders for every comic — plenty of listings in a seller scan 
 
 **Gate status (BUI-1084, Goal 1 not shipped).** The decision-sensitivity gate stays optional here and is not made the `/comic:buy` default. It needs a read-only FMV probe at the grade-range endpoints, and `comic-fmv` has none: every run writes fmv rows (and a comic stub) to the comics server, and it has no dry-run flag. Probing two hypothetical grades per book would store FMV rows for grades nobody confirmed. Make the gate the default only after `comic-fmv` gains a no-write mode.
 
-**Token totals (BUI-1084).** To compare one run with the next, read usage from the headless JSON envelope, not from the transcript: `claude -p "/comic:grade <ids>" --output-format json` returns `modelUsage`, with `outputTokens`, `cacheReadInputTokens`, and `cacheCreationInputTokens` per model. Sum across models and compare output and cache-read totals per listing set before and after a change. Any headless grader seat run (fixture gate, benchmark, re-grade) must pass `--tools Read,Bash --strict-mcp-config --mcp-config <empty-mcp.json>`, not `--allowedTools`, which leaves about 30k of built-in tool schemas in every call; see `docs/reference/headless-grader-runs.md` (BUI-1089).
+**Token totals (BUI-1084).** To compare one run with the next, read usage from the headless JSON envelope, not from the transcript: `claude -p "/comic:grade <ids>" --output-format json` returns `modelUsage`, with `outputTokens`, `cacheReadInputTokens`, and `cacheCreationInputTokens` per model. Sum across models and compare output and cache-read totals per listing set before and after a change. Headless seats (BUI-1090) run as separate processes, so the outer envelope does not include them; their usage comes from each seat's own envelope (`seat-*.json`, see Headless seats) and goes in the per-seat usage table under **Output**. Add the seat total to the outer total for a whole-run figure. Any headless grader seat run (fixture gate, benchmark, re-grade) must pass `--tools Read,Bash --strict-mcp-config --mcp-config <empty-mcp.json>`, not `--allowedTools`, which leaves about 30k of built-in tool schemas in every call; see `docs/reference/headless-grader-runs.md` (BUI-1089).
 
 **Required per-comic reporting (no silent caps):** for every comic, state how many graders ran and why — e.g. `1 grader (──$6, range wide but coverage-driven at MEDIUM-LOW)` or `1 grader (──$6, unambiguous)` or `3 graders (──$40 ≥ $25 value threshold)` or `3 graders (grade 5.0 within 0.5 of the 1/2" spine-split cap)`. When the tier came from an estimated close rather than a final price, pass Step 1's printed reason through verbatim — e.g. `3 graders (──$4.25 but not-cheap: estimated vintage 1964, 4d left)` — so a reader can see that the $25 line was crossed by an estimate, not by the price on the line. The user must be able to see where rigor was and wasn't spent.
 
 ### Grader Agent
 
-The grading persona — the full CGC/Overstreet scale, criteria, PRINT-LAYER / WRITING / GRADE-CAPPING / restoration rules, coverage-driven CONFIDENCE, the SELLER-STATED-GRADE prior, the procedure, and the **OUTPUT FORMAT contract** — lives in the **`comic-grader` subagent** (`.claude/agents/comic-grader.md`), scoped to `Read, Bash`: it writes nothing except scratch crops, and only inside the CROP DIRECTORY you assign it (BUI-911, see below). Invoke it **by type** (`comic-grader`); do not paste a grading prompt inline. This keeps the most-tuned prompt (BUI-81 anti-anchoring) in one place and its OUTPUT FORMAT aligned with `/comic:fmv` input.
+The grading persona — the full CGC/Overstreet scale, criteria, PRINT-LAYER / WRITING / GRADE-CAPPING / restoration rules, coverage-driven CONFIDENCE, the SELLER-STATED-GRADE prior, the procedure, and the **OUTPUT FORMAT contract** — lives in the **`comic-grader` subagent** (`.claude/agents/comic-grader.md`), scoped to `Read, Bash`: it writes nothing except scratch crops, and only inside the CROP DIRECTORY you assign it (BUI-911, see below). Under `SEAT_DISPATCH = headless` that file, frontmatter stripped, is each seat's `--system-prompt-file`; under `agent`, invoke it **by type** (`comic-grader`). Either way, do not paste a grading prompt inline. This keeps the most-tuned prompt (BUI-81 anti-anchoring) in one place and its OUTPUT FORMAT aligned with `/comic:fmv` input.
 
 The OUTPUT FORMAT block the agent returns (`GRADE`, `GRADE RANGE`, `CONFIDENCE`, `GRADE CAP`, defects, etc.) is the contract Step 3 parses — if you ever change it, change it in the agent def, not here.
 
-**Dynamic inputs to pass per invocation** (the only per-comic data the agent doesn't already carry):
+**Dynamic inputs to pass per invocation** (the only per-comic data the agent doesn't already carry; a headless seat's job file holds these plus the harness line from Dispatch mechanics):
 
 - **COMIC + YEAR** — e.g. `Fantastic Four #48 (1966)`
 - **IMAGE FOLDER** — e.g. `<workdir>/comic-1`, where `<workdir>` is the path from Step 1's printed `WORKDIR:` line
@@ -139,7 +195,7 @@ For a **batched cheap-book agent** (see Dispatch mechanics), hand it the per-com
 
 ## Step 3: Synthesize Consensus
 
-After all agents return for a given comic (1 grader if not escalated — see Step 2):
+After all seats return for a given comic (1 grader if not escalated — see Step 2). If the first-pass panel split by 1.0 or more, run the second-pass cross-examination (Step 2, Dispatch mechanics) first, and use the second-pass grades in every item below:
 
 1. Collect the numeric grades, plus each grader's GRADE RANGE and CONFIDENCE.
 2. Compute the average; note the spread.
@@ -173,6 +229,8 @@ Caveats: [pulled from the graders' PHOTO LIMITATIONS — what the photos couldn'
 
 (Single-grader case: one row + the consensus row carrying that grader's grade, range, and coverage-capped confidence — same table, no separate spec.)
 
+When a second pass ran, each grader row shows the second-pass grade with the first-pass grade after it, e.g. `5.0 (p1 4.0)`, and the block adds `Cross-examined: split 1.5 → 0.5`. A failed seat keeps its row with `FAILED` and its stderr's last line.
+
 After every comic's block, compile their **Consensus** rows into one final list — this is the input for `/comic:fmv`:
 
 ```
@@ -181,6 +239,18 @@ After every comic's block, compile their **Consensus** rows into one final list 
 | 1 | FF #48 (1966) | 178057470740 | 5.0 VG/FN | 4.5–6.0 | MEDIUM-LOW |
 | 2 | ASM #300 (1988) | 123456789 | 8.5 VF+ | 8.5 | HIGH |
 ```
+
+Then add the per-seat usage table (BUI-1090), one row per seat attempt from the parse status lines in Step 2 (first pass, retry, and second pass each get a row), summed across models, plus a total row:
+
+```
+| Book | Seat | Pass | Turns | Output | Cache-read | Cache-create |
+|------|------|------|-------|--------|------------|--------------|
+| ASM #194 | grader-c2-a | 1 | 5 | 9,120 | 81,400 | 31,200 |
+| ASM #194 | grader-c2-a | 2 | 5 | 8,770 | 84,100 | 30,950 |
+| **Total** | | | **10** | **17,890** | **165,500** | **62,150** |
+```
+
+`Turns` is the envelope's `num_turns`, which counts messages, not API calls (the BUI-1090 benchmark seats reported 34 to 74 under `--max-turns 8`). Count every attempt once; the outer `/comic:grade` envelope never contains seat usage, so nothing here is double-counted against it (see Token totals in Step 2). Agent-fallback rows read `n/a`.
 
 **Carry the Confidence column forward** — `comic-fmv` consumes it (as `grade_confidence`) to haircut the bid cap when grade confidence is low. Map the label to lowercase, preserving all four levels: `HIGH → high`, `MEDIUM → medium`, `MEDIUM-LOW → medium-low`, `LOW → low`. (Don't collapse MEDIUM-LOW into `low` — they haircut differently: MEDIUM-LOW → 0.70, LOW → 0.60.)
 
@@ -205,3 +275,6 @@ Structural photo-based caveats (staple rust, brittleness, restoration, the inher
 | Auto-dropping a book in triage because it looks like a beater | Condition is not a triage kill — there's no FMV floor at grade time. FLAG suspected beaters for the user; only DROP un-gradeable photos or confirmed non-matches (Step 1.5). When unsure, KEEP |
 | Inflating grade because it's a key issue | Grade physical condition only — key issue premium belongs in FMV, not grade (criteria live in the `comic-grader` subagent, not this skill) |
 | Capping the grade over a printed credit/signature | Printed credits, facsimile signatures, barcodes, and price boxes are in the print layer — never defects (PRINT-LAYER RULE, in the `comic-grader` subagent). Only a post-print autograph caps. When unsure, do NOT cap |
+| Cross-examining a split panel by messaging the seats | Headless seats have no SendMessage channel. Run the one second pass instead: re-launch each seat with the others' crops and defect lines appended (Step 2, BUI-1090) |
+| Adjudicating with a seat missing because its envelope had no OUTPUT FORMAT block | Re-run the seat once, then fall back or report it as failed; the book's block names every failed seat (BUI-1090) |
+| Launching a headless seat with `--allowedTools` | Use `--tools Read,Bash --strict-mcp-config --mcp-config <workdir>/empty-mcp.json`; `--allowedTools` ships about 30k of unused tool schemas on every call (BUI-1089) |
