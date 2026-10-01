@@ -493,15 +493,15 @@ class TestValueTier:
         is not-cheap, matching grade.md's escalation trigger 1 ("at or above").
         est_close is unaffected by the tier's threshold short-circuit (BUI-992)
         — it's still projected from the live auction's own headroom."""
-        assert grade_photos.VALUE_THRESHOLD == 100.0
-        out = self._run(tmp_path, self._item_with_price("100.00"), capsys)
+        assert grade_photos.VALUE_THRESHOLD == 25.0
+        out = self._run(tmp_path, self._item_with_price("25.00"), capsys)
         assert _printed_tier(out) == "not-cheap"
-        assert out.endswith("— tier: not-cheap — est_close: $150.00")
+        assert out.endswith("— tier: not-cheap — est_close: $37.50")
 
     def test_price_above_threshold_is_not_cheap(self, tmp_path, capsys):
-        out = self._run(tmp_path, self._item_with_price("170.00"), capsys)
+        out = self._run(tmp_path, self._item_with_price("42.50"), capsys)
         assert _printed_tier(out) == "not-cheap"
-        assert out.endswith("— tier: not-cheap — est_close: $255.00")
+        assert out.endswith("— tier: not-cheap — est_close: $63.75")
 
     def test_unknown_price_is_not_cheap(self, tmp_path, capsys):
         """BUI-917 flips BUI-165's "absent price = below threshold = cheap".
@@ -610,10 +610,10 @@ class TestEstimatedCloseTier:
         )
 
     def test_modern_young_auction_projected_over_the_threshold_is_not_cheap(self):
-        """$72 with three days to run clears $100 on any honest headroom."""
-        tier, why = _tier(72.00, hours_left=72.0, bid_count=0)
+        """$18 with three days to run clears $25 on any honest headroom."""
+        tier, why = _tier(18.00, hours_left=72.0, bid_count=0)
         assert tier == "not-cheap"
-        assert "close ≤ $216.00" in why
+        assert "close ≤ $54.00" in why
 
     def test_modern_young_auction_projected_under_the_threshold_is_cheap(self):
         tier, why = _tier(4.00, hours_left=96.5, bid_count=0)
@@ -623,11 +623,11 @@ class TestEstimatedCloseTier:
     def test_existing_bids_widen_the_headroom(self):
         """Same book, same time left: an auction with bidders has demonstrated
         competing demand, so its price is given more room to run."""
-        assert _tier(24.00, bid_count=0)[0] == "cheap"
-        assert _tier(24.00, bid_count=1)[0] == "not-cheap"
+        assert _tier(6.00, bid_count=0)[0] == "cheap"
+        assert _tier(6.00, bid_count=1)[0] == "not-cheap"
 
     def test_absent_bid_count_counts_as_no_bids(self):
-        assert _tier(24.00, bid_count=None)[0] == "cheap"
+        assert _tier(6.00, bid_count=None)[0] == "cheap"
 
     # ── the paths BUI-917 must leave alone ──────────────────────────────
 
@@ -640,9 +640,9 @@ class TestEstimatedCloseTier:
         )
 
     def test_bin_at_or_above_threshold_is_not_cheap_with_no_estimate(self):
-        assert _tier(140.00, is_auction=False) == ("not-cheap", None)
+        assert _tier(40.00, is_auction=False) == ("not-cheap", None)
 
-    @pytest.mark.parametrize("price", [100.00, 170.00])
+    @pytest.mark.parametrize("price", [25.00, 42.50])
     def test_price_already_over_the_line_needs_no_estimate(self, price):
         """The existing above-threshold path is untouched: no estimate runs, no
         reason is printed, whichever way the price is still moving."""
@@ -974,7 +974,7 @@ class TestEstimatedCloseTierEndToEnd:
             "image": {"imageUrl": "https://example.com/main.jpg"},
             "additionalImages": [],
             "buyingOptions": ["AUCTION"],
-            "currentBidPrice": {"value": "142.50"},
+            "currentBidPrice": {"value": "42.50"},
             "bidCount": 2,
             "itemEndDate": _iso_in(96.5),
             "localizedAspects": [{"name": "Publication Year", "value": "1964"}],
