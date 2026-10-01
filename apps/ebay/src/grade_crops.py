@@ -10,7 +10,7 @@ grader can Read every view in a single turn.
 
 For every ``img-NN.jpg`` in the image folder it writes into the crop dir:
 
-- ``img-NN-overview.jpg`` -- the whole photo, downscaled to a 1024 px long
+- ``img-NN-overview.jpg`` -- the whole photo, downscaled to a 768 px long
   edge (never upscaled).
 - ``img-NN-sheet-1.jpg`` -- the four corners (2x2 grid).
 - ``img-NN-sheet-2.jpg`` -- left edge top and bottom (the spine on a front
@@ -23,7 +23,7 @@ frame: on a near-uniform backdrop the four book corners are detected (a
 tilted or keystoned book is followed), and corners/edges are centred on the
 book's outline so each tile shows the edge against the backdrop. A
 full-bleed or busy photo falls back to the frame. Each region's side is 20%
-of the book's short side, enlarged to the tile (about 2.5-3x on a typical
+of the book's short side, enlarged to the tile (about 2x on a typical
 1250x1600 eBay photo), with its name and zoom drawn into the tile.
 
 stdout carries only the written paths, one per line (the grader Reads them
@@ -40,9 +40,9 @@ from pathlib import Path
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageOps
 
-OVERVIEW_LONG_EDGE = 1024
+OVERVIEW_LONG_EDGE = 768
 TILE = 512
-REGION_FRACTION = 0.2  # of the book's short side: ~2.5-3x on a 1250x1600 photo
+REGION_FRACTION = 0.2  # of the book's short side: ~2x on a 1250x1600 photo
 MIN_REGION = 8
 JPEG_QUALITY = 85
 _DETECT_EDGE = 256  # book detection runs on a copy this size (long edge)
@@ -245,7 +245,7 @@ def crop_one(src: Path, out_dir: Path, font) -> list[Path]:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="grade-crops",
-        description="Write a 1024 px overview and two labelled region contact "
+        description="Write a 768 px overview and two labelled region contact "
         "sheets (corners; left edge top/bottom, staple area, right edge top/bottom/middle, center) "
         "for every "
         "img-NN.jpg in IMAGE_FOLDER. Prints only the written paths.",

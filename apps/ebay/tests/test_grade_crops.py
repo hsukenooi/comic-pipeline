@@ -45,7 +45,7 @@ def test_two_photos_write_overview_and_two_sheets(tmp_path, capsys):
     assert all(p.startswith("/") for p in lines)
     assert sorted(p.name for p in dst.iterdir()) == sorted(names)
     with Image.open(dst / "img-01-overview.jpg") as ov:
-        assert max(ov.size) == 1024 and ov.size == (800, 1024)
+        assert max(ov.size) == 768 and ov.size == (600, 768)
     with Image.open(dst / "img-01-sheet-1.jpg") as sh:
         assert sh.size == (1024, 1024)  # four corners: 2 x 2
     with Image.open(dst / "img-01-sheet-2.jpg") as sh:
@@ -62,7 +62,7 @@ def test_landscape_and_tiny_images(tmp_path, capsys):
 
     assert rc == 0 and len(lines) == 6
     with Image.open(dst / "img-01-overview.jpg") as ov:
-        assert ov.size == (1024, 576)
+        assert ov.size == (768, 432)
     with Image.open(dst / "img-02-overview.jpg") as ov:
         assert ov.size == (40, 30)
     with Image.open(dst / "img-02-sheet-2.jpg") as sh:
