@@ -132,6 +132,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
+from PIL import Image
 
 # BUI-917: the two year helpers the value gate's age signal needs. Both are
 # pure (comic_identity_year imports nothing but `re`), so this keeps the
@@ -525,6 +526,96 @@ def _download_image(url, dest, timeout=_DOWNLOAD_TIMEOUT_SECONDS):
     dest.write_bytes(resp.content)
 
 
+# BUI-1084: photo triage. Every photo a grader sees sits in its context on
+# every turn, and listings run to 24 photos, so near-duplicates and shots that
+# cannot be a cover view cost tokens without adding evidence. After download,
+# triage_images() drops them, renumbers the survivors contiguously
+# (img-01.jpg ... img-NN.jpg, the contract grade.md and the grader rely on),
+# and reports what it dropped and why so nothing disappears silently. The
+# FIRST image (the listing's main photo, the front cover) is never dropped.
+# Triage is fail-open: a file PIL cannot read is kept, never dropped.
+MAX_PHOTOS = 12              # cap on photos handed to graders; listing order wins
+MIN_SIDE_PX = 250            # shorter side below this: thumbnail/icon, not a cover view
+MAX_ASPECT = 3.0             # long/short side above this: banner or strip, not a cover view
+DUP_HAMMING_MAX = 3          # dHash bits (of 64) that may differ and still be a near-duplicate
+_DHASH_MIN_BITS = 8          # a hash with fewer set bits is near-uniform: not comparable
+
+
+def _dhash(img):
+    """64-bit difference hash: 9x8 grayscale, one bit per left<right pixel pair.
+
+    Returns None for a near-uniform image (almost no set bits), where the hash
+    carries no identity and two different blank pages would falsely match.
+    """
+    px = list(img.convert("L").resize((9, 8)).tobytes())
+    bits = 0
+    for row in range(8):
+        for col in range(8):
+            left, right = px[row * 9 + col], px[row * 9 + col + 1]
+            bits = (bits << 1) | (1 if left < right else 0)
+    return bits if bin(bits).count("1") >= _DHASH_MIN_BITS else None
+
+
+def triage_images(outdir):
+    """Drop near-duplicate / non-cover-view images in *outdir* and renumber.
+
+    Returns ``(kept_count, dropped)`` where *dropped* is a list of
+    ``(original_number, reason)`` in listing order. Rules, applied in listing
+    order: a shot whose shorter side is under MIN_SIDE_PX or whose aspect ratio
+    exceeds MAX_ASPECT is skipped; a shot within DUP_HAMMING_MAX bits of an
+    already-kept shot's dHash is a near-duplicate; once MAX_PHOTOS are kept,
+    later shots are dropped (earlier listing positions win). The first image
+    is exempt from every rule.
+    """
+    outdir = Path(outdir)
+    kept = []          # (path, original_number)
+    kept_hashes = []   # (original_number, dhash)
+    dropped = []
+    for path in sorted(outdir.glob("img-*.jpg")):
+        n = int(path.stem.split("-")[1])
+        reason = None
+        h = None
+        try:
+            with Image.open(path) as img:
+                w, hgt = img.size
+                short, long_ = min(w, hgt), max(w, hgt)
+                if short < MIN_SIDE_PX:
+                    reason = f"too small ({w}x{hgt})"
+                elif long_ / short > MAX_ASPECT:
+                    reason = f"extreme aspect ({w}x{hgt})"
+                else:
+                    h = _dhash(img)
+        except (OSError, ValueError):
+            pass  # unreadable: fail open, keep it
+        if reason is None and h is not None:
+            for kn, kh in kept_hashes:
+                if bin(h ^ kh).count("1") <= DUP_HAMMING_MAX:
+                    reason = f"near-duplicate of img-{kn:02d}"
+                    break
+        if reason is None and len(kept) >= MAX_PHOTOS:
+            reason = f"over the {MAX_PHOTOS}-photo cap"
+        if not kept:
+            reason = None  # never drop the first image
+        if reason is not None:
+            dropped.append((n, reason))
+            continue
+        kept.append((path, n))
+        if h is not None:
+            kept_hashes.append((n, h))
+    if dropped:
+        for n, _ in dropped:
+            (outdir / f"img-{n:02d}.jpg").unlink()
+        # Two-phase rename so a survivor never overwrites a not-yet-moved file.
+        staged = []
+        for i, (path, _n) in enumerate(kept, 1):
+            tmp = path.with_name(f".tmp-{i:02d}.jpg")
+            path.rename(tmp)
+            staged.append((tmp, i))
+        for tmp, i in staged:
+            tmp.rename(outdir / f"img-{i:02d}.jpg")
+    return len(kept), dropped
+
+
 def download_listing(token, item_id, outdir, base_url):
     outdir = Path(outdir)
     # BUI-300: a re-run of this label (e.g. a listing that now has fewer
@@ -580,6 +671,9 @@ def download_listing(token, item_id, outdir, base_url):
             # BUI-331: proof-of-200 failure (item body already fetched over a
             # successful 200; only the image CDN failed) — ListingContentError.
             raise ListingContentError(f"item {item_id}: image download failed ({e})") from e
+    # BUI-1084: triage before anything counts the photos.
+    _kept, dropped = triage_images(outdir)
+    kept_count = len(imgs) - len(dropped)
     # Auction value signal for the value gate (Step 2): currentBidPrice/bidCount are
     # already in the Browse API response — capture them, no extra request needed.
     # BUI-165: for a fixed-price (BIN) listing currentBidPrice is absent, so this
@@ -613,7 +707,9 @@ def download_listing(token, item_id, outdir, base_url):
     age, age_label = _age_signal(data.get("title", ""), _flatten_aspects(data.get("localizedAspects")))
     return {
         "title": data.get("title", item_id),
-        "image_count": len(imgs),
+        "image_count": kept_count,                 # photos left after triage (BUI-1084)
+        "listing_image_count": len(imgs),          # photos the listing carries
+        "dropped_images": dropped,                 # [(original img number, reason)]
         "current_price": current_price,            # USD float: live bid or BIN price; None only if absent
         "bid_count": data.get("bidCount"),         # int for auctions, None otherwise
         "is_auction": is_auction,                  # True when the price can still move
@@ -806,6 +902,17 @@ def main(argv=None):
             f"tier: {tier}{f' ({why})' if why else ''} — "
             f"est_close: {est_str}"
         )
+        # BUI-1084: never drop silently; name every skipped photo and why.
+        if result["dropped_images"]:
+            dropped_str = "; ".join(
+                f"img-{n:02d} {why}" for n, why in result["dropped_images"]
+            )
+            print(
+                f"{label}: triage kept {result['image_count']} of "
+                f"{result['listing_image_count']} photos, renumbered "
+                f"img-01..img-{result['image_count']:02d} — dropped (original "
+                f"numbers): {dropped_str}"
+            )
     return 0
 
 
