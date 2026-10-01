@@ -17,6 +17,10 @@ For every ``img-NN.jpg`` in the image folder it writes into the crop dir:
   cover), the staple area (left edge at 30% and 70% of the height), right
   edge top, bottom and middle (the spine on a back cover), and the center
   (2x4 grid).
+- ``img-NN-sheet-3.jpg`` (BUI-1096) -- the rest of the spine run and a wider
+  cover view: left edge middle, right edge upper and lower staple area (the
+  staples sit on the right edge of a back-cover photo), and the cover face
+  (a window twice the usual side around the centre) (2x2 grid).
 
 Tiles are 512 px. Regions are located on the comic itself, not the photo
 frame: on a near-uniform backdrop the four book corners are detected (a
@@ -72,6 +76,15 @@ SHEET_2 = (
     ("right edge bottom", "right", 1.0, -1.0),
     ("right edge middle", "right", 0.5, 0.0),
     ("center", "center", 0.0, 0.0),
+)
+# BUI-1096: the regions the 2026-10-01 comp-grading seats cropped ad hoc most
+# (continuing spine/staple strips, and wider cover-face windows). An optional
+# fifth element scales the region side (the cover-face window is 2x).
+SHEET_3 = (
+    ("left edge middle", "left", 0.5, 0.0),
+    ("right edge upper staple", "right", 0.3, 0.0),
+    ("right edge lower staple", "right", 0.7, 0.0),
+    ("cover face", "center", 0.0, 0.0, 2.0),
 )
 
 
@@ -204,8 +217,9 @@ def _tile(im: Image.Image, box, label: str, font) -> Image.Image:
 def _sheet(im: Image.Image, corners, regions, side: int, font) -> Image.Image:
     rows = -(-len(regions) // 2)
     sheet = Image.new("RGB", (2 * TILE, rows * TILE), (255, 255, 255))
-    for i, (label, edge, t, dt) in enumerate(regions):
-        box = _box(im.size, _region_centre(corners, edge, t, dt, side), side)
+    for i, (label, edge, t, dt, *scale) in enumerate(regions):
+        rside = max(MIN_REGION, round(side * (scale[0] if scale else 1.0)))
+        box = _box(im.size, _region_centre(corners, edge, t, dt, rside), rside)
         sheet.paste(_tile(im, box, label, font), ((i % 2) * TILE, (i // 2) * TILE))
     # white gutters so adjacent tiles never read as one continuous region
     draw = ImageDraw.Draw(sheet)
@@ -235,7 +249,7 @@ def crop_one(src: Path, out_dir: Path, font) -> list[Path]:
     tl, tr, bl, br = corners
     short = min((_dist(tl, tr) + _dist(bl, br)) / 2, (_dist(tl, bl) + _dist(tr, br)) / 2)
     side = max(MIN_REGION, round(REGION_FRACTION * short))
-    for n, regions in ((1, SHEET_1), (2, SHEET_2)):
+    for n, regions in ((1, SHEET_1), (2, SHEET_2), (3, SHEET_3)):
         p = out_dir / f"{stem}-sheet-{n}.jpg"
         _sheet(im, corners, regions, side, font).save(p, "JPEG", quality=JPEG_QUALITY)
         written.append(p)
@@ -245,8 +259,9 @@ def crop_one(src: Path, out_dir: Path, font) -> list[Path]:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="grade-crops",
-        description="Write a 1024 px overview and two labelled region contact "
-        "sheets (corners; left edge top/bottom, staple area, right edge top/bottom/middle, center) "
+        description="Write a 1024 px overview and three labelled region contact "
+        "sheets (corners; left edge top/bottom, staple area, right edge top/bottom/middle, center; "
+        "left edge middle, right edge staple area, cover face) "
         "for every "
         "img-NN.jpg in IMAGE_FOLDER. Prints only the written paths.",
     )

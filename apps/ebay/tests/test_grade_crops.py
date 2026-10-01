@@ -1,4 +1,4 @@
-"""Tests for grade-crops (BUI-1083): overview + two labelled region sheets per photo."""
+"""Tests for grade-crops (BUI-1083): overview + three labelled region sheets per photo."""
 
 import hashlib
 import time
@@ -26,7 +26,7 @@ def _run(capsys, src, dst):
     return rc, out.splitlines(), err
 
 
-def test_two_photos_write_overview_and_two_sheets(tmp_path, capsys):
+def test_two_photos_write_overview_and_three_sheets(tmp_path, capsys):
     src, dst = tmp_path / "comic-1", tmp_path / "comic-1" / "crops-grader-a"
     src.mkdir()
     _make(src, "img-01.jpg", (1250, 1600))
@@ -38,8 +38,8 @@ def test_two_photos_write_overview_and_two_sheets(tmp_path, capsys):
     assert rc == 0 and err == ""
     names = [p.rsplit("/", 1)[1] for p in lines]
     assert names == [
-        "img-01-overview.jpg", "img-01-sheet-1.jpg", "img-01-sheet-2.jpg",
-        "img-02-overview.jpg", "img-02-sheet-1.jpg", "img-02-sheet-2.jpg",
+        "img-01-overview.jpg", "img-01-sheet-1.jpg", "img-01-sheet-2.jpg", "img-01-sheet-3.jpg",
+        "img-02-overview.jpg", "img-02-sheet-1.jpg", "img-02-sheet-2.jpg", "img-02-sheet-3.jpg",
     ]
     # stdout is only absolute paths that exist; nothing else is written
     assert all(p.startswith("/") for p in lines)
@@ -50,6 +50,8 @@ def test_two_photos_write_overview_and_two_sheets(tmp_path, capsys):
         assert sh.size == (1024, 1024)  # four corners: 2 x 2
     with Image.open(dst / "img-01-sheet-2.jpg") as sh:
         assert sh.size == (1024, 2048)
+    with Image.open(dst / "img-01-sheet-3.jpg") as sh:
+        assert sh.size == (1024, 1024)  # BUI-1096: four tiles, 2 x 2
 
 
 def test_landscape_and_tiny_images(tmp_path, capsys):
@@ -60,13 +62,15 @@ def test_landscape_and_tiny_images(tmp_path, capsys):
 
     rc, lines, _ = _run(capsys, src, dst)
 
-    assert rc == 0 and len(lines) == 6
+    assert rc == 0 and len(lines) == 8
     with Image.open(dst / "img-01-overview.jpg") as ov:
         assert ov.size == (1024, 576)
     with Image.open(dst / "img-02-overview.jpg") as ov:
         assert ov.size == (40, 30)
     with Image.open(dst / "img-02-sheet-2.jpg") as sh:
         assert sh.size == (1024, 2048)  # eight tiles: 2 x 4
+    with Image.open(dst / "img-02-sheet-3.jpg") as sh:
+        assert sh.size == (1024, 1024)  # a tiny photo still yields the full sheet
 
 
 def test_numeric_order_and_deterministic(tmp_path, capsys):
@@ -78,7 +82,7 @@ def test_numeric_order_and_deterministic(tmp_path, capsys):
     _, lines_a, _ = _run(capsys, src, tmp_path / "a")
     _, lines_b, _ = _run(capsys, src, tmp_path / "b")
 
-    assert [p.rsplit("/", 1)[1] for p in lines_a][::3] == [
+    assert [p.rsplit("/", 1)[1] for p in lines_a][::4] == [
         "img-01-overview.jpg", "img-02-overview.jpg", "img-10-overview.jpg"]
     digest = lambda d: {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in d.iterdir()}  # noqa: E731
     assert digest(tmp_path / "a") == digest(tmp_path / "b")
@@ -95,7 +99,7 @@ def test_twenty_four_photos_is_fast(tmp_path, capsys):
     t0 = time.monotonic()
     rc, lines, _ = _run(capsys, src, tmp_path / "out")
 
-    assert rc == 0 and len(lines) == 72
+    assert rc == 0 and len(lines) == 96
     assert time.monotonic() - t0 < 30
 
 
@@ -116,7 +120,7 @@ def test_unreadable_photo_reports_and_continues(tmp_path, capsys):
 
     rc, lines, err = _run(capsys, src, tmp_path / "out")
 
-    assert rc == 1 and len(lines) == 3 and "img-01.jpg" in err
+    assert rc == 1 and len(lines) == 4 and "img-01.jpg" in err
 
 
 def test_version_flag():
@@ -166,3 +170,23 @@ def test_sheet_2_covers_both_spine_edges_top_and_bottom():
     assert centre["right edge top"] == (900, 50 + side)
     assert centre["right edge bottom"] == (900, 1450 - side)
     assert centre["left edge top"] == (100, 50 + side)
+
+
+def test_sheet_3_adds_spine_run_and_wider_cover_face():
+    """BUI-1096: the regions seats cropped ad hoc most. Sheet 3 completes the
+    spine run (left edge middle) and the back-cover staples (right edge at 30%
+    and 70%), and shows the cover face in a window twice the usual side."""
+    labels = [r[0] for r in grade_crops.SHEET_3]
+    assert labels == ["left edge middle", "right edge upper staple",
+                      "right edge lower staple", "cover face"]
+    corners = ((100, 50), (900, 50), (100, 1450), (900, 1450))
+    side = 160
+    mid = grade_crops._region_centre(corners, "left", 0.5, 0.0, side)
+    assert mid == (100, 750)
+    face = grade_crops.SHEET_3[3]
+    assert face[4] == 2.0
+
+    # the 2x window is centred on the book and twice the side (landscape too)
+    im = Image.new("RGB", (1600, 900), (128, 128, 128))
+    box = grade_crops._box(im.size, (800, 450), 2 * 120)
+    assert box == (680, 330, 920, 570)
