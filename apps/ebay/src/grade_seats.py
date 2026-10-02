@@ -2,7 +2,8 @@
 
 Reads a seat spec, runs ``grade-crops`` once per book, writes each seat's job
 text, launches every seat as a parallel ``claude -p`` process, retries a failed
-seat once, runs one adjudicator seat (BUI-1100) for each book whose seats split
+seat once, dispatches a two-first book's third seat only when a trigger fires
+(BUI-1098), runs one adjudicator seat (BUI-1100) for each book whose seats split
 by 1.0 or more, and prints one compact block per book plus the usage table.
 
 Spec JSON::
@@ -12,10 +13,17 @@ Spec JSON::
                 "folder": "comic-1",              # relative to workdir, or absolute
                 "seats": ["grader-c1-a", "grader-c1-b", "grader-c1-c"],
                 "seller_grade": null,             # or "VF 8.0"
+                "policy": "two-first",            # optional; needs exactly 3 seats
                 "batch": null}]}                  # same string = one shared seat
 
 Books that share a ``batch`` value are graded by one seat (the first book's
 first seat name); a batch is first-pass only, with no adjudicator.
+
+A ``two-first`` book (BUI-1098) runs its first two seats, then its third only
+when a trigger fires: the two differ by 0.5 or more, either names a GRADE CAP,
+either reports confidence at or below MEDIUM-LOW, or a seat failed. A pre-1980
+book with eight or more photos is known up front and gets all three at once.
+Two seats that agree give the lower grade and the union of their ranges.
 """
 
 import argparse
@@ -43,6 +51,11 @@ ADJUDICATOR = "adjudicator"
 SPLIT_THRESHOLD = 1.0
 SEAT_TIMEOUT = float(os.environ.get("GRADE_SEATS_TIMEOUT", "900"))
 REQUIRED = ("GRADE:", "GRADE RANGE:", "CONFIDENCE:")
+TWO_FIRST = "two-first"
+AGREE_BAND = 0.5        # two seats this far apart or more dispatch the third
+UPFRONT_BEFORE = 1980   # a book older than this ...
+UPFRONT_PHOTOS = 8      # ... with this many photos or more gets three seats at once
+CONF_RANK = {"HIGH": 4, "MEDIUM-HIGH": 3.5, "MEDIUM": 3, "MEDIUM-LOW": 2, "LOW": 1}
 
 
 def _version_string() -> str:
@@ -69,6 +82,15 @@ def _scrub(line):
     return re.sub(r"\b\d{1,2}\.\d\b", "[grade]", line)
 
 
+def conf_label(text):
+    """Normalize a CONFIDENCE field to a CONF_RANK key, or "" when unrecognized."""
+    t = re.sub(r"[*_`]", "", text or "").upper()
+    m = re.match(r"\s*(HIGH|MEDIUM[\s\-\u2010-\u2015/]*HIGH|MEDIUM[\s\-\u2010-\u2015/]*LOW|MEDIUM|LOW)\b", t)
+    if not m:
+        return ""
+    return "-".join(re.findall(r"HIGH|MEDIUM|LOW", m.group(1)))
+
+
 def parse_block(text):
     """Parse one OUTPUT FORMAT block; None when a required field is missing."""
     if not all(re.search(rf"^{re.escape(f)}", text, re.M) for f in REQUIRED):
@@ -84,7 +106,7 @@ def parse_block(text):
     return {
         "grade": float(m.group(1)),
         "range": _field(text, "GRADE RANGE"),
-        "confidence": re.split(r"[:\s]", conf, maxsplit=1)[0] if conf else "",
+        "confidence": conf_label(conf) or (re.split(r"[:\s]", conf, maxsplit=1)[0] if conf else ""),
         "cap": cap,
         "defect": _scrub("; ".join(parts))[:240],
         "limits": _field(text, "PHOTO LIMITATIONS")[:240],
@@ -219,6 +241,66 @@ def copy_crops(folder, seat):
     return out
 
 
+# ---------- two-first policy (BUI-1098) ----------
+
+def book_year(book):
+    """The book's year: the spec's ``year``, else the last 19xx/20xx in its comic line."""
+    if book.get("year"):
+        return int(book["year"])
+    years = re.findall(r"\b(1[89]\d\d|20\d\d)\b", book.get("comic") or "")
+    return int(years[-1]) if years else None
+
+
+def photo_count(book):
+    return len(list(Path(book["folder"]).glob("img-*.jpg")))
+
+
+def upfront_trigger(book):
+    """The trigger known before any seat runs: pre-1980 with 8+ photos, else None."""
+    year, n = book_year(book), photo_count(book)
+    if year is not None and year < UPFRONT_BEFORE and n >= UPFRONT_PHOTOS:
+        return f"pre-{UPFRONT_BEFORE} ({year}) with {n} photos"
+    return None
+
+
+def has_cap(parsed):
+    cap = (parsed.get("cap") or "").strip().strip("*_` ").lower()
+    return bool(cap) and not re.match(r"(none|n/?a)\b", cap)
+
+
+def third_seat_triggers(pair):
+    """Every trigger that dispatches the third seat, given {seat: parsed or None}."""
+    out = [f"seat {s} failed" for s, p in pair.items() if not p]
+    got = {s: p for s, p in pair.items() if p}
+    if len(got) == 2:
+        grades = [p["grade"] for p in got.values()]
+        if abs(grades[0] - grades[1]) >= AGREE_BAND:
+            out.append(f"split {abs(grades[0] - grades[1]):.1f}")
+    for s, p in got.items():
+        if has_cap(p):
+            out.append(f"grade cap ({s})")
+        rank = CONF_RANK.get(p.get("confidence") or "")
+        if rank is None:
+            out.append(f"confidence unreadable ({s})")
+        elif rank <= CONF_RANK["MEDIUM-LOW"]:
+            out.append(f"confidence {p['confidence']} ({s})")
+    return out
+
+
+def _range_bounds(text):
+    return [float(x) for x in re.findall(r"\b(\d{1,2}\.\d)\b", text or "")]
+
+
+def two_seat_consensus(a, b):
+    """Two agreeing seats: the lower grade, the union of ranges, the lower confidence."""
+    nums = _range_bounds(a["range"]) + _range_bounds(b["range"]) + [a["grade"], b["grade"]]
+    lo, hi = min(nums), max(nums)
+    conf = min((a["confidence"], b["confidence"]), key=lambda c: CONF_RANK.get(c, 0))
+    return {"grade": min(a["grade"], b["grade"]),
+            "range": f"{lo:.1f}" if lo == hi else f"{lo:.1f}-{hi:.1f}",
+            "confidence": conf}
+
+
 # ---------- process running ----------
 
 def claude_cmd(workdir):
@@ -303,6 +385,10 @@ def load_spec(path):
         b["item_id"] = str(b["item_id"])
         if not b.get("seats"):
             raise ValueError(f"book {b['item_id']}: no seats")
+        if b.get("policy") not in (None, TWO_FIRST):
+            raise ValueError(f"book {b['item_id']}: unknown policy {b['policy']!r}")
+        if b.get("policy") == TWO_FIRST and (b.get("batch") or len(b["seats"]) != 3):
+            raise ValueError(f"book {b['item_id']}: {TWO_FIRST} needs exactly 3 seats and no batch")
         books.append(b)
     return workdir, books
 
@@ -321,13 +407,20 @@ def shared_crops(books):
     return shared
 
 
+def first_seats(book):
+    """The seats of the first dispatch: a two-first book runs two unless a trigger is known up front."""
+    if book.get("policy") == TWO_FIRST and not upfront_trigger(book):
+        return book["seats"][:2]
+    return book["seats"]
+
+
 def make_units(books, shared):
     units, batches = [], {}
     for b in books:
         if b.get("batch"):
             batches.setdefault(b["batch"], []).append(b)
             continue
-        units += [(seat, [b], build_job([b], seat, shared)) for seat in b["seats"]]
+        units += [(seat, [b], build_job([b], seat, shared)) for seat in first_seats(b)]
     for group in batches.values():
         seat = group[0]["seats"][0]
         units.append((seat, group, build_job(group, seat, shared)))
@@ -346,7 +439,8 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="grade-seats",
         description="Run every /comic:grade headless grader seat in one call: shared crops, "
-        "parallel claude -p seats, one retry per failed seat, one adjudicator seat on a 1.0+ split. "
+        "parallel claude -p seats, one retry per failed seat, a two-first third seat only on a trigger, "
+        "one adjudicator seat on a 1.0+ split. "
         "Prints one compact block per book and the per-seat usage table.",
     )
     parser.add_argument("spec", type=Path, help="seat spec JSON (see the module docstring)")
@@ -377,15 +471,37 @@ def main(argv=None) -> int:
     log = []  # (unit, suffix, usage, error), one entry per process attempt
     first = run_units(workdir, make_units(books, shared), "", log)
 
+    # two-first (BUI-1098): read the first two seats, dispatch the third where a trigger fires
+    policy, third = {}, []
+    for b in books:
+        if b.get("policy") != TWO_FIRST:
+            continue
+        up = upfront_trigger(b)
+        if up:
+            policy[b["item_id"]] = {"name": TWO_FIRST, "upfront": True, "trigger": up,
+                                    "third": True, "consensus": None}
+            continue
+        pair = {s: first.get((s, b["folder"]), {}).get(b["item_id"]) for s in b["seats"][:2]}
+        trig = third_seat_triggers(pair)
+        policy[b["item_id"]] = {"name": TWO_FIRST, "upfront": False, "trigger": "; ".join(trig) or None,
+                                "third": bool(trig),
+                                "consensus": None if trig else two_seat_consensus(*pair.values())}
+        if trig:
+            third.append((b["seats"][2], [b], build_job([b], b["seats"][2], shared)))
+    if third:
+        first.update(run_units(workdir, third, "", log))
+
     report = {"books": [], "usage": []}
     for b in books:
         iid = b["item_id"]
-        seat_names = b["seats"][:1] if b.get("batch") else b["seats"]
+        pol = policy.get(iid)
+        seat_names = (b["seats"][:1] if b.get("batch")
+                      else b["seats"][:2] if pol and not pol["third"] else b["seats"])
         # a batched book's seat ran under the batch's first book folder
         home = next(x["folder"] for x in books if x.get("batch") == b["batch"]) if b.get("batch") else b["folder"]
         res = {s: first[(s, home)][iid] for s in seat_names
                if (s, home) in first and first[(s, home)].get(iid)}
-        info = {"split": None, "adjudicator": None, "adjudicator_failed": False}
+        info = {"split": None, "adjudicator": None, "adjudicator_failed": False, "policy": pol}
         grades = [v["grade"] for v in res.values()]
         if not b.get("batch") and len(grades) >= 2 and max(grades) - min(grades) >= SPLIT_THRESHOLD:
             info["split"] = max(grades) - min(grades)
@@ -425,6 +541,14 @@ def render(report):
             out += [f"  - {f}" for f in adj["findings"]] or ["  (no seat findings returned)"]
         returned = sum(1 for s in bk["seats"] if not s.get("failed"))
         out.append(f"Seats: {returned} of {len(bk['seats'])} returned")
+        pol = bk.get("policy")
+        if pol and pol["third"]:
+            when = "dispatched up front" if pol["upfront"] else "third seat dispatched"
+            out.append(f"Two-first: {when} (trigger: {pol['trigger']})")
+        elif pol:
+            c = pol["consensus"]
+            out.append("Two-first: agreed, third seat skipped; two-seat consensus "
+                       f"{c['grade']} | {c['range']} | {c['confidence']}")
         if adj:
             out.append(f"Adjudicated: split {bk['split']:.1f}, adjudicator grade {adj['grade']}")
         elif bk["adjudicator_failed"]:

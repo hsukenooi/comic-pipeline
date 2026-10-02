@@ -20,9 +20,9 @@ open(os.path.join(d, seat + ".job." + str(n)), "w").write(job)
 plan = json.load(open(os.path.join(d, seat + ".json")))
 step = plan[min(n, len(plan)) - 1]
 
-def block(item, g, cap, rationale):
-    return (item + "\\nPHOTO MAP: img-01: front cover\\nGRADE: " + str(g) + " (VF)\\nGRADE RANGE: " + str(g) + "\\n"
-            "CONFIDENCE: MEDIUM-LOW: 2 photos\\nGRADE CAP: " + cap + "\\nRATIONALE: " + rationale + " More text.\\n"
+def block(item, g, cap, rationale, conf="MEDIUM-LOW: 2 photos", rng=None):
+    return (item + "\\nPHOTO MAP: img-01: front cover\\nGRADE: " + str(g) + " (VF)\\nGRADE RANGE: " + (rng or str(g)) + "\\n"
+            "CONFIDENCE: " + conf + "\\nGRADE CAP: " + cap + "\\nRATIONALE: " + rationale + " More text.\\n"
             "PHOTO LIMITATIONS: no spine.\\n")
 
 if step.get("exit"):
@@ -36,7 +36,8 @@ if step.get("garbage"):
 if "raw" in step:
     print(json.dumps({{"result": step["raw"], "num_turns": 2, "modelUsage": {{}}}}))
     sys.exit(0)
-result = "".join(block(i, g, step.get("cap", "none"), step.get("rationale", "Clean."))
+result = "".join(block(i, g, step.get("cap", "none"), step.get("rationale", "Clean."),
+                       step.get("conf", "MEDIUM-LOW: 2 photos"), step.get("range"))
                  for i, g in step.get("grades", {{}}).items())
 usage = {{"m": {{"outputTokens": 10, "cacheReadInputTokens": 100, "cacheCreationInputTokens": 5}},
          "n": {{"outputTokens": 1, "cacheReadInputTokens": 2, "cacheCreationInputTokens": 3}}}}
@@ -63,18 +64,19 @@ def plan(env, seat, *steps):
     (env / "fake" / f"{seat}.json").write_text(json.dumps(list(steps)))
 
 
-def spec(env, books):
+def spec(env, books, photos=1):
     work = env / "work"
     for b in books:
         (work / b["folder"]).mkdir(parents=True, exist_ok=True)
-        (work / b["folder"] / "img-01.jpg").write_bytes(b"x")
+        for n in range(1, photos + 1):
+            (work / b["folder"] / f"img-{n:02d}.jpg").write_bytes(b"x")
     p = env / "spec.json"
     p.write_text(json.dumps({"workdir": str(work), "books": books}))
     return p
 
 
-def run(env, books, capsys):
-    p = spec(env, books)
+def run(env, books, capsys, photos=1):
+    p = spec(env, books, photos)
     code = grade_seats.main([str(p), "--grader-agent", str(env / "agent.md"), "--json"])
     return code, json.loads(capsys.readouterr().out)
 
@@ -291,3 +293,137 @@ def test_text_output_and_version(env, capsys):
 
 def test_bad_spec_exit_2(env):
     assert grade_seats.main([str(env / "nope.json")]) == 2
+
+
+# ---------- two-first policy (BUI-1098) ----------
+
+def two_first(n=1, comic=None, **kw):
+    b = book(n, seats=("a", "b", "c"), policy="two-first", **kw)
+    if comic:
+        b["comic"] = comic
+    return b
+
+
+def ran(env, seat):
+    return (env / "fake" / f"{seat}.job.1").exists()
+
+
+def test_two_first_agreed_skips_third_and_takes_lower_grade_and_union(env, capsys):
+    plan(env, "g1-a", {"grades": {"101": 6.0}, "conf": "MEDIUM: 4 photos", "range": "5.5-6.5"})
+    plan(env, "g1-b", {"grades": {"101": 6.0}, "conf": "HIGH", "range": "6.0-7.0"})
+    plan(env, "g1-c", {"grades": {"101": 9.0}})
+    code, rep = run(env, [two_first()], capsys)
+    bk = rep["books"][0]
+    assert code == 0 and not ran(env, "g1-c") and [s["seat"] for s in bk["seats"]] == ["g1-a", "g1-b"]
+    pol = bk["policy"]
+    assert pol["third"] is False and pol["trigger"] is None
+    assert pol["consensus"] == {"grade": 6.0, "range": "5.5-7.0", "confidence": "MEDIUM"}
+    assert len(rep["usage"]) == 2
+
+
+def test_two_seat_consensus_lower_grade_when_apart():
+    a = {"grade": 9.6, "range": "9.4-9.8 NM+", "confidence": "HIGH"}
+    b = {"grade": 9.4, "range": "9.2", "confidence": "MEDIUM"}
+    assert grade_seats.two_seat_consensus(a, b) == {"grade": 9.4, "range": "9.2-9.8", "confidence": "MEDIUM"}
+    same = {"grade": 5.0, "range": "5.0", "confidence": "HIGH"}
+    assert grade_seats.two_seat_consensus(same, dict(same))["range"] == "5.0"
+
+
+def test_two_first_agreed_text_line(env, capsys):
+    plan(env, "g1-a", {"grades": {"101": 6.0}, "conf": "HIGH"})
+    plan(env, "g1-b", {"grades": {"101": 6.0}, "conf": "HIGH"})
+    p = spec(env, [two_first()])
+    assert grade_seats.main([str(p), "--grader-agent", str(env / "agent.md")]) == 0
+    out = capsys.readouterr().out
+    assert "Two-first: agreed, third seat skipped; two-seat consensus 6.0 | 6.0 | HIGH" in out
+    assert "Seats: 2 of 2 returned" in out and "g1-c" not in out
+
+
+@pytest.mark.parametrize("a, b, want", [
+    ({"grades": {"101": 6.0}, "conf": "HIGH"}, {"grades": {"101": 5.5}, "conf": "HIGH"}, "split 0.5"),
+    ({"grades": {"101": 6.0}, "conf": "HIGH", "cap": "spine split caps at 6.0"},
+     {"grades": {"101": 6.0}, "conf": "HIGH"}, "grade cap (g1-a)"),
+    ({"grades": {"101": 6.0}, "conf": "HIGH"}, {"grades": {"101": 6.0}, "conf": "Medium-Low: 2 photos"},
+     "confidence MEDIUM-LOW (g1-b)"),
+    ({"grades": {"101": 6.0}, "conf": "LOW"}, {"grades": {"101": 6.0}, "conf": "HIGH"}, "confidence LOW (g1-a)"),
+    ({"grades": {"101": 6.0}, "conf": "MEDIUM LOW"}, {"grades": {"101": 6.0}, "conf": "HIGH"},
+     "confidence MEDIUM-LOW (g1-a)"),
+    ({"garbage": True}, {"grades": {"101": 6.0}, "conf": "HIGH"}, "seat g1-a failed"),
+])
+def test_two_first_each_trigger_dispatches_third(env, capsys, a, b, want):
+    plan(env, "g1-a", a, a)
+    plan(env, "g1-b", b)
+    plan(env, "g1-c", {"grades": {"101": 6.0}, "conf": "HIGH"})
+    code, rep = run(env, [two_first()], capsys)
+    bk = rep["books"][0]
+    assert code == 0 and ran(env, "g1-c") and len(bk["seats"]) == 3
+    assert want in bk["policy"]["trigger"] and bk["policy"]["third"] and bk["policy"]["consensus"] is None
+    assert bk["adjudicator"] is None  # no seat pair split by 1.0
+
+
+def test_third_seat_then_adjudicator_on_a_one_point_split(env, capsys):
+    plan(env, "g1-a", {"grades": {"101": 6.0}, "conf": "HIGH"})
+    plan(env, "g1-b", {"grades": {"101": 5.5}, "conf": "HIGH"})
+    plan(env, "g1-c", {"grades": {"101": 4.5}, "conf": "HIGH"})
+    plan(env, "adjudicator", {"raw": adj_reply(5.0)})
+    code, rep = run(env, [two_first()], capsys)
+    bk = rep["books"][0]
+    assert bk["policy"]["trigger"] == "split 0.5" and bk["split"] == 1.5
+    assert bk["adjudicator"]["grade"] == 5.0
+    job = (env / "work/comic-1/job-adjudicator.txt").read_text()
+    assert all(f"=== FIRST-PASS SEAT g1-{s} ===" in job for s in "abc")
+
+
+def test_pre_1980_with_eight_photos_dispatches_three_up_front(env, capsys):
+    for s in "abc":
+        plan(env, f"g1-{s}", {"grades": {"101": 6.0}, "conf": "HIGH"})
+    code, rep = run(env, [two_first(comic="Hulk #180 (1974)")], capsys, photos=8)
+    pol = rep["books"][0]["policy"]
+    assert pol["upfront"] and pol["third"] and pol["trigger"] == "pre-1980 (1974) with 8 photos"
+    assert ran(env, "g1-c") and len(rep["usage"]) == 3
+
+
+def test_upfront_needs_both_age_and_photos(env, capsys):
+    for n, comic, photos in ((1, "Hulk #180 (1974)", 7), (2, "Spawn #1 (1992)", 12)):
+        b = two_first(n, comic=comic)
+        b["folder"] = f"t-{n}"
+        for f in (env / "fake").glob("*"):
+            f.unlink()
+        for s in "abc":
+            plan(env, f"g{n}-{s}", {"grades": {f"10{n}": 6.0}, "conf": "HIGH"})
+        rep = run(env, [b], capsys, photos=photos)[1]
+        assert rep["books"][0]["policy"]["third"] is False and not ran(env, f"g{n}-c")
+    assert grade_seats.book_year({"comic": "Fantastic Four #29, August 1964, Ungraded"}) == 1964
+    assert grade_seats.book_year({"comic": "No year", "year": 1975}) == 1975
+    assert grade_seats.book_year({"comic": "No year"}) is None
+
+
+def test_batched_cheap_books_untouched_beside_two_first(env, capsys):
+    plan(env, "g1-a", {"grades": {"101": 6.0}, "conf": "HIGH"})
+    plan(env, "g1-b", {"grades": {"101": 6.0}, "conf": "HIGH"})
+    plan(env, "gb", {"grades": {"102": 4.0, "103": 3.0}})
+    books = [two_first(),
+             {"item_id": "102", "comic": "Two (1970)", "folder": "comic-2", "seats": ["gb"], "batch": "x"},
+             {"item_id": "103", "comic": "Three (1970)", "folder": "comic-3", "seats": ["gb"], "batch": "x"}]
+    code, rep = run(env, books, capsys, photos=9)
+    assert code == 0 and [b["policy"] for b in rep["books"][1:]] == [None, None]
+    assert [b["seats"][0]["grade"] for b in rep["books"][1:]] == [4.0, 3.0]
+    assert rep["books"][0]["policy"]["upfront"]  # 1970 + 9 photos: three at once
+
+
+def test_two_first_spec_validation(env):
+    bad = [dict(two_first(2), seats=["x", "y"]), dict(two_first(3), batch="b"),
+           dict(book(4), policy="three-always")]
+    for b in bad:
+        p = spec(env, [b])
+        assert grade_seats.main([str(p), "--grader-agent", str(env / "agent.md")]) == 2
+
+
+def test_conf_label_and_has_cap():
+    assert grade_seats.conf_label("**MEDIUM–LOW**: two photos") == "MEDIUM-LOW"
+    assert grade_seats.conf_label("Medium") == "MEDIUM" and grade_seats.conf_label("unsure") == ""
+    assert grade_seats.conf_label("MEDIUMLOW") == "MEDIUM-LOW" and grade_seats.conf_label("Medium / High") == "MEDIUM-HIGH"
+    assert not grade_seats.has_cap({"cap": "None (no capping defect seen)"})
+    assert grade_seats.has_cap({"cap": "detached cover caps at 2.0"})
+    assert "confidence unreadable (s)" in grade_seats.third_seat_triggers(
+        {"s": {"grade": 5.0, "confidence": "unsure", "cap": "none"}, "t": None})
