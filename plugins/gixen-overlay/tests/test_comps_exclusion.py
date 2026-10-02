@@ -861,3 +861,29 @@ def test_unstamp_endpoint_422s_an_empty_ids_list(api):
 def test_unstamp_endpoint_422s_a_missing_ids_field(api):
     r = api.post("/api/comics/comps/unstamp", json={"dry_run": False})
     assert r.status_code == 422
+
+
+def test_exclude_endpoint_dry_run_reports_the_apply_and_writes_nothing(api):
+    """BUI-1047: dry_run previews the exact apply response, stamps nothing."""
+    comic_id = _create_comic(api)
+    _ingest(api, comic_id, _comp(product_id="15719"), _comp(product_id="15712"))
+    body = {"comic_id": comic_id, "product_ids": ["15719", "15719", "nope"],
+            "code": "store_variant"}
+
+    preview = api.post("/api/comics/comps/exclude", json={**body, "dry_run": True})
+    assert preview.status_code == 200, preview.text
+    assert preview.json() == {
+        "comic_id": comic_id, "pool": "slab", "code": "store_variant",
+        "stamped": 1, "already_stamped": 1, "not_found": ["nope"],
+        "dry_run": True,
+    }
+    served = api.get("/api/comics/comps", params={"comic_id": comic_id}).json()
+    assert sorted(r["product_id"] for r in served) == ["15712", "15719"]
+
+    # Omitting dry_run still APPLIES (production callers rely on it), and the
+    # counts match what the preview promised.
+    applied = api.post("/api/comics/comps/exclude", json=body)
+    assert applied.json() == {k: v for k, v in preview.json().items()
+                              if k != "dry_run"}
+    served = api.get("/api/comics/comps", params={"comic_id": comic_id}).json()
+    assert [r["product_id"] for r in served] == ["15712"]

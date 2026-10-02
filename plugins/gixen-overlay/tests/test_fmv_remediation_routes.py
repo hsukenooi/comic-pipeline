@@ -446,3 +446,61 @@ def test_retire_failure_midway_rolls_everything_back(api, monkeypatch):
                  json={"replacement_fmv_id": repl, "dry_run": False})
     assert _state(bid) == ([(stub, 1)], stub)
     assert _fmv_row(stub)["flag_reason"] is None
+
+
+# ---------------------------------------------------------------------------
+# link-fmv bid_id (BUI-1047)
+# ---------------------------------------------------------------------------
+
+
+def _two_rows_for_item(api, item_id="700000001"):
+    """An older and a newer bids row sharing one item_id -> (older, newer)."""
+    older = _bid(api, item_id)
+    c = _raw()
+    c.execute("DROP INDEX IF EXISTS idx_bids_item_id_active")
+    c.commit()
+    try:
+        c.execute(
+            "INSERT INTO bids (item_id, max_bid, status) VALUES (?, 5, 'ENDED')",
+            (item_id,),
+        )
+        c.commit()
+    except sqlite3.IntegrityError:
+        pytest.skip("schema forbids a second bid row for one item_id")
+    newer = c.execute("SELECT MAX(id) FROM bids").fetchone()[0]
+    c.close()
+    return older, newer
+
+
+def test_link_fmv_without_bid_id_targets_the_newest_row(api):
+    older, newer = _two_rows_for_item(api)
+    comic = _comic("Link", "1")
+    f = _fmv(comic)
+    r = api.post("/api/bids/700000001/link-fmv", json={"comic_id": comic, "grade": 6.0})
+    assert r.status_code == 200, r.text
+    assert _state(newer)[0] == [(f, 1)]
+    assert _state(older)[0] == []
+
+
+def test_link_fmv_bid_id_targets_the_older_row(api):
+    older, newer = _two_rows_for_item(api)
+    comic = _comic("Link", "1")
+    f = _fmv(comic)
+    r = api.post("/api/bids/700000001/link-fmv",
+                 json={"comic_id": comic, "grade": 6.0, "bid_id": older})
+    assert r.status_code == 200, r.text
+    assert _state(older) == ([(f, 1)], f)
+    assert _state(newer)[0] == []
+
+
+def test_link_fmv_rejects_a_bid_id_from_another_item(api):
+    mine = _bid(api, "700000001")
+    other = _bid(api, "700000002")
+    comic = _comic("Link", "1")
+    _fmv(comic)
+    r = api.post("/api/bids/700000001/link-fmv",
+                 json={"comic_id": comic, "grade": 6.0, "bid_id": other})
+    assert r.status_code == 404
+    assert "not a row of item 700000001" in r.json()["detail"]
+    assert _state(other)[0] == []
+    assert _state(mine)[0] == []

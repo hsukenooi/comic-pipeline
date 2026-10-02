@@ -5102,8 +5102,14 @@ def stamp_comps_excluded(
     product_ids: list[str],
     code: str,
     pool: str = "slab",
+    dry_run: bool = False,
 ) -> dict[str, Any] | None:
     """Stamp one pool's comps of one book as excluded (BUI-947, BUI-1018).
+
+    `dry_run=True` (BUI-1047) runs the same classification and returns the
+    same counts the apply would, writing nothing. A product_id repeated in
+    one call counts once as stamped and then as already_stamped, exactly as
+    the apply path would see it.
 
     Write path for `POST /api/comics/comps/exclude`. Returns None when
     `comic_id` names no known book — the route 404s on that, the same
@@ -5179,6 +5185,7 @@ def stamp_comps_excluded(
     stamped = 0
     already = 0
     not_found: list[str] = []
+    would_stamp_ids: set[int] = set()
     for raw_pid in product_ids:
         pid = str(raw_pid)
         row = conn.execute(
@@ -5189,22 +5196,27 @@ def stamp_comps_excluded(
         if row is None:
             not_found.append(pid)
             continue
-        if row["excluded_code"] is not None:
+        if row["excluded_code"] is not None or row["id"] in would_stamp_ids:
             already += 1
             continue
-        conn.execute(
-            "UPDATE comps SET excluded_code = ?, excluded_at = ? WHERE id = ?",
-            (code, now, row["id"]),
-        )
+        if dry_run:
+            would_stamp_ids.add(row["id"])
+        else:
+            conn.execute(
+                "UPDATE comps SET excluded_code = ?, excluded_at = ? "
+                "WHERE id = ?",
+                (code, now, row["id"]),
+            )
         stamped += 1
-    conn.commit()
-    if stamped:
+    if not dry_run:
+        conn.commit()
+    if stamped and not dry_run:
         logger.info(
             "stamp_comps_excluded: comic_id=%s pool=%s code=%s stamped=%d "
             "already=%d not_found=%d",
             comic_id, pool, code, stamped, already, len(not_found),
         )
-    return {
+    result: dict[str, Any] = {
         "comic_id": comic_id,
         "pool": pool,
         "code": code,
@@ -5212,6 +5224,10 @@ def stamp_comps_excluded(
         "already_stamped": already,
         "not_found": not_found,
     }
+    if dry_run:
+        # Apply responses keep their pre-BUI-1047 shape byte-for-byte.
+        result["dry_run"] = True
+    return result
 
 
 def unstamp_comps_excluded(

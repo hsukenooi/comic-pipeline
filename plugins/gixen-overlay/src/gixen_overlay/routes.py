@@ -737,8 +737,15 @@ async def api_comics_comps_exclude(req: CompsExcludeRequest, request: Request):
     existed — and a wrong exclusion has to be discoverable and reversible,
     which a DELETE would make neither.
 
-    Body: `{comic_id, product_ids: [...], code, pool?}` (`pool` is 'slab' by
-    default, or 'raw' — BUI-1018). Exactly one `code` per call
+    Body: `{comic_id, product_ids: [...], code, pool?, dry_run?}` (`pool` is
+    'slab' by default, or 'raw' — BUI-1018).
+
+    `dry_run` (BUI-1047) defaults to FALSE, i.e. APPLY, unlike the sibling
+    unstamp/exclude-by-id/restamp routes (default true). The production
+    callers (`comic-fmv`'s `_post_comps_exclusions`, `backfill_comps_ledger`)
+    send no `dry_run` and depend on the write, so a safe-by-default flip
+    would silently stop every stamp they send. `dry_run: true` returns the
+    exact apply response plus `dry_run: true`, writing nothing. Exactly one `code` per call
     — group by code caller-side rather than sending a mixed batch, so the
     reason on every stamped row is the reason that call carried.
 
@@ -767,7 +774,8 @@ async def api_comics_comps_exclude(req: CompsExcludeRequest, request: Request):
     """
     db = request.app.state.db
     result = stamp_comps_excluded(
-        db, req.comic_id, req.product_ids, req.code, req.pool
+        db, req.comic_id, req.product_ids, req.code, req.pool,
+        dry_run=req.dry_run,
     )
     if result is None:
         raise HTTPException(
@@ -967,6 +975,11 @@ async def api_link_fmv(item_id: str, req: LinkFmvRequest, request: Request):
        optionally narrowed by year. The fallback that keeps link-fmv working
        when locg_id never got populated (PER-140 Gap 2).
 
+    BUI-1047: `item_id` is not unique across bids rows, and the path alone
+    resolves to the newest one. An optional body `bid_id` (a `bids.id` that
+    must belong to this `item_id`, else 404 like unlink-fmv) links that
+    specific row instead. Absent, the newest row is linked as before.
+
     Populates the bid_fmvs junction table and sets bids.fmv_id so the
     /api/comics/snipes dashboard can show cond_grade and fmv_low/fmv_high.
 
@@ -988,6 +1001,18 @@ async def api_link_fmv(item_id: str, req: LinkFmvRequest, request: Request):
     bid = get_bid_by_item_id(db, item_id)
     if bid is None:
         raise HTTPException(status_code=404, detail=f"Item {item_id} not in DB")
+    if req.bid_id is not None and req.bid_id != bid["id"]:
+        # BUI-1047: target an older row of a repeated item_id. Same 404 as
+        # unlink-fmv when the id is not a row of THIS item.
+        bid = db.execute(
+            "SELECT * FROM bids WHERE id = ? AND item_id = ?",
+            (req.bid_id, item_id),
+        ).fetchone()
+        if bid is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"bid row {req.bid_id} is not a row of item {item_id}",
+            )
 
     fmv_row, strategy = _resolve_fmv_for_link(db, req)
     if fmv_row is None:
@@ -1423,12 +1448,23 @@ _NEEDS_MANUAL_REASON_ADVICE: dict[str, str] = {
         "certified books are not auto-priced yet (the graded FMV mode has not "
         "shipped) — hand-price it from slab comps at this certifier and grade"
     ),
+    # BUI-1046: a thin pool (empty, one comp, or two that diverge) can fill
+    # later, so this is the one reason a re-run is the right move.
+    "too_sparse": (
+        "the comp pool is too thin to price (empty, a single comp, or two "
+        "that disagree); re-run `/comic:fmv` later, once more comps have "
+        "sold, and it can price this book. To bid before then, hand-price it"
+    ),
     # BUI-1030: server-written only (retire_fmv_stub), never posted by a producer.
     "superseded": (
         "this row is a retired duplicate stub (see its `superseded_by` note); "
         "relink the bid to the live row for this book instead of pricing it"
     ),
 }
+
+# BUI-1046: reasons whose cause is a pool that can change, so the generic
+# "Do NOT re-run" tail would contradict the specific advice.
+_NEEDS_MANUAL_RERUNNABLE: frozenset[str] = frozenset({"too_sparse"})
 
 
 def _guidance_for(
@@ -1460,6 +1496,11 @@ def _guidance_for(
         )
     if verdict == "needs_manual":
         specific = _NEEDS_MANUAL_REASON_ADVICE.get(flag_reason or "")
+        if specific is not None and flag_reason in _NEEDS_MANUAL_RERUNNABLE:
+            return (
+                f"This book is flagged `needs_manual` (reason: `{flag_reason}`) "
+                f"— {specific}."
+            )
         if specific is not None:
             return (
                 f"This book is flagged `needs_manual` (reason: `{flag_reason}`) "
