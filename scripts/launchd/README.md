@@ -44,6 +44,41 @@ not spend provider budget as a side effect (same reasoning as
 Re-run the install snippet above (`cp` + `unload`/`load -w`) after any change
 to the checked-in plist, including a `SLAB_WATCH_MAX_REQUESTS` override.
 
+## com.comics.unpriced-rerun.plist (BUI-1080)
+
+Runs `comic-fmv --unpriced-rerun` on the 1st of the month at 10:00, after
+slab-watch-collect's 09:30. It re-runs the default pricing path (never
+`--force`, so hand-priced rows are skipped) over every unpriced row, oldest
+`updated_at` first, capped at `UNPRICED_RERUN_MAX_REQUESTS` books per run
+(default 150). It sets `FMV_CEILING_CAP=1` in the plist because launchd does
+not inherit shell exports; provider keys resolve through `ebay-sold-comps`
+exactly as for slab-watch-collect. The log prints BEFORE and AFTER counts
+(flagged by reason, capped). Heartbeat contract: `unpriced-rerun` in
+`docs/reference/job-heartbeat-contract.md`.
+
+Install:
+
+```bash
+cp scripts/launchd/com.comics.unpriced-rerun.plist \
+  "$HOME/Library/LaunchAgents/com.comics.unpriced-rerun.plist"
+
+launchctl unload "$HOME/Library/LaunchAgents/com.comics.unpriced-rerun.plist" 2>/dev/null || true
+launchctl load -w "$HOME/Library/LaunchAgents/com.comics.unpriced-rerun.plist"
+```
+
+For a small first run, uncomment `UNPRICED_RERUN_MAX_REQUESTS` with a small
+value (for example `5`) in the installed copy, reload, then:
+
+```bash
+launchctl kickstart -k "gui/$(id -u)/com.comics.unpriced-rerun"
+comics-api GET /api/comics/health/heartbeats
+```
+
+`unpriced-rerun` should read `status: ok`. A heartbeat is only written on exit
+0; a failed run POSTs the failure ping instead. Check
+`~/.comics-server/unpriced-rerun.log` for the counts and
+`unpriced-rerun.error.log` for failures.
+
 ## com.comics.em-batch-nightly.plist (BUI-972)
 
 Runs `scripts/em-batch-nightly.sh` at 01:00 every night: picks up to

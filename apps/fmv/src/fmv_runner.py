@@ -358,8 +358,13 @@ def run(*, batch_path: str | None, out_path: str | None,
         quiet: bool, server_url: str | None,
         grade_window: float | None = None,
         brief: bool = False,
-        probe: bool = False) -> None:
+        probe: bool = False,
+        books: list[dict] | None = None) -> list[dict]:
     """Driver for `comic-fmv`. Exits with sys.exit on hard failures.
+
+    Returns the stitched per-book result rows (the same list `--out` writes);
+    the CLI ignores it. `books` (BUI-1080) supplies the batch in memory instead
+    of `batch_path`, for `run_unpriced_rerun`.
 
     `probe` (BUI-1085) is the no-write mode: the same fetch and the same math
     as a normal run, but every comics-server write (fmv upsert, comic stub,
@@ -382,11 +387,12 @@ def run(*, batch_path: str | None, out_path: str | None,
                    "needs the server for cache reuse and DB upsert.", err=True)
         sys.exit(1)
 
-    if not batch_path:
-        click.echo("Error: --batch is required (path or '-' for stdin).", err=True)
-        sys.exit(2)
-
-    books = _read_batch(batch_path)
+    if books is None:
+        if not batch_path:
+            click.echo("Error: --batch is required (path or '-' for stdin).",
+                       err=True)
+            sys.exit(2)
+        books = _read_batch(batch_path)
     if not books:
         click.echo("Empty batch.", err=True)
         sys.exit(0)
@@ -836,6 +842,7 @@ def run(*, batch_path: str | None, out_path: str | None,
 
     if out_path:
         _write_json(out_path, final)
+    return final
 
 
 def _ping_fmv_heartbeat(server_url: str, *, persisted: int) -> None:
@@ -6100,4 +6107,303 @@ def run_slab_watch_collect(*, server_url: str | None,
         detail=(f"{n_books_attempted} fetched, {n_rows_posted} row(s) "
                f"posted, {n_skipped_fresh} skipped fresh"),
     )
+    return 0
+
+
+# ─── BUI-1080 — monthly re-run over unpriced rows ────────────────────────────
+#
+# `comic-fmv --unpriced-rerun`: a launchd job (com.comics.unpriced-rerun,
+# scripts/launchd/), never an interactive mode. A refused `fmv` row keeps its
+# `flag_reason` until something re-runs it while the comps pool behind it keeps
+# growing; two plain re-runs in one week priced far more than any model change.
+# This mode is that plain re-run, scheduled.
+#
+# It reuses `run()` wholesale (an in-memory batch, `books=`): the hand-priced
+# guard (`_split_by_db_cache` -> `skipped_hand`), the fetch, the pricing, the
+# ceiling cap, the upsert and the ledger post are all the default path. It never
+# passes `--force`, so a hand-priced row is skipped exactly as on any default
+# run.
+#
+# Cache decision: `max_age_days=0.0` is passed deliberately. The DB cache would
+# not short-circuit a refused row anyway (`_db_lookup` only counts a row with a
+# non-null `fmv_low` as a hit, and every row selected here has a null
+# `fmv_high`), but 0 states the intent: this mode exists to re-fetch stale
+# refusals, so nothing may be answered from the DB cache. The provider response
+# cache (ebay-sold-comps, `force=False`) still applies: a fresh cached response
+# is the same data a re-fetch would return.
+#
+# The cap counts BOOKS submitted per run, not provider requests: a raw book
+# costs 1-3 provider queries (tiered fetch), a certified one exactly 1. The
+# oldest-`updated_at`-first ordering rotates a capped run through the set.
+
+_UNPRICED_RERUN_DEFAULT_MAX_REQUESTS = 150
+_UNPRICED_RERUN_CERTIFIERS = ("none", "cgc", "cbcs", "other")
+_UNPRICED_RERUN_JOB = "unpriced-rerun"
+
+
+def _unpriced_rerun_max_requests(override: int | None) -> int:
+    """Resolve the per-run cap (BUI-1080): kwarg, then `UNPRICED_RERUN_MAX_REQUESTS`
+    (read fresh per run), then the default. Same shape as
+    `_slab_watch_max_requests`: an unparseable value warns and falls back."""
+    if override is not None:
+        return override
+    raw = os.environ.get("UNPRICED_RERUN_MAX_REQUESTS")
+    if not raw:
+        return _UNPRICED_RERUN_DEFAULT_MAX_REQUESTS
+    try:
+        return int(raw)
+    except ValueError:
+        click.echo(
+            f"Warning: UNPRICED_RERUN_MAX_REQUESTS={raw!r} does not parse as "
+            f"an int; using the default ({_UNPRICED_RERUN_DEFAULT_MAX_REQUESTS}).",
+            err=True,
+        )
+        return _UNPRICED_RERUN_DEFAULT_MAX_REQUESTS
+
+
+def _ping_unpriced_rerun_heartbeat(server_url: str, *, detail: str) -> None:
+    """Record the `unpriced-rerun` heartbeat (BUI-1080). Best-effort, called
+    ONLY from `run_unpriced_rerun`'s full-success branch."""
+    if _PROBE_MODE:
+        return
+    try:
+        resp = requests.post(
+            f"{server_url}/api/heartbeat/{_UNPRICED_RERUN_JOB}",
+            params={"detail": detail[:300]}, timeout=10,
+        )
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        click.echo(f"unpriced-rerun heartbeat ping failed (non-fatal): {e}",
+                   err=True)
+
+
+def _ping_unpriced_rerun_failure(server_url: str | None, detail: str) -> None:
+    """Best-effort POST /api/heartbeat/unpriced-rerun/failure (BUI-1082), so a
+    failed run shows red that day rather than at the staleness backstop."""
+    if not server_url or _PROBE_MODE:
+        return
+    try:
+        resp = requests.post(
+            f"{server_url}/api/heartbeat/{_UNPRICED_RERUN_JOB}/failure",
+            params={"detail": detail[:300]}, timeout=10,
+        )
+        if resp.status_code == 404:
+            click.echo("unpriced-rerun: failure ping 404 — the deployed overlay "
+                       "predates BUI-1082; re-deploy the comics server.",
+                       err=True)
+            return
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        click.echo(f"unpriced-rerun failure ping failed (non-fatal): {e}",
+                   err=True)
+
+
+def _unpriced_state(fmv: dict | None, *, from_db: bool) -> str:
+    """Bucket label for the before/after counts: `priced`, `capped`, or
+    `flagged:<reason>` (`flagged:unflagged` for a refusal with no reason)."""
+    fmv = fmv or {}
+    if from_db:
+        high, cap, reason = (fmv.get("fmv_high"), fmv.get("fmv_ceiling_cap"),
+                             fmv.get("fmv_flag_reason"))
+    else:
+        high = fmv.get("fmv_high")
+        cap = (fmv.get("ceiling_cap")
+               if fmv.get("pricing_basis") == _CEILING_BASIS else None)
+        reason = fmv.get("flag_reason")
+    if high is not None:
+        return "priced"
+    if cap is not None:
+        return "capped"
+    return f"flagged:{reason or 'unflagged'}"
+
+
+def _select_unpriced_rows(server_url: str) -> tuple[list[dict], int] | None:
+    """Every row with a grade and a null `fmv_high`, across all four certifier
+    markets. Returns `(rows, n_no_row)` or None when a read failed (the run
+    cannot start). `GET /api/comics` LEFT JOINs, so a comic with no fmv row in
+    a market comes back with a null `fmv_id`: that is no row at all, not an
+    unpriced one, and is dropped (counted, not re-priced)."""
+    rows: list[dict] = []
+    n_no_row = 0
+    for certifier in _UNPRICED_RERUN_CERTIFIERS:
+        params = {} if certifier == _RAW_CERTIFIER else {"certifier": certifier}
+        got = _get_json_or_warn(
+            f"{server_url}/api/comics", params=params,
+            warn=f"unpriced-rerun: /api/comics read failed ({certifier})",
+            default=_LOOKUP_FAILED,
+        )
+        if got is _LOOKUP_FAILED or not isinstance(got, list):
+            return None
+        for r in got:
+            if not isinstance(r, dict):
+                continue
+            if r.get("fmv_id") is None or r.get("grade") is None:
+                n_no_row += 1
+                continue
+            # Deploy-order guard (BUI-930): an old server drops `certifier`
+            # and would answer a slab query with raw rows, which would then
+            # be re-priced as certified books. Refuse to start.
+            if certifier != _RAW_CERTIFIER and r.get("certifier") != certifier:
+                click.echo(
+                    "Error: unpriced-rerun: the comics server does not honour "
+                    "the `certifier` filter (predates BUI-924/925); deploy it "
+                    "first.", err=True)
+                return None
+            if r.get("fmv_high") is not None:
+                continue
+            r = dict(r)
+            r["_certifier"] = certifier
+            rows.append(r)
+    return rows, n_no_row
+
+
+def _unpriced_book(row: dict) -> dict | None:
+    """The in-memory batch entry for one selected row, or None when the row has
+    no title/issue to re-price from."""
+    title, issue = row.get("title"), row.get("issue")
+    if not title or issue in (None, ""):
+        return None
+    book: dict = {"title": title, "issue": str(issue), "grade": row["grade"]}
+    for key in ("year", "locg_id", "locg_variant_id", "variant"):
+        if row.get(key) is not None:
+            book[key] = row[key]
+    if row["_certifier"] != _RAW_CERTIFIER:
+        book["certifier"] = row["_certifier"]
+        book["label"] = row.get("label") or _RAW_LABEL
+    return book
+
+
+def _fmt_counts(counts: dict[str, int]) -> str:
+    return ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "none"
+
+
+def run_unpriced_rerun(*, server_url: str | None,
+                       max_requests: int | None = None) -> int:
+    """Driver for `comic-fmv --unpriced-rerun` (BUI-1080). Returns the exit code.
+
+    \b
+      0 — success: every fetch and every write it attempted succeeded
+          (heartbeat pinged). Includes an empty set and a run that hit the cap.
+      1 — a fetch, upsert, ledger write, or provenance lookup failed, or the
+          pricing run aborted (failure ping, no success ping).
+      2 — could not start (no server URL, a selection read failed).
+
+    A hand-priced row is bucketed `skipped_hand` by the normal path and counts
+    as neither success nor failure; a row the server 422-rejects, or whose
+    hand-priced provenance could not be verified, counts as a failure.
+    """
+    if not server_url:
+        click.echo("Error: COMICS_SERVER_URL must be set. --unpriced-rerun "
+                   "reads and writes the comics server.", err=True)
+        return 2
+
+    selected = _select_unpriced_rows(server_url)
+    if selected is None:
+        click.echo("Error: failed to read the unpriced set from the comics "
+                   "server; the run did not start.", err=True)
+        _ping_unpriced_rerun_failure(server_url, "could not read unpriced set")
+        return 2
+    rows, n_no_row = selected
+
+    candidates: list[tuple[dict, dict]] = []
+    n_malformed = 0
+    for row in rows:
+        book = _unpriced_book(row)
+        if book is None:
+            n_malformed += 1
+            click.echo("Warning: unpriced-rerun: skipping a row with no "
+                       f"title/issue (comic id={row.get('id')!r}).", err=True)
+            continue
+        candidates.append((row, book))
+
+    # Oldest `updated_at` first (never-stamped first), comic id as the stable
+    # tiebreak, so a capped run rotates through the set across months.
+    candidates.sort(key=lambda rb: (rb[0].get("fmv_updated_at") or "",
+                                    rb[0].get("id") or 0))
+    max_req = _unpriced_rerun_max_requests(max_requests)
+    batch_rows = candidates[:max(max_req, 0)]
+    n_left = len(candidates) - len(batch_rows)
+
+    before: dict[str, int] = {}
+    for row, _ in candidates:
+        key = _unpriced_state(row, from_db=True)
+        before[key] = before.get(key, 0) + 1
+    click.echo(f"unpriced-rerun: BEFORE {len(candidates)} unpriced row(s): "
+               f"{_fmt_counts(before)}; {n_no_row} market row(s) with no fmv "
+               f"row skipped, {n_malformed} malformed skipped.")
+
+    if not batch_rows:
+        click.echo("unpriced-rerun: nothing to re-price.")
+        _ping_unpriced_rerun_heartbeat(server_url,
+                                       detail="0 re-priced, nothing unpriced")
+        return 0
+
+    started_at = datetime.now(timezone.utc)
+    failures: list[str] = []
+    final: list[dict] = []
+    try:
+        final = run(batch_path=None, out_path=None, max_age_days=0.0,
+                    force=False, quiet=True, server_url=server_url,
+                    books=[b for _, b in batch_rows])
+    except SystemExit as exc:
+        failures.append(f"pricing run aborted (exit {exc.code})")
+    except Exception as exc:  # noqa: BLE001 — unattended job: report, never crash
+        failures.append(f"pricing run raised {exc!r}")
+
+    if final and len(final) != len(batch_rows):
+        failures.append(f"result count mismatch ({len(final)} for "
+                        f"{len(batch_rows)} books)")
+        final = []
+
+    after = dict(before)
+    n_skipped_hand = 0
+    n_queries = 0
+    n_priced_now = 0
+    for (row, _), res in zip(batch_rows, final):
+        src = res.get("source")
+        who = (row.get("title"), row.get("issue"))
+        if src == "skipped_hand_priced":
+            n_skipped_hand += 1
+            continue
+        if src in ("skipped_lookup_error", "skipped_rejected",
+                   SOURCE_SCHEMA_MISMATCH):
+            failures.append(f"{src}: {who}")
+            continue
+        if src != "fresh":  # "error", ledger advisory, ...: nothing was written
+            failures.append(f"{src}: {who}")
+            continue
+        n_queries += len(res.get("queries_used") or [])
+        if (_is_fetch_error(res) or res.get("breaker_tripped")
+                or res.get("fmv_id") is None
+                or res.get("comps_posted") is False):
+            failures.append(f"fetch/write failed: {who}")
+        new = _unpriced_state(res.get("fmv"), from_db=False)
+        old = _unpriced_state(row, from_db=True)
+        if new != old:
+            after[old] -= 1
+            after[new] = after.get(new, 0) + 1
+            if new == "priced":
+                n_priced_now += 1
+    after = {k: v for k, v in after.items() if v > 0 and k != "priced"}
+
+    elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
+    click.echo(f"unpriced-rerun: AFTER {len(candidates) - n_priced_now} "
+               f"unpriced row(s): {_fmt_counts(after)}; {len(batch_rows)} "
+               f"re-run ({n_priced_now} newly priced, {n_skipped_hand} "
+               f"hand-priced skipped), {n_queries} provider quer"
+               f"{'y' if n_queries == 1 else 'ies'}, {elapsed:.1f}s elapsed.")
+    if n_left:
+        click.echo(f"unpriced-rerun: cap ({max_req}) reached; {n_left} row(s) "
+                   "left for the next run (oldest first).", err=True)
+    if failures:
+        for f in failures[:20]:
+            click.echo(f"unpriced-rerun: FAILED {f}", err=True)
+        _ping_unpriced_rerun_failure(
+            server_url, f"{len(failures)} failure(s): {failures[0]}")
+        return 1
+
+    _ping_unpriced_rerun_heartbeat(
+        server_url,
+        detail=(f"{len(batch_rows)} re-run, {n_priced_now} newly priced, "
+                f"{n_left} left over"))
     return 0

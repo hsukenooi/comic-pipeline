@@ -61,6 +61,7 @@ def test_the_six_named_jobs_are_declared():
         "fmv-refresh",
         "sentinel-probe",
         "slab-watch-collect",
+        "unpriced-rerun",
     }
 
 

@@ -123,6 +123,21 @@ def _print_version(ctx: click.Context, param: click.Parameter, value: bool) -> N
                    "where every book was already fresh still pings (zero "
                    "results is a success). Exits 0 (success), 1 (a fetch or "
                    "write failed), 2 (could not start). Ignores --batch.")
+@click.option("--unpriced-rerun", is_flag=True,
+              help="BUI-1080: re-run the default pricing path over every "
+                   "unpriced row (GET /api/comics, fmv_high null, raw and "
+                   "graded) oldest updated_at first, capped at "
+                   "UNPRICED_RERUN_MAX_REQUESTS books per run (default 150; "
+                   "each raw book costs 1-3 provider queries). Never forces: "
+                   "hand-priced rows are skipped as on any default run. "
+                   "Prints before/after counts (priced, flagged by reason, "
+                   "capped). Meant for the monthly launchd job "
+                   "(scripts/launchd/com.comics.unpriced-rerun.plist). Pings "
+                   "/api/heartbeat/unpriced-rerun only when every fetch and "
+                   "write succeeded, else POSTs the failure ping. For a small "
+                   "first run set UNPRICED_RERUN_MAX_REQUESTS=5. Exits 0 "
+                   "(success), 1 (a fetch or write failed), 2 (could not "
+                   "start). Ignores --batch.")
 @click.option("--probe", is_flag=True,
               help="BUI-1085: no-write mode. Fetch comps and compute the "
                    "price exactly as a normal run and print it, but write "
@@ -143,6 +158,7 @@ def cli(batch_path: str | None, out_path: str | None,
         quiet: bool, brief: bool, server_url: str | None,
         inversion_sweep: bool, sentinel_probe: bool,
         list_slab_watch: bool, slab_watch_collect: bool,
+        unpriced_rerun: bool = False,
         probe: bool = False) -> None:
     """Compute fair market value for a batch of comics.
 
@@ -184,10 +200,14 @@ def cli(batch_path: str | None, out_path: str | None,
             "warning: GIXEN_SERVER_URL is deprecated; use COMICS_SERVER_URL",
             err=True,
         )
-    if probe and (sentinel_probe or slab_watch_collect):
+    if probe and (sentinel_probe or slab_watch_collect or unpriced_rerun):
         raise click.UsageError(
             "--probe is a pricing no-write mode and cannot combine with "
-            "--sentinel-probe or --slab-watch-collect.")
+            "--sentinel-probe, --slab-watch-collect, or --unpriced-rerun.")
+    if unpriced_rerun and (sentinel_probe or slab_watch_collect):
+        raise click.UsageError(
+            "--unpriced-rerun cannot combine with --sentinel-probe or "
+            "--slab-watch-collect.")
     # BUI-583: a read-only consistency report, not a pricing run — handled
     # before run()'s --batch gate, which would otherwise reject the sweep for
     # missing an input batch it does not use.
@@ -213,6 +233,10 @@ def cli(batch_path: str | None, out_path: str | None,
     # than always returning 0.
     if slab_watch_collect:
         sys.exit(fmv_runner.run_slab_watch_collect(server_url=server_url))
+    # BUI-1080: a scheduled re-pricing run over the unpriced set; returns a
+    # real exit code like --slab-watch-collect.
+    if unpriced_rerun:
+        sys.exit(fmv_runner.run_unpriced_rerun(server_url=server_url))
     fmv_runner.run(
         batch_path=batch_path,
         out_path=out_path,

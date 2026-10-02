@@ -5984,6 +5984,34 @@ JOB_CONTRACTS: dict[str, dict[str, Any]] = {
             "SLAB_WATCH_MAX_REQUESTS)."
         ),
     },
+    "unpriced-rerun": {
+        "cadence_hours": 672.0,
+        "success": (
+            "A `comic-fmv --unpriced-rerun` run (BUI-1080) in which every comp "
+            "fetch it attempted AND every fmv/ledger write it attempted "
+            "succeeded — exit 0. Same BUI-593 rule as slab-watch-collect: a "
+            "fetch that ran clean while its upsert or comps-ledger POST failed "
+            "must not ping, and neither must a run where the comics server "
+            "could not verify a row's hand-priced provenance or rejected a "
+            "write. A run with nothing to re-price still pings ('zero results "
+            "is a success'), and so does a run that hit its request cap with "
+            "everything it DID attempt succeeding; the leftover rows are next "
+            "run's job. A failing run POSTs /api/heartbeat/unpriced-rerun/"
+            "failure (BUI-1082) instead."
+        ),
+        "wired": True,
+        "ping": (
+            "apps/fmv/src/fmv_runner.py's run_unpriced_rerun, via "
+            "_ping_unpriced_rerun_heartbeat on the no-failure branch: "
+            "POST /api/heartbeat/unpriced-rerun (failure branch: "
+            "_ping_unpriced_rerun_failure -> /failure). Best-effort — a failed "
+            "ping never changes the run's exit code. Scheduling: "
+            "scripts/launchd/com.comics.unpriced-rerun.plist (the 1st of the "
+            "month at 10:00, after slab-watch-collect's 09:30; each run spends "
+            "real provider request budget, capped by "
+            "UNPRICED_RERUN_MAX_REQUESTS)."
+        ),
+    },
 }
 
 # THE OUTER LAYER — WIRED (BUI-672). Read this before trusting the watchdog.

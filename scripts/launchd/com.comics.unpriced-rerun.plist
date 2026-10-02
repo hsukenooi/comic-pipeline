@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.comics.unpriced-rerun</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/hsukenooi/.local/bin/comic-fmv</string>
+        <string>--unpriced-rerun</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>COMICS_SERVER_URL</key>
+        <string>http://localhost:8080</string>
+        <!-- launchd starts jobs with a minimal PATH that omits ~/.local/bin,
+             where uv installs the ebay-sold-comps console script comic-fmv
+             shells out to (BUI-27). Same value as slab-watch-collect. -->
+        <key>PATH</key>
+        <string>/Users/hsukenooi/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <!-- BUI-1028: the ceiling cap is read from the environment of the
+             comic-fmv process itself, and launchd does not inherit an
+             interactive shell's exports, so it is set here explicitly. Without
+             it a re-run would leave one_sided/too_wide refusals uncapped.
+             Provider keys (SERPAPI_KEY / SOLD_COMPS_KEY) are NOT set here:
+             ebay-sold-comps resolves them itself (env, then apps/ebay/.env),
+             the same way it does for slab-watch-collect. -->
+        <key>FMV_CEILING_CAP</key>
+        <string>1</string>
+        <!-- Optional (BUI-1080): override the default 150-book-per-run cap
+             (each raw book costs 1-3 provider queries) without a code
+             deploy. Uncomment and set a value, then `launchctl unload` /
+             `launchctl load -w` to pick it up. -->
+        <!--
+        <key>UNPRICED_RERUN_MAX_REQUESTS</key>
+        <string>150</string>
+        -->
+    </dict>
+    <!-- BUI-1080: the 1st of the month at 10:00, half an hour after
+         slab-watch-collect's 09:30 slot, so the two provider-spending jobs
+         do not overlap. A missed slot (the Mini asleep) runs once at wake. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Day</key>
+        <integer>1</integer>
+        <key>Hour</key>
+        <integer>10</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/Users/hsukenooi/.comics-server/unpriced-rerun.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/hsukenooi/.comics-server/unpriced-rerun.error.log</string>
+</dict>
+</plist>
