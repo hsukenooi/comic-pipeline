@@ -87,6 +87,17 @@ class TestSelection:
         assert slab["certifier"] == "cgc" and slab["label"] == "universal"
         assert "certifier" not in next(b for b in books if b["title"] == "Raw")
 
+    def test_superseded_stub_skipped_and_counted(self, capsys):
+        # A retired duplicate stub (BUI-1030) never changes, so without the
+        # skip it sorts oldest-first and eats a cap slot every run.
+        rows = [_row(1, "Stub", "1", updated="2026-01-01T00:00:00+00:00",
+                     flag="superseded"),
+                _row(2, "Live", "1", updated="2026-05-01T00:00:00+00:00")]
+        code, run, _ = _go({"none": rows}, [_fresh()], max_requests=1)
+        assert code == 0
+        assert [b["title"] for b in run.call_args.kwargs["books"]] == ["Live"]
+        assert "1 superseded stub(s) skipped" in capsys.readouterr().out
+
     def test_malformed_identity_skipped_and_counted(self, capsys):
         by = {"none": [_row(1, "", "1"), _row(2, "Ok", "")] +
               [_row(3, "Fine", "2")]}

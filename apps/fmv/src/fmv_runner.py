@@ -6217,14 +6217,16 @@ def _unpriced_state(fmv: dict | None, *, from_db: bool) -> str:
     return f"flagged:{reason or 'unflagged'}"
 
 
-def _select_unpriced_rows(server_url: str) -> tuple[list[dict], int] | None:
+def _select_unpriced_rows(server_url: str) -> tuple[list[dict], int, int] | None:
     """Every row with a grade and a null `fmv_high`, across all four certifier
-    markets. Returns `(rows, n_no_row)` or None when a read failed (the run
+    markets, minus retired `superseded` stubs. Returns
+    `(rows, n_no_row, n_superseded)` or None when a read failed (the run
     cannot start). `GET /api/comics` LEFT JOINs, so a comic with no fmv row in
     a market comes back with a null `fmv_id`: that is no row at all, not an
     unpriced one, and is dropped (counted, not re-priced)."""
     rows: list[dict] = []
     n_no_row = 0
+    n_superseded = 0
     for certifier in _UNPRICED_RERUN_CERTIFIERS:
         params = {} if certifier == _RAW_CERTIFIER else {"certifier": certifier}
         got = _get_json_or_warn(
@@ -6251,10 +6253,17 @@ def _select_unpriced_rows(server_url: str) -> tuple[list[dict], int] | None:
                 return None
             if r.get("fmv_high") is not None:
                 continue
+            if r.get("fmv_flag_reason") == "superseded":
+                # A retired duplicate stub (BUI-1030) never changes, so it
+                # would sort oldest-first and take a cap slot every run while
+                # its re-price lands on the canonical row. That row is
+                # selected on its own if it is unpriced.
+                n_superseded += 1
+                continue
             r = dict(r)
             r["_certifier"] = certifier
             rows.append(r)
-    return rows, n_no_row
+    return rows, n_no_row, n_superseded
 
 
 def _unpriced_book(row: dict) -> dict | None:
@@ -6303,7 +6312,7 @@ def run_unpriced_rerun(*, server_url: str | None,
                    "server; the run did not start.", err=True)
         _ping_unpriced_rerun_failure(server_url, "could not read unpriced set")
         return 2
-    rows, n_no_row = selected
+    rows, n_no_row, n_superseded = selected
 
     candidates: list[tuple[dict, dict]] = []
     n_malformed = 0
@@ -6330,7 +6339,8 @@ def run_unpriced_rerun(*, server_url: str | None,
         before[key] = before.get(key, 0) + 1
     click.echo(f"unpriced-rerun: BEFORE {len(candidates)} unpriced row(s): "
                f"{_fmt_counts(before)}; {n_no_row} market row(s) with no fmv "
-               f"row skipped, {n_malformed} malformed skipped.")
+               f"row skipped, {n_superseded} superseded stub(s) skipped, "
+               f"{n_malformed} malformed skipped.")
 
     if not batch_rows:
         click.echo("unpriced-rerun: nothing to re-price.")
