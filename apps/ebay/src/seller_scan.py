@@ -255,6 +255,26 @@ def prepare_wish_items(wish_list):
     return out
 
 
+def rank_wish_matches(title, wish_items, include_graded=False):
+    """Return every (wish_item, score) at or above the 0.65 floor, best first.
+
+    BUI-1079: match_listing keeps only the single best wish, so a reject on
+    that wish dropped the listing without trying the next one ("X-Men Annual
+    #3" scored 1.0 against The X-Men #3, was rejected as annual-vs-regular,
+    and the X-Men Annual #3 wish was never tried). Sorting is stable, so ties
+    keep wish-list order (first wins), matching match_listing's old tie rule.
+    identify_comic runs once per title; see match_listing for details.
+    """
+    identity = identify_comic(title, include_graded=include_graded)
+    scored = []
+    for wish in wish_items:
+        score = score_against_wish(identity, wish)
+        if score >= 0.65:
+            scored.append((wish, score))
+    scored.sort(key=lambda ws: -ws[1])
+    return scored
+
+
 def match_listing(title, wish_items, include_graded=False):
     """Return (best_wish_item, score) or (None, 0.0) for an eBay listing title.
 
@@ -263,33 +283,41 @@ def match_listing(title, wish_items, include_graded=False):
     - At least 50% of series tokens present in title
 
     BUI-253 Step 2: the actual scoring math for a single (title, wish) pair
-    now lives in comic_identity.score_against_wish — this function is just
+    lives in comic_identity.score_against_wish — this function is just
     identify_comic(title) -> score_against_wish(identity, wish) per wish item,
-    picking the best-scoring wish above the 0.65 floor. identify_comic() runs
-    ONCE per title (not per wish item): it caches the grade-stripped/
-    normalized title on the identity (ComicIdentity._title_norm) so
-    score_against_wish never redoes that work per wish item, matching the
-    pre-refactor performance (O(1) shared string processing, not
-    O(len(wish_items))). See score_against_wish's docstring for why the
-    scoring behavior itself is unchanged.
+    picking the best-scoring wish above the 0.65 floor (first wins on tie).
+    identify_comic() runs ONCE per title (not per wish item).
 
     *include_graded* (BUI-932, default False) is forwarded to identify_comic
     so a certified title's ComicIdentity doesn't carry a "CGC slab"
     reject_reasons note when the caller has deliberately opted into scoring
     slabs — see identify_comic's docstring.
+
+    This returns the best wish WITHOUT applying the reject chain; callers
+    that reject should use match_listing_accepted (BUI-1079).
     """
-    identity = identify_comic(title, include_graded=include_graded)
-    best = None
-    best_score = 0.0
+    ranked = rank_wish_matches(title, wish_items, include_graded=include_graded)
+    if ranked:
+        return ranked[0]
+    return None, 0.0
 
-    for wish in wish_items:
-        score = score_against_wish(identity, wish)
-        if score > best_score:
-            best_score = score
-            best = wish
 
-    if best_score >= 0.65:
-        return best, best_score
+def match_listing_accepted(title, wish_items, include_graded=False):
+    """Return (wish_item, score) for the best-ranked wish the reject chain
+    (should_reject) accepts, or (None, 0.0) if none at/above 0.65 survives.
+
+    BUI-1079: the reject chain runs per candidate in rank order instead of
+    only against the single top scorer.
+    """
+    for wish, score in rank_wish_matches(
+        title, wish_items, include_graded=include_graded
+    ):
+        if not should_reject(
+            title, wish["series"], wish["issue"],
+            wish.get("_series_name"), wish.get("_release_year"),
+            include_graded=include_graded,
+        ):
+            return wish, score
     return None, 0.0
 
 
@@ -1401,20 +1429,17 @@ def _scan_one_seller_impl(seller_arg, username, token, base_url, wish_items,
         if listing["item_id"] in seen_ids:
             continue
         seen_ids.add(listing["item_id"])
-        wish, score = match_listing(title, wish_items, include_graded=include_graded)
-        if not wish:
-            continue
         # BUI-245: run the same deterministic reject chain wishlist_sellers uses
         # (hard_reject, era_mismatch, reprint/digital/trading-card/foreign-edition/
-        # second-print) against the wish item match_listing resolved, so a
-        # cross-series false positive (e.g. "Spectacular Spider-Man #15" vs wish
-        # "The Amazing Spider-Man #15") is dropped here rather than reaching Haiku
-        # with no era hint.
-        if should_reject(
-            title, wish["series"], wish["issue"],
-            wish.get("_series_name"), wish.get("_release_year"),
-            include_graded=include_graded,
-        ):
+        # second-print) so a cross-series false positive (e.g. "Spectacular
+        # Spider-Man #15" vs wish "The Amazing Spider-Man #15") is dropped here
+        # rather than reaching Haiku with no era hint. BUI-1079: applied per
+        # candidate in rank order, so a rejected top scorer falls through to the
+        # next wish at or above the floor.
+        wish, score = match_listing_accepted(
+            title, wish_items, include_graded=include_graded
+        )
+        if not wish:
             continue
         candidates.append({
             **listing,
