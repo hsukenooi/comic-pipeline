@@ -4619,6 +4619,24 @@ def test_verify_needs_manual_guidance_names_the_graded_reason(api):
     assert "grade rungs" in result["guidance"]
 
 
+def test_verify_too_sparse_guidance_says_a_rerun_can_price_it(api):
+    """BUI-1046: a thin pool fills later, so verify must not say "Do NOT
+    re-run" for too_sparse (n=0 rows moved here from fmv_stub in BUI-1029)."""
+    api.post("/api/bids", json={"item_id": "925000031", "max_bid": 50.0})
+    comic_id = api.post("/api/comics", json={
+        "title": "Sparse Comic", "issue": "1", "year": 1970, "grade": 6.0,
+        "fmv_flag_reason": "too_sparse",
+    }).json()["comic_id"]
+    api.post("/api/bids/925000031/link-fmv", json={"comic_id": comic_id, "grade": 6.0})
+    result = api.post("/api/comics/verify", json={"items": [
+        {"item_id": "925000031", "grade": 6.0}
+    ]}).json()["results"][0]
+    assert result["verdict"] == "needs_manual"
+    assert "too_sparse" in result["guidance"]
+    assert "re-run `/comic:fmv` later" in result["guidance"]
+    assert "Do NOT" not in result["guidance"]
+
+
 def _certified_bid_with_price(api, item_id, *, title, certifier, grade=9.2,
                               high=1000.0, max_bid=800.0):
     """A bid linked to an fmv row at `certifier`, with `bids.certifier` set."""

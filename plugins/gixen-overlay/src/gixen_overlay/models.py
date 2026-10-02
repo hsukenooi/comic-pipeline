@@ -306,6 +306,11 @@ class LinkFmvRequest(BaseModel):
     year: int | None = None
     certifier: str = FMV_CERTIFIER_NONE
     label: str = FMV_LABEL_UNIVERSAL
+    # BUI-1047: `item_id` repeats across bids rows (re-adds, tombstones) and
+    # the path alone resolves to the NEWEST row. Naming `bid_id` (a bids.id
+    # that must belong to the path's item_id) targets an older row, mirroring
+    # `UnlinkFmvRequest.bid_id`. Omitted keeps the newest-row behavior.
+    bid_id: int | None = None
 
     @field_validator("certifier", mode="before")
     @classmethod
@@ -816,6 +821,13 @@ class CompsExcludeRequest(BaseModel):
     # BUI-1018: which pool the product_ids live in. Default 'slab' keeps every
     # pre-existing caller (comic-fmv's BUI-947 stamp) byte-identical.
     pool: str = "slab"
+    # BUI-1047: opt-in preview. Defaults to False (APPLY), unlike the sibling
+    # unstamp/exclude-by-id/restamp routes that default to True, because the
+    # production callers (`fmv_runner._post_comps_exclusions`,
+    # `backfill_comps_ledger.py`) send no `dry_run` and rely on the write.
+    # Flipping the default would turn every stamp they send into a silent
+    # no-op. Send `dry_run: true` to preview.
+    dry_run: bool = False
 
     @field_validator("pool")
     @classmethod
