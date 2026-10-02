@@ -119,6 +119,32 @@ NEGATIVE_CONTROL_BOOK: dict = {
 # failing) can still limp to.
 SENTINEL_MIN_N = 10
 
+# BUI-1081: floor on the GRADE-WINDOWED, IQR-trimmed pool (``pool_n``) that a
+# price comparison may rest on, distinct from SENTINEL_MIN_N above (the RAW
+# comp count, a fetch-health check). Captain America #100 fetches 33 raw comps
+# but only ~5 carry a parsed grade, so its graded pool was 0-2 week to week and
+# a single sale aging in or out read as a 2.32x "wild price jump" against a
+# one-comp baseline. A median of fewer than 3 comps is one sale, not a price:
+# below this the book gets its own INCONCLUSIVE verdict, is never seeded as a
+# baseline, and a baseline that was seeded below it is re-seeded. 3 is also the
+# smallest pool ``iqr_trim`` trims, and sits under the healthy sentinels'
+# measured pools (ASM #300: 14, Batman #251: 5).
+SENTINEL_MIN_POOL_N = 3
+
+# BUI-1081: an INCONCLUSIVE (thin-pool) book does not fail the run — the raw
+# count floor above already proves the fetch worked — but the run must still
+# contain real price comparisons or it is not measuring the instrument. If
+# fewer than this many sentinels reached a conclusive verdict (compared, or
+# seeded off a deep pool), the run FAILS: grade parsing broken wholesale would
+# thin every pool at once, and that must not read as green.
+MIN_CONCLUSIVE_SENTINELS = 2
+
+# BUI-1082: set to a non-empty value to make a run fail deterministically
+# without touching code or data — a drill for the failure heartbeat. It skips
+# the provider fetch (no request budget spent), reports one synthetic failing
+# check, and takes the real failure path (exit 1 + failure ping).
+FORCE_FAIL_ENV = "COMIC_FMV_SENTINEL_FORCE_FAIL"
+
 # BUI-603: "wild price jump" bounds on (this run's grade-windowed, IQR-trimmed
 # median) / (last known-good median for the same book+grade). Grounded in the
 # same corpus: fmv_math.cv() (stdev/median) on these three sentinels' own
@@ -289,10 +315,13 @@ def _priced_median(comps: list[dict], target_grade: float) -> tuple[float, int, 
 class _Verdict:
     OK = "OK"
     OK_BASELINE_SEEDED = "OK (baseline seeded)"
+    OK_BASELINE_RESEEDED = "OK (baseline re-seeded)"
+    THIN_POOL = "INCONCLUSIVE: graded pool too thin to compare"
+    TOO_FEW_CONCLUSIVE = "ALERT: too few conclusive sentinels"
+    FORCED_FAILURE = "ALERT: forced failure (drill)"
     ZERO_COMPS = "ALERT: n=0"
     FETCH_ERROR = "ALERT: fetch error"
     DEGRADED_POOL = "ALERT: pool below floor"
-    NO_GRADEABLE_COMPS = "ALERT: no gradeable comps"
     PRICE_JUMP = "ALERT: wild price jump"
     MATCHER_BROKE_OPEN = "ALERT: negative control matched"
     EVAL_ERROR = "ALERT: evaluation error"
@@ -338,21 +367,36 @@ def _check_sentinel(book: dict, result: dict, baselines: dict) -> dict:
                 "pass": False}
 
     priced = _priced_median(comps, book["target_grade"])
-    if priced is None:
-        return {"label": label, "verdict": _Verdict.NO_GRADEABLE_COMPS, "n": n,
-                "detail": f"n={n} raw comps but none carry a parsed grade "
-                          f"within ±{fmv_math.MAX_GRADE_WINDOW} of "
-                          f"{book['target_grade']}", "pass": False}
+    if priced is None or priced[1] < SENTINEL_MIN_POOL_N:
+        # BUI-1081: thin graded pool (including none at all) — own verdict,
+        # not a failure and not a baseline. Passing here is safe only because
+        # run_sentinel_probe separately requires MIN_CONCLUSIVE_SENTINELS.
+        pool_n = 0 if priced is None else priced[1]
+        return {"label": label, "verdict": _Verdict.THIN_POOL, "n": n,
+                "detail": f"n={n} raw comps but only {pool_n} within "
+                          f"±{fmv_math.MAX_GRADE_WINDOW} of "
+                          f"{book['target_grade']} carry a parsed grade "
+                          f"(need {SENTINEL_MIN_POOL_N}); no comparison made, "
+                          "baseline left untouched",
+                "pass": True, "conclusive": False}
     median, pool_n, window = priced
 
     key = _book_key(book)
     prior = baselines.get(key)
-    if prior is None:
+    prior_thin = prior is not None and prior.get("pool_n", 0) < SENTINEL_MIN_POOL_N
+    if prior is None or prior_thin:
         baselines[key] = {"median": median, "pool_n": pool_n}
+        if prior_thin:
+            return {"label": label, "verdict": _Verdict.OK_BASELINE_RESEEDED, "n": n,
+                    "detail": f"median=${median:.2f} (pool_n={pool_n}, "
+                              f"window=±{window}); replaced a baseline of "
+                              f"${prior['median']:.2f} seeded from "
+                              f"pool_n={prior.get('pool_n')} (< {SENTINEL_MIN_POOL_N})",
+                    "pass": True, "conclusive": True}
         return {"label": label, "verdict": _Verdict.OK_BASELINE_SEEDED, "n": n,
                 "detail": f"median=${median:.2f} (pool_n={pool_n}, "
                           f"window=±{window}); no prior baseline to compare",
-                "pass": True}
+                "pass": True, "conclusive": True}
 
     baseline_median = prior["median"]
     ratio = median / baseline_median if baseline_median else float("inf")
@@ -361,14 +405,15 @@ def _check_sentinel(book: dict, result: dict, baselines: dict) -> dict:
                 "detail": f"median=${median:.2f} vs baseline ${baseline_median:.2f} "
                           f"(ratio={ratio:.2f}x, outside "
                           f"[{PRICE_JUMP_LOWER_RATIO}, {PRICE_JUMP_UPPER_RATIO}])",
-                "pass": False}
+                "pass": False, "conclusive": True}
 
     # Healthy read — roll the baseline forward (see module docstring: only a
     # PASSING run may update it).
     baselines[key] = {"median": median, "pool_n": pool_n}
     return {"label": label, "verdict": _Verdict.OK, "n": n,
             "detail": f"median=${median:.2f} (pool_n={pool_n}, window=±{window}, "
-                      f"ratio={ratio:.2f}x vs baseline)", "pass": True}
+                      f"ratio={ratio:.2f}x vs baseline)", "pass": True,
+            "conclusive": True}
 
 
 def _check_negative_control(result: dict) -> dict:
@@ -432,6 +477,33 @@ def _ping_heartbeat(server_url: str | None) -> None:
         print(f"sentinel-probe: heartbeat ping failed (non-fatal): {e}", file=sys.stderr)
 
 
+def _ping_heartbeat_failure(server_url: str | None, detail: str) -> None:
+    """Best-effort POST /api/heartbeat/sentinel-probe/failure (BUI-1082).
+
+    Records "ran and failed" apart from "didn't run" so the dashboard row goes
+    red the day the probe fails, not at the 2x-cadence staleness backstop. Like
+    the success ping it never raises and never changes the exit code, and a 404
+    (an overlay that predates BUI-1082) is only a skew warning.
+    """
+    if not server_url:
+        print("sentinel-probe: no comics-server URL — skipping the failure ping.",
+              file=sys.stderr)
+        return
+    try:
+        resp = requests.post(
+            f"{server_url}/api/heartbeat/{HEARTBEAT_JOB_NAME}/failure",
+            params={"detail": detail[:300]}, timeout=10,
+        )
+        if resp.status_code == 404:
+            print("sentinel-probe: failure ping 404 — the deployed overlay "
+                  "predates BUI-1082; re-deploy the comics server "
+                  "(./scripts/deploy.sh).", file=sys.stderr)
+            return
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        print(f"sentinel-probe: failure ping failed (non-fatal): {e}", file=sys.stderr)
+
+
 # ─── Entry point ────────────────────────────────────────────────────────────
 
 def run_sentinel_probe(*, server_url: str | None = None) -> int:
@@ -446,7 +518,10 @@ def run_sentinel_probe(*, server_url: str | None = None) -> int:
     FMV query costs nothing extra.
 
     Returns:
-      0 — every sentinel and the negative control passed.
+      0 — every sentinel and the negative control passed (a sentinel whose
+          graded pool is too thin to compare is INCONCLUSIVE, not a failure,
+          provided MIN_CONCLUSIVE_SENTINELS others reached a real verdict —
+          BUI-1081).
       1 — the probe ran to completion and at least one check failed (the
           alarm this whole module exists to raise).
       2 — the probe itself could not complete (binary missing, subprocess
@@ -454,9 +529,17 @@ def run_sentinel_probe(*, server_url: str | None = None) -> int:
           distinct from 1 so a caller doesn't mistake "couldn't check" for
           "checked, and it's broken".
     """
+    if os.environ.get(FORCE_FAIL_ENV):
+        msg = f"forced failure via {FORCE_FAIL_ENV} (BUI-1082 drill); no fetch made"
+        print(f"  [{_Verdict.FORCED_FAILURE}] drill: {msg}")
+        print("sentinel-probe: ALERT — forced failure.", file=sys.stderr)
+        _ping_heartbeat_failure(server_url, msg)
+        return 1
+
     payload = _sentinel_batch()
     results = _fetch_batch(payload)
     if results is None:
+        _ping_heartbeat_failure(server_url, "probe could not complete: comp fetch failed")
         return 2
 
     by_id: dict[int, dict] = {}
@@ -465,6 +548,7 @@ def run_sentinel_probe(*, server_url: str | None = None) -> int:
         if rid in by_id:
             print(f"sentinel-probe: duplicate result id {rid!r}; refusing to "
                   "map results positionally.", file=sys.stderr)
+            _ping_heartbeat_failure(server_url, "probe could not complete: duplicate result id")
             return 2
         by_id[rid] = r
     sent_ids = {b["_req_id"] for b in payload}
@@ -474,6 +558,7 @@ def run_sentinel_probe(*, server_url: str | None = None) -> int:
             f"got {len(results)}. Refusing to report against mismatched books.",
             file=sys.stderr,
         )
+        _ping_heartbeat_failure(server_url, "probe could not complete: result/identity mismatch")
         return 2
 
     baselines = _load_baselines()
@@ -487,6 +572,16 @@ def run_sentinel_probe(*, server_url: str | None = None) -> int:
         "(negative control)",
         _check_negative_control, by_id[len(SENTINEL_BOOKS)],
     ))
+
+    conclusive = sum(1 for r in reports[:len(SENTINEL_BOOKS)] if r.get("conclusive"))
+    if conclusive < MIN_CONCLUSIVE_SENTINELS:
+        reports.append({
+            "label": "sentinel coverage", "verdict": _Verdict.TOO_FEW_CONCLUSIVE,
+            "n": conclusive, "pass": False,
+            "detail": f"{conclusive} of {len(SENTINEL_BOOKS)} sentinels reached "
+                      f"a conclusive verdict (need {MIN_CONCLUSIVE_SENTINELS}); "
+                      "thin graded pools everywhere can mean grade parsing broke",
+        })
 
     print("comic-fmv sentinel probe (BUI-603) — calibration only, nothing written to FMV")
     for rep in reports:
@@ -503,10 +598,15 @@ def run_sentinel_probe(*, server_url: str | None = None) -> int:
 
     all_pass = all(rep["pass"] for rep in reports)
     if all_pass:
-        print("sentinel-probe: all checks passed.")
+        inconclusive = [r["label"] for r in reports if r.get("conclusive") is False]
+        print("sentinel-probe: all checks passed."
+              + (f" ({len(inconclusive)} inconclusive on a thin graded pool: "
+                 f"{', '.join(inconclusive)})" if inconclusive else ""))
         _ping_heartbeat(server_url)
         return 0
 
     print("sentinel-probe: ALERT — one or more checks failed (see above).",
           file=sys.stderr)
+    failed = [f"{r['label']}: {r['verdict']}" for r in reports if not r["pass"]]
+    _ping_heartbeat_failure(server_url, "; ".join(failed))
     return 1

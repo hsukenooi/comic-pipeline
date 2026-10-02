@@ -76,6 +76,28 @@ finally reachable — and still means what it said. A consumer wanting the
 narrower question ("is anything I *am* watching broken?") reads `stale_jobs`
 and `never_seen_jobs` directly.
 
+## Failure pings (BUI-1082)
+
+A job that knows its own verdict can report "ran and **failed**", which is a
+different fact from "did not run" (`stale`/`never`):
+
+```sh
+comics-api POST "/api/heartbeat/<job>/failure?detail=<why>"
+```
+
+The job then reports `status: failing` (with `last_failure_at`,
+`last_failure_detail`, `failure_count`), appears in the report's `failing_jobs`,
+and makes `healthy` false, until a **later** success ping lands. A success
+older than the failure does not clear it. A job whose first ever run fails
+reads `failing`, not `never`. Failures live in their own table
+(`heartbeat_failures`, created idempotently by `create_tables`) because
+`heartbeats.last_success_at` is `NOT NULL`. An unknown job is a 404, same as
+the success ping. Old clients that only send the plain success ping are
+unaffected. The staleness backstop is unchanged.
+
+Only `sentinel-probe` sends failure pings today; any other job can adopt the
+same endpoint.
+
 ## Where the jobs ping (BUI-624, extended BUI-951)
 
 Five of the six ping over HTTP. `gixen-sync` cannot, and the exception is
@@ -119,8 +141,11 @@ instructive rather than incidental.
   BUI-601 ledger: the heartbeat says the refresh ran, the ledger says what it
   failed to store.
 - **`sentinel-probe`** — `apps/fmv/src/sentinel_probe.py`'s `_ping_heartbeat`,
-  on the all-pass branch only. Best-effort: a failed ping never changes the
-  probe's exit code, which is the primary alert surface. It needs a schedule to
+  on the all-pass branch only, and `_ping_heartbeat_failure` (BUI-1082) on exit
+  1 and exit 2, so a failed run shows red that day. A sentinel whose graded pool
+  is too thin to compare (BUI-1081) is `INCONCLUSIVE`, which passes only while
+  at least two other sentinels made a real comparison. Best-effort: a failed
+  ping never changes the probe's exit code, which is the primary alert surface. It needs a schedule to
   be worth anything — see `docs/reference/sentinel-probe-scheduling.md`.
 - **`slab-watch-collect`** — `apps/fmv/src/fmv_runner.py`'s
   `run_slab_watch_collect`, via `_ping_slab_watch_collect_heartbeat`, only when

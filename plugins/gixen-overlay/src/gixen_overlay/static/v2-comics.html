@@ -214,7 +214,7 @@
   #health-section .job-status { min-width: 190px; }
   #health-section .job-note { color: var(--fg-dim); font-size: 11px; }
   #health-section .s-ok { color: var(--green); }
-  #health-section .s-stale, #health-section .s-never { color: var(--red); font-weight: 600; }
+  #health-section .s-stale, #health-section .s-never, #health-section .s-failing { color: var(--red); font-weight: 600; }
   #health-section .s-pending_instrumentation { color: var(--fg-dim); }
   #health-section .rej-row td { vertical-align: top; }
   #health-section .rej-payload { color: var(--fg-dim); font-size: 11px; word-break: break-all; }
@@ -646,12 +646,21 @@ function healthChips() {
              title="writes the server refused, or accepted but logged for review (a row's detail says which), in the last ${rej.window_hours}h">`
         + `✕ ${rej.count} rejected write${rej.count === 1 ? "" : "s"}</span>`;
   }
+  const failing = (hb.failing_jobs || []).length;
   const broken = (hb.stale_jobs || []).length + (hb.never_seen_jobs || []).length;
   const pending = (hb.pending_instrumentation_jobs || []).length;
+  if (failing > 0) {
+    // BUI-1082: a job that RAN and reported failure; red the day it fails.
+    out += `<span class="health-chip bad" data-health-toggle
+             title="jobs whose latest run reported failure and have not succeeded since">`
+        + `✕ ${failing} job${failing === 1 ? "" : "s"} failing</span>`;
+  }
   if (broken > 0) {
     out += `<span class="health-chip bad" data-health-toggle
              title="jobs whose last success is older than their declared cadence">`
         + `✕ ${broken} job${broken === 1 ? "" : "s"} stale</span>`;
+  } else if (failing > 0) {
+    // already shown red above; no green or amber chip alongside it
   } else if (pending > 0) {
     // Never green: these jobs have a declared contract but nothing pings yet,
     // so we genuinely do not know whether they are running.
@@ -682,6 +691,8 @@ function renderHealth() {
     const age = j.age_hours == null ? "never" : `${j.age_hours.toFixed(1)}h ago`;
     const note = j.status === "pending_instrumentation"
       ? escapeHtml(j.ping || "")
+      : j.status === "failing"
+      ? escapeHtml(`last run failed ${j.last_failure_at || ""}: ${j.last_failure_detail || "no detail"}`)
       : `cadence ${j.cadence_hours}h · stale after ${j.stale_after_hours}h`;
     return `<div class="job-row">`
       + `<span class="job-name">${escapeHtml(j.job)}</span>`

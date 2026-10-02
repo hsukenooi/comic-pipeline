@@ -142,6 +142,7 @@ elif healthy is False:
         return ",".join(str(v) for v in vals)
 
     print("STATUS=UNHEALTHY")
+    print("FAILING=" + csv("failing_jobs"))
     print("STALE=" + csv("stale_jobs"))
     print("NEVER=" + csv("never_seen_jobs"))
     print("PENDING=" + csv("pending_instrumentation_jobs"))
@@ -157,12 +158,14 @@ if [ "$parse_status" -ne 0 ] || [ -z "$parsed" ]; then
 fi
 
 status="PARSE_ERROR"
+failing_jobs=""
 stale_jobs=""
 never_jobs=""
 pending_jobs=""
 while IFS='=' read -r key value; do
   case "$key" in
     STATUS) status="$value" ;;
+    FAILING) failing_jobs="$value" ;;
     STALE) stale_jobs="$value" ;;
     NEVER) never_jobs="$value" ;;
     PENDING) pending_jobs="$value" ;;
@@ -187,7 +190,7 @@ case "$status" in
     exit 1
     ;;
   UNHEALTHY)
-    fail_body="stale_jobs=${stale_jobs}; never_seen_jobs=${never_jobs}; pending_instrumentation_jobs=${pending_jobs}"
+    fail_body="failing_jobs=${failing_jobs}; stale_jobs=${stale_jobs}; never_seen_jobs=${never_jobs}; pending_instrumentation_jobs=${pending_jobs}"
     echo "heartbeat-outer-ping: heartbeats report healthy=false — ${fail_body}" >&2
     # Best-effort: whether or not this delivers, the script still exits
     # non-zero below. If it fails to deliver too, the resulting silence
