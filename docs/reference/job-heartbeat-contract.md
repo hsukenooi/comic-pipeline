@@ -31,6 +31,7 @@ a ping is the alarm.
 | `fmv-refresh` | 168h | 336h | A `comic-fmv` batch that fetched sold comps **and persisted them**. BUI-593 is precisely a run where the fetch succeeded and the write 422'd, so "`comic-fmv` exited 0" alone is not the success definition; the upsert must have been accepted. | yes |
 | `sentinel-probe` | 168h | 336h | A `comic-fmv --sentinel-probe` run (BUI-603) where every sentinel book **and** the negative control passed — exit 0. Stricter than the rest on purpose: exit 1 means the probe ran and found the comp pipeline miscalibrated, which already alarms via its own exit code. Exit 2 (could not complete) does not ping either. | yes |
 | `slab-watch-collect` | 672h | 1344h | A `comic-fmv --slab-watch-collect` run (BUI-951) where every comp fetch **and** every ledger write it attempted succeeded — exit 0. Mirrors `fmv-refresh`'s BUI-593 lesson: a fetch that ran clean while its ledger POST failed must not ping. A run where every watch-set book was already fresh (nothing fetched) still pings, and so does a run that hit its request cap as long as nothing it attempted failed. | yes |
+| `unpriced-rerun` | 672h | 1344h | A `comic-fmv --unpriced-rerun` run (BUI-1080) where every comp fetch **and** every fmv/ledger write it attempted succeeded — exit 0. Same rule as `slab-watch-collect`: a fetch that ran clean while its upsert or ledger POST failed must not ping, nor must a run where a row's hand-priced provenance could not be verified or the server rejected a write. A run with nothing unpriced still pings, and so does a run that hit its request cap as long as nothing it attempted failed. A failing run POSTs `/api/heartbeat/unpriced-rerun/failure` instead. | yes |
 
 Cadences are sized to the **slowest normal run**, not the average, and a job is
 only flagged once it is `HEARTBEAT_STALE_FACTOR` (2×) cadences late. A watchdog
@@ -70,8 +71,9 @@ The report's top-level `healthy` means *every job in the contract is verified
 to be running*, so an uninstrumented job makes it `false` exactly as a stale one
 does. Before BUI-624 that meant `healthy` was permanently `false`: nothing
 pinged, and a version that counted only wired jobs would have handed an external
-monitor a green light for a system observing almost nothing. All six are wired
-now (BUI-951 added the sixth, `slab-watch-collect`), so `healthy: true` is
+monitor a green light for a system observing almost nothing. All seven are wired
+now (BUI-951 added the sixth, `slab-watch-collect`; BUI-1080 the seventh,
+`unpriced-rerun`), so `healthy: true` is
 finally reachable — and still means what it said. A consumer wanting the
 narrower question ("is anything I *am* watching broken?") reads `stale_jobs`
 and `never_seen_jobs` directly.
@@ -154,8 +156,15 @@ instructive rather than incidental.
   launchd calendar slot to "every four weeks") by
   `scripts/launchd/com.comics.slab-watch-collect.plist` — see
   `scripts/launchd/README.md` for install/verify steps.
+- **`unpriced-rerun`** — `apps/fmv/src/fmv_runner.py`'s `run_unpriced_rerun`
+  (BUI-1080), via `_ping_unpriced_rerun_heartbeat`, only when every fetch and
+  every write it attempted succeeded; otherwise `_ping_unpriced_rerun_failure`
+  POSTs `/api/heartbeat/unpriced-rerun/failure`. Capped by
+  `UNPRICED_RERUN_MAX_REQUESTS` books per run (default 150). Scheduled on the
+  1st at 10:00, after slab-watch-collect's 09:30, by
+  `scripts/launchd/com.comics.unpriced-rerun.plist`.
 
-Every ping is **advisory to its caller**: none of the six may fail, block, or
+Every ping is **advisory to its caller**: none of the seven may fail, block, or
 alter the job it reports on. A watchdog that can break the work it watches has
 bought nothing.
 
