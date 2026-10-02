@@ -2,8 +2,8 @@
 
 Reads a seat spec, runs ``grade-crops`` once per book, writes each seat's job
 text, launches every seat as a parallel ``claude -p`` process, retries a failed
-seat once, runs the BUI-1090 second pass for books whose seats split by 1.0 or
-more, and prints one compact block per book plus the per-seat usage table.
+seat once, runs one adjudicator seat (BUI-1100) for each book whose seats split
+by 1.0 or more, and prints one compact block per book plus the usage table.
 
 Spec JSON::
 
@@ -15,7 +15,7 @@ Spec JSON::
                 "batch": null}]}                  # same string = one shared seat
 
 Books that share a ``batch`` value are graded by one seat (the first book's
-first seat name); a batch is first-pass only, with no second pass.
+first seat name); a batch is first-pass only, with no adjudicator.
 """
 
 import argparse
@@ -34,6 +34,12 @@ HARNESS = (
     "HARNESS: SendMessage is unavailable in this run. Your final message is your "
     "report: end with the OUTPUT FORMAT block(s) and write nothing after them."
 )
+ADJ_HARNESS = (
+    "HARNESS: SendMessage is unavailable in this run. Your final message is your "
+    "report: the RECONCILED BLOCK line, one OUTPUT FORMAT block, the SEAT FINDINGS "
+    "line and its seat lines, and nothing after them."
+)
+ADJUDICATOR = "adjudicator"
 SPLIT_THRESHOLD = 1.0
 SEAT_TIMEOUT = float(os.environ.get("GRADE_SEATS_TIMEOUT", "900"))
 REQUIRED = ("GRADE:", "GRADE RANGE:", "CONFIDENCE:")
@@ -82,7 +88,29 @@ def parse_block(text):
         "cap": cap,
         "defect": _scrub("; ".join(parts))[:240],
         "limits": _field(text, "PHOTO LIMITATIONS")[:240],
+        "raw": text.strip(),
     }
+
+
+def parse_adjudication(text):
+    """Parse the adjudicator's reply: its reconciled block plus per-seat findings.
+
+    The reply may quote the seats' blocks, so the reconciled block is the text after
+    the LAST ``RECONCILED BLOCK`` marker, up to ``SEAT FINDINGS``. Without a marker
+    the reply must hold exactly one GRADE: line, or it is ambiguous and fails.
+    """
+    marks = list(re.finditer(r"^[ \t*#]*RECONCILED BLOCK\b.*$", text, re.M))
+    body = text[marks[-1].end():] if marks else text
+    if not marks and len(re.findall(r"^GRADE:", text, re.M)) != 1:
+        return None
+    parts = re.split(r"^[ \t*#]*SEAT FINDINGS\b.*$", body, maxsplit=1, flags=re.M)
+    block = parse_block(parts[0])
+    if not block:
+        return None
+    tail = parts[1] if len(parts) > 1 else ""
+    block["findings"] = [ln.strip().lstrip("-* ").strip()[:400]
+                         for ln in tail.splitlines() if ln.strip().startswith(("-", "*"))]
+    return block
 
 
 def split_books(result, item_ids):
@@ -97,7 +125,7 @@ def split_books(result, item_ids):
     return out
 
 
-def parse_envelope(path, item_ids):
+def parse_envelope(path, item_ids, parse=parse_block):
     """Return ({item_id: parsed or None}, usage dict, error string)."""
     usage = {"turns": 0, "out": 0, "cache_read": 0, "cache_create": 0}
     none = {i: None for i in item_ids}
@@ -117,7 +145,7 @@ def parse_envelope(path, item_ids):
     if d.get("is_error"):
         return none, usage, str(d.get("subtype") or "is_error")
     texts = split_books(d.get("result") or "", item_ids)
-    parsed = {i: parse_block(texts[i]) for i in item_ids}
+    parsed = {i: parse(texts[i]) for i in item_ids}
     err = "" if all(parsed.values()) else "no OUTPUT FORMAT block"
     return parsed, usage, err
 
@@ -141,30 +169,46 @@ def book_block(book, seat, crops_shared):
     return "\n".join(lines)
 
 
-def build_job(books, seat, shared, cross=None):
+def build_job(books, seat, shared):
     text = "\n\n".join(book_block(b, seat, shared.get(b["item_id"])) for b in books) + "\n\n"
-    if cross:
-        text += (
-            "CROSS-EXAMINATION (second pass): other graders of this book saw the defects "
-            "below. Read their crops, then re-grade from all the evidence. Change your grade "
-            "only for a defect you can confirm in a photo or crop; printed art, glare, and "
-            "lint are not defects. Return a full OUTPUT FORMAT block.\n" + cross + "\n\n"
-        )
     return text + HARNESS + "\n"
 
 
-def cross_text(seat, firsts, xexam):
-    """One line per other seat: its defect line (no grade number) plus crop paths."""
-    out = []
-    for other, parsed in firsts.items():
-        if other != seat:
-            crops = ", ".join(xexam.get(other, [])) or "none"
-            out.append(f"- {other}: {parsed['defect'] or 'no named defect'}. Crops: {crops}")
-    return "\n".join(out)
+def adjudication_job(book, firsts, xexam, shared):
+    """One adjudicator job: every first-pass seat's full block and crops (BUI-1100)."""
+    seats = ", ".join(firsts)
+    out = [book_block(book, ADJUDICATOR, shared.get(book["item_id"])), "",
+           f"ADJUDICATION: the first-pass graders of this book ({seats}) split by "
+           f"{SPLIT_THRESHOLD:.1f} or more. You are the adjudicator, not another independent "
+           "seat. Their full OUTPUT FORMAT blocks and the ad hoc crops each one made follow. "
+           "Do not re-survey every photo: in one parallel turn Read every seat crop listed "
+           "below plus the shared crops and photos that show the disputed defects, then at "
+           "most one ad hoc crop round into your CROP DIRECTORY. Test each defect claim that "
+           "moves a seat's grade or cap. Confirm a claim only when you can see it in a named "
+           "photo or crop; printed art, glare, and lint are not defects. A claim nobody can "
+           "see either way is coverage: widen GRADE RANGE and lower CONFIDENCE, never "
+           "average the grades.",
+           "Reply in exactly this shape, nothing before or after:",
+           "RECONCILED BLOCK",
+           "<one full OUTPUT FORMAT block for this book>",
+           "SEAT FINDINGS",
+           "- <seat name>: confirmed <claims, each with its photo or crop>; rejected "
+           "<claims> because <why>",
+           f"(one line per seat: {seats})", ""]
+    for seat, parsed in firsts.items():
+        crops = xexam.get(seat) or []
+        out.append(f"=== FIRST-PASS SEAT {seat} ===")
+        out.append(f"SEAT CROPS ({seat}):")
+        out += [f"  {c}" for c in crops] or ["  none (this seat made no ad hoc crops)"]
+        out.append(f"SEAT BLOCK ({seat}):")
+        out.append(parsed.get("raw") or "(block text unavailable)")
+        out.append(f"=== END SEAT {seat} ===")
+        out.append("")
+    return "\n".join(out) + "\n" + ADJ_HARNESS + "\n"
 
 
 def copy_crops(folder, seat):
-    """Copy a seat's ad hoc crops to xexam/ so the second pass cannot overwrite them."""
+    """Copy a seat's ad hoc crops to xexam/ so the adjudicator reads a stable copy."""
     dest = Path(folder) / "xexam"
     dest.mkdir(exist_ok=True)
     out = []
@@ -212,7 +256,7 @@ def run_seat(workdir, folder, seat, suffix, job):
     return str(env_path), err
 
 
-def run_units(workdir, units, suffix, log):
+def run_units(workdir, units, suffix, log, parse=parse_block):
     """Run units (seat, books, job) in parallel, retrying each failure once.
 
     Returns {(seat, first folder): {item_id: parsed or None}}. Every attempt,
@@ -221,7 +265,7 @@ def run_units(workdir, units, suffix, log):
     def attempt(unit, sfx):
         seat, books, job = unit
         env, run_err = run_seat(workdir, books[0]["folder"], seat, sfx, job)
-        parsed, usage, perr = parse_envelope(env, [b["item_id"] for b in books])
+        parsed, usage, perr = parse_envelope(env, [b["item_id"] for b in books], parse)
         return unit, sfx, parsed, usage, run_err or perr
 
     def key(unit):
@@ -290,25 +334,19 @@ def make_units(books, shared):
     return units
 
 
-def second_pass(workdir, book, good, shared, log):
-    """Cross-examine one split book. Returns ({seat: parsed+p1}, failed seats)."""
+def adjudicate(workdir, book, good, shared, log):
+    """Run one adjudicator seat for a split book; its parsed block, or None (BUI-1100)."""
     xexam = {s: copy_crops(book["folder"], s) for s in good}
-    units = [(s, [book], build_job([book], s, shared, cross_text(s, good, xexam))) for s in good]
-    p2, failed = {}, []
-    for (s, _), parsed in run_units(workdir, units, "-p2", log).items():
-        v = parsed[book["item_id"]]
-        if v:
-            p2[s] = dict(v, p1=good[s]["grade"])
-        else:
-            failed.append(s)
-    return p2, failed
+    unit = (ADJUDICATOR, [book], adjudication_job(book, good, xexam, shared))
+    res = run_units(workdir, [unit], "", log, parse=parse_adjudication)
+    return res[(ADJUDICATOR, book["folder"])][book["item_id"]]
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="grade-seats",
         description="Run every /comic:grade headless grader seat in one call: shared crops, "
-        "parallel claude -p seats, one retry per failed seat, a second pass on a 1.0+ split. "
+        "parallel claude -p seats, one retry per failed seat, one adjudicator seat on a 1.0+ split. "
         "Prints one compact block per book and the per-seat usage table.",
     )
     parser.add_argument("spec", type=Path, help="seat spec JSON (see the module docstring)")
@@ -347,20 +385,22 @@ def main(argv=None) -> int:
         home = next(x["folder"] for x in books if x.get("batch") == b["batch"]) if b.get("batch") else b["folder"]
         res = {s: first[(s, home)][iid] for s in seat_names
                if (s, home) in first and first[(s, home)].get(iid)}
-        info = {"p2": False, "split_before": None, "split_after": None, "p2_failed": []}
+        info = {"split": None, "adjudicator": None, "adjudicator_failed": False}
         grades = [v["grade"] for v in res.values()]
         if not b.get("batch") and len(grades) >= 2 and max(grades) - min(grades) >= SPLIT_THRESHOLD:
-            info["split_before"] = max(grades) - min(grades)
-            p2, info["p2_failed"] = second_pass(workdir, b, res, shared, log)
-            info["p2"] = True
-            res.update(p2)
-            g2 = [v["grade"] for v in res.values()]
-            info["split_after"] = max(g2) - min(g2)
-        seats = [dict(res[s], seat=s) if s in res else {"seat": s, "failed": True} for s in seat_names]
+            info["split"] = max(grades) - min(grades)
+            adj = adjudicate(workdir, b, res, shared, log)
+            if adj:
+                info["adjudicator"] = {k: v for k, v in adj.items() if k != "raw"}
+            else:
+                info["adjudicator_failed"] = True
+        seats = [dict({k: v for k, v in res[s].items() if k != "raw"}, seat=s)
+                 if s in res else {"seat": s, "failed": True} for s in seat_names]
         report["books"].append({"item_id": iid, "comic": b["comic"], "seats": seats, **info})
     for unit, sfx, usage, err in log:
         report["usage"].append({"book": unit[1][0]["comic"], "seat": unit[0],
-                                "pass": 2 if "-p2" in sfx else 1, "retry": sfx.endswith("-retry"),
+                                "pass": "adj" if unit[0] == ADJUDICATOR else 1,
+                                "retry": sfx.endswith("-retry"),
                                 "error": err, **usage})
 
     print(json.dumps(report, indent=2) if args.json else render(report))
@@ -376,19 +416,24 @@ def render(report):
             if s.get("failed"):
                 out.append(f"{tag} {s['seat']}: FAILED (no valid block after retry)")
                 continue
-            p1 = f" (p1 {s['p1']})" if "p1" in s else ""
-            out.append(f"{tag} {s['seat']}: {s['grade']}{p1} | {s['range']} | {s['confidence']} | "
+            out.append(f"{tag} {s['seat']}: {s['grade']} | {s['range']} | {s['confidence']} | "
                        f"cap: {s['cap'] or 'none'} | defect: {s['defect']}")
+        adj = bk["adjudicator"]
+        if adj:
+            out.append(f"ADJ {ADJUDICATOR}: {adj['grade']} | {adj['range']} | {adj['confidence']} | "
+                       f"cap: {adj['cap'] or 'none'} | defect: {adj['defect']}")
+            out += [f"  - {f}" for f in adj["findings"]] or ["  (no seat findings returned)"]
         returned = sum(1 for s in bk["seats"] if not s.get("failed"))
         out.append(f"Seats: {returned} of {len(bk['seats'])} returned")
-        if bk["p2"]:
-            note = f"Cross-examined: split {bk['split_before']:.1f} → {bk['split_after']:.1f}"
-            if bk["p2_failed"]:
-                note += f" (second pass failed, first-pass grade kept: {', '.join(bk['p2_failed'])})"
-            out.append(note)
+        if adj:
+            out.append(f"Adjudicated: split {bk['split']:.1f}, adjudicator grade {adj['grade']}")
+        elif bk["adjudicator_failed"]:
+            out.append(f"Adjudicated: split {bk['split']:.1f}, adjudicator FAILED twice, "
+                       "first-pass grades kept")
         else:
-            out.append("Cross-examined: no")
-        limits = next((s["limits"] for s in bk["seats"] if s.get("limits")), "")
+            out.append("Adjudicated: no")
+        src = ([adj] if adj else []) + bk["seats"]
+        limits = next((s["limits"] for s in src if s.get("limits")), "")
         if limits:
             out.append(f"Caveats: {limits}")
         out.append("")
