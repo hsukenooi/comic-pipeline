@@ -123,11 +123,27 @@ def _print_version(ctx: click.Context, param: click.Parameter, value: bool) -> N
                    "where every book was already fresh still pings (zero "
                    "results is a success). Exits 0 (success), 1 (a fetch or "
                    "write failed), 2 (could not start). Ignores --batch.")
+@click.option("--probe", is_flag=True,
+              help="BUI-1085: no-write mode. Fetch comps and compute the "
+                   "price exactly as a normal run and print it, but write "
+                   "NOTHING to the comics server: no fmv rows, no comic "
+                   "stubs, no comps-ledger posts, no exclusion stamps, no "
+                   "heartbeat. Reads still happen (DB cache, hand-priced "
+                   "guard, certifier schema probe), so a hand-priced row is "
+                   "still skipped and a fresh row for the SAME grade is still "
+                   "reused (add --force to re-fetch). Rows carry no "
+                   "comic_id/fmv_id, so nothing can be linked to a snipe from "
+                   "a probe. Spends provider requests like a normal run. "
+                   "Use it to price a grade nobody confirmed (the /comic:buy "
+                   "sensitivity gate). --out still writes its local file. "
+                   "Cannot combine with --sentinel-probe or "
+                   "--slab-watch-collect.")
 def cli(batch_path: str | None, out_path: str | None,
         max_age_days: float, force: bool, grade_window: float | None,
         quiet: bool, brief: bool, server_url: str | None,
         inversion_sweep: bool, sentinel_probe: bool,
-        list_slab_watch: bool, slab_watch_collect: bool) -> None:
+        list_slab_watch: bool, slab_watch_collect: bool,
+        probe: bool = False) -> None:
     """Compute fair market value for a batch of comics.
 
     Pipeline per book:
@@ -168,6 +184,10 @@ def cli(batch_path: str | None, out_path: str | None,
             "warning: GIXEN_SERVER_URL is deprecated; use COMICS_SERVER_URL",
             err=True,
         )
+    if probe and (sentinel_probe or slab_watch_collect):
+        raise click.UsageError(
+            "--probe is a pricing no-write mode and cannot combine with "
+            "--sentinel-probe or --slab-watch-collect.")
     # BUI-583: a read-only consistency report, not a pricing run — handled
     # before run()'s --batch gate, which would otherwise reject the sweep for
     # missing an input batch it does not use.
@@ -202,6 +222,7 @@ def cli(batch_path: str | None, out_path: str | None,
         quiet=quiet,
         brief=brief,
         server_url=server_url,
+        probe=probe,
     )
 
 

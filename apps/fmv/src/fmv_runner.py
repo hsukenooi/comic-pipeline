@@ -357,8 +357,16 @@ def run(*, batch_path: str | None, out_path: str | None,
         max_age_days: float, force: bool,
         quiet: bool, server_url: str | None,
         grade_window: float | None = None,
-        brief: bool = False) -> None:
+        brief: bool = False,
+        probe: bool = False) -> None:
     """Driver for `comic-fmv`. Exits with sys.exit on hard failures.
+
+    `probe` (BUI-1085) is the no-write mode: the same fetch and the same math
+    as a normal run, but every comics-server write (fmv upsert, comic stub,
+    comps ledger, exclusion stamps, heartbeat) is suppressed — see
+    `_PROBE_MODE`. Reads (cache lookup, hand-priced provenance, certifier
+    schema probe) still happen, so the hand-priced guard and the DB-cache
+    split behave exactly as on a normal run.
 
     `grade_window` (BUI-86) caps how far the comp pool may widen; None uses
     fmv_math's default ceiling. It does not bypass the priceability guards.
@@ -367,6 +375,8 @@ def run(*, batch_path: str | None, out_path: str | None,
     (see `_brief_row`) after the human table — the linkage/pricing projection
     an orchestrator needs, without re-reading the full `--out` file.
     """
+    global _PROBE_MODE
+    _PROBE_MODE = bool(probe)
     if not server_url:
         click.echo("Error: COMICS_SERVER_URL must be set. The fmv command "
                    "needs the server for cache reuse and DB upsert.", err=True)
@@ -585,6 +595,13 @@ def run(*, batch_path: str | None, out_path: str | None,
 
     if not quiet:
         _print_table(final)
+    if _PROBE_MODE:
+        click.echo(
+            "PROBE (BUI-1085): nothing was written to the comics server. "
+            "No fmv rows, comic stubs, or ledger posts exist for these "
+            "prices, and no row carries a comic_id/fmv_id to link.",
+            err=True,
+        )
 
     # BUI-533: report the skip count unconditionally (not gated by --quiet) so
     # it surfaces whether the caller reads the human table/summary or only
@@ -838,7 +855,7 @@ def _ping_fmv_heartbeat(server_url: str, *, persisted: int) -> None:
     accepted deliberately, because that error direction is loud and
     investigable, and the other one is silent and expensive.
     """
-    if persisted <= 0:
+    if persisted <= 0 or _PROBE_MODE:
         return
     try:
         resp = requests.post(
@@ -3774,6 +3791,21 @@ class _UpsertRejected(Exception):
     """
 
 
+# BUI-1085: the no-write ("probe") mode, set per process by `run(probe=True)`.
+# A probe fetches comps and prices exactly like a normal run but writes
+# NOTHING to the comics server, so an orchestrator can price a book at grades
+# nobody confirmed (the /comic:buy decision-sensitivity gate probes both ends
+# of a grader's range) without storing those prices. Enforced centrally:
+# `_post_json` (every upsert and ledger post goes through it) returns a
+# synthetic echo instead of POSTing, and the three direct `requests.post`
+# sites (heartbeat, exclusion stamps, slab-watch heartbeat) check the flag
+# themselves. Reads are untouched, so the DB-cache split and the hand-priced
+# guard behave as on a normal run; the cache is NOT bypassed, because its
+# lookup already matches the exact grade (a row for another grade can never
+# satisfy a probe) and `--force` still skips it.
+_PROBE_MODE = False
+
+
 def _post_json(url: str, body: dict, *, what: str,
                hard_fail: bool = True) -> dict | None:
     """POST JSON and return the parsed response, failing LOUD (BUI-186 / R11).
@@ -3798,7 +3830,14 @@ def _post_json(url: str, body: dict, *, what: str,
     book at its already-persisted result rather than nuking a run whose
     primary writes all succeeded. The caller must then NOT promote the
     in-memory result to a price the DB doesn't hold.
+
+    BUI-1085: under `_PROBE_MODE` nothing is POSTed. The synthetic return
+    echoes the body (so `_upsert_fmv`'s certifier-echo check still passes)
+    and carries NO `comic_id`/`fmv_id`, which is the truth: nothing was
+    stored, so nothing exists to link a snipe to.
     """
+    if _PROBE_MODE:
+        return dict(body)
     try:
         resp = requests.post(url, json=body, timeout=15)
         resp.raise_for_status()
@@ -4158,6 +4197,11 @@ def _post_comps_exclusions(server_url: str, dropped_rows: list[dict],
             if code is None:
                 continue
             ids_by_code.setdefault(code, []).append(pid)
+
+        if _PROBE_MODE:
+            # BUI-1085: no-write mode. Report what WOULD be stamped so the
+            # run-level "dropped N, stamped M" warning does not fire falsely.
+            return sum(len(p) for p in ids_by_code.values())
 
         stamped = 0
         for code, pids in sorted(ids_by_code.items()):
@@ -5770,6 +5814,8 @@ def _ping_slab_watch_collect_heartbeat(server_url: str, *, detail: str) -> None:
     (BUI-593: a fetch that ran clean but whose ledger write silently failed
     must not ping).
     """
+    if _PROBE_MODE:  # BUI-1085: no-write mode never pings
+        return
     try:
         resp = requests.post(
             f"{server_url}/api/heartbeat/slab-watch-collect",
