@@ -367,6 +367,20 @@ def create_tables(conn: sqlite3.Connection) -> None:
             success_count    INTEGER NOT NULL DEFAULT 1
         )
     """)
+    # BUI-1082: "ran and FAILED", kept apart from "didn't run". A separate
+    # table (not columns on `heartbeats`) because `heartbeats.last_success_at`
+    # is NOT NULL: a job whose very first run fails has no success row to hang
+    # the failure on, and loosening that NOT NULL would need a table rebuild on
+    # the production DB. CREATE TABLE IF NOT EXISTS is the idempotent migration;
+    # old servers simply never have the table, old clients never touch it.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS heartbeat_failures (
+            job              TEXT PRIMARY KEY,
+            last_failure_at  TEXT NOT NULL,
+            detail           TEXT,
+            failure_count    INTEGER NOT NULL DEFAULT 1
+        )
+    """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS migration_state (
             migration TEXT PRIMARY KEY
@@ -5928,7 +5942,11 @@ JOB_CONTRACTS: dict[str, dict[str, Any]] = {
             "consequence is intended: a persistently failing probe eventually "
             "also goes stale here, which is a second, louder alarm about the "
             "same fact and never a quieter one. Exit 2 (the probe could not "
-            "complete) must not ping either."
+            "complete) must not ping either. BUI-1082: exit 1 and exit 2 "
+            "instead POST /api/heartbeat/sentinel-probe/failure, so the row "
+            "reads `failing` the day it fails. BUI-1081: a sentinel with a "
+            "graded pool under 3 comps is INCONCLUSIVE (passes, never seeds a "
+            "baseline) while at least 2 sentinels made a real comparison."
         ),
         "wired": True,
         "ping": (
@@ -6007,6 +6025,9 @@ HEARTBEAT_STATUS_OK = "ok"
 HEARTBEAT_STATUS_STALE = "stale"
 HEARTBEAT_STATUS_NEVER = "never"
 HEARTBEAT_STATUS_PENDING = "pending_instrumentation"
+# BUI-1082: the job RAN and reported failure, and no success has landed since.
+# Worse than stale (it is a positive signal of breakage, not silence).
+HEARTBEAT_STATUS_FAILING = "failing"
 
 
 def record_heartbeat(
@@ -6044,6 +6065,38 @@ def record_heartbeat(
     return dict(row)
 
 
+def record_heartbeat_failure(
+    conn: sqlite3.Connection,
+    job: str,
+    *,
+    detail: str | None = None,
+    at: str | None = None,
+) -> dict[str, Any]:
+    """Record that `job` ran and FAILED (BUI-1082). Returns the stored row.
+
+    Upsert, one row per job, like `record_heartbeat`. A later success ping does
+    not delete this row; `heartbeat_report` calls the job failing only while the
+    failure is newer than the last success, so the row doubles as history.
+    Commit-free; the endpoint enforces the JOB_CONTRACTS allow-list.
+    """
+    ts = at or datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO heartbeat_failures (job, last_failure_at, detail, failure_count) "
+        "VALUES (?, ?, ?, 1) "
+        "ON CONFLICT(job) DO UPDATE SET "
+        "  last_failure_at = excluded.last_failure_at, "
+        "  detail = excluded.detail, "
+        "  failure_count = heartbeat_failures.failure_count + 1",
+        (job, ts, detail),
+    )
+    row = conn.execute(
+        "SELECT job, last_failure_at, detail, failure_count "
+        "FROM heartbeat_failures WHERE job=?",
+        (job,),
+    ).fetchone()
+    return dict(row)
+
+
 def _heartbeat_age_hours(last_success_at: str, ref: datetime) -> float | None:
     """Hours since `last_success_at`, or None if the stored value is unparseable.
 
@@ -6057,6 +6110,22 @@ def _heartbeat_age_hours(last_success_at: str, ref: datetime) -> float | None:
     if seen.tzinfo is None:
         seen = seen.replace(tzinfo=timezone.utc)
     return (ref - seen).total_seconds() / 3600.0
+
+
+def _failure_is_current(failure_at: str, success_at: str | None) -> bool:
+    """True when a recorded failure has not been superseded by a later success."""
+    if success_at is None:
+        return True
+    try:
+        f = datetime.fromisoformat(failure_at)
+        ok = datetime.fromisoformat(success_at)
+    except (TypeError, ValueError):
+        return True
+    if f.tzinfo is None:
+        f = f.replace(tzinfo=timezone.utc)
+    if ok.tzinfo is None:
+        ok = ok.replace(tzinfo=timezone.utc)
+    return f > ok
 
 
 def heartbeat_report(
@@ -6081,9 +6150,23 @@ def heartbeat_report(
         ).fetchall()
     }
 
+    # BUI-1082: the table is absent on a DB the migration has not reached yet
+    # (a report against an old schema must not 500).
+    try:
+        failures = {
+            r["job"]: r
+            for r in conn.execute(
+                "SELECT job, last_failure_at, detail, failure_count "
+                "FROM heartbeat_failures"
+            ).fetchall()
+        }
+    except sqlite3.OperationalError:
+        failures = {}
+
     jobs: list[dict[str, Any]] = []
     for name, contract in JOB_CONTRACTS.items():
         row = stored.pop(name, None)
+        fail = failures.get(name)
         cadence = float(contract["cadence_hours"])
         entry: dict[str, Any] = {
             "job": name,
@@ -6094,6 +6177,9 @@ def heartbeat_report(
             "last_success_at": row["last_success_at"] if row else None,
             "success_count": row["success_count"] if row else 0,
             "age_hours": None,
+            "last_failure_at": fail["last_failure_at"] if fail else None,
+            "last_failure_detail": fail["detail"] if fail else None,
+            "failure_count": fail["failure_count"] if fail else 0,
         }
         if row is None:
             # Never pinged. If nobody has wired the caller yet that is expected
@@ -6112,8 +6198,16 @@ def heartbeat_report(
                 entry["status"] = HEARTBEAT_STATUS_STALE
             else:
                 entry["status"] = HEARTBEAT_STATUS_OK
+        # BUI-1082: a failure newer than the last success (or with no success
+        # at all) outranks ok/stale/never. An unparseable timestamp on either
+        # side reads as failing, never as recovered.
+        if fail is not None and _failure_is_current(
+            fail["last_failure_at"], row["last_success_at"] if row else None
+        ):
+            entry["status"] = HEARTBEAT_STATUS_FAILING
         jobs.append(entry)
 
+    failing = [j["job"] for j in jobs if j["status"] == HEARTBEAT_STATUS_FAILING]
     stale = [j["job"] for j in jobs if j["status"] == HEARTBEAT_STATUS_STALE]
     never = [j["job"] for j in jobs if j["status"] == HEARTBEAT_STATUS_NEVER]
     pending = [j["job"] for j in jobs if j["status"] == HEARTBEAT_STATUS_PENDING]
@@ -6128,7 +6222,8 @@ def heartbeat_report(
         # reintroduced one layer up. Consumers wanting the narrower question
         # ("is anything I AM watching broken?") read stale_jobs +
         # never_seen_jobs directly.
-        "healthy": not stale and not never and not pending,
+        "healthy": not failing and not stale and not never and not pending,
+        "failing_jobs": failing,
         "stale_jobs": stale,
         "never_seen_jobs": never,
         "pending_instrumentation_jobs": pending,

@@ -398,3 +398,90 @@ def test_report_names_the_ping_site_for_every_silent_job(api):
     assert silent, "fixture store should have no heartbeat rows"
     for j in silent:
         assert j["ping"], f"{j['job']} has no ping site recorded"
+
+
+# ---------------------------------------------------------------------------
+# BUI-1082: "ran and failed" is its own state, apart from "did not run"
+# ---------------------------------------------------------------------------
+
+
+def _entry(report, job):
+    return next(j for j in report["jobs"] if j["job"] == job)
+
+
+def test_a_failure_newer_than_the_last_success_reads_failing(conn):
+    from gixen_overlay.db import record_heartbeat_failure
+
+    record_heartbeat(conn, "sentinel-probe", at=(NOW - timedelta(hours=100)).isoformat())
+    record_heartbeat_failure(
+        conn, "sentinel-probe", detail="Cap #100: wild jump",
+        at=(NOW - timedelta(hours=1)).isoformat(),
+    )
+    report = heartbeat_report(conn, now=NOW)
+    e = _entry(report, "sentinel-probe")
+    # The success is only 100h old (cadence 168h): without the failure ping this
+    # row is "ok", which is exactly the BUI-1082 bug.
+    assert e["status"] == "failing"
+    assert e["last_failure_detail"] == "Cap #100: wild jump"
+    assert e["failure_count"] == 1
+    assert report["failing_jobs"] == ["sentinel-probe"]
+    assert report["healthy"] is False
+
+
+def test_a_later_success_clears_failing(conn):
+    from gixen_overlay.db import record_heartbeat_failure
+
+    record_heartbeat_failure(conn, "sentinel-probe", at=(NOW - timedelta(hours=5)).isoformat())
+    record_heartbeat(conn, "sentinel-probe", at=(NOW - timedelta(hours=1)).isoformat())
+    e = _entry(heartbeat_report(conn, now=NOW), "sentinel-probe")
+    assert e["status"] == "ok"
+    assert e["failure_count"] == 1  # history kept
+
+
+def test_a_first_ever_run_that_fails_is_failing_not_never(conn):
+    from gixen_overlay.db import record_heartbeat_failure
+
+    record_heartbeat_failure(conn, "sentinel-probe", at=NOW.isoformat())
+    assert _entry(heartbeat_report(conn, now=NOW), "sentinel-probe")["status"] == "failing"
+
+
+def test_unparseable_failure_timestamp_reads_failing(conn):
+    from gixen_overlay.db import record_heartbeat_failure
+
+    record_heartbeat(conn, "sentinel-probe", at=NOW.isoformat())
+    record_heartbeat_failure(conn, "sentinel-probe", at="garbage")
+    assert _entry(heartbeat_report(conn, now=NOW), "sentinel-probe")["status"] == "failing"
+
+
+def test_report_survives_a_db_without_the_failures_table(conn):
+    conn.execute("DROP TABLE heartbeat_failures")
+    report = heartbeat_report(conn, now=NOW)
+    assert report["failing_jobs"] == []
+
+
+def test_failures_table_migration_is_idempotent(conn):
+    create_tables(conn)
+    create_tables(conn)
+
+
+def test_failure_endpoint_records_and_reports(api):
+    api.post("/api/heartbeat/sentinel-probe")
+    r = api.post("/api/heartbeat/sentinel-probe/failure?detail=boom")
+    assert r.status_code == 200
+    assert r.json()["failure_count"] == 1
+    report = api.get("/api/comics/health/heartbeats").json()
+    assert _entry(report, "sentinel-probe")["status"] == "failing"
+    assert report["failing_jobs"] == ["sentinel-probe"]
+    # a following success ping recovers the row
+    api.post("/api/heartbeat/sentinel-probe")
+    report = api.get("/api/comics/health/heartbeats").json()
+    assert _entry(report, "sentinel-probe")["status"] == "ok"
+
+
+def test_failure_endpoint_unknown_job_is_404(api):
+    assert api.post("/api/heartbeat/not-a-job/failure").status_code == 404
+
+
+def test_plain_success_ping_with_no_body_still_works(api):
+    r = api.post("/api/heartbeat/sentinel-probe")
+    assert r.status_code == 200 and r.json()["status"] == "ok"

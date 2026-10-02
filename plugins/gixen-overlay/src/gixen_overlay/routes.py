@@ -25,6 +25,7 @@ from gixen_overlay.db import (
     certifier_from_title,
     heartbeat_report,
     record_heartbeat,
+    record_heartbeat_failure,
     multi_issue_lot_reason,
     rejected_writes_report,
     upsert_comic,
@@ -4341,4 +4342,34 @@ async def api_heartbeat(job: str, request: Request, detail: str | None = None):
         "success_count": row["success_count"],
         "detail": row["detail"],
         "cadence_hours": contract["cadence_hours"],
+    }
+
+
+@router.post("/api/heartbeat/{job}/failure")
+async def api_heartbeat_failure(job: str, request: Request, detail: str | None = None):
+    """Record that `job` RAN and FAILED (BUI-1082).
+
+    The counterpart of the success ping above, for jobs that already know their
+    own verdict. Until a success lands after it, the job reports `failing` in
+    `GET /api/comics/health/heartbeats` and the whole report is unhealthy; so a
+    probe that ran and found a problem shows red the day it fails instead of
+    staying green until the staleness backstop (2x cadence) trips. Same
+    404-on-unknown-job rule as the success ping.
+    """
+    if JOB_CONTRACTS.get(job) is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Unknown job {job!r}. Known jobs: {', '.join(sorted(JOB_CONTRACTS))}"
+            ),
+        )
+    async with _write_locked():
+        with write_transaction(_get_db_path()) as wconn:
+            row = record_heartbeat_failure(wconn, job, detail=detail)
+    return {
+        "status": "recorded",
+        "job": row["job"],
+        "last_failure_at": row["last_failure_at"],
+        "failure_count": row["failure_count"],
+        "detail": row["detail"],
     }

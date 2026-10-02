@@ -156,16 +156,17 @@ class TestSentinelFailures:
         code = sentinel_probe.run_sentinel_probe(server_url=None)
         assert code == 1
 
-    def test_no_gradeable_comps_alerts(self, monkeypatch):
-        """Enough raw comps to clear the floor, but none carry a parsed
-        grade — build_pool() would return an empty pool."""
+    def test_no_gradeable_comps_is_inconclusive_not_an_alert(self, monkeypatch):
+        """BUI-1081: enough raw comps to clear the floor but none carry a parsed
+        grade is a THIN pool (own verdict), not a broken instrument, while the
+        other sentinels still make real comparisons."""
         results = _all_healthy_results()
         results[0] = _result(0, comps=[_comp(5.0 + i, grade=None)
                                        for i in range(sentinel_probe.SENTINEL_MIN_N + 5)])
         _wire_subprocess(monkeypatch, results)
 
         code = sentinel_probe.run_sentinel_probe(server_url=None)
-        assert code == 1
+        assert code == 0
 
     def test_malformed_comp_does_not_crash_the_whole_batch(self, monkeypatch, capsys):
         """A comp missing an expected field (schema drift upstream) must
@@ -315,13 +316,62 @@ class TestNegativeControl:
 # ─── Heartbeat robustness ────────────────────────────────────────────────────
 
 class TestHeartbeat:
-    def test_not_pinged_on_any_failure(self, monkeypatch):
+    def test_failure_pings_the_failure_endpoint_never_the_success_one(self, monkeypatch):
+        """BUI-1082: a failed run reports "ran and failed" so the dashboard row
+        goes red that day; it must still never hit the success endpoint."""
         results = _all_healthy_results()
         results[0] = _result(0, comps=[])
         _wire_subprocess(monkeypatch, results)
-        # autouse _no_real_heartbeat_post fixture raises if post() is called
+        posted = []
+        monkeypatch.setattr(
+            sentinel_probe.requests, "post",
+            lambda url, params=None, timeout=None: posted.append((url, params)) or type(
+                "R", (), {"status_code": 200, "raise_for_status": lambda self: None})())
         code = sentinel_probe.run_sentinel_probe(server_url="http://x")
         assert code == 1
+        assert [u for u, _ in posted] == ["http://x/api/heartbeat/sentinel-probe/failure"]
+        assert "Amazing Spider-Man #300" in posted[0][1]["detail"]
+
+    def test_could_not_complete_also_reports_failure(self, monkeypatch):
+        monkeypatch.setattr(sentinel_probe.shutil, "which", lambda _b: None)
+        posted = []
+        monkeypatch.setattr(
+            sentinel_probe.requests, "post",
+            lambda url, params=None, timeout=None: posted.append(url) or type(
+                "R", (), {"status_code": 200, "raise_for_status": lambda self: None})())
+        assert sentinel_probe.run_sentinel_probe(server_url="http://x") == 2
+        assert posted == ["http://x/api/heartbeat/sentinel-probe/failure"]
+
+    def test_failure_ping_error_and_404_are_non_fatal(self, monkeypatch, capsys):
+        results = _all_healthy_results()
+        results[0] = _result(0, comps=[])
+        _wire_subprocess(monkeypatch, results)
+
+        def _raise(url, params=None, timeout=None):
+            raise requests.RequestException("down")
+        monkeypatch.setattr(sentinel_probe.requests, "post", _raise)
+        assert sentinel_probe.run_sentinel_probe(server_url="http://x") == 1
+        monkeypatch.setattr(
+            sentinel_probe.requests, "post",
+            lambda url, params=None, timeout=None: type(
+                "R", (), {"status_code": 404, "raise_for_status": lambda self: None})())
+        assert sentinel_probe.run_sentinel_probe(server_url="http://x") == 1
+        assert "predates BUI-1082" in capsys.readouterr().err
+
+    def test_forced_failure_env_fails_without_fetching(self, monkeypatch):
+        """BUI-1082 drill: deterministic failure, no provider request, real
+        failure ping."""
+        monkeypatch.setenv(sentinel_probe.FORCE_FAIL_ENV, "1")
+        monkeypatch.setattr(sentinel_probe, "_fetch_batch",
+                            lambda p: pytest.fail("forced run must not fetch"))
+        posted = []
+        monkeypatch.setattr(
+            sentinel_probe.requests, "post",
+            lambda url, params=None, timeout=None: posted.append((url, params)) or type(
+                "R", (), {"status_code": 200, "raise_for_status": lambda self: None})())
+        assert sentinel_probe.run_sentinel_probe(server_url="http://x") == 1
+        assert posted[0][0] == "http://x/api/heartbeat/sentinel-probe/failure"
+        assert "forced failure" in posted[0][1]["detail"]
 
     def test_404_is_logged_and_non_fatal(self, monkeypatch, capsys):
         _wire_subprocess(monkeypatch, _all_healthy_results())
@@ -468,3 +518,94 @@ def test_sentinels_are_pre_speculative_era_keys():
     for book in sentinel_probe.SENTINEL_BOOKS:
         assert book["year"] < 2000
         assert book["measured_pool_depth"] >= sentinel_probe.SENTINEL_MIN_N * 5
+
+
+# ─── Thin graded pools (BUI-1081) ───────────────────────────────────────────
+
+def _book_key_for(i):
+    return sentinel_probe._book_key(sentinel_probe.SENTINEL_BOOKS[i])
+
+
+def _thin_comps(target_grade, pool, n=15):
+    comps = [_comp(250.0 + i, grade=target_grade) for i in range(pool)]
+    comps += [_comp(3.0 + i, grade=None) for i in range(n - pool)]
+    return comps
+
+
+def _cap_idx():
+    return next(i for i, b in enumerate(sentinel_probe.SENTINEL_BOOKS)
+                if b["title"] == "Captain America")
+
+
+class TestThinPool:
+    def test_incident_one_comp_baseline_then_two_comp_pool_passes(self, monkeypatch):
+        """The exact 2026-10-01 shape: a baseline seeded from pool_n=1, then a
+        2-comp pool at 2.3x. Unfixed code reported PRICE_JUMP and exited 1."""
+        cap = _cap_idx()
+        sentinel_probe._save_baselines(
+            {_book_key_for(cap): {"median": 131.10, "pool_n": 1}})
+        results = _all_healthy_results()
+        results[cap] = _result(cap, comps=_thin_comps(
+            sentinel_probe.SENTINEL_BOOKS[cap]["target_grade"], pool=2))
+        _wire_subprocess(monkeypatch, results)
+
+        assert sentinel_probe.run_sentinel_probe(server_url=None) == 0
+        # the thin baseline is left alone, not overwritten with a 2-comp median
+        saved = sentinel_probe._load_baselines()
+        assert saved[_book_key_for(cap)] == {"median": 131.10, "pool_n": 1}
+
+    def test_thin_pool_is_never_seeded(self, monkeypatch):
+        cap = _cap_idx()
+        results = _all_healthy_results()
+        results[cap] = _result(cap, comps=_thin_comps(
+            sentinel_probe.SENTINEL_BOOKS[cap]["target_grade"], pool=2))
+        _wire_subprocess(monkeypatch, results)
+        assert sentinel_probe.run_sentinel_probe(server_url=None) == 0
+        assert _book_key_for(cap) not in sentinel_probe._load_baselines()
+
+    def test_deep_pool_replaces_a_thin_baseline_instead_of_comparing(self, monkeypatch):
+        cap = _cap_idx()
+        sentinel_probe._save_baselines(
+            {_book_key_for(cap): {"median": 10.0, "pool_n": 1}})
+        results = _all_healthy_results()  # pool 5 at $100: 10x the thin baseline
+        _wire_subprocess(monkeypatch, results)
+        assert sentinel_probe.run_sentinel_probe(server_url=None) == 0
+        assert sentinel_probe._load_baselines()[_book_key_for(cap)] == {
+            "median": 100.0, "pool_n": 5}
+
+    def test_deep_pool_price_jump_still_fails(self, monkeypatch):
+        """The comparison itself is not weakened for baselines of real depth."""
+        cap = _cap_idx()
+        sentinel_probe._save_baselines(
+            {_book_key_for(cap): {"median": 10.0, "pool_n": 6}})
+        _wire_subprocess(monkeypatch, _all_healthy_results())
+        assert sentinel_probe.run_sentinel_probe(server_url=None) == 1
+
+    def test_all_sentinels_thin_fails_instead_of_masking_a_broken_instrument(
+            self, monkeypatch, capsys):
+        results = _all_healthy_results()
+        for i, book in enumerate(sentinel_probe.SENTINEL_BOOKS):
+            results[i] = _result(i, comps=_thin_comps(book["target_grade"], pool=1))
+        _wire_subprocess(monkeypatch, results)
+        assert sentinel_probe.run_sentinel_probe(server_url=None) == 1
+        assert "too few conclusive" in capsys.readouterr().out
+
+    def test_thin_pool_does_not_mask_a_fetch_error(self, monkeypatch):
+        results = _all_healthy_results()
+        results[0] = _result(0, comps=[], error="boom")
+        _wire_subprocess(monkeypatch, results)
+        assert sentinel_probe.run_sentinel_probe(server_url=None) == 1
+
+    def test_thin_run_still_pings_success(self, monkeypatch):
+        cap = _cap_idx()
+        results = _all_healthy_results()
+        results[cap] = _result(cap, comps=_thin_comps(
+            sentinel_probe.SENTINEL_BOOKS[cap]["target_grade"], pool=0))
+        _wire_subprocess(monkeypatch, results)
+        posted = []
+        monkeypatch.setattr(
+            sentinel_probe.requests, "post",
+            lambda url, params=None, timeout=None: posted.append(url) or type(
+                "R", (), {"status_code": 200, "raise_for_status": lambda self: None})())
+        assert sentinel_probe.run_sentinel_probe(server_url="http://x") == 0
+        assert posted == ["http://x/api/heartbeat/sentinel-probe"]

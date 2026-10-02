@@ -91,8 +91,19 @@ comics-api GET /api/comics/health/heartbeats
 
 `sentinel-probe` should read `status: ok` with `success_count >= 1`. If it still
 reads `never`, the probe either did not run or did not pass — check
-`~/.comics-server/sentinel-probe.error.log`; a heartbeat is only written on
-exit 0.
+`~/.comics-server/sentinel-probe.error.log`; a success heartbeat is only
+written on exit 0. A failed run (exit 1 or 2) instead posts a failure ping
+(BUI-1082), so the row reads `failing` that day, not `ok`.
+
+To drill the failure path (safe: no provider fetch, nothing written to the DB
+file or the baseline), run the probe with the force flag, then clear it with a
+real run or a success ping:
+
+```bash
+COMIC_FMV_SENTINEL_FORCE_FAIL=1 comic-fmv --sentinel-probe   # exit 1, row turns red
+comics-api GET /api/comics/health/heartbeats                 # sentinel-probe: failing
+comics-api POST /api/heartbeat/sentinel-probe                # clears it (or run a real probe)
+```
 
 `RunAtLoad` is deliberately `false`: loading the agent during a deploy should
 not spend provider budget as a side effect.
@@ -115,14 +126,15 @@ not spend provider budget as a side effect.
 
 | Exit | Meaning | Pings the heartbeat? | Scheduler action |
 |------|---------|---------------------|------------------|
-| `0` | Every sentinel and the negative control passed | **yes** | Silent |
-| `1` | Ran to completion; at least one check failed — the comp pipeline has drifted | no | Alert; this is the alarm the probe exists to raise |
-| `2` | The probe itself could not complete (binary missing, subprocess timeout/crash, result-identity mismatch) | no | Alert; distinct from `1` so "couldn't check" is never read as "checked, and it's broken" |
+| `0` | Every sentinel and the negative control passed (a thin-graded-pool sentinel is `INCONCLUSIVE`, allowed while at least 2 sentinels made a real comparison) | **yes** (success) | Silent |
+| `1` | Ran to completion; at least one check failed — the comp pipeline has drifted, or fewer than 2 sentinels were conclusive | failure ping | Alert; this is the alarm the probe exists to raise |
+| `2` | The probe itself could not complete (binary missing, subprocess timeout/crash, result-identity mismatch) | failure ping | Alert; distinct from `1` so "couldn't check" is never read as "checked, and it's broken" |
 
 The exit code is the **primary** alert surface; the heartbeat is the staleness
 backstop underneath it. A run that alarms with exit 1 every week will also go
 stale here after two weeks — a second, louder signal about the same fact, never
-a quieter one.
+a quieter one. Since BUI-1082 the failure ping makes the first signal show on the
+dashboard the same day.
 
 ---
 
