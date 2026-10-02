@@ -136,7 +136,7 @@ def test_seller_scan_doc_threshold_matches_emit_floor():
     never surfaced. Assert the doc references the real 0.65 floor and no longer
     carries the dead '0.5 means partial' advice."""
     src = (REPO_ROOT / "apps" / "ebay" / "src" / "seller_scan.py").read_text()
-    assert "best_score >= 0.65" in src, (
+    assert "score >= 0.65" in src, (
         "seller_scan.py emit floor changed — update the doc + this contract"
     )
     doc = (SKILLS_DIR / "seller-scan.md").read_text()

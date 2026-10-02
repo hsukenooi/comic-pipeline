@@ -3565,7 +3565,7 @@ class TestSkippedCountAndForceReverify:
         )
         # Override the always-match stub so no candidate survives matching.
         monkeypatch.setattr(
-            seller_scan, "match_listing", lambda title, wish_items, **kwargs: (None, 0.0)
+            seller_scan, "match_listing_accepted", lambda title, wish_items, **kwargs: (None, 0.0)
         )
 
         code = seller_scan.main(["seller1", "--json"])
@@ -5382,3 +5382,39 @@ class TestMainCandidateLoopGateChain:
         assert "Correct series: The Amazing Spider-Man (Vol. 1) (1963 - 1998)" in prompts_seen[0]
         assert kept == []
         assert dropped == []
+
+
+class TestNextBestWishAfterReject:
+    """BUI-1079: a rejected top scorer must not drop the listing."""
+
+    def _wishes(self):
+        return seller_scan.prepare_wish_items([
+            {"id": "w1", "name": "The X-Men #3",
+             "series_name": "The X-Men (Vol. 1) (1963 - 1981)",
+             "release_date": "1964-01-01"},
+            {"id": "w2", "name": "X-Men Annual #3",
+             "series_name": "X-Men Annual (1970 - 1991)",
+             "release_date": "1979-08-01"},
+        ])
+
+    def test_annual_title_falls_through_to_annual_wish(self):
+        wish, score = seller_scan.match_listing_accepted(
+            "X-Men Annual #3 (Marvel Comics August 1979)", self._wishes())
+        assert wish is not None
+        assert wish["id"] == "w2"
+        assert score >= 0.65
+
+    def test_all_rejected_returns_none(self):
+        wishes = self._wishes()[:1]
+        assert seller_scan.match_listing_accepted(
+            "X-Men Annual #3 (Marvel Comics August 1979)", wishes
+        ) == (None, 0.0)
+
+    def test_below_floor_never_returned(self):
+        assert seller_scan.match_listing_accepted(
+            "Totally Unrelated Book #99", self._wishes()) == (None, 0.0)
+
+    def test_match_listing_signature_unchanged(self):
+        wish, score = seller_scan.match_listing(
+            "X-Men Annual #3 (Marvel Comics August 1979)", self._wishes())
+        assert wish is not None and score >= 0.65
