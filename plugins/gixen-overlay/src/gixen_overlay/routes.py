@@ -99,6 +99,7 @@ from server.db import (
     get_bid_by_item_id,
     resolve_server_dir,
     TOMBSTONE_STATUSES_SQL,
+    is_seller_restriction,
     write_transaction,
 )
 from server.main import (
@@ -1805,6 +1806,12 @@ def _build_comics_row(row):
         "end_date_iso": end_date_iso,
         "status": item["status"],
         "status_mirror": item.get("status_mirror"),
+        # BUI-1116: Gixen's seller-wide refusal text (or None). The dashboard
+        # renders a red "blocked" pill from this instead of "missed"/"outbid".
+        "blocked_reason": (
+            item["status_mirror"]
+            if is_seller_restriction(item.get("status_mirror")) else None
+        ),
         "winning_bid": item.get("winning_bid"),
         "seller": item.get("seller"),
         "cached_at": item.get("cached_at"),

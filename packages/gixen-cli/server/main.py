@@ -41,7 +41,7 @@ from server.db import (
     mark_bids_purged, cache_gixen_data,
     set_auction_end_time, get_bids_ready_to_snipe, set_local_snipe_result,
     refresh_snipe_group, mirror_gixen_max_bid,
-    TOMBSTONE_STATUSES_SQL,
+    TOMBSTONE_STATUSES_SQL, is_seller_restriction,
     write_transaction,
     record_bid_decision, list_bid_decisions,
     BID_DECISION_OUTCOME_COMMITTED, BID_DECISION_OUTCOME_UNCONFIRMED,
@@ -1646,6 +1646,61 @@ def _classify_watchdog_row(
     }
 
 
+def _seller_restriction_alerts(conn: sqlite3.Connection) -> list[dict]:
+    """BUI-1116: one alert per seller that has a restricted row AND live snipes.
+
+    eBay's "AUCTION RESTRICTED: BIDDER HAS UNPAID ITEMS" applies to the whole
+    seller, and Gixen mirrors it into ``bids.status_mirror``. If any
+    non-tombstoned row for a seller carries it, every PENDING snipe on that
+    seller is expected to fail, so the alert names the seller and lists them.
+    A pure read (one SELECT), like the rest of the watchdog; it clears when the
+    seller has no PENDING snipes left or the restricted rows are tombstoned.
+    A seller with a restriction but nothing pending raises nothing (there is
+    nothing left to warn about); NULL-seller rows cannot be named and are
+    skipped.
+    """
+    rows = conn.execute(
+        "SELECT item_id, ebay_title, seller, status, status_mirror FROM bids "
+        f"WHERE seller IS NOT NULL AND status NOT IN ({TOMBSTONE_STATUSES_SQL}) "
+        "AND (status = 'PENDING' OR status_mirror LIKE '%RESTRICTED%')"
+    ).fetchall()
+    by_seller: dict[str, dict] = {}
+    for r in rows:
+        key = r["seller"].strip().lower()
+        if not key:
+            continue
+        g = by_seller.setdefault(
+            key, {"seller": r["seller"], "texts": [], "pending": []}
+        )
+        if is_seller_restriction(r["status_mirror"]) and r["status_mirror"] not in g["texts"]:
+            g["texts"].append(r["status_mirror"])
+        if r["status"] == "PENDING":
+            g["pending"].append({"item_id": r["item_id"], "title": r["ebay_title"]})
+    alerts = []
+    for key in sorted(by_seller):
+        g = by_seller[key]
+        if not g["texts"] or not g["pending"]:
+            continue
+        pending = sorted(g["pending"], key=lambda p: p["item_id"])
+        alerts.append({
+            "kind": "seller_restricted",
+            "seller": g["seller"],
+            "gixen_text": g["texts"][0],
+            "pending_snipes": pending,
+            "detail": (
+                f"seller {g['seller']} is restricted ({g['texts'][0]}); eBay "
+                f"will refuse every bid on this seller. {len(pending)} PENDING "
+                "snipe(s) will fail: "
+                + ", ".join(
+                    f"#{p['item_id']}" + (f" {p['title']}" if p["title"] else "")
+                    for p in pending
+                )
+                + ". Remove them or clear the unpaid item."
+            ),
+        })
+    return alerts
+
+
 def _build_snipe_watchdog_report(
     conn: sqlite3.Connection,
     now_dt: datetime,
@@ -1656,7 +1711,7 @@ def _build_snipe_watchdog_report(
 ) -> dict:
     """The BUI-604 watchdog verdict. READ-ONLY, by construction and on purpose.
 
-    This function issues exactly one statement against the DB — a SELECT — and
+    This function issues only SELECTs against the DB (the PENDING scan plus BUI-1116's seller-restriction read) — and
     returns a dict derived from it. It writes no row, sets no status, opens no
     write_transaction, takes no lock, and triggers no Gixen scrape (in
     particular it must never call _ensure_fresh_sync/_spawn_fallback_task: an
@@ -1748,6 +1803,8 @@ def _build_snipe_watchdog_report(
         if alert is not None:
             alerts.append(alert)
     alerts.sort(key=lambda a: (a["kind"], a["item_id"]))
+    restriction_alerts = _seller_restriction_alerts(conn)
+    counts["seller_restricted"] = len(restriction_alerts)
 
     # A watchdog that reports on snipes using observations it knows are stale
     # is the fails-green bug it exists to prevent, so when our own sync is not
@@ -1766,6 +1823,11 @@ def _build_snipe_watchdog_report(
                 + " — snipe outcomes cannot be vouched for until it does."
             ),
         }]
+
+    # BUI-1116: appended AFTER the sync-stale swap. These findings are not a
+    # claim about silence we might have caused (Gixen's own error text is the
+    # evidence), so a stale sync must not withhold them.
+    alerts = alerts + restriction_alerts
 
     return {
         "generated_at": now_dt.isoformat(),

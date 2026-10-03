@@ -473,8 +473,70 @@ def test_every_bucket_is_counted_even_on_an_empty_store(db):
         "vanished_before_end",
         "missing_outcome",
         "stale_unknown_end",
+        "seller_restricted",
     }
     assert set(report["counts"].values()) == {0}
+
+
+# --------------------------------------------------------------------------
+# BUI-1116: seller-wide bid restriction
+# --------------------------------------------------------------------------
+
+RESTRICTED = "AUCTION RESTRICTED: BIDDER HAS UNPAID ITEMS"
+
+
+def _seed_seller(conn, item_id, status, seller, mirror=None, title=None):
+    conn.execute(
+        "INSERT INTO bids (item_id, max_bid, status, seller, status_mirror, ebay_title, "
+        "auction_end_at) VALUES (?, 10.0, ?, ?, ?, ?, ?)",
+        (item_id, status, seller, mirror, title,
+         (NOW + timedelta(days=1)).isoformat() if status == "PENDING" else LONG_AGO),
+    )
+    conn.commit()
+
+
+def test_a_restricted_seller_alerts_with_its_pending_snipes(db):
+    _seed_seller(db, "100", "LOST", "timemachinecomics", RESTRICTED)
+    _seed_seller(db, "201", "PENDING", "TimeMachineComics", None, "Thor #150")
+    _seed_seller(db, "202", "PENDING", "timemachinecomics", None, "Thor #151")
+    _seed_seller(db, "300", "PENDING", "otherseller", None, "Hulk #1")
+    report = _report(db)
+    alerts = [a for a in report["alerts"] if a["kind"] == "seller_restricted"]
+    assert len(alerts) == 1
+    a = alerts[0]
+    assert a["seller"].lower() == "timemachinecomics"
+    assert a["gixen_text"] == RESTRICTED
+    assert [p["item_id"] for p in a["pending_snipes"]] == ["201", "202"]
+    assert "300" not in a["detail"]
+    assert report["healthy"] is False
+    assert report["counts"]["seller_restricted"] == 1
+
+
+def test_a_restriction_with_no_pending_snipes_raises_nothing(db):
+    _seed_seller(db, "100", "LOST", "timemachinecomics", RESTRICTED)
+    assert _report(db)["alerts"] == []
+
+
+def test_a_tombstoned_restricted_row_does_not_alert(db):
+    _seed_seller(db, "100", "REMOVED", "timemachinecomics", RESTRICTED)
+    _seed_seller(db, "201", "PENDING", "timemachinecomics")
+    assert _report(db)["alerts"] == []
+
+
+def test_unrestricted_sellers_are_unchanged(db):
+    _seed_seller(db, "100", "LOST", "someone", "outbid")
+    _seed_seller(db, "201", "PENDING", "someone")
+    report = _report(db)
+    assert report["alerts"] == []
+    assert report["healthy"] is True
+
+
+def test_a_stale_sync_does_not_withhold_the_restriction_alert(db):
+    _seed_seller(db, "100", "LOST", "timemachinecomics", RESTRICTED)
+    _seed_seller(db, "201", "PENDING", "timemachinecomics")
+    report = _report(db, last_sync_ok_at=NOW.timestamp() - 100 * 3600)
+    kinds = {a["kind"] for a in report["alerts"]}
+    assert kinds == {"sync_stale", "seller_restricted"}
 
 
 # --------------------------------------------------------------------------

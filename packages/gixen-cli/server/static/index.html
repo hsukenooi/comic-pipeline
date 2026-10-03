@@ -507,7 +507,11 @@ function renderWatchdog(report) {
     return;
   }
   const degraded = report.alerts.every(a => a.kind === "sync_stale");
-  const heading = degraded ? "watchdog blind" : "snipe outcome missing";
+  const restrictedOnly = report.alerts.every(
+    a => a.kind === "seller_restricted" || a.kind === "sync_stale");
+  const heading = degraded ? "watchdog blind"
+    : restrictedOnly ? "seller restricted"
+    : "snipe outcome missing";  // BUI-1116 adds the seller_restricted kind
   // A stuck snipe alerts for as long as it stays stuck — correctly, since the
   // anomaly is what persists — so the banner is capped and the overflow
   // counted. /api/snipe-watchdog still returns every alert; only the banner

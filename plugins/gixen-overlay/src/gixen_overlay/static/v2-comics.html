@@ -238,6 +238,7 @@
 <div class="refresh-bar" id="refresh-bar"></div>
 
 <div class="wrap">
+  <div id="watchdog-section"></div>
   <div id="health-section"></div>
   <div id="active-section"></div>
   <div id="ended-section"></div>
@@ -425,6 +426,13 @@ function fmtTitle(r) {
 // an OUTBID-on-tie loss (winning_bid == max_bid because eBay's bid-increment
 // rule defeats a tied snipe) should still render as "outbid".
 function outcome(r) {
+  // BUI-1116: a seller-wide eBay restriction ("AUCTION RESTRICTED: BIDDER HAS
+  // UNPAID ITEMS") is neither a loss nor a miss; show Gixen's own text. Checked
+  // first so a LOST/ENDED row that never had a real bid is not painted "outbid".
+  if (r.blocked_reason && r.status !== "WON" && r.status !== "PURGED" && r.status !== "REMOVED") {
+    return `<span class="pill err" title="${escapeHtml(r.blocked_reason)}">blocked</span>`
+      + `<span class="mute"> ${escapeHtml(r.blocked_reason)}</span>`;
+  }
   if (r.status === "PENDING") return '<span class="pill pending">pending</span>';
   if (r.status === "WON") return '<span class="pill won">won</span>';
   if (r.status === "LOST") return '<span class="pill lost">outbid</span>';
@@ -596,6 +604,33 @@ function _uiInteractionLive() {
       || Boolean(document.querySelector("#active-section .editing, #active-section .saving"));
 }
 
+// BUI-1116: seller-restriction alerts from the host watchdog. Only that kind is
+// rendered here (the full watchdog banner lives on the gixen-cli dashboard). A
+// failed fetch renders nothing rather than an all-clear.
+function renderSellerAlerts(report) {
+  const el = document.getElementById("watchdog-section");
+  const alerts = ((report && report.alerts) || []).filter(a => a.kind === "seller_restricted");
+  if (!alerts.length) { el.innerHTML = ""; return; }
+  el.innerHTML = alerts.map(a => {
+    const list = (a.pending_snipes || []).map(p =>
+      `<li><a href="https://www.ebay.com/itm/${escapeHtml(p.item_id)}" target="_blank">#${escapeHtml(p.item_id)}</a>`
+      + `${p.title ? " " + escapeHtml(p.title) : ""}</li>`).join("");
+    return `<div class="panel seller-alert" style="border-color:var(--red,#c0392b)">`
+      + `<div class="panel-head"><span class="label" style="color:var(--red,#c0392b)">`
+      + `seller blocked: ${escapeHtml(a.seller)}</span></div>`
+      + `<div style="padding:8px">${escapeHtml(a.gixen_text)}. `
+      + `${(a.pending_snipes || []).length} pending snipe(s) will fail:<ul>${list}</ul></div></div>`;
+  }).join("");
+}
+
+async function loadSellerAlerts() {
+  try {
+    renderSellerAlerts(await fetchJson("/api/snipe-watchdog"));
+  } catch (e) {
+    console.error("seller-restriction alert refresh failed:", e);
+  }
+}
+
 async function load() {
   if (_inFlight) return;
   _inFlight = true;
@@ -607,6 +642,7 @@ async function load() {
     ]);
     _lastSnipes = snipes;
     if (!_uiInteractionLive()) renderAll(snipes, history);
+    loadSellerAlerts();
   } catch (e) {
     console.error("comics dashboard refresh failed:", e);
   } finally {

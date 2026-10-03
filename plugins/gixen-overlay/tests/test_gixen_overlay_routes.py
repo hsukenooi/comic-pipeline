@@ -2713,6 +2713,32 @@ def test_comics_snipes_and_history_expose_the_same_fmv_field_set(api):
     assert snipe_row["flag_reason"] == history_row["flag_reason"] == "one_sided"
 
 
+def test_restricted_status_mirror_serializes_as_blocked_on_both_endpoints(api):
+    """BUI-1116: Gixen's "AUCTION RESTRICTED" text must reach the dashboard as
+    `blocked_reason` on BOTH /snipes and /history (endpoint parity); a normal
+    row stays None so it still renders outbid/missed."""
+    db_path = os.environ["DB_PATH"]
+    text = "AUCTION RESTRICTED: BIDDER HAS UNPAID ITEMS"
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "INSERT INTO bids (item_id, max_bid, status, auction_end_at, status_mirror) "
+        "VALUES ('1116000001', 10.0, 'LOST', datetime('now', '-1 day'), ?)", (text,))
+    raw.execute(
+        "INSERT INTO bids (item_id, max_bid, status, auction_end_at, status_mirror) "
+        "VALUES ('1116000002', 10.0, 'LOST', datetime('now', '-1 day'), NULL)")
+    raw.execute(
+        "INSERT INTO bids (item_id, max_bid, status, auction_end_at, status_mirror) "
+        "VALUES ('1116000003', 10.0, 'PENDING', datetime('now', '+1 day'), ?)",
+        (text.lower(),))
+    raw.commit()
+    raw.close()
+    hist = {r["item_id"]: r for r in api.get("/api/comics/history").json()}
+    assert hist["1116000001"]["blocked_reason"] == text
+    assert hist["1116000002"]["blocked_reason"] is None
+    snipes = {r["item_id"]: r for r in api.get("/api/comics/snipes").json()}
+    assert snipes["1116000003"]["blocked_reason"] == text.lower()  # case-insensitive
+
+
 # --- /api/comics/outcomes (BUI-286) ------------------------------------------
 
 

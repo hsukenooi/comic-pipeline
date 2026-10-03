@@ -42,6 +42,19 @@ DB_PATH = resolve_server_dir() / "db.sqlite"
 # f"status NOT IN ('PENDING', {TOMBSTONE_STATUSES_SQL})".
 TOMBSTONE_STATUSES_SQL = "'PURGED', 'REMOVED'"
 
+
+def is_seller_restriction(status_mirror: str | None) -> bool:
+    """BUI-1116: does Gixen's mirrored error text report a seller-wide bid block?
+
+    Gixen copies eBay's refusal into ``bids.status_mirror`` verbatim, e.g.
+    ``"AUCTION RESTRICTED: BIDDER HAS UNPAID ITEMS"``. eBay applies it to the
+    whole seller, so one such row means every other snipe on that seller fails
+    too. Single source of truth for the dashboard pill (via the overlay) and the
+    watchdog; the SQL twin is ``status_mirror LIKE '%RESTRICTED%'`` (LIKE is
+    case-insensitive for ASCII in SQLite).
+    """
+    return bool(status_mirror) and "restricted" in status_mirror.lower()
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS bids (
     id              INTEGER PRIMARY KEY,
