@@ -395,7 +395,7 @@ def estimated_close(price, *, is_auction, hours_left, bid_count, age, age_label)
     would bound only one more of them, so the vintage veto, not the missing
     year, is what keeps the row unbounded. It stays: no multiple is a safe
     bound on a vintage close. grade.md documents that the sensitivity gate
-    therefore rarely fires and routes unbounded rows straight to the panel.
+    therefore rarely fires: an unbounded row always escalates to the panel.
     """
     if price is None:
         return None, "price unknown"
