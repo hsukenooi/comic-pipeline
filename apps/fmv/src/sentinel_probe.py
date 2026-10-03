@@ -92,7 +92,14 @@ SENTINEL_BOOKS: list[dict] = [
         "issue": "100",
         "year": 1968,
         "publisher": "marvel",
-        "target_grade": 6.5,
+        # BUI-1118: retargeted 6.5 -> 4.0, where Cap #100's parsed-grade comps
+        # cluster. At 6.5 the live graded pool was 0-2 (probe log, 2026-10-03:
+        # 2 of 33 raw within +/-2.0; corpus 5). At 4.0 it is 10 in the
+        # 21,772-item cached corpus (+/-2.0, 2026-10-04) and 5 in one live
+        # fetch (33 raw, 5 graded in-window, median $164.99, stable across
+        # targets 3.5-4.5). Hulk #181 @6.0 was measured and rejected: live
+        # pool 4 and a bimodal median ($1260 vs $2162 at 6.0 vs 5.0).
+        "target_grade": 4.0,
         "measured_pool_depth": 88,  # unique valid raw comps, 3 cached query snapshots
     },
 ]
