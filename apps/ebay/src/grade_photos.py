@@ -386,6 +386,16 @@ def estimated_close(price, *, is_auction, hours_left, bid_count, age, age_label)
     generous-upper-bound projection decide_tier() uses for its own dollar
     estimate, so using it to prove a grade range can't move the buy call only
     ever costs one extra grader, never under-covers real money.
+
+    BUI-1119: in practice this returns ``None`` for nearly every /comic:buy
+    auction, which grades days before close and mostly buys pre-1992 books.
+    Over the 76 most recent bids (2026-10-04), 74 (97%) were unbounded at
+    grading time: 62 age unknown (the main seller's listings carry no
+    Publication Year, Era, or title year) and 12 vintage. Knowing the year
+    would bound only one more of them, so the vintage veto, not the missing
+    year, is what keeps the row unbounded. It stays: no multiple is a safe
+    bound on a vintage close. grade.md documents that the sensitivity gate
+    therefore rarely fires and routes unbounded rows straight to the panel.
     """
     if price is None:
         return None, "price unknown"
