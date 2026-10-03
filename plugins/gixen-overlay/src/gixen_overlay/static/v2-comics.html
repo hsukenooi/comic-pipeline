@@ -429,7 +429,7 @@ function outcome(r) {
   // BUI-1116: a seller-wide eBay restriction ("AUCTION RESTRICTED: BIDDER HAS
   // UNPAID ITEMS") is neither a loss nor a miss; show Gixen's own text. Checked
   // first so a LOST/ENDED row that never had a real bid is not painted "outbid".
-  if (r.blocked_reason && r.status !== "PURGED" && r.status !== "REMOVED") {
+  if (r.blocked_reason && r.status !== "WON" && r.status !== "PURGED" && r.status !== "REMOVED") {
     return `<span class="pill err" title="${escapeHtml(r.blocked_reason)}">blocked</span>`
       + `<span class="mute"> ${escapeHtml(r.blocked_reason)}</span>`;
   }
