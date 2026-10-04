@@ -574,6 +574,21 @@ def test_a_text_less_lost_row_does_not_clear_the_restriction(db):
     assert len(_restriction_alerts(db)) == 1
 
 
+def test_won_ended_before_the_restriction_but_resolved_after_does_not_clear(db):
+    """Order by auction end, not resolved_at (which lags the end)."""
+    d = lambda n: (NOW - timedelta(days=n)).isoformat()
+    db.execute(
+        "INSERT INTO bids (item_id, max_bid, status, seller, auction_end_at, resolved_at) "
+        "VALUES ('150', 10.0, 'WON', 'tm', ?, ?)", (d(9), d(1)))
+    db.execute(
+        "INSERT INTO bids (item_id, max_bid, status, seller, status_mirror, "
+        "auction_end_at, resolved_at) VALUES ('100', 10.0, 'LOST', 'tm', ?, ?, ?)",
+        (RESTRICTED, d(3), d(3)))
+    db.commit()
+    _seed_seller(db, "201", "PENDING", "tm")
+    assert len(_restriction_alerts(db)) == 1
+
+
 def test_null_timestamps_never_clear_the_restriction(db):
     """A timestamp-less restriction keeps alerting; a timestamp-less WON clears nothing."""
     db.execute(

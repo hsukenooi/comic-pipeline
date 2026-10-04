@@ -1661,7 +1661,8 @@ def _seller_restriction_alerts(conn: sqlite3.Connection) -> list[dict]:
 
     BUI-1129: a restriction is cleared once the seller has a LATER clean WON
     row (the bid reached eBay and was accepted, so the unpaid item is paid).
-    Ordering key is ``resolved_at``, else ``auction_end_at``. A restriction
+    Ordering key is ``auction_end_at`` (when the snipe fired), else
+    ``resolved_at``, which can lag the end (the eBay fallback resolves hours later). A restriction
     with no usable timestamp is never cleared (fail loud, keep alerting); a
     WON row with none cannot clear anything. LOST/ENDED/FAILED rows never
     clear: a text-less LOST can be an eBay-fallback inference with no proof a
@@ -1669,7 +1670,7 @@ def _seller_restriction_alerts(conn: sqlite3.Connection) -> list[dict]:
     """
     rows = conn.execute(
         "SELECT item_id, ebay_title, seller, status, status_mirror, "
-        "COALESCE(resolved_at, auction_end_at) AS ord_at FROM bids "
+        "COALESCE(auction_end_at, resolved_at) AS ord_at FROM bids "
         f"WHERE seller IS NOT NULL AND status NOT IN ({TOMBSTONE_STATUSES_SQL}) "
         "AND (status IN ('PENDING', 'WON') OR status_mirror LIKE '%RESTRICTED%')"
     ).fetchall()
