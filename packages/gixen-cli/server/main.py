@@ -1658,24 +1658,55 @@ def _seller_restriction_alerts(conn: sqlite3.Connection) -> list[dict]:
     A seller with a restriction but nothing pending raises nothing (there is
     nothing left to warn about); NULL-seller rows cannot be named and are
     skipped.
+
+    BUI-1129: a restriction is cleared once the seller has a LATER clean WON
+    row (the bid reached eBay and was accepted, so the unpaid item is paid).
+    Ordering key is ``auction_end_at`` (when the snipe fired), else
+    ``resolved_at``, which can lag the end (the eBay fallback resolves hours later). A restriction
+    with no usable timestamp is never cleared (fail loud, keep alerting); a
+    WON row with none cannot clear anything. LOST/ENDED/FAILED rows never
+    clear: a text-less LOST can be an eBay-fallback inference with no proof a
+    bid was placed. No fixed window: the clear-on-paid signal is the real one.
     """
     rows = conn.execute(
-        "SELECT item_id, ebay_title, seller, status, status_mirror FROM bids "
+        "SELECT item_id, ebay_title, seller, status, status_mirror, "
+        "COALESCE(auction_end_at, resolved_at) AS ord_at FROM bids "
         f"WHERE seller IS NOT NULL AND status NOT IN ({TOMBSTONE_STATUSES_SQL}) "
-        "AND (status = 'PENDING' OR status_mirror LIKE '%RESTRICTED%')"
+        "AND (status IN ('PENDING', 'WON') OR status_mirror LIKE '%RESTRICTED%')"
     ).fetchall()
+
+    def _ord(v: str | None) -> datetime | None:
+        if not v:
+            return None
+        try:
+            dt = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
     by_seller: dict[str, dict] = {}
     for r in rows:
         key = r["seller"].strip().lower()
         if not key:
             continue
         g = by_seller.setdefault(
-            key, {"seller": r["seller"], "texts": [], "pending": []}
+            key,
+            {"seller": r["seller"], "texts": [], "pending": [], "restricted": [],
+             "last_won": None},
         )
-        if is_seller_restriction(r["status_mirror"]) and r["status_mirror"] not in g["texts"]:
-            g["texts"].append(r["status_mirror"])
+        at = _ord(r["ord_at"])
+        if is_seller_restriction(r["status_mirror"]):
+            g["restricted"].append((at, r["status_mirror"]))
+        elif r["status"] == "WON" and at is not None:
+            if g["last_won"] is None or at > g["last_won"]:
+                g["last_won"] = at
         if r["status"] == "PENDING":
             g["pending"].append({"item_id": r["item_id"], "title": r["ebay_title"]})
+    for g in by_seller.values():
+        for at, text in g["restricted"]:
+            cleared = at is not None and g["last_won"] is not None and g["last_won"] > at
+            if not cleared and text not in g["texts"]:
+                g["texts"].append(text)
     alerts = []
     for key in sorted(by_seller):
         g = by_seller[key]

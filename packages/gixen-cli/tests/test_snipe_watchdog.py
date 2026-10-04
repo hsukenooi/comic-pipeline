@@ -539,6 +539,72 @@ def test_a_stale_sync_does_not_withhold_the_restriction_alert(db):
     assert kinds == {"sync_stale", "seller_restricted"}
 
 
+def _seed_resolved(conn, item_id, status, seller, resolved_at, mirror=None):
+    conn.execute(
+        "INSERT INTO bids (item_id, max_bid, status, seller, status_mirror, "
+        "auction_end_at, resolved_at) VALUES (?, 10.0, ?, ?, ?, ?, ?)",
+        (item_id, status, seller, mirror, resolved_at, resolved_at),
+    )
+    conn.commit()
+
+
+def _restriction_alerts(db):
+    return [a for a in _report(db)["alerts"] if a["kind"] == "seller_restricted"]
+
+
+def test_a_later_clean_won_bid_clears_the_restriction(db):
+    """BUI-1129: the unpaid item was paid, a later bid won, no more alert."""
+    _seed_resolved(db, "100", "LOST", "tm", (NOW - timedelta(days=9)).isoformat(), RESTRICTED)
+    _seed_resolved(db, "150", "WON", "TM", (NOW - timedelta(days=3)).isoformat())
+    _seed_seller(db, "201", "PENDING", "tm", None, "Thor #150")
+    assert _restriction_alerts(db) == []
+
+
+def test_a_restriction_after_the_last_clean_bid_still_alerts(db):
+    _seed_resolved(db, "150", "WON", "tm", (NOW - timedelta(days=9)).isoformat())
+    _seed_resolved(db, "100", "LOST", "tm", (NOW - timedelta(days=3)).isoformat(), RESTRICTED)
+    _seed_seller(db, "201", "PENDING", "tm", None, "Thor #150")
+    assert len(_restriction_alerts(db)) == 1
+
+
+def test_a_text_less_lost_row_does_not_clear_the_restriction(db):
+    _seed_resolved(db, "100", "LOST", "tm", (NOW - timedelta(days=9)).isoformat(), RESTRICTED)
+    _seed_resolved(db, "150", "LOST", "tm", (NOW - timedelta(days=3)).isoformat())
+    _seed_seller(db, "201", "PENDING", "tm")
+    assert len(_restriction_alerts(db)) == 1
+
+
+def test_won_ended_before_the_restriction_but_resolved_after_does_not_clear(db):
+    """Order by auction end, not resolved_at (which lags the end)."""
+    d = lambda n: (NOW - timedelta(days=n)).isoformat()
+    db.execute(
+        "INSERT INTO bids (item_id, max_bid, status, seller, auction_end_at, resolved_at) "
+        "VALUES ('150', 10.0, 'WON', 'tm', ?, ?)", (d(9), d(1)))
+    db.execute(
+        "INSERT INTO bids (item_id, max_bid, status, seller, status_mirror, "
+        "auction_end_at, resolved_at) VALUES ('100', 10.0, 'LOST', 'tm', ?, ?, ?)",
+        (RESTRICTED, d(3), d(3)))
+    db.commit()
+    _seed_seller(db, "201", "PENDING", "tm")
+    assert len(_restriction_alerts(db)) == 1
+
+
+def test_null_timestamps_never_clear_the_restriction(db):
+    """A timestamp-less restriction keeps alerting; a timestamp-less WON clears nothing."""
+    db.execute(
+        "INSERT INTO bids (item_id, max_bid, status, seller, status_mirror) "
+        "VALUES ('100', 10.0, 'LOST', 'tm', ?)", (RESTRICTED,))
+    _seed_resolved(db, "150", "WON", "tm", (NOW - timedelta(days=1)).isoformat())
+    _seed_seller(db, "201", "PENDING", "tm")
+    assert len(_restriction_alerts(db)) == 1
+    db.execute("DELETE FROM bids WHERE item_id IN ('100', '150')")
+    _seed_resolved(db, "100", "LOST", "tm", (NOW - timedelta(days=9)).isoformat(), RESTRICTED)
+    db.execute(
+        "INSERT INTO bids (item_id, max_bid, status, seller) VALUES ('150', 10.0, 'WON', 'tm')")
+    db.commit()
+    assert len(_restriction_alerts(db)) == 1
+
+
 # --------------------------------------------------------------------------
 # the endpoint + the sync stamp
 # --------------------------------------------------------------------------
