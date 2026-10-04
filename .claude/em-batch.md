@@ -30,7 +30,7 @@ Loaded by the `/em-batch` skill (`~/.claude/skills/em-batch/SKILL.md`). The doct
 
 - **Script** – Run `scripts/gates.sh` before every commit and report its summary lines. It runs exactly the five required CI jobs (`workspace`, `apps-python`, `lint`, `solutions-lint`, `ezship`) with CI's commands and flags, fails fast, and prints one `PASS` line with counts per gate (about 2 minutes warm). It covers the `apps/ebay` plus `apps/fmv` pairing (KTD11 replay, BUI-929), `solutions-lint` for prompt-only diffs, and `test_skill_contracts.py` for `.claude/commands/**` edits (BUI-919).
 - **Typecheck** – The script skips the non-required `typecheck` job. An `apps/fmv` change still owes `uvx mypy --ignore-missing-imports apps/fmv/src/fmv_runner.py plugins/gixen-overlay/src/gixen_overlay/routes.py plugins/gixen-overlay/src/gixen_overlay/ledger.py`, because mypy follows imports (PR #524, 2026-09-21). Fix it before merging.
-- **Prompt-only diffs** – `solutions-lint` is the only gate for `.claude/commands/**` and `.claude/agents/**`. Pair it with a full re-read of the edited files for self-contradiction (BUI-911).
+- **Prompt-only diffs** – `solutions-lint` is the only gate for `.claude/commands/**` and `.claude/agents/**`. Pair it with a full re-read of the edited files for self-contradiction (BUI-911). A cross-skill reference names a real heading without quotes: `file.md § Heading Words` (BUI-919).
 - **Live re-run** – A pool-shape or exclusion change owes a live re-run on the deployed build before the ticket closes (BUI-946, 2026-09-21). The suite proves the math, and only the deployed run proves the plumbing. See `docs/solutions/best-practices/a-fetch-time-exclusion-is-undone-by-an-archive-that-re-admits.md`.
 
 ## Review classes

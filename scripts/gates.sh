@@ -59,8 +59,8 @@ gate "solutions-lint: self-test" . ./scripts/solutions-lint --self-test
 gate "solutions-lint: lint" . ./scripts/solutions-lint
 gate "solutions-lint: premise-check selftest" . ./scripts/premise-check --selftest
 
-# Job: ezship (CI uses Node 20 and a clean `npm ci`; reuse node_modules if present)
-[[ -d apps/ezship/node_modules ]] || gate "ezship: npm ci" apps/ezship npm ci
+# Job: ezship (CI uses Node 20 and a clean `npm ci`, so stale deps can't hide a lockfile drift)
+gate "ezship: npm ci" apps/ezship npm ci
 gate "ezship: tsc" apps/ezship npx tsc --noEmit
 gate "ezship: npm test" apps/ezship npm test
 
