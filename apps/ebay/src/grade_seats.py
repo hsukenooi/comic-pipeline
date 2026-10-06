@@ -304,8 +304,12 @@ def two_seat_consensus(a, b):
 # ---------- process running ----------
 
 def claude_cmd(workdir):
+    workdir = Path(workdir).resolve()
+    exe = os.environ.get("GRADE_SEATS_CLAUDE", "claude")
+    if os.sep in exe:
+        exe = str(Path(exe).resolve())  # a relative path must survive the cwd change
     return [
-        os.environ.get("GRADE_SEATS_CLAUDE", "claude"), "-p", "--model", MODEL,
+        exe, "-p", "--model", MODEL,
         "--system-prompt-file", str(workdir / "grader-body.md"),
         "--tools", "Read,Bash", "--strict-mcp-config",
         "--mcp-config", str(workdir / "empty-mcp.json"),
@@ -323,7 +327,10 @@ def run_seat(workdir, folder, seat, suffix, job):
     err = ""
     try:
         with open(job_path) as fin, open(env_path, "w") as fout, open(err_path, "w") as ferr:
-            proc = subprocess.Popen(claude_cmd(workdir), stdin=fin, stdout=fout, stderr=ferr)
+            # cwd=workdir (outside the repo, BUI-1177): a seat launched from the repo
+            # root auto-loads CLAUDE.md + MEMORY.md, ~17k extra tokens per API call.
+            proc = subprocess.Popen(claude_cmd(workdir), stdin=fin, stdout=fout, stderr=ferr,
+                                    cwd=Path(workdir).resolve())
             try:
                 code = proc.wait(timeout=SEAT_TIMEOUT)
             except subprocess.TimeoutExpired:

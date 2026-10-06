@@ -16,6 +16,10 @@ claude -p --model <model> \
 - `--strict-mcp-config` with an empty `--mcp-config` stops user and project MCP servers from adding their tool schemas.
 - `--max-turns 8` is a backstop, not a budget.
 
+## Launch from outside the repo (BUI-1177)
+
+Run `claude -p` with its working directory set to a directory outside the repo (the run's workdir). From the repo root the seat also auto-loads the project CLAUDE.md and the auto-memory MEMORY.md (48.5k characters), which adds about 17.7k tokens to every API call (28.6k from the repo root against 10.9k from a non-repo directory, same flags, 2026-10-06). `grade-seats` sets `cwd=<workdir>` on every seat, retry, and adjudicator process. A harness script must `cd` to its output directory before `claude -p`. Job text paths must be absolute.
+
 ## Do not use `--allowedTools` for this
 
 `--allowedTools` only gates permission prompts. Every built-in tool schema still ships on every API call.
