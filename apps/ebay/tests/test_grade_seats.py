@@ -3,6 +3,7 @@
 import json
 import stat
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -17,6 +18,7 @@ d = os.environ["FAKE_DIR"]
 seat = re.search(r"crops-([\\w-]+)", job).group(1)
 n = len([f for f in os.listdir(d) if f.startswith(seat + ".job.")]) + 1
 open(os.path.join(d, seat + ".job." + str(n)), "w").write(job)
+open(os.path.join(d, seat + ".cwd." + str(n)), "w").write(os.getcwd())
 plan = json.load(open(os.path.join(d, seat + ".json")))
 step = plan[min(n, len(plan)) - 1]
 
@@ -133,6 +135,20 @@ def test_agreeing_seats_no_second_pass(env, capsys):
     job = (env / "work/comic-1/job-g1-a.txt").read_text()
     assert "CROP DIRECTORY: " in job and job.rstrip().endswith("write nothing after them.")
     assert (env / "work/grader-body.md").read_text().strip() == "BODY"
+
+
+def test_every_seat_launches_in_workdir_not_repo(env, capsys):
+    """BUI-1177: first-pass, retry, and adjudicator seats all run with cwd=workdir."""
+    plan(env, "g1-a", {"grades": {"101": 5.0}})
+    plan(env, "g1-b", {"exit": 1}, {"grades": {"101": 7.0}})  # retried, then splits 2.0
+    plan(env, "adjudicator", {"raw": "RECONCILED BLOCK\n101\nGRADE: 6.0\nGRADE RANGE: 6.0\n"
+                                      "CONFIDENCE: MEDIUM\nSEAT FINDINGS\n- g1-a: ok\n- g1-b: ok\n"})
+    code, rep = run(env, [book()], capsys)
+    work = (env / "work").resolve()
+    cwds = sorted((env / "fake").glob("*.cwd.*"))
+    assert len(cwds) == 4  # a, b, b-retry, adjudicator
+    assert {Path(c.read_text()).resolve() for c in cwds} == {work}
+    assert Path(grade_seats.__file__).resolve().parents[3] not in work.parents
 
 
 def test_retry_after_failure_uses_retry_job_name(env, capsys):
