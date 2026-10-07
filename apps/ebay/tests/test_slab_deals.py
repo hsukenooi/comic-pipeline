@@ -84,6 +84,18 @@ class TestClassifyListing:
     def test_wrong_book_dropped(self, title):
         assert classify(title)[1] == "rejected"
 
+    @pytest.mark.parametrize("title", [
+        "Williams-Verlag 1976 German Amazing Spider-Man #50 CGC 9.0",
+        "Amazing Spider-Man 50, CGC 6.0, RARE 1968 SWEDISH Foreign Ed",
+        "Amazing Spider-Man #50 Capullo Variant Marvel Comics 2024 CGC 9.8",
+        "Amazing Spider-man 1 2 3 4 5 6 7 8 9 10 11 12-50 All CGC 4.0",
+        "Amazing Spider-Man #50 Panini Comics CGC 9.0",
+    ])
+    def test_should_reject_alone_drops_bui_1201_classes(self, title):
+        """BUI-1201: these classes no longer depend on the slab-only list."""
+        assert sd.should_reject(title, "Amazing Spider-Man", "50",
+                                release_year="1967", include_graded=True)
+
     def test_series_year_in_paren_is_kept(self):
         assert classify("Amazing Spider-Man (1963) # 50 CGC 5.0 VG/FN")[1] is None
 

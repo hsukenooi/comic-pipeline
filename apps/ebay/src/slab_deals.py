@@ -48,19 +48,25 @@ LADDER_LABEL = "universal"
 
 _LEADING_ARTICLE_RE = re.compile(r"^(?:the|a|an)\s+", re.IGNORECASE)
 
-# A listing for a different product than the book's first-print copy. Foreign
-# editions, later-era variants and incentive covers, homages, and multi-issue
-# lots share the title text of the real book. Each marker is a whole word or
-# phrase. A false drop only hides a listing, it never prices one.
+# Slab-only extras on top of comic_identity.should_reject (BUI-1201), which
+# now rejects foreign-edition publishers/phrases (Williams-Verlag, Panini,
+# "Swedish Foreign Ed"), later-era variant covers relative to --year, lots,
+# and facsimiles for every caller. What stays here is too broad for the
+# purchase path that seller-scan and wishlist-sellers gate with
+# should_reject, where a false reject costs a missed purchase (BUI-239):
+# bare nationality words (and "Canadian"/"UK"/"pence" price variants of the
+# US printing), any variant cover at all, sketch/homage/Sony/foil covers,
+# and an explicit Vol. 2-9. Here a false drop only hides a listing, it never
+# prices one, and the CGC Universal ladder is for the plain first print.
 _NOT_THE_BOOK_RE = re.compile(
     r"""\bforeign\b
     | \b(?:german|swedish|italian|dutch|netherlands|danish|norwegian|finnish
         |spanish|french|brazilian|mexico|mexican|greek|turkish|yugoslavian
         |australian|canadian|uk)\b
-    | \bwilliams[\s-]verlag\b | \bpanini\b | \bvariants?\b | \bvirgin\b
+    | \bvariants?\b | \bvirgin\b
     | \bincentive\b | \b1:\d+\b | \blgy\b | \bsketch\b | \bhomage\b
-    | \bsony\b | \bfoil\b | \bfacsimile\b | \bvol(?:ume)?\.?\s*[2-9]\b
-    | \bv[2-9]\b | \blot\b | \bpence\b""",
+    | \bsony\b | \bfoil\b | \bvol(?:ume)?\.?\s*[2-9]\b
+    | \bv[2-9]\b | \bpence\b""",
     re.IGNORECASE | re.VERBOSE,
 )
 _YEAR_RE = re.compile(r"(?<!\d)(19[3-9]\d|20[0-3]\d)(?!\d)")

@@ -194,7 +194,13 @@ _LOT_RE = re.compile(
     # LOT ("STRANGE TALES 164/165") falls through to Haiku instead — the safe
     # under-reject direction; a 3+ member slash chain ("164/165/166") is still
     # caught by the branch above.
-    rf"|{_LOT_MEMBER}\s*&\s*{_LOT_MEMBER}",
+    rf"|{_LOT_MEMBER}\s*&\s*{_LOT_MEMBER}"
+    # BUI-1201: a space-separated run that ENDS in a dash range — "Amazing
+    # Spider-man 1 2 3 4 5 6 7 8 9 10 11 12-50 All CGC 4.0". Needs 3+ spaced
+    # members before the range, so 4+ numbers in all. The bare spaced run
+    # ("Batman 655 656 657 658") stays comp-only (BUI-637), and a 2-member
+    # dash pair ("129-150", "Reprints #180 181") stays unmatched.
+    rf"|{_LOT_MEMBER}(?:\s+{_LOT_MEMBER}){{2,}}\s*-\s*{_LOT_MEMBER}",
     re.IGNORECASE,
 )
 
@@ -594,6 +600,28 @@ _FOREIGN_EDITION_MARKERS: frozenset[str] = frozenset({
     "espanol",         # ASCII variant (no accent) — common in eBay titles
     "spanish edition", # explicit English phrase
     "foreign edition", # generic foreign-edition marker
+    # BUI-1201: the slab-deals ASM #50 probe (BUI-1188) found German,
+    # Swedish, and Italian editions passing this gate. Still no bare
+    # nationality words (BUI-239): only market-specific publisher names and
+    # "<nationality> edition"/"foreign ed" phrases. "Canadian", "UK",
+    # "Australian", and "pence" are deliberately absent — those name price
+    # variants of the US printing, which a collector can want.
+    "foreign ed",      # "RARE 1968 SWEDISH Foreign Ed" (abbreviated)
+    "williams verlag", # German Marvel licensee (1970s)
+    "williams-verlag",
+    "williams forlag", # Swedish Marvel licensee
+    "williams förlag",
+    "bastei",          # German publisher
+    "semic",           # Swedish/Nordic publisher (Semic Press)
+    "editoriale corno",  # Italian Marvel licensee
+    "panini",          # licensed European/Latin American editions (BUI-563)
+    "ebal",            # Brazilian publisher
+    "editora abril",   # Brazilian publisher
+    *(f"{nat} edition" for nat in (
+        "german", "swedish", "italian", "french", "dutch", "danish",
+        "norwegian", "finnish", "greek", "turkish", "brazilian",
+        "portuguese", "japanese", "yugoslavian", "mexican",
+    )),
 })
 
 
@@ -807,6 +835,8 @@ def should_reject(
       5. _trading_card_reject — trading card / TCG product (BUI-232).
       6. _foreign_edition_reject — foreign-language/-market reprint (BUI-239).
       7. _second_print_reject   — later printing / non-first-print (BUI-244).
+      8. modern_variant_mismatch — later-era variant cover of the wished
+                              book, relative to the wish era (BUI-1201).
 
     *series_name* and *release_year* are optional — pass them whenever the
     caller has a decorated LOCG series name / per-issue release year so the
@@ -830,7 +860,81 @@ def should_reject(
         return True
     if _second_print_reject(title):
         return True
+    if modern_variant_mismatch(title, series_name, release_year):
+        return True
     return False
+
+
+# ─── Modern variant of an earlier book (BUI-1201) ────────────────────────────
+# "Amazing Spider-Man #50 Capullo Variant Marvel Comics 2024 CGC 9.8" carries
+# the series name and issue number of the 1967 book, so every gate above
+# passes it. Bare "variant" cannot reject it on its own: vintage books have
+# genuine variants (pence, 30/35-cent, Whitman, Mark Jewelers, Canadian
+# price), and a wish for a 2019 book whose listing says "variant" may be
+# exactly the book wanted. The rule is therefore RELATIVE to the wish's era:
+#
+#   1. A variant-cover token plus stated years that ALL fall after the wish
+#      era's upper bound (release_year + 1, else the series' end year + 1).
+#      One in-era year anywhere keeps the listing ("ASM #4 VARIANT 1963").
+#   2. With no year at all, only tokens that did not exist before 1990
+#      (ratio "1:25", "incentive", "LGY") reject, and only for a wish whose
+#      era ends before 1990.
+#
+# A later year WITHOUT a variant token is not enough ("Hulk #181 1st
+# Wolverine, Logan movie 2017" is the real book); slab_deals keeps that
+# broader year check as a slab-only extra. FAIL-OPEN: no wish era (no
+# release_year and no closed series range) never rejects.
+_VARIANT_TOKEN_RE = re.compile(
+    r"\bvariants?\b|\bvirgin\b|\bincentive\b|\blgy\b|(?<![\d.])1:\d{2,4}\b",
+    re.IGNORECASE,
+)
+_POST_1990_VARIANT_RE = re.compile(
+    r"\bincentive\b|\blgy\b|(?<![\d.])1:\d{2,4}\b", re.IGNORECASE,
+)
+_MODERN_VARIANT_ERA = 1990
+_PRICE_RE = re.compile(r"\$\s*[\d,]+(?:\.\d+)?")
+_NON_COVER_YEAR_RE = re.compile(
+    r"\b(?:pressed|graded|cgc|cbcs|pgx|slabbed|signed|cleaned)\s+\d{4}\b"
+    r"|\b\d{4}\s+(?:movie|film|tv|show|holder|label)\b",
+    re.IGNORECASE,
+)
+
+
+def _wish_era_upper(series_name: "str | None", release_year: "str | None") -> "int | None":
+    """Latest plausible cover year for the wished book, or None (unknown)."""
+    if release_year is not None:
+        try:
+            iy = int(str(release_year).strip())
+        except (ValueError, TypeError):
+            iy = None
+        if iy is not None and _is_plausible_year(iy):
+            return iy + 1
+    rng = series_year_range(series_name) if series_name else None
+    if rng is not None and rng[1] != _ERA_OPEN_END:
+        return rng[1] + 1
+    return None
+
+
+def modern_variant_mismatch(
+    title: str,
+    series_name: "str | None" = None,
+    release_year: "str | None" = None,
+) -> bool:
+    """True when *title* is a later-era variant cover of the wished book.
+
+    See the block comment above for the two rules and why each is bounded.
+    """
+    if not _VARIANT_TOKEN_RE.search(title or ""):
+        return False
+    upper = _wish_era_upper(series_name, release_year)
+    if upper is None:
+        return False
+    # A price ("$1999 OBO") or a service/media date ("Pressed 2023", "CGC
+    # 2023 holder", "Venom 2018 movie") is not a cover year.
+    years = _all_title_years(_NON_COVER_YEAR_RE.sub(" ", _PRICE_RE.sub(" ", title)))
+    if years:
+        return min(years) > upper
+    return upper <= _MODERN_VARIANT_ERA and bool(_POST_1990_VARIANT_RE.search(title))
 
 
 # ─── FMV comp-exclusion (BUI-269) ────────────────────────────────────────────
