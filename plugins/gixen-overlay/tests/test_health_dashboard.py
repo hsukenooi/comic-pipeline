@@ -196,3 +196,13 @@ def test_all_clear_shows_a_quiet_green_chip_and_no_rejection_chip(node, html):
     assert "jobs ok" in out
     assert "health-chip good" in out
     assert "rejected" not in out
+
+
+def test_fmv_cell_width_capped_with_hover_title(html):
+    """BUI-1205: the fmv <td> is width-capped/ellipsised and carries the full
+    plain-text value as a title; both tables share the renderer."""
+    assert re.search(r"td\.fmv-cell\s*\{[^}]*max-width:[^}]*text-overflow:\s*ellipsis", html)
+    assert "function fmvCell(" in html
+    assert 'class="right num fmv-cell" title="' in html
+    assert html.count("${fmvCell(r)}") == 2
+    assert "<td class=\"right num\">${fmtFmv(r)}</td>" not in html
