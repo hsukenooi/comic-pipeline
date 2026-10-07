@@ -255,6 +255,19 @@ class TestResolvePageQuality:
         ("CGC 9.4 C/OW", "c_ow"),
         ("CGC 9.4 CR/OW", "c_ow"),
         ("CGC 9.4 CREAM", "cream"),
+        # BUI-1187: spelled-out forms
+        ("CGC 4.5 Off White To White", "ow_w"),
+        ("CGC 4.5 Off-White to White", "ow_w"),
+        ("CGC 4.5 Off-White to White Pages", "ow_w"),
+        ("CGC 4.5 OffWhite to White", "ow_w"),
+        ("CGC 9.4 WP", "white"),
+        ("CGC 9.4 (W)", "white"),
+        ("CGC 9.4 White Pages", "white"),
+        ("CGC 4.5 Cream to Off-White", "c_ow"),
+        ("CGC 4.5 Cream to Off White", "c_ow"),
+        ("CGC 4.5 Cream to Off-White Pages", "c_ow"),
+        ("CGC 4.5 Off-White", "ow"),
+        ("CGC 4.5 Off White Pages", "ow"),
     ])
     def test_tokens(self, text, expected):
         assert gt.resolve_page_quality(text) == expected
@@ -264,6 +277,19 @@ class TestResolvePageQuality:
         compound patterns must win by being checked first."""
         assert gt.resolve_page_quality("OW/W") == "ow_w"
         assert gt.resolve_page_quality("C/OW") == "c_ow"
+
+    @pytest.mark.parametrize("text", [
+        "White Queen #1 CGC 9.4",
+        "Wolverine #1 CGC 9.4",
+        "White Tiger CGC 9.4",
+        "Wasp #1 CGC 9.4",
+        "Swamp Thing WPP",
+        "Off the Wall #1 CGC 9.4",
+    ])
+    def test_title_words_not_page_quality(self, text):
+        """BUI-1187: WP and the spelled forms must not false-positive on
+        common title words."""
+        assert gt.resolve_page_quality(text) is None
 
     def test_no_page_quality(self):
         assert gt.resolve_page_quality("Invincible #1 2003 CGC 9.4") is None
