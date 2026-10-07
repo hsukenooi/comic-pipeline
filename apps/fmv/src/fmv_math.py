@@ -2178,17 +2178,29 @@ def graded_fmv(comps: list[dict], target_grade: float, *,
         rescued. BUI-957 renamed that value (it was `"ladder_starved"`, and no
         row is starved any more).
 
-        **The exact-tier gate is never re-run on the wider pool (BUI-943).**
-        The gate reads the scoped bucket, once. Sales at the target grade whose
-        page quality is not the target's stay what the ladder tier makes of any
-        target rung — dropped, and reported as evidence (`exact_effective_n`/
-        `exact_sales` are re-read on the wider pool for the notes' "recorded,
-        NOT used as the price" line, which is why that field can read >= 2 on a
-        `basis=ladder` row). Measured, the two rules price the same band: the
-        same envelope bounds it either way, and all that changes is the
-        haircut — 0.60 against 0.80, a $1,450 cap against a $1,925 one on the
-        case in the code below. Equal evidence, higher cap, paid for with the
-        comps the preference declined.
+        **The exact bucket widens to every page quality when the scoped one
+        holds fewer than two sales (BUI-1186, BUI-1204).** Page quality barely
+        moves price within a grade (0.98x-1.12x of the grade median, 427 CGC
+        comps), so same quality is a preference, not a wall. When the scoped
+        exact bucket is EMPTY (BUI-1186), or holds exactly ONE sale while the
+        any-quality bucket holds more and clears the exact gate (BUI-1204),
+        the any-quality sales at the target grade become the exact bucket,
+        reported as `page_quality_fallback_reason="exact_any_page_quality"`.
+        The one-sale widen is taken only when it prices `direct`; below the
+        gate the row falls through exactly as before (the scoped lone sale to
+        the lone-sale tier, then the ladder).
+
+        **What BUI-943 still governs.** A scoped bucket of TWO or more sales
+        wins, even below the gate: the other-quality sales at the target grade
+        are then what the ladder makes of any target rung — dropped, and
+        reported as evidence (`exact_effective_n`/`exact_sales` are re-read on
+        the wider pool for the notes' "recorded, NOT used as the price" line,
+        which is why that field can read >= 2 on a `basis=ladder` row). And
+        the ladder never reads the target rung, widened or not. BUI-943
+        measured the trade the widen makes: the same envelope bounds the band
+        either way, and only the haircut changes, 0.60 against 0.80 (a $1,450
+        cap against a $1,925 one on its case). BUI-1186 and BUI-1204 accept
+        that trade where the same-quality evidence is one sale or none.
       * REFUSALS — `no_certifier_pool` (nothing survived the identity + age
         filters), `ladder_too_thin` (< 3 anchor-eligible rungs in the whole
         same-label pool), `outside_ladder` (no rung on one side — the proxy's
@@ -2256,8 +2268,9 @@ def graded_fmv(comps: list[dict], target_grade: float, *,
     # (ASM #50 CGC 6.0: three sales at $1,230-$1,329 ignored for a $1,100
     # interpolation across 5.5/6.5). Page quality barely moves price within a
     # grade (427 CGC comps: 0.98x-1.12x of the grade median), so same-quality
-    # stays the PREFERENCE (a non-empty scoped bucket, even one sale, still
-    # wins) and any-quality is the fallback BEFORE the ladder. The ladder is
+    # stays the PREFERENCE (a scoped bucket of two or more sales still wins;
+    # BUI-1204 below covers one) and any-quality is the fallback BEFORE the
+    # ladder. The ladder is
     # unchanged and still never reads the target rung. This deliberately
     # reverses BUI-943's "never re-run the gate on the wider pool" for the
     # empty-bucket case only: that note priced the haircut gap (0.60 vs 0.80)
@@ -2267,20 +2280,39 @@ def graded_fmv(comps: list[dict], target_grade: float, *,
         if widened:
             exact_comps = widened
             exact_effective_n = eff_n.get(target_grade, 0.0)
-            identity["exact_effective_n"] = exact_effective_n
-            identity["exact_sales"] = sorted(float(c["price"]) for c in widened)
-            identity["exact_sales_detail"] = _exact_sales_detail(widened)
             # Provenance. If neither exact tier prices this, the ladder block
             # below overwrites the reason with `ladder_reads_all_qualities`.
-            identity["page_quality_fallback"] = True
-            identity["page_quality_fallback_reason"] = "exact_any_page_quality"
+            identity.update(_exact_any_page_quality_fields(widened, exact_effective_n))
+
+    # BUI-1204 extends the same widen to a scoped bucket of exactly ONE sale.
+    # "One" is a count of sales, not effective n: a single sale weighs at most
+    # 1.0, so it can never clear the gate itself. The widen is taken only when
+    # the any-quality bucket holds more sales, clears
+    # GRADED_EXACT_MIN_EFFECTIVE_N, AND actually prices `direct` (the direct
+    # tier can still refuse a thin, wide pair `too_sparse`). Otherwise this
+    # block changes nothing and the row falls through exactly as before: the
+    # scoped lone sale to BUI-952's tier, then the ladder, so no row trades a
+    # price for a refusal. ASM #50 CGC 6.0 OW/W: one ow_w 6.0 sale priced
+    # alone at $1,225 (LOW/0.70) while the other 6.0 sales sat unread.
+    # BUI-943 still governs a scoped bucket of TWO or more sales: it wins,
+    # even below the gate, and the other-quality sales stay evidence.
+    elif len(exact_comps) == 1 and len(pool) < len(full_pool):
+        widened = [c for c in full_pool if float(c["grade"]) == target_grade]
+        widened_eff_n = eff_n.get(target_grade, 0.0)
+        if len(widened) > 1 and widened_eff_n >= GRADED_EXACT_MIN_EFFECTIVE_N:
+            direct = _graded_direct(
+                widened, ladder, eff_n, target_grade,
+                {**identity, **_exact_any_page_quality_fields(widened, widened_eff_n)})
+            if direct["flag_reason"] is None:
+                return direct
 
     if exact_effective_n >= GRADED_EXACT_MIN_EFFECTIVE_N:
         return _graded_direct(exact_comps, ladder, eff_n, target_grade, identity)
 
-    # BUI-952. Reads the SCOPED exact bucket, like the tier above it and for
-    # the same reason (BUI-937: the exact bucket is the one thing page quality
-    # scopes), while its bracket rungs come from the WHOLE same-label pool,
+    # BUI-952. Reads the same exact bucket as the tier above: the scoped one,
+    # or the any-quality one when BUI-1186 widened an empty scoped bucket
+    # (a BUI-1204 widen always priced above, so never reaches here). Its
+    # bracket rungs come from the WHOLE same-label pool,
     # like the exact tier's envelope clamp and the ladder's own neighbours.
     # Returns None — not a refusal — whenever any condition fails, so the
     # fall-through below is byte-for-byte the pre-BUI-952 path.
@@ -2293,18 +2325,20 @@ def graded_fmv(comps: list[dict], target_grade: float, *,
         # reads every quality — so the row says so, in the two fields BUI-939
         # introduced for exactly this disclosure.
         #
-        # BUI-943: the gate above is NOT re-run on the wider pool, and the
-        # exact-grade fields re-read below are evidence, never a second gate.
-        # Two sales at the target grade whose page quality is not the target's
-        # WOULD clear `GRADED_EXACT_MIN_EFFECTIVE_N` here — and on a measured
-        # case (a white 9.4 target over 9.2/9.6/9.8 white rungs and two cream
-        # 9.4 sales) both rules land on the SAME $2,400 band, because the same
-        # envelope bounds it either way. The only thing that differs is the
-        # haircut: 0.60 as a ladder point, 0.80 as a rubric-graded exact
-        # bucket — a $1,450 cap against a $1,925 one. Equal band, higher cap,
-        # bought with the very comps the page-quality preference declined: the
-        # exact tier is the page-quality-preferring tier by definition
-        # (BUI-937), and the wider pool is the ladder's.
+        # The exact-grade fields re-read below are evidence, never a second
+        # gate. The wider pool's exact sales already had their one chance to
+        # price, in the `exact_any_page_quality` widen above (BUI-1186 for an
+        # empty scoped bucket, BUI-1204 for a one-sale bucket). A row reaches
+        # here with them unused only when that widen declined: the scoped
+        # bucket held TWO+ sales (BUI-943: same quality wins, even thin), or
+        # the one-sale widen missed `GRADED_EXACT_MIN_EFFECTIVE_N` (or the
+        # direct tier refused it) and the scoped lone sale did not price
+        # either. BUI-943's measured case (a
+        # white 9.4 target over 9.2/9.6/9.8 white rungs and two cream 9.4
+        # sales) shows the trade: the same $2,400 band either way, because the
+        # same envelope bounds it, and only the haircut differs, 0.60 as a
+        # ladder point against 0.80 as an exact bucket ($1,450 cap against
+        # $1,925).
         identity["page_quality_fallback"] = True
         identity["page_quality_fallback_reason"] = "ladder_reads_all_qualities"
         # `pool_n` is already the whole pool (BUI-957) — it never was the
@@ -2317,13 +2351,28 @@ def graded_fmv(comps: list[dict], target_grade: float, *,
     return _graded_ladder(full_pool, ladder, eff_n, target_grade, identity)
 
 
+def _exact_any_page_quality_fields(widened: list[dict],
+                                   widened_eff_n: float) -> dict:
+    """Identity fields for an exact bucket widened to every page quality
+    (BUI-1186: empty scoped bucket; BUI-1204: one-sale scoped bucket)."""
+    return {
+        "exact_effective_n": widened_eff_n,
+        "exact_sales": sorted(float(c["price"]) for c in widened),
+        "exact_sales_detail": _exact_sales_detail(widened),
+        "page_quality_fallback": True,
+        "page_quality_fallback_reason": "exact_any_page_quality",
+    }
+
+
 def _graded_direct(exact_comps: list[dict], ladder: dict[float, float],
                    eff_n: dict[float, float], target_grade: float,
                    identity: dict) -> dict:
     """The EXACT tier: price the band off the target-grade bucket alone.
 
-    `exact_comps` is the page-quality-SCOPED bucket (it is the band, and its
-    effective n already decided this tier), while `ladder`/`eff_n` are the
+    `exact_comps` is the page-quality-SCOPED bucket, or the any-quality one
+    when the scoped bucket held fewer than two sales (BUI-1186/BUI-1204). It
+    is the band, and its effective n already decided this tier, while
+    `ladder`/`eff_n` are the
     WHOLE same-label pool's rungs (BUI-937) — the envelope that bounds the
     band must exist even when scoping left the scoped pool one rung wide.
     """
