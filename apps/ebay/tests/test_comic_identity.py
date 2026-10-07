@@ -5,6 +5,8 @@ those symbols through seller_scan's re-exports — this file covers only the
 genuinely new title→identity extraction logic.
 """
 
+import pytest
+
 import comic_identity as ci
 import comic_identity_year as ciy  # BUI-942: _title_cover_date_years is not re-exported
 import seller_scan
@@ -1315,3 +1317,102 @@ class TestEraCorroboration:
             )
             is None
         )
+
+
+# ─── should_reject gaps from the slab-deals probe (BUI-1201) ──────────────
+
+ASM = "Amazing Spider-Man"
+ASM_V1 = "The Amazing Spider-Man (Vol. 1) (1963 - 1998)"
+
+
+class TestShouldRejectForeignEditions:
+    @pytest.mark.parametrize("title", [
+        "Williams-Verlag 1976 German Amazing Spider-Man #50 CGC 9.0",
+        "Amazing Spider-Man #50 Williams Verlag Marvel 1976",
+        "Amazing Spider-Man 50, CGC 6.0, RARE 1968 SWEDISH Foreign Ed",
+        "Amazing Spider-Man #50 Italian Edition Editoriale Corno 1972",
+        "Amazing Spider-Man #50 Semic Press 1977",
+        "Amazing Spider-Man #50 Panini Comics",
+        "Amazing Spider-Man #50 German Edition",
+        "Amazing Spider-Man #50 EBAL Brazil 1970",
+    ])
+    def test_rejected(self, title):
+        assert ci.should_reject(title, ASM, "50", ASM_V1, "1967")
+
+    @pytest.mark.parametrize("title", [
+        # Price variants of the US printing are wanted books (BUI-239).
+        "Amazing Spider-Man #50 Canadian Price Variant 1967",
+        "Amazing Spider-Man #50 UK Pence Variant 1967",
+        "Amazing Spider-Man #50 Canadian Edition 1967",
+        # Bare nationality words stay out of the purchase path (BUI-239).
+        "Amazing Spider-Man #50 1967 German collector estate",
+        "Amazing Spider-Man #50 1967 Italian seller ships worldwide",
+        "Amazing Spider-Man #50 1967 Foreign shipping OK",
+        # A nationality inside a US story or character name.
+        "Daredevil #50 1969 The Swedish Chef cameo",
+        "Fantastic Four #50 1966 Silver Surfer Galactus",
+    ])
+    def test_kept(self, title):
+        series = title.split(" #")[0]
+        assert not ci.should_reject(title, series, "50", None, title.split()[-1]
+                                    if title.split()[-1].isdigit() else None)
+
+
+class TestShouldRejectModernVariants:
+    @pytest.mark.parametrize("title,series_name,release_year", [
+        ("Amazing Spider-Man #50 Capullo Variant Marvel Comics 2024 CGC 9.8",
+         None, "1967"),
+        ("Amazing Spider-Man #50 Virgin Variant 2024", ASM_V1, None),
+        ("Amazing Spider-Man #50 1:25 Incentive Variant NM", None, "1967"),
+        ("Amazing Spider-Man #50 LGY #851 Variant", ASM_V1, "1967"),
+    ])
+    def test_rejected_for_a_vintage_wish(self, title, series_name, release_year):
+        assert ci.should_reject(title, ASM, "50", series_name, release_year,
+                                include_graded=True)
+
+    @pytest.mark.parametrize("title,series_name,release_year", [
+        # Vintage variants: an in-era year keeps the listing.
+        ("AMAZING SPIDER-MAN #4 VARIANT 1963 Sandman First appearance", ASM_V1, "1963"),
+        ("Amazing Spider-Man #155 35 Cent Price Variant 1976", ASM_V1, "1976"),
+        ("Amazing Spider-Man #4 Pence Variant", ASM_V1, "1963"),
+        ("Amazing Spider-Man #50 Variant 1963-1998 run", ASM_V1, None),
+        # A later year without a variant token is the real book (movie hype).
+        ("Amazing Spider-Man #50 1st Kingpin No Way Home 2021", ASM_V1, "1967"),
+        # The wish IS a modern book: its own variant is wanted.
+        ("Amazing Spider-Man #50 Capullo Variant 2024", None, "2024"),
+        ("Amazing Spider-Man #50 1:25 Incentive Variant", None, "2019"),
+        # A price is not a cover year.
+        ("Amazing Spider-Man #50 Pence Variant $1999 OBO", ASM_V1, "1967"),
+        # Service and media dates are not cover years.
+        ("Amazing Spider-Man #129 Variant 1st Punisher Pressed 2023", ASM_V1, "1974"),
+        ("Amazing Spider-Man #129 newsstand variant CGC 2023 holder", ASM_V1, "1974"),
+        ("Amazing Spider-Man #300 Venom 2018 movie variant cover", ASM_V1, "1988"),
+        # No wish era: fail open.
+        ("Amazing Spider-Man #50 Capullo Variant 2024", None, None),
+        ("Amazing Spider-Man #50 Capullo Variant 2024",
+         "The Amazing Spider-Man (2022 - Present)", None),
+    ])
+    def test_kept(self, title, series_name, release_year):
+        issue = title.split("#")[1].split()[0]
+        assert not ci.should_reject(title, ASM, issue, series_name, release_year,
+                                    include_graded=True)
+
+
+class TestShouldRejectSpacedRunLot:
+    def test_spaced_run_ending_in_range_is_a_lot(self):
+        title = "Amazing Spider-man 1 2 3 4 5 6 7 8 9 10 11 12-50 All CGC 4.0"
+        assert ci._LOT_RE.search(title)
+        assert ci.should_reject(title, ASM, "50", include_graded=True)
+
+    @pytest.mark.parametrize("title,issue", [
+        # Bare spaced run stays comp-only (BUI-637).
+        ("Batman 655 656 657 658 1st Damian Wayne NM", "655"),
+        # Two-member dash pairs stay ambiguous (BUI-221/243).
+        ("King Size Hulk #1 Reprints #180 181-182", "1"),
+        ("Amazing Spider-Man #50 1963-1998 run key", "50"),
+        ("X-Men #94 129-150 era key", "94"),
+        # Grades never join a run.
+        ("Amazing Spider-Man #50 CGC 9.4 9.6 6-7 1967", "50"),
+    ])
+    def test_kept(self, title, issue):
+        assert not ci._LOT_RE.search(title)
