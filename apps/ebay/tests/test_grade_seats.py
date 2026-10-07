@@ -377,6 +377,18 @@ def test_two_first_each_trigger_dispatches_third(env, capsys, a, b, want):
     assert bk["adjudicator"] is None  # no seat pair split by 1.0
 
 
+def test_unbounded_two_photo_book_agreeing_at_medium_low_still_runs_third(env, capsys):
+    """BUI-1127 routes a gate-on book with an unbounded est_close straight to two-first,
+    skipping the probe. That is only safe because two agreeing 2-photo seats at
+    MEDIUM-LOW (the normal read on such a listing) still dispatch the third seat."""
+    for s in "abc":
+        plan(env, f"g1-{s}", {"grades": {"101": 8.5}})  # default conf MEDIUM-LOW: 2 photos
+    code, rep = run(env, [two_first(comic="Daredevil #227 (1986)")], capsys, photos=2)
+    pol = rep["books"][0]["policy"]
+    assert code == 0 and ran(env, "g1-c") and pol["third"] and not pol["upfront"]
+    assert pol["trigger"] == "confidence MEDIUM-LOW (g1-a); confidence MEDIUM-LOW (g1-b)"
+
+
 def test_third_seat_then_adjudicator_on_a_one_point_split(env, capsys):
     plan(env, "g1-a", {"grades": {"101": 6.0}, "conf": "HIGH"})
     plan(env, "g1-b", {"grades": {"101": 5.5}, "conf": "HIGH"})
