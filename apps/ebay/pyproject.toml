@@ -16,6 +16,7 @@ dependencies = [
 ebay-fetch = "ebay_fetch:main"
 ebay-sold-comps = "sold_comps:main"
 seller-scan = "seller_scan:main"
+slab-deals = "slab_deals:main"
 wishlist-sellers = "wishlist_sellers:main"
 comic-identify = "comic_identify:main"
 grade-photos = "grade_photos:main"

@@ -65,7 +65,7 @@ if ! command -v uv >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "Installing ebay-tools (ebay-fetch, ebay-sold-comps, seller-scan, comic-identify, wishlist-sellers, ebay-shipped)..."
+echo "Installing ebay-tools (ebay-fetch, ebay-sold-comps, seller-scan, comic-identify, wishlist-sellers, ebay-shipped, slab-deals)..."
 # BUI-241: --editable so the file-relative _load_dotenv() in seller_scan.py
 # resolves back into the source tree (apps/ebay/.env) regardless of caller cwd;
 # secrets stay out of the built wheel.
@@ -122,6 +122,6 @@ done
 
 echo
 echo "Done. CLIs installed via uv into $bin_dir:"
-for name in comic-fmv ebay-sold-comps ebay-fetch seller-scan comic-identify wishlist-sellers ebay-shipped gixen locg comics-api premise-check; do
+for name in comic-fmv ebay-sold-comps ebay-fetch seller-scan comic-identify wishlist-sellers ebay-shipped slab-deals gixen locg comics-api premise-check; do
   printf '  %-16s -> %s\n' "$name" "$(command -v "$name" 2>/dev/null || echo 'NOT ON PATH — add '"$bin_dir"' to PATH')"
 done
