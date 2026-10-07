@@ -2583,7 +2583,10 @@ class TestGradedPageQualityLadderFallback:
 
 
 class TestGradedExactTierIsNotReRunAfterAWiden:
-    """BUI-943: a widened pool's exact-grade sales do not reopen the tier.
+    """BUI-943, SUPERSEDED for an empty scoped bucket by BUI-1186: the
+    other-quality exact sales now price directly (see the tests below).
+
+    Original note: a widened pool's exact-grade sales do not reopen the tier.
 
     The pool here is a white 9.4 target over white 9.2/9.6/9.8 rungs plus TWO
     full-weight cream 9.4 sales — enough effective n at the exact grade to
@@ -2603,48 +2606,115 @@ class TestGradedExactTierIsNotReRunAfterAWiden:
                      _slab_comp(3600, 9.4, age=12, page_quality="cream",
                                 product_id="c2")]
 
-    def test_two_exact_sales_of_another_quality_still_price_by_ladder(self):
+    def test_two_exact_sales_of_another_quality_now_price_directly(self):
         out = _graded(self._WHITE_RUNGS + self._CREAM_EXACTS, 9.4,
                       page_quality="white")
-        assert out["pricing_basis"] == "ladder"
-        assert out["confidence"] == "LOW"
-        assert out["bid_factor"] == 0.60
+        assert out["pricing_basis"] == "direct"
+        assert out["bid_factor"] == 0.80
         assert out["page_quality_fallback"] is True
-        assert out["page_quality_fallback_reason"] == "ladder_reads_all_qualities"
-        # The two cream sales are dropped with the rest of the target rung and
-        # the white 9.2/9.6 neighbours interpolate across the gap.
-        assert out["graded_ladder"]["grade_below"] == 9.2
-        assert out["graded_ladder"]["grade_above"] == 9.6
-        assert out["fmv_high"] == 2400
-        assert out["max_bid"] == 1450
+        assert out["page_quality_fallback_reason"] == "exact_any_page_quality"
+        assert out["exact_sales"] == [3400.0, 3600.0]
+        assert out["fmv_high"] == 2400   # same envelope-bounded band as before
+        assert out["max_bid"] == 1925
 
-    def test_the_dropped_exact_sales_are_still_reported_as_evidence(self):
-        """`exact_effective_n` reads 2.0 on a `basis=ladder` row on purpose —
-        it is the widened pool's evidence, printed by `_build_notes` as
-        "recorded, NOT used as the price", and never an input to the tier."""
+    def test_the_exact_sales_are_reported_as_the_band(self):
         out = _graded(self._WHITE_RUNGS + self._CREAM_EXACTS, 9.4,
                       page_quality="white")
         assert out["exact_effective_n"] == 2.0
-        assert out["exact_sales"] == [3400.0, 3600.0]
         assert [d["price"] for d in out["exact_sales_detail"]] == [3400.0, 3600.0]
 
-    def test_re_running_the_gate_would_have_raised_the_cap_not_the_band(self):
-        """Why the ladder wins the decision, measured rather than asserted.
-
-        Reading the same pool with NO page-quality reading is exactly what
-        re-running the gate on the widened pool would do — the same bucket, the
-        same envelope clamp. It lands on the identical $2,400 band and differs
-        only in the haircut, 0.80 against the ladder's 0.60. Equal evidence,
-        higher cap, paid for with the comps the preference declined.
-        """
+    def test_the_widened_row_matches_an_unscoped_read(self):
+        """Measured by BUI-943: the same band, differing only in the haircut
+        the ladder used to apply (0.60). BUI-1186 takes the exact read."""
         pool = self._WHITE_RUNGS + self._CREAM_EXACTS
-        ladder_row = _graded(pool, 9.4, page_quality="white")
-        exact_rerun = _graded(pool, 9.4, page_quality=None)
-        assert exact_rerun["pricing_basis"] == "direct"
-        assert exact_rerun["fmv_high"] == ladder_row["fmv_high"] == 2400
-        assert exact_rerun["bid_factor"] == 0.80
-        assert exact_rerun["max_bid"] == 1925
-        assert ladder_row["max_bid"] < exact_rerun["max_bid"]
+        widened = _graded(pool, 9.4, page_quality="white")
+        unscoped = _graded(pool, 9.4, page_quality=None)
+        for k in ("pricing_basis", "fmv_low", "fmv_high", "bid_factor", "max_bid"):
+            assert widened[k] == unscoped[k]
+
+
+class TestGradedExactAnyPageQualityBeforeLadder:
+    """BUI-1186: an EMPTY same-quality exact bucket reads every quality's
+    sales at the target grade before the ladder is tried (ASM #50 shape)."""
+
+    # >= 2 ow_w comps at OTHER grades so the filter scopes to ow_w, while every
+    # sale at the target 6.0 is `unknown` page quality.
+    _OW_RUNGS = [_slab_comp(900, 5.5, age=3, page_quality="ow_w", product_id="o1"),
+                 _slab_comp(1000, 5.5, age=4, page_quality="ow_w", product_id="o2"),
+                 _slab_comp(1500, 6.5, age=5, page_quality="ow_w", product_id="o3"),
+                 _slab_comp(1650, 6.5, age=6, page_quality="ow_w", product_id="o4")]
+    _UNKNOWN_EXACT = [_slab_comp(1230, 6.0, age=7, product_id="u1"),
+                      _slab_comp(1290, 6.0, age=8, product_id="u2"),
+                      _slab_comp(1329, 6.0, age=9, product_id="u3")]
+
+    def test_unknown_exact_sales_price_directly_for_an_ow_w_target(self):
+        out = _graded(self._OW_RUNGS + self._UNKNOWN_EXACT, 6.0,
+                      page_quality="ow_w")
+        assert out["flag_reason"] is None
+        assert out["pricing_basis"] == "direct"
+        assert out["n"] == 3
+        assert out["exact_sales"] == [1230.0, 1290.0, 1329.0]
+        assert out["page_quality_fallback"] is True
+        assert out["page_quality_fallback_reason"] == "exact_any_page_quality"
+        assert out["pool_n"] == 7
+        assert out["fmv_high"] >= 1290
+
+    def test_one_unknown_exact_sale_prices_as_a_lone_sale(self):
+        out = _graded(self._OW_RUNGS + self._UNKNOWN_EXACT[:1]
+                      + [_slab_comp(2000, 7.0, age=2, product_id="u9")], 6.0,
+                      page_quality="ow_w")
+        assert out["pricing_basis"] == "lone_sale"
+        assert out["fmv_low"] == out["fmv_high"] == 1225  # rounded to $5
+        assert out["page_quality_fallback_reason"] == "exact_any_page_quality"
+
+    def test_same_quality_exact_bucket_still_wins(self):
+        own = [_slab_comp(1400, 6.0, age=1, page_quality="ow_w", product_id="s1"),
+               _slab_comp(1450, 6.0, age=2, page_quality="ow_w", product_id="s2")]
+        out = _graded(self._OW_RUNGS + own + self._UNKNOWN_EXACT, 6.0,
+                      page_quality="ow_w")
+        assert out["pricing_basis"] == "direct"
+        assert out["page_quality_fallback"] is False
+        assert out["page_quality_fallback_reason"] is None
+        assert out["exact_sales"] == [1400.0, 1450.0]
+
+    def test_a_single_same_quality_sale_is_not_widened(self):
+        """Non-empty scoped bucket keeps the BUI-952 path: the preference is
+        for same quality, and the fallback is for an EMPTY bucket only."""
+        own = [_slab_comp(1400, 6.0, age=1, page_quality="ow_w", product_id="s1")]
+        out = _graded(self._OW_RUNGS + own + self._UNKNOWN_EXACT, 6.0,
+                      page_quality="ow_w")
+        assert out["pricing_basis"] != "direct"
+        assert out["page_quality_fallback_reason"] != "exact_any_page_quality"
+
+    def test_no_exact_sales_at_all_falls_to_the_ladder(self):
+        out = _graded(self._OW_RUNGS + [_slab_comp(2000, 7.0, age=2,
+                                                    product_id="u9")], 6.0,
+                      page_quality="ow_w")
+        assert out["pricing_basis"] == "ladder"
+        assert out["page_quality_fallback_reason"] == "ladder_reads_all_qualities"
+        assert out["exact_sales"] == []
+
+    def test_a_stale_lone_exact_sale_falls_to_the_ladder_with_ladder_reason(self):
+        stale = [_slab_comp(1230, 6.0, age=200, product_id="u1")]
+        out = _graded(self._OW_RUNGS + stale
+                      + [_slab_comp(2000, 7.0, age=2, product_id="u9")], 6.0,
+                      page_quality="ow_w")
+        assert out["pricing_basis"] == "ladder"
+        assert out["page_quality_fallback_reason"] == "ladder_reads_all_qualities"
+
+    def test_the_ladder_still_never_reads_the_target_rung(self):
+        out = _graded(self._OW_RUNGS + [_slab_comp(1230, 6.0, age=200,
+                                                   product_id="u1"),
+                                        _slab_comp(2000, 7.0, age=2,
+                                                   product_id="u9")], 6.0,
+                      page_quality="ow_w")
+        assert out["pricing_basis"] == "ladder"
+        assert 6.0 not in out["graded_ladder"]["ladder"]
+
+    def test_no_target_page_quality_is_unchanged(self):
+        out = _graded(self._OW_RUNGS + self._UNKNOWN_EXACT, 6.0)
+        assert out["pricing_basis"] == "direct"
+        assert out["page_quality_fallback"] is False
 
 
 class TestGradedPageQualityScopesTheExactBucketOnly:

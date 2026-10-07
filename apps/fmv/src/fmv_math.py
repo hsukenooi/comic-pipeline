@@ -2249,6 +2249,32 @@ def graded_fmv(comps: list[dict], target_grade: float, *,
     ladder = bucket_weighted_medians(full_pool)
     eff_n = bucket_effective_n(full_pool)
 
+    # BUI-1186: when the page-quality-scoped exact bucket is EMPTY but the
+    # whole same-label pool holds sales at the target grade, those sales are
+    # the exact bucket — of any page quality. Most slab comps read `unknown`,
+    # so a scoped bucket is routinely empty while real sales sit at the grade
+    # (ASM #50 CGC 6.0: three sales at $1,230-$1,329 ignored for a $1,100
+    # interpolation across 5.5/6.5). Page quality barely moves price within a
+    # grade (427 CGC comps: 0.98x-1.12x of the grade median), so same-quality
+    # stays the PREFERENCE (a non-empty scoped bucket, even one sale, still
+    # wins) and any-quality is the fallback BEFORE the ladder. The ladder is
+    # unchanged and still never reads the target rung. This deliberately
+    # reverses BUI-943's "never re-run the gate on the wider pool" for the
+    # empty-bucket case only: that note priced the haircut gap (0.60 vs 0.80)
+    # on a case where the scoped bucket was non-empty-but-thin.
+    if not exact_comps and len(pool) < len(full_pool):
+        widened = [c for c in full_pool if float(c["grade"]) == target_grade]
+        if widened:
+            exact_comps = widened
+            exact_effective_n = eff_n.get(target_grade, 0.0)
+            identity["exact_effective_n"] = exact_effective_n
+            identity["exact_sales"] = sorted(float(c["price"]) for c in widened)
+            identity["exact_sales_detail"] = _exact_sales_detail(widened)
+            # Provenance. If neither exact tier prices this, the ladder block
+            # below overwrites the reason with `ladder_reads_all_qualities`.
+            identity["page_quality_fallback"] = True
+            identity["page_quality_fallback_reason"] = "exact_any_page_quality"
+
     if exact_effective_n >= GRADED_EXACT_MIN_EFFECTIVE_N:
         return _graded_direct(exact_comps, ladder, eff_n, target_grade, identity)
 
