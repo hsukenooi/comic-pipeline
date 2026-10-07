@@ -2465,17 +2465,25 @@ class TestGradedPageQualityLadderFallback:
         rungs = {c["grade"] for c in scoped} - {9.4}
         assert rungs == {9.2, 9.8}
 
+        # BUI-1204: the scoped 9.4 bucket is ONE white sale and the
+        # any-quality 9.4 bucket is two (white + cream, effective n 2.0), so
+        # this real case now prices `direct` from both. It used to price
+        # `ladder` at the same $2,475 band (cap $1,475 at 0.60); the envelope
+        # bounding the direct band is the same 9.2/9.6 interpolation, so only
+        # the haircut moves (0.80, cap $1,975).
         out = _graded(pool, 9.4, page_quality="white")
         assert out["flag_reason"] is None
-        assert out["pricing_basis"] == "ladder"
+        assert out["pricing_basis"] == "direct"
         assert out["page_quality_fallback"] is True
-        assert out["page_quality_fallback_reason"] == "ladder_reads_all_qualities"
+        assert out["page_quality_fallback_reason"] == "exact_any_page_quality"
         assert out["pool_n"] == 9
-        # The bracket comes from the WIDENED (9.2/9.6) pair, not the
+        assert out["exact_sales"] == [3400.0, 3609.0]
+        # The envelope comes from the WIDENED (9.2/9.6) pair, not the
         # scoped-only (9.2/9.8) pair — proof the full pool, not just the two
-        # white-only rungs, fed the ladder.
-        assert out["graded_ladder"]["grade_below"] == 9.2
-        assert out["graded_ladder"]["grade_above"] == 9.6
+        # white-only rungs, fed the rungs.
+        assert out["graded_ladder"]["envelope_price"] == pytest.approx(2475.0)
+        assert out["fmv_high"] == 2475
+        assert out["max_bid"] == 1975
 
     def test_scoped_pool_pricing_direct_is_never_widened(self):
         """Direct pricing still prefers same-quality comps even when the
@@ -2677,14 +2685,81 @@ class TestGradedExactAnyPageQualityBeforeLadder:
         assert out["page_quality_fallback_reason"] is None
         assert out["exact_sales"] == [1400.0, 1450.0]
 
-    def test_a_single_same_quality_sale_is_not_widened(self):
-        """Non-empty scoped bucket keeps the BUI-952 path: the preference is
-        for same quality, and the fallback is for an EMPTY bucket only."""
-        own = [_slab_comp(1400, 6.0, age=1, page_quality="ow_w", product_id="s1")]
+    def test_a_single_same_quality_sale_is_widened_when_more_sales_exist(self):
+        """BUI-1204 (the live ASM #50 CGC 6.0 OW/W shape): one ow_w 6.0 sale
+        used to price alone as a `lone_sale` while three other 6.0 sales sat
+        unread. A scoped bucket of ONE sale now yields to the any-quality
+        bucket when that bucket holds more sales and clears the exact gate."""
+        own = [_slab_comp(1225, 6.0, age=1, page_quality="ow_w", product_id="s1")]
         out = _graded(self._OW_RUNGS + own + self._UNKNOWN_EXACT, 6.0,
                       page_quality="ow_w")
-        assert out["pricing_basis"] != "direct"
-        assert out["page_quality_fallback_reason"] != "exact_any_page_quality"
+        assert out["flag_reason"] is None
+        assert out["pricing_basis"] == "direct"
+        assert out["n"] == 4
+        assert out["exact_sales"] == [1225.0, 1230.0, 1290.0, 1329.0]
+        assert out["exact_effective_n"] == 4.0
+        assert out["page_quality_fallback"] is True
+        assert out["page_quality_fallback_reason"] == "exact_any_page_quality"
+
+    def test_a_single_same_quality_sale_with_no_others_stays_lone(self):
+        """BUI-1204: nothing to widen to, so BUI-952's lone-sale path is
+        unchanged."""
+        own = [_slab_comp(1225, 6.0, age=1, page_quality="ow_w", product_id="s1")]
+        out = _graded(self._OW_RUNGS + own
+                      + [_slab_comp(2000, 7.0, age=2, product_id="u9")], 6.0,
+                      page_quality="ow_w")
+        assert out["pricing_basis"] == "lone_sale"
+        assert out["fmv_high"] == 1225
+        assert out["page_quality_fallback"] is False
+        assert out["page_quality_fallback_reason"] is None
+        assert out["exact_sales"] == [1225.0]
+
+    def test_two_same_quality_sales_still_win_over_more_others(self):
+        """BUI-943 still governs a scoped bucket of TWO+ sales, even below the
+        gate: two stale ow_w 6.0 sales (effective n 1.0) do not yield to the
+        three fresh unknown 6.0 sales. Unchanged by BUI-1204."""
+        own = [_slab_comp(1400, 6.0, age=200, page_quality="ow_w", product_id="s1"),
+               _slab_comp(1450, 6.0, age=210, page_quality="ow_w", product_id="s2")]
+        out = _graded(self._OW_RUNGS + own + self._UNKNOWN_EXACT
+                      + [_slab_comp(2000, 7.0, age=2, product_id="u9")], 6.0,
+                      page_quality="ow_w")
+        assert out["pricing_basis"] == "ladder"
+        assert out["bid_factor"] == 0.60
+        assert out["page_quality_fallback_reason"] == "ladder_reads_all_qualities"
+
+    def test_a_widened_bucket_the_direct_tier_refuses_falls_through(self):
+        """BUI-1204: the widened pair (1225 ow_w + 300 unknown) clears the
+        gate but disagrees past SMALL_POOL_MAX_RATIO with no binding
+        envelope, so the direct tier would refuse it `too_sparse`. The widen
+        must not trade the scoped lone-sale price for that refusal."""
+        own = [_slab_comp(1225, 6.0, age=1, page_quality="ow_w", product_id="s1")]
+        cheap = [_slab_comp(300, 6.0, age=2, product_id="u2")]
+        base = (self._OW_RUNGS + own + cheap
+                + [_slab_comp(2000, 7.0, age=2, product_id="u9")])
+        unscoped = _graded(base, 6.0)
+        assert unscoped["flag_reason"] == "too_sparse"  # the trap is real
+        out = _graded(base, 6.0, page_quality="ow_w")
+        assert out["flag_reason"] is None
+        assert out["pricing_basis"] == "lone_sale"
+        assert out["fmv_high"] == 1225
+        assert out["page_quality_fallback_reason"] is None
+
+    def test_a_widened_bucket_below_the_gate_falls_through_unchanged(self):
+        """BUI-1204: one fresh ow_w 6.0 sale plus one STALE unknown 6.0 sale
+        is an any-quality bucket of effective n 1.5, below the gate. The
+        widen is declined and the row prices exactly as before: the scoped
+        lone sale, with no `exact_any_page_quality` provenance."""
+        own = [_slab_comp(1225, 6.0, age=1, page_quality="ow_w", product_id="s1")]
+        stale = [_slab_comp(1290, 6.0, age=200, product_id="u2")]
+        base = (self._OW_RUNGS + own + stale
+                + [_slab_comp(2000, 7.0, age=2, product_id="u9")])
+        out = _graded(base, 6.0, page_quality="ow_w")
+        assert out["pricing_basis"] == "lone_sale"
+        assert out["fmv_high"] == 1225
+        assert out["bid_factor"] == 0.70
+        assert out["page_quality_fallback"] is False
+        assert out["page_quality_fallback_reason"] is None
+        assert out["exact_sales"] == [1225.0]
 
     def test_no_exact_sales_at_all_falls_to_the_ladder(self):
         out = _graded(self._OW_RUNGS + [_slab_comp(2000, 7.0, age=2,
