@@ -69,6 +69,7 @@ Before the final grade, check these hard ceilings and state the cap in your rati
 - Spine split 2" → caps at GD (2.0)
 - Missing piece > 1/2" triangle or > 1/4" square → caps at GD (2.0)
 - Cover detached at both staples → caps at GD (2.0)
+- Interior leaf, wrap, or centerfold detached at both staples → caps at GD (2.0) (the scale allows only one-staple detachment above 2.0)
 - More than 1/4 of front cover missing → caps at FR (1.0)
 
 RESTORATION RED FLAGS: uniform cover color with no fading gradient; spine too tight for heavy corner wear; staples shiny against tanned pages; one region brighter than the rest; cover edges too crisp for the page color. With 2+ flags, write "possible restoration — black-light examination needed".
