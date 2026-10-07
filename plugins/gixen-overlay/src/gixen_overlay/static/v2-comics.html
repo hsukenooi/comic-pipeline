@@ -33,6 +33,15 @@
   /* BUI-1076: the BUI-1028 ceiling cap of a refused row. Dim + dotted
      underline so it never reads as a price band; a bid cap, not a fair value. */
   .fmv-cap { color: var(--fg-mute); font-style: italic; text-decoration: underline dotted; }
+  /* BUI-1205: cap the fmv column so a long ceiling/anchor value (e.g. "~$30 raw
+     (n=17) cap $15 (ceiling)") truncates instead of stretching the table. The
+     full text rides on the cell's title attribute (see fmvCell). */
+  td.fmv-cell {
+    max-width: 150px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
   .flag-marker {
     display: inline-block;
     color: var(--yellow);
@@ -402,6 +411,17 @@ function fmtFmv(r) {
   return `$${Math.round(lo ?? hi).toLocaleString()}`;
 }
 
+// BUI-1205: <td> for the fmv column (shared by Active Snipes and History).
+// The title attribute carries the plain-text full value for hover when the
+// cell is ellipsis-truncated; inner span titles still win on their own text.
+function fmvCell(r) {
+  const html = fmtFmv(r);
+  const tmp = document.createElement("div");
+  tmp.innerHTML = html;
+  const full = (tmp.textContent || "").trim();
+  return `<td class="right num fmv-cell" title="${escapeHtml(full)}">${html}</td>`;
+}
+
 // Pick the color class for the active-table max cell. Red is already used by
 // the overbid warn-cell branch; green flags a deal worth holding (current bid
 // is well under FMV midpoint). Falls back to neutral.
@@ -520,7 +540,7 @@ function renderActive(snipes) {
       <td>${fmtCond(r)}</td>
       <td class="right num">${fmtUSD(r.current_bid)}</td>
       <td class="right num">${maxCell}</td>
-      <td class="right num">${fmtFmv(r)}</td>
+      ${fmvCell(r)}
       <td class="right num">${timeCell}</td>
       <td class="seller">${fmtSeller(r)}${removeCell}</td>
     </tr>`;
@@ -558,7 +578,7 @@ function renderEnded(history) {
       <td>${fmtCond(r)}</td>
       <td class="right num">${winning}</td>
       <td class="right num">${fmtUSD(r.max_bid)}</td>
-      <td class="right num">${fmtFmv(r)}</td>
+      ${fmvCell(r)}
       <td>${outcome(r)}</td>
       <td class="seller">${fmtSeller(r)}</td>
     </tr>`;
