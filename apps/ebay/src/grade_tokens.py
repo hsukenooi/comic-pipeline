@@ -451,12 +451,16 @@ def resolve_label(text):
 # Ordered most-specific-first: "OW/W"/"OWW"/"OW-W" and "C/OW"/"CR/OW" must be
 # checked before bare "OW", or `\bow\b` would match the "OW" component of
 # each compound token first (e.g. inside "C/OW", the boundary before "OW" is
-# the "/" — a non-word char — so `\bow\b` matches there too).
+# the "/" — a non-word char — so `\bow\b` matches there too) BUI-1187: the
+# spelled-out compounds ("Off-White to White", "Cream to Off-White") sit in the
+# same compound slots, so they beat "Off-White" alone and "White Pages".
 _PAGE_QUALITY_PATTERNS = (
-    (re.compile(r'\bow[/\-]w\b|\boww\b', re.I), "ow_w"),
-    (re.compile(r'\b(?:c|cr)[/\-]ow\b', re.I), "c_ow"),
-    (re.compile(r'\bow\b', re.I), "ow"),
-    (re.compile(r'\bwhite\s+pages\b|\bw\b', re.I), "white"),
+    (re.compile(r'\bow[/\-]w\b|\boww\b'
+                r'|\boff[\s\-]?white\s+to\s+white\b', re.I), "ow_w"),
+    (re.compile(r'\b(?:c|cr)[/\-]ow\b'
+                r'|\bcream\s+to\s+off[\s\-]?white\b', re.I), "c_ow"),
+    (re.compile(r'\bow\b|\boff[\s\-]?white\b', re.I), "ow"),
+    (re.compile(r'\bwhite\s+pages\b|\bw\b|\bwp\b', re.I), "white"),
     (re.compile(r'\bcream\b', re.I), "cream"),
 )
 
