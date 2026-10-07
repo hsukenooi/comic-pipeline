@@ -4338,10 +4338,13 @@ def _graded_note_parts(fmv: dict) -> list[str]:
         # was widened — the row simply did not price from its scoped bucket.
         pq_note = ""
         if fmv.get("page_quality_fallback"):
+            _pq_reason = fmv.get("page_quality_fallback_reason")
             pq_note = (" (exact bucket scoped to same-quality but unpriced; "
                        "ladder rungs read every quality)"
-                       if fmv.get("page_quality_fallback_reason")
-                       == "ladder_reads_all_qualities"
+                       if _pq_reason == "ladder_reads_all_qualities"
+                       else " (no same-quality sales at the target grade; "
+                            "exact bucket read every page quality)"
+                       if _pq_reason == "exact_any_page_quality"
                        else " (no 2+ same-quality comps; pooled all qualities)")
         parts.append(f"page_quality={pq}{pq_note}")
     # All three count the same population from different points on the way in:
