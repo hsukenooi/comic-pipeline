@@ -1387,6 +1387,8 @@ class TestShouldRejectModernVariants:
         ("Amazing Spider-Man #129 Variant 1st Punisher Pressed 2023", ASM_V1, "1974"),
         ("Amazing Spider-Man #129 newsstand variant CGC 2023 holder", ASM_V1, "1974"),
         ("Amazing Spider-Man #300 Venom 2018 movie variant cover", ASM_V1, "1988"),
+        # A slab date (BUI-1206).
+        ("Amazing Spider-Man #129 Pence variant 2023 slab", ASM_V1, "1974"),
         # No wish era: fail open.
         ("Amazing Spider-Man #50 Capullo Variant 2024", None, None),
         ("Amazing Spider-Man #50 Capullo Variant 2024",
@@ -1396,6 +1398,20 @@ class TestShouldRejectModernVariants:
         issue = title.split("#")[1].split()[0]
         assert not ci.should_reject(title, ASM, issue, series_name, release_year,
                                     include_graded=True)
+
+    def test_hulk_pence_variant_with_slab_date_is_kept(self):
+        # BUI-1206: the slab date is not a cover year.
+        assert not ci.should_reject(
+            "Hulk #181 Pence variant CGC 9.0 2023 slab", "Incredible Hulk",
+            "181", "The Incredible Hulk (1968 - 1999)", "1974",
+            include_graded=True)
+
+    def test_year_after_a_grade_without_slab_still_reads_as_cover_year(self):
+        # A year after the grade can be the modern cover year, so only a
+        # trailing "slab" marks it as the slab date.
+        assert ci.should_reject(
+            "Amazing Spider-Man #50 Capullo Variant CGC 9.8 2024", ASM, "50",
+            ASM_V1, "1967", include_graded=True)
 
 
 class TestShouldRejectSpacedRunLot:
