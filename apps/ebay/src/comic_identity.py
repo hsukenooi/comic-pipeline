@@ -895,7 +895,7 @@ _MODERN_VARIANT_ERA = 1990
 _PRICE_RE = re.compile(r"\$\s*[\d,]+(?:\.\d+)?")
 _NON_COVER_YEAR_RE = re.compile(
     r"\b(?:pressed|graded|cgc|cbcs|pgx|slabbed|signed|cleaned)\s+\d{4}\b"
-    r"|\b\d{4}\s+(?:movie|film|tv|show|holder|label)\b",
+    r"|\b\d{4}\s+(?:movie|film|tv|show|holder|label|slab|slabbed)\b",
     re.IGNORECASE,
 )
 
@@ -930,7 +930,8 @@ def modern_variant_mismatch(
     if upper is None:
         return False
     # A price ("$1999 OBO") or a service/media date ("Pressed 2023", "CGC
-    # 2023 holder", "Venom 2018 movie") is not a cover year.
+    # 2023 holder", "CGC 9.0 2023 slab", "Venom 2018 movie") is not a cover
+    # year.
     years = _all_title_years(_NON_COVER_YEAR_RE.sub(" ", _PRICE_RE.sub(" ", title)))
     if years:
         return min(years) > upper
