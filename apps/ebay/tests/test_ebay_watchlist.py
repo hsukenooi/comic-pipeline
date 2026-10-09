@@ -30,7 +30,7 @@ def _item(t):
     )
 
 
-def page_xml(items, page=1, total_pages=1, ack="Success", errors=()):
+def page_xml(items, page=1, total_pages=1, ack="Success", errors=(), omit_watchlist=False):
     errs = "".join(
         f"<Errors><ErrorCode>{c}</ErrorCode><LongMessage>{m}</LongMessage></Errors>"
         for c, m in errors
@@ -39,7 +39,7 @@ def page_xml(items, page=1, total_pages=1, ack="Success", errors=()):
         f"<WatchList><PaginationResult><TotalNumberOfPages>{total_pages}</TotalNumberOfPages>"
         f"</PaginationResult><ItemArray>{''.join(_item(i) for i in items)}</ItemArray></WatchList>"
     )
-    body = wl_xml if ack != "Failure" else ""
+    body = wl_xml if ack != "Failure" and not omit_watchlist else ""
     return (
         f'<?xml version="1.0" encoding="UTF-8"?><GetMyeBayBuyingResponse {NSDECL}>'
         f"<Ack>{ack}</Ack>{errs}{body}</GetMyeBayBuyingResponse>"
@@ -203,12 +203,12 @@ def test_token_network_error_uses_its_own_exit_code(monkeypatch, capsys):
 
 def test_ack_failure_exits_4_no_stdout(http, capsys):
     http.queue.append(
-        FakeResp(page_xml([], ack="Failure", errors=[("932", "Auth token is hard expired.")]))
+        FakeResp(page_xml([], ack="Failure", errors=[("10007", "Internal error.")]))
     )
     code, out, err = run(capsys, "--json")
     assert code == 4
     assert out == ""
-    assert "932" in err and "hard expired" in err
+    assert "10007" in err and "Internal error" in err
 
 
 def test_ack_failure_on_later_page_prints_nothing(http, capsys):
@@ -250,3 +250,61 @@ def test_ack_warning_with_items_is_success(http, capsys):
     assert code == 0
     assert len(json.loads(out)) == 1
     assert "21917" in err
+
+
+# BUI-1214: live eBay behavior found on the first deploy.
+
+
+def test_type_auction_accepts_watchlist_auction_label(http, capsys):
+    live = ("2001", "Watched Auction #1", "Auction", "2099-01-01T12:00:00.000Z", "1.81", 2, "s")
+    http.queue.append(FakeResp(page_xml([live, BIN_LIVE])))
+    _, out, _ = run(capsys, "--json", "--type", "auction")
+    assert [i["item_id"] for i in json.loads(out)] == ["2001"]
+
+
+def test_missing_watchlist_is_retried(http, capsys):
+    http.queue.append(FakeResp(page_xml([], omit_watchlist=True)))
+    http.queue.append(FakeResp(page_xml([], omit_watchlist=True)))
+    http.queue.append(FakeResp(page_xml([AUCTION_LIVE])))
+    code, out, _ = run(capsys, "--json")
+    assert code == 0
+    assert [i["item_id"] for i in json.loads(out)] == ["1001"]
+    assert len(http) == 3
+
+
+def test_persistently_missing_watchlist_exits_5_no_stdout(http, capsys):
+    for _ in range(wl.MISSING_WATCHLIST_TRIES):
+        http.queue.append(FakeResp(page_xml([], omit_watchlist=True)))
+    code, out, err = run(capsys, "--json")
+    assert code == 5
+    assert out == ""
+    assert "no WatchList element" in err
+    assert len(http) == wl.MISSING_WATCHLIST_TRIES
+
+
+def test_missing_watchlist_on_later_page_prints_nothing(http, capsys):
+    http.queue.append(FakeResp(page_xml([AUCTION_LIVE], page=1, total_pages=2)))
+    for _ in range(wl.MISSING_WATCHLIST_TRIES):
+        http.queue.append(FakeResp(page_xml([], omit_watchlist=True)))
+    code, out, _ = run(capsys, "--urls")
+    assert code == 5
+    assert out == ""
+
+
+def test_page_cap_exceeded_fails_instead_of_truncating(http, capsys, monkeypatch):
+    monkeypatch.setattr(wl, "MAX_PAGES", 2)
+    http.queue.append(FakeResp(page_xml([AUCTION_LIVE], page=1, total_pages=3)))
+    http.queue.append(FakeResp(page_xml([BIN_LIVE], page=2, total_pages=3)))
+    code, out, err = run(capsys, "--json")
+    assert code == 5
+    assert out == ""
+    assert "cap" in err
+
+
+@pytest.mark.parametrize("code_", ["931", "932", "21916984", "21917053"])
+def test_trading_auth_rejection_exits_3(http, capsys, code_):
+    http.queue.append(FakeResp(page_xml([], ack="Failure", errors=[(code_, "token rejected")])))
+    code, out, err = run(capsys, "--json")
+    assert code == 3
+    assert out == ""
+    assert "ebay-auth login" in err

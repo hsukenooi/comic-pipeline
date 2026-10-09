@@ -28,6 +28,16 @@ MAX_PAGES = 100  # runaway guard; 20,000 watched items
 EXIT_FAILURE_ACK = 4
 EXIT_NETWORK = 5
 BIN_TYPES = {"FixedPriceItem", "StoresFixedPrice"}
+# The WatchList reports an auction as "Auction"; other Trading calls (and the
+# WonList in this same response) say "Chinese". Accept both (BUI-1214).
+AUCTION_TYPES = {"Chinese", "Auction"}
+# eBay intermittently answers Ack=Success with the WatchList element missing
+# (about every other call on 2026-10-09). That is a flap, never an empty
+# watchlist, so retry it and fail loudly if it persists (R4, BUI-1214).
+MISSING_WATCHLIST_TRIES = 5
+# Trading error codes that mean the user token itself was rejected: point the
+# user at `ebay-auth login` (exit 3) rather than a generic Ack failure.
+AUTH_ERROR_CODES = {"931", "932", "21916984", "21917053"}
 
 
 def _version_string() -> str:
@@ -46,6 +56,10 @@ class WatchlistError(Exception):
     def __init__(self, message, exit_code):
         super().__init__(message)
         self.exit_code = exit_code
+
+
+class MissingWatchlistError(WatchlistError):
+    """Ack=Success but no WatchList element: retryable."""
 
 
 def _request_body(page):
@@ -92,12 +106,18 @@ def _fetch_page(token, page):
     ]
     if ack not in ("Success", "Warning"):
         detail = "; ".join(f"{code}: {msg}" for code, msg in errors) or "no error detail"
+        if any(code in AUTH_ERROR_CODES for code, _ in errors):
+            raise WatchlistError(
+                f"eBay rejected the user token ({detail}); {eut.RELOGIN_HINT}", eut.EXIT_RELOGIN
+            )
         raise WatchlistError(f"eBay Trading API Ack={ack}: {detail}", EXIT_FAILURE_ACK)
     warnings = [f"{code}: {msg}" for code, msg in errors] if ack == "Warning" else []
 
     wl = root.find("e:WatchList", NS)
     if wl is None:
-        return [], 1, warnings
+        raise MissingWatchlistError(
+            f"eBay returned Ack={ack} with no WatchList element", EXIT_NETWORK
+        )
     items = []
     for it in wl.findall("e:ItemArray/e:Item", NS):
         f = lambda p: it.findtext(p, namespaces=NS)  # noqa: E731
@@ -121,15 +141,32 @@ def _fetch_page(token, page):
     return items, total, warnings
 
 
+def _fetch_page_retrying(token, page):
+    for attempt in range(1, MISSING_WATCHLIST_TRIES + 1):
+        try:
+            return _fetch_page(token, page)
+        except MissingWatchlistError as exc:
+            if attempt == MISSING_WATCHLIST_TRIES:
+                raise MissingWatchlistError(
+                    f"{exc} on page {page}, {attempt} tries in a row; refusing to report "
+                    "an empty watchlist",
+                    EXIT_NETWORK,
+                ) from None
+
+
 def fetch_watchlist(token):
     """Return (all items across every page, warnings). Raises WatchlistError."""
     items, warnings, page = [], [], 1
     while True:
-        page_items, total, warns = _fetch_page(token, page)
+        page_items, total, warns = _fetch_page_retrying(token, page)
         items.extend(page_items)
         warnings.extend(warns)
-        if page >= total or page >= MAX_PAGES:
+        if page >= total:
             break
+        if page >= MAX_PAGES:
+            raise WatchlistError(
+                f"watchlist has {total} pages, more than the {MAX_PAGES}-page cap", EXIT_NETWORK
+            )
         page += 1
     return items, warnings
 
@@ -145,7 +182,7 @@ def filter_items(items, item_type="all", include_ended=False, now=None):
     now = now or datetime.now(timezone.utc)
     out = []
     for it in items:
-        if item_type == "auction" and it["listing_type"] != "Chinese":
+        if item_type == "auction" and it["listing_type"] not in AUCTION_TYPES:
             continue
         if item_type == "bin" and it["listing_type"] not in BIN_TYPES:
             continue
