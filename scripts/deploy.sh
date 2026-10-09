@@ -167,6 +167,7 @@ check_cli_sha "gixen"      gixen
 check_cli_sha "locg"       locg
 check_cli_sha "comic-fmv"  comic-fmv
 check_cli_sha "ebay-fetch" ebay-fetch
+check_cli_sha "ebay-auth"  ebay-auth
 
 # COMICS_SERVER_URL was already resolved above (before the install/sync/
 # kickstart steps); re-health-gate it now that the server has been restarted.

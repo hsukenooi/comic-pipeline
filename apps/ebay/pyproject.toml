@@ -23,6 +23,7 @@ grade-photos = "grade_photos:main"
 grade-crops = "grade_crops:main"
 grade-seats = "grade_seats:main"
 ebay-shipped = "shipped_orders:main"
+ebay-auth = "ebay_auth:main"
 
 [tool.hatch.build.targets.wheel]
 # BUI-332: glob-based include so every src/*.py is shipped automatically —
