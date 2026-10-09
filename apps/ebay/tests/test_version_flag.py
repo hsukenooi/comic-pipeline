@@ -22,6 +22,7 @@ class TestVersionFlag:
         "seller-scan",
         "ebay-shipped",
         "ebay-auth",
+        "ebay-watchlist",
     ]
 
     def test_version_flag_exists_and_exits_zero(self):
@@ -126,6 +127,7 @@ class TestVersionFlag:
         import comic_identify
         import ebay_auth
         import ebay_fetch
+        import ebay_watchlist
         import grade_photos
         import seller_scan
         import shipped_orders
@@ -136,6 +138,7 @@ class TestVersionFlag:
             comic_identify,
             ebay_auth,
             ebay_fetch,
+            ebay_watchlist,
             grade_photos,
             seller_scan,
             shipped_orders,
