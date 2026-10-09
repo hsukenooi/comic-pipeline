@@ -50,7 +50,7 @@ If there are no candidates and no flagged auctions, say so and stop.
 
 Ask which rows to buy. Candidates are offered by default. A likely-too-late row goes forward only if the user names it.
 
-Read `buy.md` and follow it, passing each chosen `url` as the Step 1 input (see `buy.md` § Step 1 Identify). The watchlist data is an `item_id` source only. `/comic:buy` fetches each listing fresh, so never carry forward the title, price, bid count, or end time shown here (the BUI-572 staleness trap).
+Read `buy.md` and follow it, passing each chosen `url` as the Step 1 input (see `buy.md` Step 1). The watchlist data is an `item_id` source only. `/comic:buy` fetches each listing fresh, so never carry forward the title, price, bid count, or end time shown here (the BUI-572 staleness trap).
 
 Identify flags non-comics. The watchlist holds novels and other items. Drop any row identify flags as a non-comic before pricing, and tell the user which rows you dropped.
 
