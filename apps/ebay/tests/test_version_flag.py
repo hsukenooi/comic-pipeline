@@ -21,6 +21,7 @@ class TestVersionFlag:
         "ebay-sold-comps",
         "seller-scan",
         "ebay-shipped",
+        "ebay-auth",
     ]
 
     def test_version_flag_exists_and_exits_zero(self):
@@ -123,6 +124,7 @@ class TestVersionFlag:
     def test_version_string_pattern_for_all_scripts(self, capsys):
         """All version strings follow the pattern: <script> <version> (git <sha>, <date>)."""
         import comic_identify
+        import ebay_auth
         import ebay_fetch
         import grade_photos
         import seller_scan
@@ -132,6 +134,7 @@ class TestVersionFlag:
 
         modules = [
             comic_identify,
+            ebay_auth,
             ebay_fetch,
             grade_photos,
             seller_scan,
