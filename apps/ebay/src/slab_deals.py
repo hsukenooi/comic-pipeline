@@ -166,18 +166,33 @@ def _squash(text: str) -> str:
 def _wrong_book(text: str, *, title: str, issue: str, year: int | None) -> bool:
     """True when the title is visibly not this book's own first-print copy:
     the series name or issue number is absent (another series or issue, a
-    homage), a later-era year appears, a foreign/variant/lot marker appears,
-    or an `N-<issue>` range or `1 2 3` run says it is a multi-issue lot."""
-    if _squash(_LEADING_ARTICLE_RE.sub("", title)) not in _squash(text):
-        return True
+    homage), the series name only follows the issue number (another series
+    whose character text names this one: "Detective Comics #227 ...
+    Batman/Robin" for Batman #227, BUI-1212), a year more than one after
+    the target appears, or one more than one before it follows the issue
+    number, a foreign/variant/lot marker appears, or an `N-<issue>`
+    range or `1 2 3` run says it is a multi-issue lot."""
+    series = _squash(_LEADING_ARTICLE_RE.sub("", title))
     num = re.escape(str(issue))
-    if not re.search(rf"(?<![\d:/.])(?:#\s*|\s){num}(?![\d:/.])", text):
+    hit = next((m for m in re.finditer(
+        rf"(?<![\d:/.])(?:#\s*|\s){num}(?![\d:/.])", text)
+        if series in _squash(text[:m.start()])), None)
+    if hit is None:
         return True
     if re.search(rf"\b\d+\s*-\s*{num}\b|\b1\s+2\s+3\b", text):
         return True
     if _NOT_THE_BOOK_RE.search(text):
         return True
-    return year is not None and any(int(y) > year + 1 for y in _YEAR_RE.findall(text))
+    if year is None:
+        return False
+    if any(int(y) > year + 1 for y in _YEAR_RE.findall(text)):
+        return True
+    # Earlier years count only after the issue number: a series start year
+    # ("Amazing Spider-Man (1963) # 50") sits before it, and "(1963 series)"
+    # names the volume, not the cover date.
+    return any(int(m.group(1)) < year - 1 for m in
+               _YEAR_RE.finditer(text, hit.end())
+               if not re.match(r"\s*series\b", text[m.end():], re.IGNORECASE))
 
 
 def classify_listing(item: dict, *, title: str, issue: str,

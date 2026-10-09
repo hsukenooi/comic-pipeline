@@ -99,6 +99,24 @@ class TestClassifyListing:
     def test_series_year_in_paren_is_kept(self):
         assert classify("Amazing Spider-Man (1963) # 50 CGC 5.0 VG/FN")[1] is None
 
+    def test_series_year_after_issue_is_kept(self):
+        assert classify("Amazing Spider-Man #50 (1963 series) CGC 5.0")[1] is None
+
+    def test_earlier_cover_year_after_issue_dropped(self):
+        assert classify("Amazing Spider-Man #50 CGC 5.0 1959")[1] == "rejected"
+
+    @pytest.mark.parametrize("title,reason", [
+        # BUI-1212: the 2026-10-09 top "Batman #227 deal" was this listing.
+        ("Detective Comics #227 (CGC 5.5) 1956, Batman/Robin", "rejected"),
+        ("Batman #227 CGC 7.5 Beautiful Book! Vol 1 Classic Detective "
+         "Comics 31 Cover 1970", None),
+        ("Batman #227 (DC 1970) CGC 6.5 FN+   OW Pages  Classic Cover", None),
+    ])
+    def test_other_series_naming_the_character_dropped(self, title, reason):
+        got = sd.classify_listing(item(title), title="Batman", issue="227",
+                                  year=1970)
+        assert got[1] == reason
+
     def test_non_usd_price_dropped(self):
         it = item("Amazing Spider-Man #50 CGC 6.5 1967")
         it["current_price"] = "GBP 500.00"
