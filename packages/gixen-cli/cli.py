@@ -45,6 +45,7 @@ from add_batch import (
     apply_verify_results,
     build_batch_rows,
     build_bid_payload,
+    build_link_fmv_body,
     created_from_response,
     parse_brief_rows,
     parse_rows,
@@ -559,11 +560,15 @@ def add(
         link_attempted = grade is not None and (comic_id is not None or catalog_id is not None)
         link_ok = True
         if link_attempted:
+            # BUI-1220: a certified add must name its slab identity or the
+            # server links the raw FMV row (LinkFmvRequest defaults to none).
+            link_body = build_link_fmv_body(
+                grade=grade, comic_id=comic_id, locg_id=catalog_id,
+                certifier=certifier,
+            )
             if comic_id is not None:
-                link_body = {"comic_id": comic_id, "grade": grade}
                 link_desc = f"comic_id={comic_id}, grade={grade}"
             else:
-                link_body = {"locg_id": catalog_id, "grade": grade}
                 link_desc = f"locg_id={catalog_id}, grade={grade}"
             try:
                 _server_request(

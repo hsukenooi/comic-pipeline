@@ -634,6 +634,30 @@ def add_one_row(row: dict, *, server_request: ServerRequestFn) -> RowResult:
     return result
 
 
+def build_link_fmv_body(
+    *,
+    grade: float,
+    comic_id: Any = None,
+    locg_id: Any = None,
+    certifier: str | None = None,
+    label: str | None = None,
+) -> dict[str, Any]:
+    """The `POST /api/bids/{item_id}/link-fmv` body, shared by `add-batch` and
+    the single-item `gixen add` (BUI-1220). A certified identity (`certifier`
+    set and not "none", case-insensitive) sends `certifier` (+ `label` when
+    given); a raw payload stays exactly `{comic_id|locg_id, grade}`."""
+    body: dict[str, Any] = (
+        {"comic_id": comic_id, "grade": grade}
+        if comic_id is not None
+        else {"locg_id": locg_id, "grade": grade}
+    )
+    if certifier is not None and certifier.lower() != "none":
+        body["certifier"] = certifier
+        if label is not None:
+            body["label"] = label
+    return body
+
+
 def attempt_fmv_link(
     result: RowResult,
     *,
@@ -663,11 +687,9 @@ def attempt_fmv_link(
     if grade is None or comic_id is None:
         return
     result.link_attempted = True
-    body: dict[str, Any] = {"comic_id": comic_id, "grade": grade}
-    if certifier is not None and certifier != "none":
-        body["certifier"] = certifier
-        if label is not None:
-            body["label"] = label
+    body = build_link_fmv_body(
+        grade=grade, comic_id=comic_id, certifier=certifier, label=label,
+    )
     link_ok, _link_resp, link_err = server_request(
         "post",
         f"/api/bids/{result.item_id}/link-fmv",
