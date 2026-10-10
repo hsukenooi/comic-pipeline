@@ -6,7 +6,7 @@
     "flag_reason": null,
     "fmv_high": 140,
     "fmv_low": 90,
-    "max_bid": 110,
+    "max_bid": 120,
     "median": 120,
     "n": 5,
     "window": 0.5
@@ -54,7 +54,7 @@
     "flag_reason": null,
     "fmv_high": 130,
     "fmv_low": 80,
-    "max_bid": 100,
+    "max_bid": 110,
     "median": 110,
     "n": 8,
     "window": 0.5
@@ -66,7 +66,7 @@
     "flag_reason": null,
     "fmv_high": 250,
     "fmv_low": 160,
-    "max_bid": 200,
+    "max_bid": 225,
     "median": 225,
     "n": 8,
     "window": 0.5

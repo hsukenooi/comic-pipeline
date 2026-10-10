@@ -227,14 +227,25 @@ class TestComputeFmv:
         assert out["window"] == 1.0
         assert out["n"] == 6
 
-    def test_max_bid_is_80_percent(self):
-        # Construct a pool where Q75 is exactly $100 → max_bid should be ~80
+    def test_max_bid_is_80_percent_of_high_on_a_low_tier(self):
+        # BUI-1219: 0.80 x fmv_high is now the LOW / VERY LOW rule. Three
+        # comps → MEDIUM-LOW → LOW tier.
+        comps = [_comp(p, 8.0) for p in [60, 100, 140]]
+        out = fm.compute_fmv(comps, target_grade=8.0)
+        assert out["bid_tier"] == "LOW"
+        assert out["bid_basis"] == "high"
+        assert out["max_bid"] == fm.clean_round(0.8 * out["fmv_high"])
+
+    def test_max_bid_is_the_median_on_a_median_tier(self):
+        # BUI-1219: the IQR trim drops the $50 → five comps, MEDIUM-HIGH →
+        # MEDIUM tier → 1.00 x median $100 (today's rule: 0.80 x $110 = $90).
         comps = [_comp(p, 8.0) for p in [50, 75, 100, 100, 100, 100]]
         out = fm.compute_fmv(comps, target_grade=8.0)
-        # Just verify the relationship holds within rounding
-        assert out["max_bid"] is not None
-        assert out["fmv_high"] is not None
-        assert abs(out["max_bid"] - 0.8 * out["fmv_high"]) <= 10
+        assert out["bid_tier"] == "MEDIUM"
+        assert out["max_bid"] == 100
+        assert out["bid_basis"] == "median"
+        assert out["max_bid"] == min(fm.clean_round(out["median"]),
+                                     out["fmv_high"])
 
 
 # ─── Priceability guards (BUI-86) ─────────────────────────────────────────────
@@ -1661,7 +1672,9 @@ class TestMinRangeWidth:
             [_comp(p, 9.0) for p in [100, 105, 110, 115, 120, 125, 130]],
             target_grade=9.0)
         assert out["fmv_low"] < out["fmv_high"]          # a real, non-zero range
-        assert (out["fmv_low"], out["fmv_high"], out["max_bid"]) == (110, 120, 100)
+        # BUI-1219: a VERY HIGH pool bids its median ($115 → $120 clean),
+        # not 0.80 x high ($100). The band itself is unchanged.
+        assert (out["fmv_low"], out["fmv_high"], out["max_bid"]) == (110, 120, 120)
 
     def test_reopen_never_lifts_bid_cap_when_dispersion_is_below_median(self):
         # thick_mild_skew shape: median sits near the TOP of the observed range,

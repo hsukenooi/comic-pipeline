@@ -1,19 +1,23 @@
 {
   "bracketed_priced": {
+    "bid_basis": "median",
     "bid_factor": 0.8,
+    "bid_tier": "MEDIUM",
     "confidence": "MEDIUM-HIGH",
     "flag_reason": null,
     "fmv_high": 140,
     "fmv_low": 90,
     "grade_span": 1.0,
-    "max_bid": 110,
+    "max_bid": 120,
     "median": 120,
     "n": 5,
     "ungraded_anchor": null,
     "window": 0.5
   },
   "collapsed_range_reopened": {
+    "bid_basis": "high",
     "bid_factor": 0.8,
+    "bid_tier": "LOW",
     "confidence": "MEDIUM-LOW",
     "flag_reason": null,
     "fmv_high": 50,
@@ -26,7 +30,9 @@
     "window": 2.0
   },
   "degenerate_identical_priced": {
+    "bid_basis": "high",
     "bid_factor": 0.8,
+    "bid_tier": "LOW",
     "confidence": "MEDIUM-LOW",
     "flag_reason": null,
     "fmv_high": 60,
@@ -39,7 +45,9 @@
     "window": 2.0
   },
   "grade_haircut_low_confidence": {
+    "bid_basis": "high",
     "bid_factor": 0.6,
+    "bid_tier": "VERY HIGH",
     "confidence": "HIGH",
     "flag_reason": null,
     "fmv_high": 140,
@@ -52,7 +60,9 @@
     "window": 0.5
   },
   "interpolated_thick_brackets": {
+    "bid_basis": "high",
     "bid_factor": 0.6,
+    "bid_tier": "VERY LOW",
     "confidence": "LOW",
     "flag_reason": null,
     "fmv_high": 225,
@@ -65,20 +75,24 @@
     "window": 2.0
   },
   "narrow_high": {
+    "bid_basis": "median",
     "bid_factor": 0.8,
+    "bid_tier": "VERY HIGH",
     "confidence": "HIGH",
     "flag_reason": null,
     "fmv_high": 140,
     "fmv_low": 90,
     "grade_span": 0.0,
-    "max_bid": 110,
+    "max_bid": 120,
     "median": 120,
     "n": 9,
     "ungraded_anchor": null,
     "window": 0.5
   },
   "one_sided_flag": {
+    "bid_basis": null,
     "bid_factor": 0.8,
+    "bid_tier": null,
     "confidence": "LOW",
     "flag_reason": "one_sided",
     "fmv_high": null,
@@ -91,7 +105,9 @@
     "window": 1.0
   },
   "too_sparse_single_comp": {
+    "bid_basis": null,
     "bid_factor": 0.8,
+    "bid_tier": null,
     "confidence": "LOW",
     "flag_reason": "too_sparse",
     "fmv_high": null,
@@ -104,7 +120,9 @@
     "window": 2.0
   },
   "too_wide_flag": {
+    "bid_basis": null,
     "bid_factor": 0.8,
+    "bid_tier": null,
     "confidence": "LOW",
     "flag_reason": "too_wide",
     "fmv_high": null,
@@ -117,7 +135,9 @@
     "window": 2.0
   },
   "two_comp_tight": {
+    "bid_basis": "high",
     "bid_factor": 0.8,
+    "bid_tier": "VERY LOW",
     "confidence": "LOW",
     "flag_reason": null,
     "fmv_high": 60,
@@ -130,7 +150,9 @@
     "window": 2.0
   },
   "two_comp_wild_outlier": {
+    "bid_basis": null,
     "bid_factor": 0.8,
+    "bid_tier": null,
     "confidence": "LOW",
     "flag_reason": "too_sparse",
     "fmv_high": null,
@@ -143,7 +165,9 @@
     "window": 2.0
   },
   "ungraded_anchor_from_dropped_comps": {
+    "bid_basis": "high",
     "bid_factor": 0.8,
+    "bid_tier": "LOW",
     "confidence": "MEDIUM-LOW",
     "flag_reason": null,
     "fmv_high": 130,
@@ -159,13 +183,15 @@
     "window": 2.0
   },
   "wide_window_caps_medium": {
+    "bid_basis": "median",
     "bid_factor": 0.8,
+    "bid_tier": "MEDIUM",
     "confidence": "MEDIUM",
     "flag_reason": null,
     "fmv_high": 140,
     "fmv_low": 90,
     "grade_span": 1.5,
-    "max_bid": 110,
+    "max_bid": 120,
     "median": 120,
     "n": 9,
     "ungraded_anchor": null,
