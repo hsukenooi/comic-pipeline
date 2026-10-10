@@ -3330,3 +3330,58 @@ class TestIdentifyMainFailures:
         lines = captured.out.strip().splitlines()
         assert lines[2].startswith(f"| [1](https://www.ebay.com/itm/{_RECORDED_ITEM_ID}) |")
         assert lines[3] == "\u26a0\ufe0f Item not-an-item: could not parse an item id from this input"
+
+
+class TestSplitGradeTitles:
+    """BUI-1223: a split grade keeps both halves and maps to its CGC midpoint."""
+
+    @pytest.mark.parametrize("title,expected", [
+        ("Green Lantern #87 VG/Fine Cond", 5.0),
+        ("Green Lantern #87 VG/FN", 5.0),
+        ("Fantastic Four #50 Fine/VF Cond", 7.0),
+        ("Fantastic Four #50 FN/VF Cond", 7.0),
+        ("New Mutants Annual # 2 - 1st Psylocke VF/NM Cond", 9.0),
+        ("Hulk #181 (VG/Fine)", 5.0),
+        ("Hulk #181 Very Fine/Near Mint", 9.0),
+        ("Hulk #181 NM/M", 9.6),
+        ("Hulk #181 F/VF+", 7.5),
+        ("Hulk #181 VG/FN+", 5.5),
+    ])
+    def test_split_grade_midpoint(self, title, expected):
+        grade, source, _ = ebay_fetch.extract_grade([], title)
+        assert grade == expected
+        assert source == "title"
+
+    @pytest.mark.parametrize("title,expected", [
+        ("Hulk #181 VG Cond", "VG"),
+        ("Hulk #181 Fine Cond", "Fine"),
+        ("Hulk #181 VF+ Cond", "VF+"),
+        ("Hulk #181 Fine/Good Cond", "Fine"),   # reversed pair is not a known split
+        ("Hulk #181 VF/NM+ Cond", "VF"),        # "NM+" modifier on a split is not a grade
+    ])
+    def test_non_split_unchanged(self, title, expected):
+        assert ebay_fetch.extract_grade([], title)[0] == expected
+
+    def test_item_specifics_still_win(self):
+        grade, source, _ = ebay_fetch.extract_grade(
+            [{"name": "Grade", "value": "NM"}], "Hulk #181 VG/Fine")
+        assert (grade, source) == ("NM", "item_specifics")
+
+
+class TestIdentifyAnnualSeries:
+    """BUI-1224: the table's series cell keeps "Annual"."""
+    NOW = datetime(2026, 10, 11, 12, 0, 0, tzinfo=timezone.utc)
+
+    def test_new_mutants_annual_2(self):
+        title = "New Mutants Annual # 2 - 1st Psylocke VF/NM Cond"
+        grade, source, _ = ebay_fetch.extract_grade([], title)
+        row = ebay_fetch.identify_row(
+            1, _identify_item(title=title, grade=grade, grade_source=source), self.NOW)
+        cells = [c.strip() for c in row.strip().strip("|").split(" | ")]
+        assert cells[1].upper() == "NEW MUTANTS ANNUAL"
+        assert cells[2] == "#2"
+        assert cells[4] == "9.0"
+
+    def test_non_annual_series_untouched(self):
+        row = ebay_fetch.identify_row(1, _identify_item(), self.NOW)
+        assert "Annual" not in row
