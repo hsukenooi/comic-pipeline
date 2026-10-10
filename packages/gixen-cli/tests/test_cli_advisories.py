@@ -439,3 +439,46 @@ def test_edit_blocked_409_renders_message_and_advisories_then_exits_nonzero():
     assert result.exit_code == 1
     assert "Blocked by policy check(s): over_fmv." in result.output
     assert "over_fmv" in result.output
+
+
+# ---------------------------------------------------------------------------
+# BUI-1220: single-item `gixen add` link-fmv body carries the slab identity
+# ---------------------------------------------------------------------------
+
+
+def _link_body(args):
+    runner = CliRunner()
+    captured = {}
+
+    def fake_request(method, path, **kwargs):
+        if path == "/api/bids":
+            return {"item_id": "444", "created": True}
+        if path.endswith("/link-fmv"):
+            captured["json"] = kwargs.get("json")
+        return {}
+
+    with patch("cli._server_url", return_value="http://srv"), \
+         patch("cli._server_request", side_effect=fake_request), \
+         patch("cli._record_add"):
+        result = runner.invoke(cli, ["add", "444", "500.00", *args])
+    assert result.exit_code == 0, result.output
+    return captured["json"]
+
+
+def test_add_certified_link_fmv_body_sends_certifier():
+    body = _link_body(["--comic-id", "187", "--grade", "9.6", "--certifier", "cgc"])
+    assert body == {"comic_id": 187, "grade": 9.6, "certifier": "cgc"}
+
+
+def test_add_certified_catalog_id_link_fmv_body_sends_certifier():
+    body = _link_body(["--catalog-id", "55", "--grade", "9.6", "--certifier", "cbcs"])
+    assert body == {"locg_id": 55, "grade": 9.6, "certifier": "cbcs"}
+
+
+def test_add_raw_link_fmv_body_unchanged():
+    assert _link_body(["--comic-id", "187", "--grade", "5.0"]) == {
+        "comic_id": 187, "grade": 5.0}
+    assert _link_body(["--comic-id", "187", "--grade", "5.0", "--certifier", "none"]) == {
+        "comic_id": 187, "grade": 5.0}
+    assert _link_body(["--catalog-id", "55", "--grade", "5.0"]) == {
+        "locg_id": 55, "grade": 5.0}
