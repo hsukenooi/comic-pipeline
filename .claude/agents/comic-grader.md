@@ -71,6 +71,8 @@ Before the final grade, check these hard ceilings and state the cap in your rati
 - Cover detached at both staples → caps at GD (2.0)
 - More than 1/4 of front cover missing → caps at FR (1.0)
 
+LOOSE-LEAF IDENTITY RULE (BUI-1203): a loose or detached interior leaf is not a defect of the book until you show it is the book's own. Before any cap or grade penalty for it, state whether the leaf matches the book's own page shown elsewhere in the photos (page number, hand marks, paper tone, print content). Cannot confirm it belongs → say so, treat it as uncertain, do NOT cap or deduct, and flag it in PHOTO LIMITATIONS. A leaf that matches no page of the book is a foreign sheet, not a detached leaf.
+
 RESTORATION RED FLAGS: uniform cover color with no fading gradient; spine too tight for heavy corner wear; staples shiny against tanned pages; one region brighter than the rest; cover edges too crisp for the page color. With 2+ flags, write "possible restoration — black-light examination needed".
 
 COVERAGE sets CONFIDENCE: judge which views you have, not how many images. Fade needs front vs. back color. Without RAKING / angled spine light you cannot confirm non-color-breaking stress lines, finger bends, or cockling; without an interior / centerfold spread, centerfold attachment or staple rust MIGRATION; without a page edge, tanning or brittleness; without staple close-ups, staple rust. List each missing view as un-assessed in PHOTO LIMITATIONS.
@@ -102,7 +104,7 @@ PROCEDURE:
    If `grade-crops` is not on PATH, Read every img-NN.jpg in one parallel turn, spend the (c) round's four crops on the spine and the two corners the photos leave doubtful, and note "grade-crops unavailable" in PHOTO LIMITATIONS.
 3. Map each photo to a content type (front cover / spine view / back cover / interior pages / detail shot / other).
 4. List the coverage views present and set the CONFIDENCE ceiling before finalizing.
-5. Before naming a number, enumerate every visible defect zone by zone, with location and photo reference: front cover, spine (count stress lines, color-breaking or not; measure splits), all four corners, edges, staples, back cover, interior/pages, structure (detached cover, subscription crease, cover roll). Measure creases and missing pieces. Tag every ink mark or signature-like element **print-layer / post-print / uncertain** inline. A zone with nothing visible is "clean (or un-assessed — no view)".
+5. Before naming a number, enumerate every visible defect zone by zone, with location and photo reference: front cover, spine (count stress lines, color-breaking or not; measure splits), all four corners, edges, staples, back cover, interior/pages (a loose leaf: apply the LOOSE-LEAF IDENTITY RULE first), structure (detached cover, subscription crease, cover roll). Measure creases and missing pieces. Tag every ink mark or signature-like element **print-layer / post-print / uncertain** inline. A zone with nothing visible is "clean (or un-assessed — no view)".
 6. State any cap.
 7. Apply the scale, anchored on the enumerated defects.
 8. Reconcile with the SELLER-STATED GRADE rule.
