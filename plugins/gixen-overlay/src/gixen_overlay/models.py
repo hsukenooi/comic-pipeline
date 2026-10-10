@@ -13,6 +13,7 @@ from gixen_overlay.db import (
     COMPS_POOLS,
     COMPS_PROVENANCES,
     COMPS_RESTAMP_FIELDS,
+    FMV_BID_TIERS,
     FMV_CERTIFIER_NONE,
     FMV_CERTIFIERS,
     FMV_LABEL_UNIVERSAL,
@@ -178,6 +179,11 @@ class UpsertComicRequest(BaseModel):
     # `fmv_flag_reason` and `pricing_basis='ceiling'`, with no fmv_low/high —
     # see `upsert_fmv` for why it is its own column and not a price.
     fmv_ceiling_cap: float | None = None
+    # BUI-1219: the raw direct pool's median and five-tier bid tier, the
+    # inputs to the median-anchored bid cap. Sent together, on a priced,
+    # unflagged row only; see `upsert_fmv` for the ON CONFLICT treatment.
+    fmv_median: float | None = None
+    fmv_bid_tier: str | None = None
     locg_id: int | None = None
     locg_variant_id: int | None = None
 
@@ -268,6 +274,32 @@ class UpsertComicRequest(BaseModel):
         if self.fmv_low is not None or self.fmv_high is not None:
             raise ValueError(
                 "fmv_ceiling_cap cannot be sent with fmv_low/fmv_high")
+        return self
+
+    @model_validator(mode="after")
+    def validate_median_bid_tier_shape(self) -> "UpsertComicRequest":
+        # BUI-1219: mirrors `upsert_fmv`'s guard as a 422 (not a 500 from the
+        # db layer). The pair rides only on a priced, unflagged RAW row; the
+        # pricing-basis half of the raw-direct rule is checked in `upsert_fmv`
+        # because the basis may be derived there from the notes.
+        if self.fmv_bid_tier is not None and self.fmv_bid_tier.strip() == "":
+            self.fmv_bid_tier = None
+        median, tier = self.fmv_median, self.fmv_bid_tier
+        if median is None and tier is None:
+            return self
+        if median is None or tier is None:
+            raise ValueError("fmv_median and fmv_bid_tier must be sent together")
+        if not median >= 0:
+            raise ValueError("fmv_median must be >= 0")
+        if tier not in FMV_BID_TIERS:
+            raise ValueError(
+                "fmv_bid_tier must be one of: " + ", ".join(FMV_BID_TIERS))
+        if (self.fmv_low is None or self.fmv_high is None
+                or self.fmv_flag_reason):
+            raise ValueError(
+                "fmv_median/fmv_bid_tier require a priced, unflagged row")
+        if self.certifier != FMV_CERTIFIER_NONE:
+            raise ValueError("fmv_median/fmv_bid_tier are raw-row only")
         return self
 
 

@@ -2475,6 +2475,7 @@ def _ledger_advisory(server_url: str, *, inp: dict, target_grade: float,
     # compute one, so this stays a one-line, greppable, testable assertion
     # about the emitted row instead of a new branch inside the shared math.
     fmv["max_bid"] = None
+    fmv["bid_basis"] = None  # BUI-1219: no cap, so no basis either
     fmv["ledger_advisory"] = True
     # Keys `_build_notes` reads off a fresh band; absent here because no live
     # fetch happened. Set explicitly so the notes projection can't differ from
@@ -3874,6 +3875,21 @@ def _post_json(url: str, body: dict, *, what: str,
         return None
 
 
+def _median_bid_eligible(fmv: dict) -> bool:
+    """True for a priced RAW DIRECT fmv dict (BUI-1219): the only rows whose
+    median and bid tier are persisted for the median-anchored cap. Excludes
+    graded, CGC-proxy, interpolated, ceiling, ledger-advisory, and flagged
+    rows, whose caps all ride their own rule."""
+    return (not fmv.get("graded") and not fmv.get("cgc_proxy")
+            and not fmv.get("interpolated")
+            and not fmv.get("ledger_advisory")
+            and fmv.get("pricing_basis") in (None, "direct")
+            and fmv.get("flag_reason") is None
+            and fmv.get("fmv_low") is not None
+            and fmv.get("median") is not None
+            and fmv.get("bid_tier") in fmv_math.BID_TIERS)
+
+
 def _upsert_fmv(server_url: str, inp: dict, fmv: dict,
                 hard_fail: bool = True) -> dict | None:
     """POST /api/comics with the computed FMV. Returns the row JSON, or aborts
@@ -3949,6 +3965,15 @@ def _upsert_fmv(server_url: str, inp: dict, fmv: dict,
         # unknown basis, which `_apply_ceiling_cap` treats as "left refused".
         body["pricing_basis"] = _CEILING_BASIS
         body["fmv_ceiling_cap"] = fmv["ceiling_cap"]
+    elif _median_bid_eligible(fmv):
+        # BUI-1219: the median and five-tier bid tier a cache hit and the
+        # overlay's recomputed_cap check re-derive the median-anchored cap
+        # from. Raw direct rows only; every other row posts neither, and the
+        # server stores NULL, which keeps today's factor x fmv_high rule.
+        # An older server ignores both fields (pydantic drops unknown keys),
+        # so its rows also stay on today's rule: deploy the server first.
+        body["fmv_median"] = fmv.get("median")
+        body["fmv_bid_tier"] = fmv.get("bid_tier")
     if inp.get("locg_id"):
         body["locg_id"] = inp["locg_id"]
     if inp.get("locg_variant_id"):
@@ -4874,6 +4899,42 @@ _PRICING_BASIS_FORCES_LOW = ("ladder", "interpolated", "lone_sale")
 # `_fmv_from_db_row` never sees one.
 _CEILING_BASIS = "ceiling"
 
+# BUI-1219: the stored `fmv_confidence` each median tier sits under.
+# `_confidence_to_db_label` collapses HIGH → 'high' and {MEDIUM-HIGH, MEDIUM}
+# → 'medium', so a median tier stored beside a 'low' (or missing) confidence
+# is a contradiction no writer produces. Read it as no tier, which keeps
+# today's cap.
+_MEDIAN_TIER_DB_CONFIDENCE = {
+    fmv_math.TIER_VERY_HIGH: "HIGH",
+    fmv_math.TIER_HIGH: "HIGH",
+    fmv_math.TIER_MEDIUM: "MEDIUM",
+}
+
+
+def _cached_bid_tier(stored: object, fmv_conf: str,
+                     window: float | None) -> str | None:
+    """The stored five-tier bid tier (BUI-1219), checked against its row.
+
+    None for a missing or unknown value. A median tier survives only when the
+    stored confidence, after the caller's BUI-182 wide-window cap, is the one
+    its writer would have stored beside it, so a HIGH/VERY HIGH tier past
+    WIDE_GRADE_WINDOW (confidence capped to MEDIUM) reads as no tier. Past
+    the VERY HIGH window a VERY HIGH tier reads HIGH, which relabels inside
+    the median tiers and moves no cap.
+    """
+    if not isinstance(stored, str):
+        return None
+    tier = stored.strip().upper()
+    if tier not in fmv_math.BID_TIERS:
+        return None
+    if tier in fmv_math.MEDIAN_BID_TIERS:
+        if _MEDIAN_TIER_DB_CONFIDENCE[tier] != fmv_conf:
+            return None
+        if (tier == fmv_math.TIER_VERY_HIGH and window is not None
+                and window > fmv_math.VERY_HIGH_MAX_WINDOW):
+            return fmv_math.TIER_HIGH
+    return tier
+
 
 def _fmv_from_db_row(row: dict, grade_confidence: str | None = None) -> dict:
     """Project a gixen-overlay `comics` row back into the fmv dict shape.
@@ -4932,6 +4993,30 @@ def _fmv_from_db_row(row: dict, grade_confidence: str | None = None) -> dict:
         interpolated = True
     certifier = _identity_token(row.get("certifier"), _RAW_CERTIFIER)
     label = _identity_token(row.get("label"), _RAW_LABEL)
+    # BUI-1219: the median-anchored cap, re-derived from the STORED median and
+    # tier through the same `fmv_math.median_bid_cap` compute_fmv uses, so a
+    # cache hit bids what a fresh run would. `fmv_confidence` is stored
+    # collapsed (MEDIUM-HIGH and MEDIUM both read 'medium') and cannot carry
+    # the five-tier split, which is why the tier has its own column. A row
+    # with no stored median or tier (every row written before BUI-1219, or
+    # through an older server that dropped the fields) keeps factor x
+    # fmv_high. Path gate: raw direct only — the same rows compute_fmv's
+    # direct branch writes.
+    median = row.get("fmv_median")
+    tier = _cached_bid_tier(row.get("fmv_bid_tier"), fmv_conf, window)
+    max_bid: int | None = None
+    bid_basis: str | None = None
+    if fmv_high is not None:
+        median_cap = None
+        if (certifier == _RAW_CERTIFIER and basis in (None, "direct")
+                and not interpolated and not cgc_proxy):
+            median_cap = fmv_math.median_bid_cap(median, fmv_high, tier, factor)
+        if median_cap is not None:
+            max_bid, bid_basis = median_cap, "median"
+        else:
+            # BUI-182: `is not None`, not a falsy check — a legitimate
+            # fmv_high of 0 must round to a 0 max_bid, not be nulled out.
+            max_bid, bid_basis = fmv_math.clean_round(fmv_high * factor), "high"
     return {
         "n": row.get("fmv_comps") or 0,
         # Shape parity with compute_fmv (effective_n exists there for the
@@ -4948,16 +5033,15 @@ def _fmv_from_db_row(row: dict, grade_confidence: str | None = None) -> dict:
         "grade_span": None,
         "fmv_low": row.get("fmv_low"),
         "fmv_high": fmv_high,
-        "median": None,
-        # BUI-182: `is not None`, not a falsy check — a legitimate fmv_high of 0
-        # must round to a 0 max_bid, not be nulled out.
-        "max_bid": (fmv_math.clean_round(fmv_high * factor)
-                    if fmv_high is not None else None),
+        "median": median,  # BUI-1219: stored; None on a pre-BUI-1219 row
+        "max_bid": max_bid,
         "cv": None,
         "cv_pct": "n/a",
         "confidence": fmv_conf,
         "grade_confidence": grade_confidence,
         "bid_factor": factor,
+        "bid_tier": tier,
+        "bid_basis": bid_basis,
         "trimmed_pool": [],
         # BUI-306: shape parity with compute_fmv. An interpolated book persists
         # a real number (flag cleared) so it IS cache-reusable — recover the
@@ -5324,6 +5408,13 @@ def _brief_row(r: dict) -> dict:
         "certifier": fmv.get("certifier"),
         "label": fmv.get("label"),
         "pricing_basis": fmv.get("pricing_basis"),
+        # BUI-1219: additive. `bid_tier` is the five-tier label
+        # (VERY HIGH..VERY LOW, null on a flagged or slab row); `bid_basis`
+        # says what `max_bid` was built from: "median" (1.00 x median, at most
+        # fmv_high) or "high" (bid_factor x fmv_high).
+        "median": fmv.get("median"),
+        "bid_tier": fmv.get("bid_tier"),
+        "bid_basis": fmv.get("bid_basis"),
         "source": r.get("source"),
         # BUI-949: additive — every key above is unchanged, so an existing
         # `--brief` consumer that ignores unknown keys sees no drift.
@@ -5373,6 +5464,14 @@ def _cell(value) -> str:
     BUI-928 certified punt carries `confidence: None` — must not crash the
     renderer's `:<12` format spec (`None.__format__` rejects any spec)."""
     return "?" if value is None else str(value)
+
+
+def _money_cell(value) -> str:
+    """`$90` for a fresh int or a stored REAL `90.0` alike (BUI-1219: a
+    cache hit now carries the stored median); `$?` when absent."""
+    if value is None:
+        return "$?"
+    return f"${value:g}" if isinstance(value, float) else f"${value}"
 
 
 def _print_table(rows: list[dict]) -> None:
@@ -5449,8 +5548,12 @@ def _print_table(rows: list[dict]) -> None:
             mb_str = f"${fmv.get('max_bid') or '?'}"
         elif fmv.get("fmv_low") is not None:
             fmv_str = f"${fmv['fmv_low']}–${fmv['fmv_high']}"
-            med_str = f"${fmv.get('median') or '?'}"
+            med_str = _money_cell(fmv.get("median"))
             mb_str = f"${fmv.get('max_bid') or '?'}"
+            if fmv.get("bid_basis") == "median":
+                # BUI-1219: built from the median (1.00 x median, at most
+                # fmv_high), not bid_factor x fmv_high.
+                mb_str += " med"
         elif r.get("source") == "skipped_lookup_error":
             # BUI-544/BUI-775: never priced this run — the hand-price guard
             # could not reach a verdict (lookup failed, or answered
@@ -5509,7 +5612,8 @@ def _print_table(rows: list[dict]) -> None:
             f"{i:>3}  {label[:30]:<30} {str(grade):>5}  "
             f"{fmv_str:<14} {med_str:>5}  {_cell(fmv.get('n')):>3}  "
             f"{_cell(fmv.get('cv_pct')):>5}  "
-            f"{_cell(fmv.get('confidence')):<12} {prov_str:<24} "
+            f"{_cell(fmv.get('bid_tier') or fmv.get('confidence')):<12} "
+            f"{prov_str:<24} "
             f"{mb_str:>7}  {r['source']}"
         )
 

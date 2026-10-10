@@ -698,6 +698,86 @@ def clean_round(value: float) -> int:
     return int(round(value / step) * step)
 
 
+# ─── Bid tiers + the median-anchored raw bid cap (BUI-1219) ──────────────────
+#
+# Five DISPLAY tiers, derived from the internal rubric label (`confidence_label`,
+# unchanged) plus the window and cv the pool was priced at:
+#
+#   VERY HIGH = HIGH label AND window <= ±0.5 AND cv < 25%
+#   HIGH      = any other HIGH
+#   MEDIUM    = MEDIUM-HIGH or MEDIUM
+#   LOW       = MEDIUM-LOW
+#   VERY LOW  = LOW
+#
+# The bid rule (user-approved 2026-10-10, backtest in
+# docs/audit/2026-10-10-median-bid-factor-backtest.md): on the RAW direct
+# pricing path only, a VERY HIGH / HIGH / MEDIUM book caps at
+# clean_round(MEDIAN_BID_FACTOR x median), clamped to <= fmv_high. Every other
+# path keeps BASE_BID_FACTOR x fmv_high or its own tier haircut. When the photo
+# grade-confidence haircut engages (factor < BASE_BID_FACTOR) the median rule
+# steps aside and today's conservative factor x fmv_high stands, so the
+# haircut can never get looser.
+#
+# PARITY: the overlay's policy check (`gixen_overlay.policy`) re-derives this
+# cap from the stored `fmv.median` + `fmv.bid_tier`; it pins MEDIAN_BID_TIERS
+# and MEDIAN_BID_FACTOR as its own constants, and
+# plugins/gixen-overlay/tests/test_fmv_rung_parity.py fails if they drift.
+TIER_VERY_HIGH = "VERY HIGH"
+TIER_HIGH = "HIGH"
+TIER_MEDIUM = "MEDIUM"
+TIER_LOW = "LOW"
+TIER_VERY_LOW = "VERY LOW"
+BID_TIERS = (TIER_VERY_HIGH, TIER_HIGH, TIER_MEDIUM, TIER_LOW, TIER_VERY_LOW)
+MEDIAN_BID_TIERS = (TIER_VERY_HIGH, TIER_HIGH, TIER_MEDIUM)
+MEDIAN_BID_FACTOR = 1.00
+VERY_HIGH_MAX_WINDOW = DEFAULT_GRADE_WINDOW  # ±0.5
+VERY_HIGH_MAX_CV = 0.25
+
+_TIER_BY_LABEL = {
+    "HIGH": TIER_HIGH,
+    "MEDIUM-HIGH": TIER_MEDIUM,
+    "MEDIUM": TIER_MEDIUM,
+    "MEDIUM-LOW": TIER_LOW,
+    "LOW": TIER_VERY_LOW,
+}
+
+
+def bid_tier(label: str | None, window: float | None,
+             cv_value: float | None) -> str:
+    """The five-tier display/bid tier for a rubric `label` (see block above).
+
+    An unknown or blank label maps to VERY LOW — the direction that keeps
+    today's 0.80 x fmv_high cap, never the median rule. VERY HIGH needs a
+    KNOWN window and cv: a missing one cannot prove the pool was tight.
+    """
+    tier = _TIER_BY_LABEL.get((label or "").strip().upper(), TIER_VERY_LOW)
+    if (tier == TIER_HIGH and window is not None and cv_value is not None
+            and window <= VERY_HIGH_MAX_WINDOW and cv_value < VERY_HIGH_MAX_CV):
+        return TIER_VERY_HIGH
+    return tier
+
+
+def median_bid_cap(median: float | None, fmv_high: float | None,
+                   tier: str | None, factor: float) -> int | None:
+    """The median-anchored raw bid cap, or None when the rule does not apply.
+
+    None (caller keeps `clean_round(factor x fmv_high)`) when: the tier is not
+    a median tier, the median or fmv_high is missing, or `factor` is below
+    BASE_BID_FACTOR (a photo grade haircut, or a tier haircut such as
+    interpolated/proxy, already engaged — that conservative path stands).
+    Otherwise clean_round(MEDIAN_BID_FACTOR x median), clamped to fmv_high so
+    the median rule can never cap above the band's top.
+
+    Callers own the PATH gate: only the raw direct path may call this with a
+    real tier (compute_fmv, and fmv_runner's cache hit on a raw direct row).
+    """
+    if tier not in MEDIAN_BID_TIERS or median is None or fmv_high is None:
+        return None
+    if factor < BASE_BID_FACTOR:
+        return None
+    return min(clean_round(MEDIAN_BID_FACTOR * median), int(fmv_high))
+
+
 # ─── Sold-comp ceiling cap (BUI-1028) ─────────────────────────────────────────
 #
 # A raw `one_sided` / `too_wide` refusal whose pool still holds at least two
@@ -1048,6 +1128,10 @@ def cgc_proxy_fmv(graded_comps: list[dict], target_grade: float,
         "confidence": CGC_PROXY_CONFIDENCE,
         "grade_confidence": grade_confidence,
         "bid_factor": factor,
+        # BUI-1219: display tier of the MEDIUM-LOW proxy label (LOW). The
+        # median rule is raw-direct only, so a proxy cap rides fmv_high.
+        "bid_tier": bid_tier(CGC_PROXY_CONFIDENCE, None, None),
+        "bid_basis": "high",
         "trimmed_pool": [],
         "interpolated": False,
         "interpolation": None,
@@ -1358,12 +1442,16 @@ def compute_fmv(comps: list[dict], target_grade: float,
       "fmv_low": int | None,           # weighted Q25, clean-rounded (None if flagged/no-comps)
       "fmv_high": int | None,          # weighted Q75, clean-rounded
       "median": int | None,            # weighted median, clean-rounded
-      "max_bid": int | None,           # bid_factor × fmv_high, clean-rounded
+      "max_bid": int | None,           # bid_factor × fmv_high, clean-rounded; or,
+                                        # BUI-1219, clean_round(1.00 × median) ≤ fmv_high
+                                        # for a VERY HIGH/HIGH/MEDIUM tier with no haircut
       "cv": float | None,              # raw CV (not %)
       "cv_pct": str,                   # human "27%" or "n/a"
       "confidence": str,               # HIGH | MEDIUM-HIGH | MEDIUM | MEDIUM-LOW | LOW
       "grade_confidence": str | None,  # echoed back for traceability
       "bid_factor": float,             # the multiplier actually applied
+      "bid_tier": str | None,          # VERY HIGH|HIGH|MEDIUM|LOW|VERY LOW (BUI-1219)
+      "bid_basis": str | None,         # "median" | "high" — what max_bid was built from
       "trimmed_pool": list[float],     # for debugging / display
       "interpolated": bool,            # §7 grade-curve interp was applied (BUI-306)
       "interpolation": dict | None,    # {grade/median_below, _above, target_price}
@@ -1514,6 +1602,13 @@ def compute_fmv(comps: list[dict], target_grade: float,
     med: int | None
     max_bid: int | None
     width_floored = False  # BUI-990: set by apply_width_floor on a priced band
+    # BUI-1219: the five-tier bid tier, from the label as capped above. A
+    # flagged book has no bid, so no tier; an interpolated one is always
+    # VERY LOW (its label is forced LOW) and never reaches the median rule.
+    tier: str | None = (bid_tier(label, window, cv_val)
+                        if flag_reason is None or interpolation is not None
+                        else None)
+    bid_basis: str | None = None  # "median" | "high" once a max_bid exists
     # BUI-990: the band as the pool priced it, before the width floor. The
     # floor adds no market evidence, so the anchor-divergence flag below reads
     # this one — otherwise widening a band would mask a real divergence.
@@ -1529,6 +1624,7 @@ def compute_fmv(comps: list[dict], target_grade: float,
         pool_low, pool_high = fmv_low, fmv_high
         fmv_low, fmv_high, width_floored = apply_width_floor(fmv_low, fmv_high)
         max_bid = clean_round(fmv_high * factor)
+        bid_basis = "high"
         flag_reason = None
     elif flag_reason is not None or n == 0:
         fmv_low = fmv_high = med = max_bid = None
@@ -1552,7 +1648,16 @@ def compute_fmv(comps: list[dict], target_grade: float,
         # from it, so the cap rides the floored fmv_high.
         pool_low, pool_high = fmv_low, fmv_high
         fmv_low, fmv_high, width_floored = apply_width_floor(fmv_low, fmv_high)
-        max_bid = clean_round(fmv_high * factor)
+        # BUI-1219: the raw direct path is the ONLY one the median rule
+        # reaches. `median_bid_cap` returns None (today's factor x fmv_high
+        # stands) for a non-median tier or an engaged haircut.
+        median_cap = median_bid_cap(med, fmv_high, tier, factor)
+        if median_cap is not None:
+            max_bid = median_cap
+            bid_basis = "median"
+        else:
+            max_bid = clean_round(fmv_high * factor)
+            bid_basis = "high"
 
     # BUI-534: flag-only pool-vs-anchor divergence — computed from fields
     # already resolved above (fmv_low/fmv_high, the anchor from BUI-522),
@@ -1576,6 +1681,12 @@ def compute_fmv(comps: list[dict], target_grade: float,
         "confidence": label,
         "grade_confidence": grade_confidence,
         "bid_factor": factor,
+        # BUI-1219: the five-tier bid tier (None on a flagged book) and which
+        # number max_bid was built from: "median" (MEDIAN_BID_FACTOR x median,
+        # clamped to fmv_high) or "high" (bid_factor x fmv_high). None when
+        # there is no max_bid.
+        "bid_tier": tier,
+        "bid_basis": bid_basis,
         "trimmed_pool": sorted(trimmed),
         # BUI-306 §7/§5: interpolation + monotonicity, marked so a downstream
         # consumer can tell an interpolated value from a real direct comp and
@@ -1951,6 +2062,10 @@ def _graded_result(**over) -> dict:
         # attribution and `bid_factor` both see the same absence.
         "grade_confidence": None,
         "bid_factor": BASE_BID_FACTOR,
+        # BUI-1219: shape parity. The five-tier median rule is raw-direct
+        # only; a slab's cap rides its own tier factor x fmv_high/point.
+        "bid_tier": None,
+        "bid_basis": None,
         "trimmed_pool": [],
         # Shape parity with compute_fmv. `interpolated` stays False even on a
         # `ladder` row: `pricing_basis` is the carrier now (plan KTD "Pricing

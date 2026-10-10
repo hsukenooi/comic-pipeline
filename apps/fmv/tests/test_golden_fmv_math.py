@@ -36,6 +36,7 @@ GRADED_BASELINE = Path(__file__).parent / "fixtures" / "fmv_math_graded_golden.j
 _FROZEN = (
     "n", "window", "flag_reason", "grade_span", "fmv_low", "fmv_high",
     "median", "max_bid", "confidence", "bid_factor", "ungraded_anchor",
+    "bid_tier", "bid_basis",  # BUI-1219
 )
 
 

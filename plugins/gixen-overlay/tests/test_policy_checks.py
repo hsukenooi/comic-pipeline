@@ -384,6 +384,84 @@ def test_recomputed_cap_high_confidence_passes_within_080(conn):
     assert r["data"]["recomputed_cap"] == pytest.approx(80.0)
 
 
+def _median_setup(conn, item_id, bid_amount, *, confidence="high",
+                  tier="VERY HIGH", median=95.0, certifier="none",
+                  pricing_basis="direct"):
+    """BUI-1219: a raw direct row carrying the stored median + tier."""
+    _comic_id, fmv_id = _insert_comic_fmv(
+        conn, high=100.0, confidence=confidence, certifier=certifier)
+    conn.execute(
+        "UPDATE fmv SET median=?, bid_tier=?, pricing_basis=? WHERE id=?",
+        (median, tier, pricing_basis, fmv_id))
+    conn.commit()
+    bid = _insert_bid(conn, item_id, bid_amount, certifier=certifier)
+    _link(conn, bid["id"], fmv_id)
+    return _intent(item_id=item_id, max_bid=bid_amount, trigger="edit",
+                   prior_row=bid)
+
+
+@pytest.mark.parametrize("confidence, tier", [
+    ("high", "VERY HIGH"), ("high", "HIGH"), ("medium", "MEDIUM")])
+def test_recomputed_cap_passes_a_median_capped_bid(conn, confidence, tier):
+    """A median-tier bid at the median ($95 > 0.80 x $100) must not draw the
+    false advisory today's rung-only recompute would give it."""
+    results = policy.check_bid_write(conn, _median_setup(
+        conn, "900100080", 95.0, confidence=confidence, tier=tier))
+    r = _by_code(results, "recomputed_cap")
+    assert r["outcome"] == "pass"
+    assert r["data"]["recomputed_cap"] == pytest.approx(95.0)
+    assert r["data"]["per_link"][0]["median_cap"] == pytest.approx(95.0)
+    assert _by_code(results, "over_fmv")["outcome"] == "pass"
+
+
+def test_recomputed_cap_advises_above_the_median(conn):
+    results = policy.check_bid_write(conn, _median_setup(conn, "900100081", 100.0))
+    assert _by_code(results, "recomputed_cap")["outcome"] == "advise"
+
+
+def test_recomputed_cap_median_is_clamped_to_high(conn):
+    """A stored median above high (a hand-written row) never lifts the cap
+    past high."""
+    results = policy.check_bid_write(conn, _median_setup(
+        conn, "900100082", 110.0, median=150.0))
+    r = _by_code(results, "recomputed_cap")
+    assert r["outcome"] == "advise"
+    assert r["data"]["recomputed_cap"] == pytest.approx(100.0)
+
+
+def test_recomputed_cap_keeps_the_rung_when_the_median_is_lower(conn):
+    """max(rung x high, median): a book whose median sits below 0.80 x high
+    may still have bid at the rung (a photo-haircut path cannot be seen
+    here), so the rung stays the floor of the cap."""
+    results = policy.check_bid_write(conn, _median_setup(
+        conn, "900100083", 80.0, median=60.0))
+    r = _by_code(results, "recomputed_cap")
+    assert r["outcome"] == "pass"
+    assert r["data"]["recomputed_cap"] == pytest.approx(80.0)
+
+
+@pytest.mark.parametrize("over", [
+    {"tier": "LOW", "confidence": "low"},       # not a median tier
+    {"tier": None},                             # pre-BUI-1219 row (NULL)
+    {"median": None},
+    {"confidence": "low"},                      # contradicts the median tier
+    {"tier": "HIGH", "confidence": "medium"},   # contradicts the median tier
+    {"pricing_basis": "proxy"},
+    {"pricing_basis": "interpolated"},
+    {"certifier": "cgc"},                       # slabs never take the rule
+])
+def test_recomputed_cap_ignores_a_median_outside_the_gate(conn, over):
+    kwargs = {"confidence": "high", "tier": "VERY HIGH", "median": 95.0,
+              "certifier": "none", "pricing_basis": "direct", **over}
+    intent = _median_setup(conn, "900100084", 95.0, **kwargs)
+    if kwargs["certifier"] != "none":
+        intent = _intent(item_id="900100084", max_bid=95.0, trigger="edit",
+                         prior_row=intent.prior_row)
+    r = _by_code(policy.check_bid_write(conn, intent), "recomputed_cap")
+    assert r["data"]["per_link"][0]["median_cap"] is None
+    assert r["outcome"] == "advise"
+
+
 # ---------------------------------------------------------------------------
 # Check 4 — staleness
 # ---------------------------------------------------------------------------

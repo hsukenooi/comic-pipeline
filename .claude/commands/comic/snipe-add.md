@@ -49,11 +49,12 @@ Bid caps follow the same **rung ladder** `comic-fmv` computes (`docs/conventions
 
 | Rung | Formula | When it applies |
 |---|---|---|
-| Base | `max_bid = 0.80 × top of FMV range` | Default — no confidence signal, or grade + comp confidence are both HIGH/MEDIUM |
+| Median (BUI-1219) | `max_bid = 1.00 × median`, never above the top of FMV range | A raw direct row in the VERY HIGH, HIGH, or MEDIUM bid tier with no photo haircut (`comic-fmv` shows `$X med` and `bid_basis: "median"`) |
+| Base | `max_bid = 0.80 × top of FMV range` | Default — LOW/VERY LOW tier, or no median on the row, with no haircut below |
 | Haircut (medium-low) | `max_bid = 0.70 × top of FMV range` | The more conservative of photo `grade_confidence` and comp-pool confidence lands at MEDIUM-LOW |
 | Haircut (low) | `max_bid = 0.60 × top of FMV range` | The more conservative of the two lands at LOW (includes a §7 interpolated single-point estimate and the CGC-proxy tier, both capped here) |
 
-If the user hasn't set max bids manually, default to the **base rung**: `max_bid = 80% × top of FMV range`. When the bid comes from `comic-fmv` (the `/comic:buy` path), the CLI has already applied whichever rung its confidence axes require — look for `bid_haircut=…` in the row's Notes to see which one fired. A haircut rung is intentional; don't "correct" it back up to 0.80× without a reason. The base-rung formula above is the fallback for manually-set bids only, never a correction to apply on top of a comic-fmv-computed max_bid.
+If the user hasn't set max bids manually, default to the **base rung**: `max_bid = 80% × top of FMV range`. When the bid comes from `comic-fmv` (the `/comic:buy` path), the CLI has already applied whichever rung its confidence axes require — look for `bid_haircut=…` in the row's Notes to see which one fired. A haircut rung is intentional; don't "correct" it back up to 0.80× without a reason. A median-rung bid is intentional too; don't "correct" it to 0.80 × FMV high. The base-rung formula above is the fallback for manually-set bids only, never a correction to apply on top of a comic-fmv-computed max_bid.
 
 **Never apply any rung to a ledger-advisory band (BUI-663).** A `comic-fmv` row with `source: "ledger-advisory"` shows an FMV range whose `max_bid` is deliberately `null`: the sold-comps fetch failed for that book, so the band was priced from **stored** comps and the cap was withheld on purpose. It is the one row where "no max bid yet" does **not** mean "apply the base rung" — the withheld cap is the whole safety property, and `0.80 × fmv_high` reinstates exactly the risk it was withheld to avoid. Its `flag_reason` is `null` and it has no `comic_id`, so neither of the usual guards catches it: gate on `source`. Either re-run `comic-fmv` once the providers recover, or have the **user** state a max bid explicitly — never derive one from the band.
 

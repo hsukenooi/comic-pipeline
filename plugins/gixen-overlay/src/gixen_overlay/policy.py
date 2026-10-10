@@ -116,6 +116,49 @@ _RUNG_BY_CONFIDENCE = {
 }
 
 
+# BUI-1219: the median-anchored raw bid cap, duplicated from fmv_math for the
+# same KTD5 reason as the rungs above. fmv_math caps a VERY HIGH / HIGH /
+# MEDIUM raw direct book with no photo haircut at
+# min(clean_round(MEDIAN_BID_FACTOR x median), fmv_high), and persists the
+# median and tier as `fmv.median` / `fmv.bid_tier`. Pinned equal to
+# fmv_math's constants by tests/test_fmv_rung_parity.py, which also imports
+# fmv_math and checks this module's recompute never sits below its cap.
+MEDIAN_BID_TIERS = ("VERY HIGH", "HIGH", "MEDIUM")  # == fmv_math.MEDIAN_BID_TIERS
+MEDIAN_BID_FACTOR = 1.00                            # == fmv_math.MEDIAN_BID_FACTOR
+# The collapsed `fmv.confidence` each median tier's writer stores beside it
+# (HIGH → 'high', {MEDIUM-HIGH, MEDIUM} → 'medium'). A median tier beside any
+# other confidence is a contradiction no writer produces, so it earns no
+# median cap: the check falls back to the rung alone, the stricter reading.
+_MEDIAN_TIER_CONFIDENCE = {"VERY HIGH": "high", "HIGH": "high", "MEDIUM": "medium"}
+
+
+def _median_cap(r: dict) -> float | None:
+    """The BUI-1219 median-anchored cap for one fmv row, or None when the
+    row cannot carry one (no stored median/tier — every pre-BUI-1219 row —
+    a non-median tier, a slab, a non-direct basis, or a contradictory
+    confidence). Never above the row's `high`.
+
+    The stored median is already clean-rounded by its writer, and
+    `clean_round` is idempotent on its own outputs (pinned by the parity
+    test), so no rounding is repeated here.
+    """
+    high, median, tier = r.get("high"), r.get("median"), r.get("bid_tier")
+    if high is None or median is None or not isinstance(tier, str):
+        return None
+    tier = tier.strip().upper()
+    if tier not in MEDIAN_BID_TIERS:
+        return None
+    if (r.get("certifier") or FMV_CERTIFIER_NONE) != FMV_CERTIFIER_NONE:
+        return None
+    if r.get("pricing_basis") not in (None, "direct"):
+        return None
+    confidence = r.get("confidence")
+    if (not isinstance(confidence, str)
+            or confidence.strip().lower() != _MEDIAN_TIER_CONFIDENCE[tier]):
+        return None
+    return min(MEDIAN_BID_FACTOR * median, high)
+
+
 def _rung_for_confidence(confidence: Any) -> float:
     if isinstance(confidence, str):
         return _RUNG_BY_CONFIDENCE.get(confidence.strip().lower(), RUNG_HIGH_CONFIDENCE)
@@ -386,28 +429,47 @@ def _check_over_fmv(conn: sqlite3.Connection, intent: Any) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
+def _recomputed_link_cap(r: dict) -> dict:
+    """One link's recomputed cap: the confidence rung x high, or, on a row
+    carrying a BUI-1219 median tier, the LARGER of that and the median cap.
+
+    The larger, because grade_confidence is not stored: a median-tier book
+    bids at the median cap with no photo haircut and at rung x high (or
+    lower) with one, and this check cannot tell which happened. Taking the
+    max keeps the KTD9 rule — advise only on a bid no legitimate path could
+    have produced — and both terms are at most `high`, so the median rule
+    never widens the cap past the band's top.
+    """
+    high = _effective_high(r)
+    factor = _factor(r)
+    rung_cap = factor * high
+    median_cap = _median_cap(r)
+    cap = rung_cap if median_cap is None else max(rung_cap, median_cap)
+    return {
+        "fmv_id": r.get("id"),
+        "confidence": r.get("confidence"),
+        "high": high,
+        "factor": factor,
+        "bid_tier": r.get("bid_tier"),
+        "median_cap": median_cap,
+        "cap": cap,
+    }
+
+
 def _check_recomputed_cap(conn: sqlite3.Connection, intent: Any) -> dict | None:
     resolved, _ = _resolve_identities(conn, intent)
     priceable = _priceable(resolved)
     if not priceable:
         return None
 
-    per_link = [
-        {
-            "fmv_id": r.get("id"),
-            "confidence": r.get("confidence"),
-            "high": _effective_high(r),
-            "factor": _factor(r),
-            "cap": _factor(r) * _effective_high(r),
-        }
-        for r in priceable
-    ]
+    per_link = [_recomputed_link_cap(r) for r in priceable]
     recomputed_cap = sum(row["cap"] for row in per_link)
     data = {
         "max_bid": intent.target_max_bid, "recomputed_cap": recomputed_cap,
         "link_count": len(priceable), "per_link": per_link,
-        "basis": "fmv.confidence only — grade_confidence is not stored on "
-                 "the fmv row (see U8)",
+        "basis": "fmv.confidence rung x high, or the larger of that and "
+                 "min(median, high) on a BUI-1219 median-tier row — "
+                 "grade_confidence is not stored on the fmv row (see U8)",
         "rungs": {
             "high": RUNG_HIGH_CONFIDENCE, "medium": RUNG_MEDIUM_CONFIDENCE,
             "low": RUNG_LOW_CONFIDENCE,

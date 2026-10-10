@@ -556,6 +556,8 @@ async def api_upsert_comic(req: UpsertComicRequest, request: Request):
             label=req.label,
             pricing_basis=req.pricing_basis,
             ceiling_cap=req.fmv_ceiling_cap,  # BUI-1028
+            median=req.fmv_median,  # BUI-1219
+            bid_tier=req.fmv_bid_tier,  # BUI-1219
         )
         # BUI-659: append an immutable snapshot of the row upsert_fmv just
         # wrote to fmv_history. Runs AFTER upsert_fmv's own commit — the fmv

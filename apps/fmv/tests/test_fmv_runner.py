@@ -5619,7 +5619,10 @@ class TestBriefProjection:
                   "provenance",
                   # BUI-954: the active-ask ceiling. Additive — null on every
                   # row without one.
-                  "active_ask_low", "active_ask_n"}
+                  "active_ask_low", "active_ask_n",
+                  # BUI-1219: the median, five-tier bid tier, and what
+                  # max_bid was built from. Additive.
+                  "median", "bid_tier", "bid_basis"}
 
     def test_fresh_row_projects_top_level_ids(self):
         row = {
@@ -5646,7 +5649,9 @@ class TestBriefProjection:
                          # no `haircut` token.
                          "provenance": "direct n5",
                          # BUI-954: a priced row never fetches an ask ceiling.
-                         "active_ask_low": None, "active_ask_n": None}
+                         "active_ask_low": None, "active_ask_n": None,
+                         # BUI-1219: absent on this hand-built fmv dict.
+                         "median": None, "bid_tier": None, "bid_basis": None}
 
     def test_fresh_row_fmv_notes_matches_upsert_notes(self):
         # BUI-505: the brief line's fmv_notes must be exactly what
