@@ -7486,7 +7486,9 @@ class TestPageQualityRowReporting:
         assert "exact n2" in out        # the provenance cell, unchanged
 
     def _ladder_row(self, tmp_path, server_url):
-        """A scoped row that reaches the LADDER tier. The two white 4.5 sales
+        """(BUI-1217: the other-grade comps state a DIFFERENT quality, "cream";
+        `unknown` comps now count as matches and would keep the pool whole.)
+        A scoped row that reaches the LADDER tier. The two white 4.5 sales
         above would price `direct`, so the exact bucket is thinned to one
         STALE white sale (weight 0.5, under the exact tier's floor of 2.0 and
         under the lone-sale tier's freshness bar) while a second white comp at
@@ -7496,9 +7498,12 @@ class TestPageQualityRowReporting:
                             page_quality="white"),      # stale: weight 0.5
             _make_slab_comp(905, 4.0, "w1", sold_date="2026-08-21",
                             page_quality="white"),
-            _make_slab_comp(900, 4.0, "e1", sold_date="2026-08-20"),
-            _make_slab_comp(1400, 5.5, "e2", sold_date="2026-08-10"),
-            _make_slab_comp(1500, 6.0, "e3", sold_date="2026-08-05"),
+            _make_slab_comp(900, 4.0, "e1", sold_date="2026-08-20",
+                            page_quality="cream"),
+            _make_slab_comp(1400, 5.5, "e2", sold_date="2026-08-10",
+                            page_quality="cream"),
+            _make_slab_comp(1500, 6.0, "e3", sold_date="2026-08-05",
+                            page_quality="cream"),
         ]
         return _graded_harness()._run(
             self._white_book(), self._white_result(comps), tmp_path,
@@ -7541,9 +7546,12 @@ class TestPageQualityRowReporting:
         comps = [
             _make_slab_comp(700, 4.5, "w0", sold_date="2026-09-01",
                             page_quality="white"),
-            _make_slab_comp(900, 4.0, "e1", sold_date="2026-08-20"),
-            _make_slab_comp(1400, 5.5, "e2", sold_date="2026-08-10"),
-            _make_slab_comp(1500, 6.0, "e3", sold_date="2026-08-05"),
+            _make_slab_comp(900, 4.0, "e1", sold_date="2026-08-20",
+                            page_quality="cream"),
+            _make_slab_comp(1400, 5.5, "e2", sold_date="2026-08-10",
+                            page_quality="cream"),
+            _make_slab_comp(1500, 6.0, "e3", sold_date="2026-08-05",
+                            page_quality="cream"),
         ]
         h = _graded_harness()
         row, upsert, _ = h._run(self._white_book(),

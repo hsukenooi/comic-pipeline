@@ -216,7 +216,11 @@ class TestInvincible1Replay:
         target = data["target"]
         assert target["page_quality"] == "white"
         before = _price(data["comps"], target, page_quality="white")
-        assert before["page_quality_fallback_reason"] == "ladder_reads_all_qualities"
+        # BUI-1217: all but two of this pool's comps are `unknown`, which now
+        # count as matches for "white", so the scoped pool IS the whole pool
+        # and no widen is reported. The refusal itself is unchanged.
+        assert before["page_quality_fallback"] is False
+        assert before["page_quality_fallback_reason"] is None
         assert before["flag_reason"] == "ladder_non_monotone"
         after = _price(_guarded(data), target, page_quality="white")
         assert after["pricing_basis"] == "lone_sale"

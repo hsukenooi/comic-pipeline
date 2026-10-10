@@ -2034,6 +2034,12 @@ def _graded_page_quality_filter(
 ) -> tuple[list[dict], bool, str | None]:
     """Prefer comps whose page quality matches the target's.
 
+    A comp whose page quality is `unknown`/None counts as a match for any
+    target (BUI-1217): the title did not say, so it is missing information,
+    not a different quality. Only comps stating a DIFFERENT quality are
+    excluded. (Batman #227 CGC 6.5 OW: two unknown sales at $1,075/$1,275 were
+    dropped beside two OW sales, lifting the median from $1,312.50 to $1,400.)
+
     Returns `(pool, fell_back, reason)`. Applied ONLY when the target's page
     quality is a real reading — `None`/`"unknown"` is the ABSENCE of one, and
     "prefer the comps whose page quality we also failed to read" is not a
@@ -2066,7 +2072,11 @@ def _graded_page_quality_filter(
     # one, which is why this is a guard rather than a wider condition below.
     if not pool:
         return pool, False, None
-    matched = [c for c in pool if c.get("page_quality") == page_quality]
+    # BUI-1217: an `unknown`/None sale is a title that did not say, i.e.
+    # MISSING information, not a conflicting quality — it matches any target.
+    # Only a sale that STATES a different quality is excluded.
+    matched = [c for c in pool
+               if c.get("page_quality") in (page_quality, None, "unknown", "")]
     if len(matched) >= 2:
         return matched, False, None
     return pool, True, "too_few_matches"
@@ -2189,6 +2199,15 @@ def graded_fmv(comps: list[dict], target_grade: float, *,
         The one-sale widen is taken only when it prices `direct`; below the
         gate the row falls through exactly as before (the scoped lone sale to
         the lone-sale tier, then the ladder).
+
+        **Unknown page quality is not a different quality (BUI-1217).** The
+        scoped pool keeps every comp whose page quality is `unknown`/None
+        alongside the ones that match the target, at EVERY grade — so the
+        scoped exact bucket, the ladder-tier pools and the `too_few_matches`
+        count of two all include them. Only a comp that STATES a different
+        quality is left out. The widen above therefore fires only when
+        stated-different-quality sales sit at the target grade; an `unknown`
+        sale is never what it widens to, because it never left.
 
         **What BUI-943 still governs.** A scoped bucket of TWO or more sales
         wins, even below the gate: the other-quality sales at the target grade
