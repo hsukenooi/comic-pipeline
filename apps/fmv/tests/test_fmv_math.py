@@ -2646,14 +2646,20 @@ class TestGradedExactAnyPageQualityBeforeLadder:
     sales at the target grade before the ladder is tried (ASM #50 shape)."""
 
     # >= 2 ow_w comps at OTHER grades so the filter scopes to ow_w, while every
-    # sale at the target 6.0 is `unknown` page quality.
+    # sale at the target 6.0 STATES a different quality ("w"). BUI-1217: these
+    # were `unknown` before, but an unknown sale now counts as a match for any
+    # target and stays in the scoped bucket, so the widen path needs a stated
+    # conflicting quality to exercise it.
     _OW_RUNGS = [_slab_comp(900, 5.5, age=3, page_quality="ow_w", product_id="o1"),
                  _slab_comp(1000, 5.5, age=4, page_quality="ow_w", product_id="o2"),
                  _slab_comp(1500, 6.5, age=5, page_quality="ow_w", product_id="o3"),
                  _slab_comp(1650, 6.5, age=6, page_quality="ow_w", product_id="o4")]
-    _UNKNOWN_EXACT = [_slab_comp(1230, 6.0, age=7, product_id="u1"),
-                      _slab_comp(1290, 6.0, age=8, product_id="u2"),
-                      _slab_comp(1329, 6.0, age=9, product_id="u3")]
+    _UNKNOWN_EXACT = [_slab_comp(1230, 6.0, age=7, page_quality="w",
+                      product_id="u1"),
+                      _slab_comp(1290, 6.0, age=8, page_quality="w",
+                      product_id="u2"),
+                      _slab_comp(1329, 6.0, age=9, page_quality="w",
+                      product_id="u3")]
 
     def test_unknown_exact_sales_price_directly_for_an_ow_w_target(self):
         out = _graded(self._OW_RUNGS + self._UNKNOWN_EXACT, 6.0,
@@ -2733,7 +2739,8 @@ class TestGradedExactAnyPageQualityBeforeLadder:
         envelope, so the direct tier would refuse it `too_sparse`. The widen
         must not trade the scoped lone-sale price for that refusal."""
         own = [_slab_comp(1225, 6.0, age=1, page_quality="ow_w", product_id="s1")]
-        cheap = [_slab_comp(300, 6.0, age=2, product_id="u2")]
+        cheap = [_slab_comp(300, 6.0, age=2, page_quality="w",
+                      product_id="u2")]
         base = (self._OW_RUNGS + own + cheap
                 + [_slab_comp(2000, 7.0, age=2, product_id="u9")])
         unscoped = _graded(base, 6.0)
@@ -2750,7 +2757,8 @@ class TestGradedExactAnyPageQualityBeforeLadder:
         widen is declined and the row prices exactly as before: the scoped
         lone sale, with no `exact_any_page_quality` provenance."""
         own = [_slab_comp(1225, 6.0, age=1, page_quality="ow_w", product_id="s1")]
-        stale = [_slab_comp(1290, 6.0, age=200, product_id="u2")]
+        stale = [_slab_comp(1290, 6.0, age=200, page_quality="w",
+                      product_id="u2")]
         base = (self._OW_RUNGS + own + stale
                 + [_slab_comp(2000, 7.0, age=2, product_id="u9")])
         out = _graded(base, 6.0, page_quality="ow_w")
@@ -2763,6 +2771,7 @@ class TestGradedExactAnyPageQualityBeforeLadder:
 
     def test_no_exact_sales_at_all_falls_to_the_ladder(self):
         out = _graded(self._OW_RUNGS + [_slab_comp(2000, 7.0, age=2,
+                                                    page_quality="w",
                                                     product_id="u9")], 6.0,
                       page_quality="ow_w")
         assert out["pricing_basis"] == "ladder"
@@ -2770,7 +2779,8 @@ class TestGradedExactAnyPageQualityBeforeLadder:
         assert out["exact_sales"] == []
 
     def test_a_stale_lone_exact_sale_falls_to_the_ladder_with_ladder_reason(self):
-        stale = [_slab_comp(1230, 6.0, age=200, product_id="u1")]
+        stale = [_slab_comp(1230, 6.0, age=200, page_quality="w",
+                      product_id="u1")]
         out = _graded(self._OW_RUNGS + stale
                       + [_slab_comp(2000, 7.0, age=2, product_id="u9")], 6.0,
                       page_quality="ow_w")
@@ -2790,6 +2800,51 @@ class TestGradedExactAnyPageQualityBeforeLadder:
         out = _graded(self._OW_RUNGS + self._UNKNOWN_EXACT, 6.0)
         assert out["pricing_basis"] == "direct"
         assert out["page_quality_fallback"] is False
+
+
+class TestGradedUnknownPageQualityStaysInExactBucket:
+    """BUI-1217: a sale whose title did not state a page quality is MISSING
+    information, not a conflicting quality — it matches any target."""
+
+    # Batman #227 CGC 6.5 OW (2026-10-10): four 6.5 sales, two unknown.
+    _BATMAN = [_slab_comp(1075, 6.5, age=1, product_id="b1"),
+               _slab_comp(1275, 6.5, age=2, product_id="b2"),
+               _slab_comp(1350, 6.5, age=3, page_quality="ow", product_id="b3"),
+               _slab_comp(1449, 6.5, age=4, page_quality="ow", product_id="b4")]
+
+    def test_batman_227_keeps_all_four_sales_in_the_exact_bucket(self):
+        out = _graded(self._BATMAN, 6.5, page_quality="ow")
+        assert out["flag_reason"] is None
+        assert out["pricing_basis"] == "direct"
+        assert out["exact_sales"] == [1075.0, 1275.0, 1350.0, 1449.0]
+        assert out["n"] == 4
+        # Rounded for display; unrounded it is the four-sale median $1,312.50
+        # (the two OW sales alone gave $1,400).
+        assert out["median"] == 1300
+        raw = fm.bucket_weighted_medians(fm.graded_pool(
+            self._BATMAN, as_of=_GREF)[0])[6.5]
+        assert raw == pytest.approx(1312.5, abs=0.01)
+        assert out["page_quality_fallback"] is False
+        assert out["page_quality_fallback_reason"] is None
+
+    def test_a_stated_different_quality_is_still_excluded(self):
+        pool = [_slab_comp(1000, 6.5, age=5, page_quality="w", product_id="d1"),
+                _slab_comp(1100, 6.5, age=6, page_quality="w", product_id="d2")]
+        matched, fell_back, reason = fm._graded_page_quality_filter(
+            pool + self._BATMAN, "ow")
+        assert sorted(c["price"] for c in matched) == [1075, 1275, 1350, 1449]
+        assert (fell_back, reason) == (False, None)
+
+    def test_unknown_sales_count_toward_the_two_match_floor(self):
+        one_ow = [_slab_comp(1350, 6.5, page_quality="ow", product_id="x1"),
+                  _slab_comp(1000, 6.5, page_quality="w", product_id="x2"),
+                  _slab_comp(1200, 6.5, product_id="x3")]
+        matched, fell_back, _ = fm._graded_page_quality_filter(one_ow, "ow")
+        assert sorted(c["price"] for c in matched) == [1200, 1350]
+        assert fell_back is False
+        # Without the unknown sale it is one match -> whole-pool fallback.
+        _, fell_back, reason = fm._graded_page_quality_filter(one_ow[:2], "ow")
+        assert (fell_back, reason) == (True, "too_few_matches")
 
 
 class TestGradedPageQualityScopesTheExactBucketOnly:
