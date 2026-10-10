@@ -587,6 +587,47 @@ def test_add_one_row_links_fmv_when_grade_and_comic_id_present():
     assert link_calls == [("post", "/api/bids/1/link-fmv", {"comic_id": 187, "grade": 9.2})]
 
 
+def test_add_one_row_certified_row_link_carries_certifier_and_label():
+    """BUI-1216: LinkFmvRequest defaults certifier=none, so a slab bid must
+    name its identity or it links to the raw row (or 404s)."""
+    server = _FakeServer({
+        ("post", "/api/bids"): (True, {"item_id": "1", "created": True}, None),
+        ("post", "/api/bids/1/link-fmv"): (True, {}, None),
+    })
+    add_one_row(
+        _row("1", comic_id=187, grade=6.5, certifier="cgc", label="universal"),
+        server_request=server,
+    )
+    link_calls = [c for c in server.calls if c[1].endswith("link-fmv")]
+    assert link_calls == [(
+        "post", "/api/bids/1/link-fmv",
+        {"comic_id": 187, "grade": 6.5, "certifier": "cgc", "label": "universal"},
+    )]
+
+
+def test_add_one_row_certified_row_without_label_omits_label_from_link():
+    server = _FakeServer({
+        ("post", "/api/bids"): (True, {"item_id": "1", "created": True}, None),
+        ("post", "/api/bids/1/link-fmv"): (True, {}, None),
+    })
+    add_one_row(_row("1", comic_id=187, grade=6.5, certifier="cbcs"), server_request=server)
+    link = [c for c in server.calls if c[1].endswith("link-fmv")][0][2]
+    assert link == {"comic_id": 187, "grade": 6.5, "certifier": "cbcs"}
+
+
+def test_add_one_row_certifier_none_link_payload_stays_raw():
+    server = _FakeServer({
+        ("post", "/api/bids"): (True, {"item_id": "1", "created": True}, None),
+        ("post", "/api/bids/1/link-fmv"): (True, {}, None),
+    })
+    add_one_row(
+        _row("1", comic_id=187, grade=9.2, certifier="none", label="universal"),
+        server_request=server,
+    )
+    link = [c for c in server.calls if c[1].endswith("link-fmv")][0][2]
+    assert link == {"comic_id": 187, "grade": 9.2}
+
+
 def test_add_one_row_no_link_when_grade_missing():
     server = _FakeServer({("post", "/api/bids"): (True, {"item_id": "1", "created": True}, None)})
     result = add_one_row(_row("1", comic_id=187), server_request=server)
@@ -1677,6 +1718,24 @@ def test_reconcile_found_live_upgrades_to_landed_and_attempts_fmv_link():
     assert row.link_ok is True
     assert ("post", "/api/bids/111/link-fmv", {"comic_id": 42, "grade": 9.0}) in server.calls
     assert outcome.exit_code() == 0
+
+
+def test_reconcile_found_live_certified_row_link_carries_certifier_and_label():
+    """BUI-1216: the reconcile path's link attempt names the slab identity too."""
+    server = _FakeServer({
+        ("post", "/api/bids"): _TIMEOUT,
+        ("get", "/api/comics/snipes"): (True, [_snipe("111", 20.0)], None),
+        ("post", "/api/bids/111/link-fmv"): (True, {"ok": True}, None),
+    })
+    run_batch(
+        [_row("111", max_bid=20, comic_id=42, grade=6.5, certifier="cgc", label="universal")],
+        server_request=server, health_check=lambda: True,
+        sleep=_no_sleep, settle_seconds=0,
+    )
+    assert (
+        "post", "/api/bids/111/link-fmv",
+        {"comic_id": 42, "grade": 6.5, "certifier": "cgc", "label": "universal"},
+    ) in server.calls
 
 
 def test_reconcile_found_live_without_identity_does_not_fake_a_link():
