@@ -626,7 +626,10 @@ def add_one_row(row: dict, *, server_request: ServerRequestFn) -> RowResult:
         advisories=advisories_from_response(resp),
     )
 
-    attempt_fmv_link(result, comic_id=comic_id, grade=grade, server_request=server_request)
+    attempt_fmv_link(
+        result, comic_id=comic_id, grade=grade, certifier=certifier, label=label,
+        server_request=server_request,
+    )
 
     return result
 
@@ -636,6 +639,8 @@ def attempt_fmv_link(
     *,
     comic_id: Any,
     grade: float | None,
+    certifier: str | None = None,
+    label: str | None = None,
     server_request: ServerRequestFn,
 ) -> None:
     """The post-add `POST /api/bids/{item_id}/link-fmv` call, mutating
@@ -648,14 +653,25 @@ def attempt_fmv_link(
 
     Linking fires only when grade AND comic_id are both present (the existing
     add/add-batch contract) — a gradeless or unidentified row leaves
-    `link_attempted` False, exactly as before."""
+    `link_attempted` False, exactly as before.
+
+    BUI-1216: a certified row (`certifier` set and not "none") sends
+    `certifier` (and `label`, when the row carried one) so the server links
+    the slab's own FMV row. LinkFmvRequest defaults to certifier=none, so
+    omitting them linked a slab bid to the raw row (or 404'd). A raw row's
+    payload stays exactly `{comic_id, grade}`."""
     if grade is None or comic_id is None:
         return
     result.link_attempted = True
+    body: dict[str, Any] = {"comic_id": comic_id, "grade": grade}
+    if certifier is not None and certifier != "none":
+        body["certifier"] = certifier
+        if label is not None:
+            body["label"] = label
     link_ok, _link_resp, link_err = server_request(
         "post",
         f"/api/bids/{result.item_id}/link-fmv",
-        json={"comic_id": comic_id, "grade": grade},
+        json=body,
     )
     result.link_ok = link_ok
     if not link_ok:
@@ -857,7 +873,8 @@ def reconcile_indeterminate_rows(
             except (TypeError, ValueError):
                 comic_id = None
         attempt_fmv_link(
-            r, comic_id=comic_id, grade=r.grade, server_request=server_request,
+            r, comic_id=comic_id, grade=r.grade,
+            certifier=r.certifier, label=r.label, server_request=server_request,
         )
 
 
