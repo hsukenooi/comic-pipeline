@@ -5,7 +5,7 @@ DIAGNOSTIC ONLY, read-only. No production code is touched.
 Method. Each held-out test sale is a ledger (`comps`, pool='slab') CGC universal-label
 sale from the 16 books below, sold 2026-09-10..2026-10-09. For each, price the book
 twice with `fmv_math.graded_fmv` as of the day before the sale, scored against the
-sale price (the ledger price, which BUI-552 shows is the accepted amount):
+sale price (the ledger price; BUI-552 says it is the accepted amount, which BUI-1222 questions):
 
   baseline  ledger slab comps sold strictly before the sale date
   plus-PC   baseline + PriceCharting CGC universal sales, before the sale date,

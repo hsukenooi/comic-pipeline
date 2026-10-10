@@ -4,7 +4,7 @@ Date: 2026-10-10. Script: `2026-10-10-pricecharting-slab-spike.py` (scrape step:
 
 ## Verdict: GO, marginal and conditional
 
-The decision bar is met: Winkler improves and no upward bias is added in aggregate. The gain is small once one outlier book is removed, and the 7 books PC newly prices are poor. Details below.
+The Winkler leg of the decision bar is met: Winkler improves and no upward bias is added in aggregate. The coverage leg fails (below). The gain is small once one outlier book is removed, and the 7 books PC newly prices are poor. Details below.
 
 ## Terms check
 
@@ -58,7 +58,7 @@ Better on 8 books, worse on 6 (ASM #194, ASM #50, X-Men #96, Batman #655, Invinc
 
 PC's page labels two prices on best-offer sales: "best offer accepted price" and "best offer list price". Of 295 sales present in both sources, 92 differ: 8 single-price rows by about 1% (FX), and 84 best-offer rows. In all 84 where PC shows two prices, the ledger holds the list price (79 exactly, the other 5 within 1%), never the accepted amount. Batman #227 6.5 (Sep 22): PC accepted $1,087, list $1,275, ledger $1,275. The accepted amount is a median 0.89 of list (range 0.65 to 0.97). PC accepted prices look like real offers: 94% whole dollars and 81% multiples of $5, versus 77% and 60% for the list prices.
 
-This contradicts the BUI-552 close ("`soldPrice` already is the accepted amount"). The eBay listing cannot settle it: `ebay-fetch` on 6 of the conflicting items shows only the list price (for example $1,275 for Batman #227), because eBay does not publish the accepted amount. So PC's figure is the only evidence of the real price, and the ledger overstates best-offer sales by about 11%. That matters beyond this spike (BUI-552 should be reopened).
+This contradicts the BUI-552 close ("`soldPrice` already is the accepted amount"). The eBay listing cannot settle it: `ebay-fetch` on 6 of the conflicting items shows only the list price (for example $1,275 for Batman #227), because eBay does not publish the accepted amount. So PC's figure is the only evidence of the real price. If PC is right, the ledger overstates best-offer sales by about 11%. This is plausible, not proven, and BUI-1222 tracks it.
 
 ## Recommendation for the build ticket
 
