@@ -191,7 +191,7 @@ class TestInvincible1Replay:
         after = _price(_guarded(data), target, page_quality=None)
         assert after["flag_reason"] == "ladder_too_thin"
 
-    def test_page_quality_scoping_widens_and_the_guards_then_price(self):
+    def test_unknown_page_quality_comps_keep_the_pool_unscoped_and_the_guards_then_price(self):
         # BUI-939 and this ticket, kept apart: the target reads page_quality
         # "white", and `_graded_page_quality_filter` cuts the server pool to
         # the 2 comps whose own titles say "white". Post-BUI-939 that scoped

@@ -2307,8 +2307,9 @@ def graded_fmv(comps: list[dict], target_grade: float, *,
         holds fewer than two sales (BUI-1186, BUI-1204).** Page quality barely
         moves price within a grade (0.98x-1.12x of the grade median, 427 CGC
         comps), so same quality is a preference, not a wall. When the scoped
-        exact bucket is EMPTY (BUI-1186), or holds exactly ONE sale while the
-        any-quality bucket holds more and clears the exact gate (BUI-1204),
+        exact bucket is EMPTY (BUI-1186), or holds at most ONE sale stating
+        the target quality, misses the exact gate, and the any-quality bucket
+        holds more sales and clears it (BUI-1204, BUI-1221),
         the any-quality sales at the target grade become the exact bucket,
         reported as `page_quality_fallback_reason="exact_any_page_quality"`.
         The one-sale widen is taken only when it prices `direct`; below the
@@ -2322,10 +2323,12 @@ def graded_fmv(comps: list[dict], target_grade: float, *,
         count of two all include them. Only a comp that STATES a different
         quality is left out. The widen above therefore fires only when
         stated-different-quality sales sit at the target grade; an `unknown`
-        sale is never what it widens to, because it never left.
+        sale is never what it widens to, because it never left. Nor does an
+        `unknown` sale count toward BUI-943's "two or more" below (BUI-1221):
+        one stated-matching sale plus unknowns is still the one-sale widen.
 
         **What BUI-943 still governs.** A scoped bucket of TWO or more sales
-        wins, even below the gate: the other-quality sales at the target grade
+        stating the target quality wins, even below the gate: the other-quality sales at the target grade
         are then what the ladder makes of any target rung — dropped, and
         reported as evidence (`exact_effective_n`/`exact_sales` are re-read on
         the wider pool for the notes' "recorded, NOT used as the price" line,
@@ -2420,20 +2423,31 @@ def graded_fmv(comps: list[dict], target_grade: float, *,
 
     # BUI-1204 extends the same widen to a scoped bucket of exactly ONE sale.
     # "One" is a count of sales, not effective n: a single sale weighs at most
-    # 1.0, so it can never clear the gate itself. The widen is taken only when
-    # the any-quality bucket holds more sales, clears
+    # 1.0, so it can never clear the gate itself. BUI-1221: since BUI-1217 the
+    # scoped bucket also holds `unknown` sales, so "one" counts only the sales
+    # that STATE the target quality — one ow_w sale beside a stale unknown one
+    # is still one sale of same-quality evidence, not BUI-943's two (and a
+    # bucket of unknowns alone is the empty bucket BUI-1186 widened before
+    # BUI-1217). Because unknowns can lift the scoped bucket over the gate on
+    # their own, the widen also requires the scoped bucket to miss it: a
+    # scoped bucket that prices `direct` is never widened. The widen is taken
+    # only when the any-quality bucket holds more sales, clears
     # GRADED_EXACT_MIN_EFFECTIVE_N, AND actually prices `direct` (the direct
     # tier can still refuse a thin, wide pair `too_sparse`). Otherwise this
     # block changes nothing and the row falls through exactly as before: the
     # scoped lone sale to BUI-952's tier, then the ladder, so no row trades a
     # price for a refusal. ASM #50 CGC 6.0 OW/W: one ow_w 6.0 sale priced
     # alone at $1,225 (LOW/0.70) while the other 6.0 sales sat unread.
-    # BUI-943 still governs a scoped bucket of TWO or more sales: it wins,
+    # BUI-943 still governs a scoped bucket of TWO or more stated-quality sales: it wins,
     # even below the gate, and the other-quality sales stay evidence.
-    elif len(exact_comps) == 1 and len(pool) < len(full_pool):
+    elif (len(pool) < len(full_pool)
+          and exact_effective_n < GRADED_EXACT_MIN_EFFECTIVE_N
+          and sum(1 for c in exact_comps
+                  if c.get("page_quality") == page_quality) <= 1):
         widened = [c for c in full_pool if float(c["grade"]) == target_grade]
         widened_eff_n = eff_n.get(target_grade, 0.0)
-        if len(widened) > 1 and widened_eff_n >= GRADED_EXACT_MIN_EFFECTIVE_N:
+        if (len(widened) > len(exact_comps)
+                and widened_eff_n >= GRADED_EXACT_MIN_EFFECTIVE_N):
             direct = _graded_direct(
                 widened, ladder, eff_n, target_grade,
                 {**identity, **_exact_any_page_quality_fields(widened, widened_eff_n)})
@@ -2464,7 +2478,7 @@ def graded_fmv(comps: list[dict], target_grade: float, *,
         # price, in the `exact_any_page_quality` widen above (BUI-1186 for an
         # empty scoped bucket, BUI-1204 for a one-sale bucket). A row reaches
         # here with them unused only when that widen declined: the scoped
-        # bucket held TWO+ sales (BUI-943: same quality wins, even thin), or
+        # bucket held TWO+ stated-quality sales (BUI-943: same quality wins, even thin), or
         # the one-sale widen missed `GRADED_EXACT_MIN_EFFECTIVE_N` (or the
         # direct tier refused it) and the scoped lone sale did not price
         # either. BUI-943's measured case (a
