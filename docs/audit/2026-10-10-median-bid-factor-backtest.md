@@ -30,6 +30,29 @@ date: 2026-10-10
 - **0.95 equals 1.00:** `clean_round` rounds to the nearest $5/$10/$25 step. Since the median is already a clean step, 0.95 x median rounds back to the median on almost every row. Phase 2 must floor, or pick factors at least one step apart.
 - **Ticket live data agrees:** the reconstruction gives today's win rate as high 20%, medium 48%, low 44%. The last 50 bids gave 0/4, 42%, and 41%.
 
+## Five tiers: does each deserve its own coefficient?
+
+Tiers use the fine label `compute_fmv` returns at hold-out time (not the stored collapse), plus the window (`<= 0.5`) and cv it returns. VERY HIGH = HIGH + window +/-0.5 + cv <25%. HIGH = other HIGH. MEDIUM = MEDIUM-HIGH + MEDIUM. LOW = MEDIUM-LOW. VERY LOW = LOW. Interpolated books stay a separate row. The script sweeps cap = k x median for k 0.80 to 1.20 (step 0.05) with `clean_round`; full tables are in its output.
+
+**Suggested k** = the highest k whose pooled wins (ours + ledger) pay at most the median on average AND whose share of wins above the median is at or below today's cap's share.
+
+| Tier | n ours / ledger | Pricing error | Today win (ours / ledger) | Today above-med | Suggested k (sales) | Win at k (ours / ledger) | Paid/med at k |
+|---|---|---|---|---|---|---|---|
+| VERY HIGH | 18 / 42 | 29% (19% ours) | 28% / 67% | 0% | 1.00 (60) | 50% / 76% | -29% |
+| HIGH | 12 / 46 | 30% (19%) | 8% / 50% | 4% | 1.05 (58) | 25% / 50% | -36% |
+| MEDIUM | 101 / 348 | 37% (23%) | 48% / 72% | 3% | 1.05 (449) | 50% / 74% | -36% |
+| LOW | 146 / 700 | 46% (25%) | 43% / 70% | 18% | 1.20* (846) | 53% / 66% | -35% |
+| VERY LOW | 72 / 258 | 44% (29%) | 46% / 78% | 7% | 1.05 (330) | 46% / 76% | -38% |
+| INTERP | 6 / 31 | 43% (44%) | 33% / 42% | 0% | 1.15 (37) | 50% / 68% | -34% |
+
+Pricing error = median |sale - median| / sale on the held-out sales (pooled; ours alone in brackets).
+
+- **Different coefficients are justified by error, not by tier name:** error rises from 29% (VERY HIGH) to 46% (LOW), but VERY LOW (44%) is no worse than LOW, so the five tiers collapse to about three error bands (VERY HIGH/HIGH ~30%, MEDIUM 37%, LOW/VERY LOW/INTERP ~45%).
+- **Too thin to set its own coefficient (<30 sales):** none pooled. On our auctions alone (the population the decision is about), HIGH (12), INTERP (6) and VERY HIGH (18) are under 30. Only MEDIUM, LOW and VERY LOW have 30+ of our own.
+- **The suggested-k rule is weak:** paid/med is negative at every k (wins are skewed to cheap sales), so the share-above-median condition is the only binding one. For LOW that condition is loose because today's cap is already ~1.5-2x median (18% above), so k hits the top of the sweep (*). Read LOW as "k >= 1.20 passes", not a measured optimum.
+- **1.00 and 1.05 give near-identical caps** under `clean_round` (VERY HIGH, HIGH, MEDIUM, VERY LOW), so the practical choice among 1.00 to 1.05 is one rounding step.
+- **Win-rate effect on our auctions at the suggested k:** up in every tier (HIGH 8% to 25%, VERY HIGH 28% to 50%, MEDIUM 48% to 50%, LOW 43% to 53%, VERY LOW 46% to 46%). LOW at 1.00 would win 38%, below today.
+
 ## Strong tier
 
 Strong uses only stored fields: notes `label=HIGH`, notes `window=±0.5`, and notes `cv` below 25%. The row stores no exact-grade count and no median.

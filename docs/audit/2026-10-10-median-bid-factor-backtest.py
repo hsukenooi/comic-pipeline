@@ -166,6 +166,70 @@ def policy_hits(rows: list[dict]) -> None:
             print(f"- {t} {f:.2f} x median: recomputed_cap {rc}/{len(g)}, over_fmv {of}/{len(g)}")
 
 
+KS = tuple(round(0.80 + 0.05 * i, 2) for i in range(9))
+FIVE = ["VERY HIGH", "HIGH", "MEDIUM", "LOW", "VERY LOW", "INTERP"]
+FIVE_MAP = {"MEDIUM-HIGH": "MEDIUM", "MEDIUM": "MEDIUM", "MEDIUM-LOW": "LOW", "LOW": "VERY LOW"}
+
+
+def tier_five(e: dict) -> str:
+    """Five-tier name from the FINE label compute_fmv returns at hold-out time."""
+    if e["interp"]:
+        return "INTERP"
+    if e["label"] == "HIGH":
+        vh = e["window"] <= 0.5 and e["cv"] is not None and e["cv"] < 0.25
+        return "VERY HIGH" if vh else "HIGH"
+    return FIVE_MAP[e["label"]]
+
+
+def cap_of(e: dict, k: float | None) -> float:
+    return e["today"] if k is None else fmv_math.clean_round(k * e["median"])
+
+
+def wins_stats(rows: list[dict], k: float | None) -> dict:
+    w = [r for r in rows if cap_of(r["e"], k) >= r["price"]]
+    rel = [r["price"] / r["e"]["median"] for r in w]
+    return {"n": len(rows), "w": len(w),
+            "paid": mean(x - 1 for x in rel) if rel else None,
+            "above": sum(x > 1 for x in rel) / len(rel) if rel else None}
+
+
+def five_tiers(ours: list[dict], loo: list[dict]) -> None:
+    from statistics import median
+    print("\n## Five tiers (fine label recomputed at hold-out time)")
+    for t in FIVE:
+        o = [r for r in ours if tier_five(r["e"]) == t]
+        l = [r for r in loo if tier_five(r["e"]) == t]
+        both = o + l
+        if not both:
+            continue
+        err = median(abs(r["price"] - r["e"]["median"]) / r["price"] for r in both)
+        err_o = median(abs(r["price"] - r["e"]["median"]) / r["price"] for r in o) if o else None
+        print(f"\n{t}: ours n={len(o)}, ledger n={len(l)}, pooled {len(both)}"
+              f"{'  TOO THIN (<30)' if len(both) < 30 else ''}; pricing error "
+              f"{100 * err:.0f}% pooled" + (f" ({100 * err_o:.0f}% ours)" if o else ""))
+        print("  cap        win ours  win ledger  paid/med  above-med  (wins pooled)")
+        rows = []
+        for k in (None,) + KS:
+            so, sl, sb = wins_stats(o, k), wins_stats(l, k), wins_stats(both, k)
+            rows.append((k, so, sl, sb))
+            lab = "today" if k is None else f"{k:.2f}xmed"
+            wo = f"{100 * so['w'] / so['n']:4.0f}%" if so["n"] else "  n/a"
+            wl = f"{100 * sl['w'] / sl['n']:4.0f}%" if sl["n"] else "  n/a"
+            pd = f"{100 * sb['paid']:+4.0f}%" if sb["paid"] is not None else " n/a"
+            ab = f"{100 * sb['above']:3.0f}%" if sb["above"] is not None else "n/a"
+            print(f"  {lab:8s}  {wo:>8s}  {wl:>9s}  {pd:>8s}  {ab:>8s}   {sb['w']}")
+        td = rows[0][3]
+        ok = [r for r in rows[1:] if r[3]["paid"] is not None and r[3]["paid"] <= 0
+              and td["above"] is not None and r[3]["above"] <= td["above"]]
+        if ok:
+            k, so, sl, sb = ok[-1]
+            wo = 100 * so['w'] / so['n'] if so['n'] else float('nan')
+            wl = 100 * sl['w'] / sl['n'] if sl['n'] else float('nan')
+            print(f"  suggested k = {k:.2f} ({sb['n']} sales, {sb['w']} wins; win ours {wo:.0f}%, ledger {wl:.0f}%)")
+        else:
+            print("  suggested k = none (no k meets both conditions)")
+
+
 def population(name: str, rows: list[dict]) -> None:
     print(f"\n## {name}: priced N={len(rows)}")
     fine_order = ["HIGH", "MEDIUM-HIGH", "MEDIUM", "MEDIUM-LOW", "LOW", "INTERP"]
@@ -244,6 +308,7 @@ def main() -> int:
 
     population("LOO ledger auction sales", loo)
     population("Our resolved raw auctions", ours)
+    five_tiers(ours, loo)
     stored_strong(comics)
     return 0
 
