@@ -2667,15 +2667,15 @@ class TestGradedExactAnyPageQualityBeforeLadder:
                  _slab_comp(1000, 5.5, age=4, page_quality="ow_w", product_id="o2"),
                  _slab_comp(1500, 6.5, age=5, page_quality="ow_w", product_id="o3"),
                  _slab_comp(1650, 6.5, age=6, page_quality="ow_w", product_id="o4")]
-    _UNKNOWN_EXACT = [_slab_comp(1230, 6.0, age=7, page_quality="w",
+    _OTHER_QUALITY_EXACT = [_slab_comp(1230, 6.0, age=7, page_quality="w",
                       product_id="u1"),
                       _slab_comp(1290, 6.0, age=8, page_quality="w",
                       product_id="u2"),
                       _slab_comp(1329, 6.0, age=9, page_quality="w",
                       product_id="u3")]
 
-    def test_unknown_exact_sales_price_directly_for_an_ow_w_target(self):
-        out = _graded(self._OW_RUNGS + self._UNKNOWN_EXACT, 6.0,
+    def test_other_quality_exact_sales_price_directly_for_an_ow_w_target(self):
+        out = _graded(self._OW_RUNGS + self._OTHER_QUALITY_EXACT, 6.0,
                       page_quality="ow_w")
         assert out["flag_reason"] is None
         assert out["pricing_basis"] == "direct"
@@ -2686,8 +2686,8 @@ class TestGradedExactAnyPageQualityBeforeLadder:
         assert out["pool_n"] == 7
         assert out["fmv_high"] >= 1290
 
-    def test_one_unknown_exact_sale_prices_as_a_lone_sale(self):
-        out = _graded(self._OW_RUNGS + self._UNKNOWN_EXACT[:1]
+    def test_one_other_quality_exact_sale_prices_as_a_lone_sale(self):
+        out = _graded(self._OW_RUNGS + self._OTHER_QUALITY_EXACT[:1]
                       + [_slab_comp(2000, 7.0, age=2, product_id="u9")], 6.0,
                       page_quality="ow_w")
         assert out["pricing_basis"] == "lone_sale"
@@ -2697,7 +2697,7 @@ class TestGradedExactAnyPageQualityBeforeLadder:
     def test_same_quality_exact_bucket_still_wins(self):
         own = [_slab_comp(1400, 6.0, age=1, page_quality="ow_w", product_id="s1"),
                _slab_comp(1450, 6.0, age=2, page_quality="ow_w", product_id="s2")]
-        out = _graded(self._OW_RUNGS + own + self._UNKNOWN_EXACT, 6.0,
+        out = _graded(self._OW_RUNGS + own + self._OTHER_QUALITY_EXACT, 6.0,
                       page_quality="ow_w")
         assert out["pricing_basis"] == "direct"
         assert out["page_quality_fallback"] is False
@@ -2710,7 +2710,7 @@ class TestGradedExactAnyPageQualityBeforeLadder:
         unread. A scoped bucket of ONE sale now yields to the any-quality
         bucket when that bucket holds more sales and clears the exact gate."""
         own = [_slab_comp(1225, 6.0, age=1, page_quality="ow_w", product_id="s1")]
-        out = _graded(self._OW_RUNGS + own + self._UNKNOWN_EXACT, 6.0,
+        out = _graded(self._OW_RUNGS + own + self._OTHER_QUALITY_EXACT, 6.0,
                       page_quality="ow_w")
         assert out["flag_reason"] is None
         assert out["pricing_basis"] == "direct"
@@ -2736,10 +2736,69 @@ class TestGradedExactAnyPageQualityBeforeLadder:
     def test_two_same_quality_sales_still_win_over_more_others(self):
         """BUI-943 still governs a scoped bucket of TWO+ sales, even below the
         gate: two stale ow_w 6.0 sales (effective n 1.0) do not yield to the
-        three fresh unknown 6.0 sales. Unchanged by BUI-1204."""
+        three fresh w 6.0 sales. Unchanged by BUI-1204 and BUI-1221."""
         own = [_slab_comp(1400, 6.0, age=200, page_quality="ow_w", product_id="s1"),
                _slab_comp(1450, 6.0, age=210, page_quality="ow_w", product_id="s2")]
-        out = _graded(self._OW_RUNGS + own + self._UNKNOWN_EXACT
+        out = _graded(self._OW_RUNGS + own + self._OTHER_QUALITY_EXACT
+                      + [_slab_comp(2000, 7.0, age=2, product_id="u9")], 6.0,
+                      page_quality="ow_w")
+        assert out["pricing_basis"] == "ladder"
+        assert out["bid_factor"] == 0.60
+        assert out["page_quality_fallback_reason"] == "ladder_reads_all_qualities"
+
+    def test_one_same_quality_plus_one_unknown_sale_is_widened(self):
+        """BUI-1221: since BUI-1217 an unknown 6.0 sale stays in the scoped
+        bucket, so one ow_w sale plus one stale unknown sale is TWO scoped
+        sales at effective n 1.5, below the gate. Only one of them states the
+        target quality, so this is still BUI-1204's one-sale shape: it prices
+        direct from the any-quality bucket, not off the ladder at 0.60."""
+        own = [_slab_comp(1225, 6.0, age=1, page_quality="ow_w", product_id="s1")]
+        unknown = [_slab_comp(1260, 6.0, age=200, product_id="k1")]
+        out = _graded(self._OW_RUNGS + own + unknown + self._OTHER_QUALITY_EXACT
+                      + [_slab_comp(2000, 7.0, age=2, product_id="u9")], 6.0,
+                      page_quality="ow_w")
+        assert out["flag_reason"] is None
+        assert out["pricing_basis"] == "direct"
+        assert out["bid_factor"] == 0.80
+        assert out["n"] == 5
+        assert out["exact_sales"] == [1225.0, 1230.0, 1260.0, 1290.0, 1329.0]
+        assert out["exact_effective_n"] == 4.5
+        assert out["page_quality_fallback"] is True
+        assert out["page_quality_fallback_reason"] == "exact_any_page_quality"
+
+    def test_only_unknown_sales_below_the_gate_are_widened(self):
+        """BUI-1221: two stale unknown 6.0 sales and no ow_w one were an EMPTY
+        scoped bucket before BUI-1217 (BUI-1186 widened it). No scoped sale
+        states the target quality, so the any-quality bucket prices direct."""
+        unknown = [_slab_comp(1260, 6.0, age=200, product_id="k1"),
+                   _slab_comp(1270, 6.0, age=210, product_id="k2")]
+        out = _graded(self._OW_RUNGS + unknown + self._OTHER_QUALITY_EXACT
+                      + [_slab_comp(2000, 7.0, age=2, product_id="u9")], 6.0,
+                      page_quality="ow_w")
+        assert out["pricing_basis"] == "direct"
+        assert out["n"] == 5
+        assert out["page_quality_fallback_reason"] == "exact_any_page_quality"
+
+    def test_a_scoped_bucket_clearing_the_gate_with_unknowns_is_not_widened(self):
+        """BUI-1221: one ow_w sale plus two fresh unknown sales clears the gate
+        on its own, so it prices direct from the scoped bucket and the stated
+        w sales stay out."""
+        own = [_slab_comp(1225, 6.0, age=1, page_quality="ow_w", product_id="s1")]
+        unknown = [_slab_comp(1260, 6.0, age=2, product_id="k1"),
+                   _slab_comp(1270, 6.0, age=3, product_id="k2")]
+        out = _graded(self._OW_RUNGS + own + unknown + self._OTHER_QUALITY_EXACT,
+                      6.0, page_quality="ow_w")
+        assert out["pricing_basis"] == "direct"
+        assert out["page_quality_fallback"] is False
+        assert out["exact_sales"] == [1225.0, 1260.0, 1270.0]
+
+    def test_two_same_quality_plus_one_unknown_below_the_gate_stays_on_ladder(self):
+        """BUI-1221 does not touch BUI-943: two STATED ow_w sales hold the
+        scoped bucket even with an unknown beside them below the gate."""
+        own = [_slab_comp(1400, 6.0, age=200, page_quality="ow_w", product_id="s1"),
+               _slab_comp(1450, 6.0, age=210, page_quality="ow_w", product_id="s2")]
+        unknown = [_slab_comp(1260, 6.0, age=220, product_id="k1")]
+        out = _graded(self._OW_RUNGS + own + unknown + self._OTHER_QUALITY_EXACT
                       + [_slab_comp(2000, 7.0, age=2, product_id="u9")], 6.0,
                       page_quality="ow_w")
         assert out["pricing_basis"] == "ladder"
@@ -2810,7 +2869,7 @@ class TestGradedExactAnyPageQualityBeforeLadder:
         assert 6.0 not in out["graded_ladder"]["ladder"]
 
     def test_no_target_page_quality_is_unchanged(self):
-        out = _graded(self._OW_RUNGS + self._UNKNOWN_EXACT, 6.0)
+        out = _graded(self._OW_RUNGS + self._OTHER_QUALITY_EXACT, 6.0)
         assert out["pricing_basis"] == "direct"
         assert out["page_quality_fallback"] is False
 
