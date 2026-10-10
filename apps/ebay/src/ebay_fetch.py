@@ -628,10 +628,56 @@ def fetch_item_description(item_id, token, base_url, retries=3):
     return text or None
 
 
+# BUI-1223: split grades ("VG/Fine", "Fine/VF", "VF/NM"). The bare/paren
+# alternation above matches the FIRST half ("VG", "Fine", "VF") and the
+# (?!\w) boundary is satisfied by the "/", so the upper half was dropped and
+# a 5.0 book read as 4.0. Split grades are resolved first, to the CGC
+# midpoint values grade_tokens already uses for the same pairs.
+_SPLIT_HALF = (
+    r"(?:NM|VFN?|FN|VG|GD|FR|F|G|M"
+    r"|Near[\s_]*Mint|Very[\s_]*Fine|Very[\s_]*Good|Fine|Good|Fair|Mint)"
+)
+_SPLIT_GRADE_RE = re.compile(
+    r"(?<![\w+\-])(" + _SPLIT_HALF + r")\s*/\s*(" + _SPLIT_HALF + r")(\+?)(?![\w+\-])",
+    re.IGNORECASE,
+)
+_SPLIT_HALF_CANON = {
+    "nm": "NM", "near mint": "NM", "mint": "M", "m": "M",
+    "vf": "VF", "vfn": "VF", "very fine": "VF",
+    "fn": "FN", "f": "FN", "fine": "FN",
+    "vg": "VG", "very good": "VG",
+    "gd": "GD", "g": "GD", "good": "GD",
+    "fr": "FR", "fair": "FR",
+}
+_SPLIT_GRADE_VALUES = {
+    ("VF", "NM"): 9.0, ("FN", "VF"): 7.0, ("VG", "FN"): 5.0,
+    ("GD", "VG"): 3.0, ("FR", "GD"): 1.5, ("NM", "M"): 9.6,
+}
+
+
+def _split_grade_from_text(text):
+    """Return the CGC-scale float for a split grade in `text`, else None."""
+    for m in _SPLIT_GRADE_RE.finditer(text):
+        halves = []
+        for raw in (m.group(1), m.group(2)):
+            key = re.sub(r"[\s_]+", " ", raw.strip().lower())
+            halves.append(_SPLIT_HALF_CANON.get(key))
+        value = _SPLIT_GRADE_VALUES.get(tuple(halves))
+        if value is None:
+            continue
+        if m.group(3):
+            if halves[1] not in ("VF", "FN"):
+                continue  # only "F/VF+" / "VG/FN+" style (grade_tokens parity)
+            value += 0.5
+        return value
+    return None
+
+
 def _grade_from_text(text):
     """Try to extract a comic grade from arbitrary text.
 
-    Returns the matched grade string or None.
+    Returns the matched grade string (a float for a split grade, BUI-1223)
+    or None.
     """
     if not text:
         return None
@@ -639,6 +685,9 @@ def _grade_from_text(text):
     m = GRADE_PATTERN.search(text)
     if m:
         return m.group(1)
+    split = _split_grade_from_text(text)
+    if split is not None:
+        return split
     # Fall back to bare inline grades
     m = GRADE_BARE_PATTERN.search(text)
     if m:
@@ -1836,6 +1885,12 @@ def identify_row(index, item, now):
     ident = identify_comic(item.get("title"))
 
     series = ident.series
+    if series and ident.edition == "annual" and not ident.is_lot:
+        # BUI-1224: identify_comic strips "Annual" from the series (annuals nest
+        # under the parent series for LOCG matching) and records it only in
+        # `edition`. The table has no edition column, so without this an
+        # Annual read as the parent run's issue of the same number.
+        series = f"{series} Annual"
     if ident.is_lot:
         # A lot is never a single-issue identification, even when its contents
         # could not be parsed (constituent_issues == [] means "known bundle,
