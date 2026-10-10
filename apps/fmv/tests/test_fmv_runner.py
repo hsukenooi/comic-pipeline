@@ -8774,3 +8774,63 @@ class TestEmptyPoolFlag:
         out = capsys.readouterr().out
         assert "manual:too_sparse" in out
         assert "Thor .5" in out
+
+
+class TestListingTitleRefusal:
+    """BUI-1225: a listing-style `title` is refused per-row before any
+    lookup, fetch, or upsert."""
+
+    @pytest.mark.parametrize("title", [
+        "X-Men # 97 - 1st Lilandra Fine/VF Cond",
+        "Amazing Spider-Man - Key Issue",
+        "Hulk NM- copy",
+        "Hulk VF/NM",
+        "Hulk Near Mint",
+        "Hulk Condition report",
+    ])
+    def test_noise_detected(self, title):
+        assert fmv_runner._listing_title_noise(title)
+
+    @pytest.mark.parametrize("title", [
+        "X-Men", "The Amazing Spider-Man", "Giant-Size X-Men",
+        "Marvel Team-Up", "Spider-Man 2099", "Conan the Barbarian",
+        "Fantastic Four", "Nova", "Avengers Vs. X-Men", None,
+    ])
+    def test_real_series_names_pass(self, title):
+        assert fmv_runner._listing_title_noise(title) is None
+
+    def test_zero_lookup_fetch_and_upsert_for_flagged_row(
+            self, tmp_path, server_url, capsys):
+        batch_path = tmp_path / "batch.json"
+        batch_path.write_text(json.dumps([
+            {"item_id": "1", "title": "X-Men # 97 - 1st Lilandra Fine/VF Cond",
+             "issue": "97", "year": 1976, "grade": 9.0},
+            {"item_id": "2", "title": "Raw", "issue": "1", "year": 1990,
+             "grade": 9.0},
+        ]))
+        out_path = tmp_path / "out.json"
+        fetch_mock = MagicMock(return_value=[
+            {"input": {"_req_id": 1, "title": "Raw", "issue": "1",
+                       "year": 1990, "grade": 9.0, "item_id": "2"},
+             "comps": [_make_comp(p, 9.0) for p in [50, 55, 60, 65, 70]],
+             "queries_used": [{"tier": "base", "cached": False}]},
+        ])
+        upsert_mock = MagicMock(return_value={"comic_id": 99, "fmv_id": 5})
+        lookup_mock = MagicMock(return_value=[])
+        with patch("fmv_runner._fetch_comps", fetch_mock), \
+             patch("fmv_runner._upsert_fmv", upsert_mock), \
+             patch("fmv_runner._db_lookup_by_identity", lookup_mock):
+            fmv_runner.run(batch_path=str(batch_path), out_path=str(out_path),
+                           max_age_days=7, force=False, quiet=True,
+                           server_url=server_url)
+        out = json.loads(out_path.read_text())
+        assert out[0]["source"] == "skipped_listing_title"
+        assert out[0]["fmv"] is None
+        assert "BUI-1225" in out[0]["error"]
+        sent = fetch_mock.call_args.args[0]
+        assert [b["title"] for b in sent] == ["Raw"]
+        assert upsert_mock.call_count == 1
+        assert upsert_mock.call_args.args[1]["title"] == "Raw"
+        assert all("Lilandra" not in str(c) for c in lookup_mock.call_args_list)
+        assert out[1]["source"] == "fresh"
+        assert "listing title" in capsys.readouterr().err

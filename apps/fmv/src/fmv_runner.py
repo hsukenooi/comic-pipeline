@@ -166,6 +166,32 @@ def _normalize_book_title(book: dict) -> None:
     book["title"] = _strip_embedded_issue(_strip_leading_article(title), issue)
 
 
+# BUI-1225: a `title` that is a full eBay listing title ("X-Men # 97 - 1st
+# Lilandra Fine/VF Cond") returns zero comps and used to still write a comic
+# stub. Noise = a spaced dash tagline, or a whole-token grade word. Grade
+# abbreviations match UPPERCASE only and only as whole tokens, so real series
+# names ("Spider-Man", "Giant-Size X-Men", "Vf" inside a word) never match.
+_LISTING_TAGLINE_RE = re.compile(r"\s[-\u2013\u2014]\s")
+_LISTING_GRADE_CASE_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:NM|VF|FN|VG|GD|FR)(?:[+-]|/(?:NM|VF|FN|VG|GD|FR))?"
+    r"(?![A-Za-z0-9])"
+)
+_LISTING_GRADE_WORD_RE = re.compile(
+    r"\b(?:Cond(?:ition)?|Near\s+Mint|Very\s+Fine)\b", re.IGNORECASE)
+
+
+def _listing_title_noise(title) -> str | None:
+    """Return a short description of listing noise in `title`, else None."""
+    if not isinstance(title, str):
+        return None
+    if _LISTING_TAGLINE_RE.search(title):
+        return "spaced ' - ' tagline"
+    m = _LISTING_GRADE_CASE_RE.search(title) or _LISTING_GRADE_WORD_RE.search(title)
+    if m:
+        return f"grade word {m.group(0)!r}"
+    return None
+
+
 def _normalize_book_year(book: dict) -> None:
     """Coerce `book["year"]` to an int in place (BUI-565).
 
@@ -213,6 +239,7 @@ _RAW_LABEL = "universal"
 # looked up at all, because the server this run is talking to predates the
 # column that tells a slab price apart from a raw one.
 SOURCE_SCHEMA_MISMATCH = "skipped_schema_mismatch"
+SOURCE_LISTING_TITLE = "skipped_listing_title"
 
 # The certifiers the graded pricing mode can actually price from. `other`
 # (PGX and friends) is a real value in the vocabulary and an unpriceable one:
@@ -422,15 +449,25 @@ def run(*, batch_path: str | None, out_path: str | None,
     #    `books` list, so those indices are translated back immediately after
     #    the call rather than threading two index spaces through the rest of
     #    `run`.
+    # BUI-1225: per-row refusal of a listing-style title, before the probe, the
+    # cache split, any provider call, or any upsert. Per-row (not an abort)
+    # because the sibling skips are per-row and a mixed batch should still
+    # price its clean rows.
+    listing_title: dict[int, str] = {}
+    for i, b in enumerate(books):
+        noise = _listing_title_noise(b.get("title"))
+        if noise:
+            listing_title[i] = noise
     schema_mismatch: dict[int, dict] = {}
-    certified_idx = [i for i, b in enumerate(books) if _is_certified(b)]
+    certified_idx = [i for i, b in enumerate(books)
+                     if i not in listing_title and _is_certified(b)]
     if certified_idx and not _probe_certifier_support(
             server_url, grade=_coerce_grade(books[certified_idx[0]].get("grade"))):
         schema_mismatch = {i: books[i] for i in certified_idx}
     eligible_books: list[dict] = []
     eligible_idx: list[int] = []
     for i, book in enumerate(books):
-        if i in schema_mismatch:
+        if i in schema_mismatch or i in listing_title:
             continue
         eligible_idx.append(i)
         eligible_books.append(book)
@@ -597,7 +634,7 @@ def run(*, batch_path: str | None, out_path: str | None,
     #    write-rejected-skipped + schema-mismatch-skipped (BUI-930)
     final = _stitch(books, cached, fresh_fmvs, skipped_hand,
                     skipped_lookup_error, skipped_rejected,
-                    schema_mismatch)
+                    schema_mismatch, listing_title)
 
     if not quiet:
         _print_table(final)
@@ -701,6 +738,16 @@ def run(*, batch_path: str | None, out_path: str | None,
     # the one run-level probe found a comics server that cannot describe a
     # price's certifier. Loud for the same reason as the others, and with the
     # remedy named: this is a DEPLOY-ORDER problem, not a pricing one.
+    if listing_title:
+        click.echo(
+            f"⚠️  skipped {len(listing_title)} book(s) whose `title` looks "
+            "like an eBay listing title, not a series name (BUI-1225): "
+            + "; ".join(f"{books[i].get('title')!r} ({why})"
+                        for i, why in sorted(listing_title.items()))
+            + ". Nothing was fetched or written for them. Pass the "
+            "identified series name (no grade, tagline, or ' - ').",
+            err=True,
+        )
     if schema_mismatch:
         click.echo(
             f"⚠️  skipped {len(schema_mismatch)} certified (CGC/CBCS) book(s): "
@@ -4665,7 +4712,8 @@ def _stitch(books: list[dict], cached: dict[int, dict],
             skipped_hand: dict[int, dict] | None = None,
             skipped_lookup_error: dict[int, str] | None = None,
             skipped_rejected: dict[int, str] | None = None,
-            schema_mismatch: dict[int, dict] | None = None) -> list[dict]:
+            schema_mismatch: dict[int, dict] | None = None,
+            listing_title: dict[int, str] | None = None) -> list[dict]:
     """Combine cached, fresh, and all four kinds of skipped result back into
     the input order. `skipped_hand` (BUI-533) reuses the existing DB row
     exactly like `cached` does (never recomputed), tagged with a distinct
@@ -4703,9 +4751,26 @@ def _stitch(books: list[dict], cached: dict[int, dict],
     skipped_lookup_error = skipped_lookup_error or {}
     skipped_rejected = skipped_rejected or {}
     schema_mismatch = schema_mismatch or {}
+    listing_title = listing_title or {}
     out: list[dict] = []
     for i, book in enumerate(books):
-        if i in schema_mismatch:
+        if i in listing_title:
+            out.append({
+                "input": _input_summary(book),
+                "fmv": None,
+                "comp_count_total": 0,
+                "queries_used": [],
+                "db_row": None,
+                "source": SOURCE_LISTING_TITLE,
+                "breaker_tripped": False,
+                "error": (
+                    "BUI-1225: skipped, `title` looks like an eBay listing "
+                    f"title ({listing_title[i]}), not a series name. Nothing "
+                    "was fetched, computed, or written. Re-run with the "
+                    "identified series name."
+                ),
+            })
+        elif i in schema_mismatch:
             out.append({
                 "input": _input_summary(book),
                 "fmv": None,
@@ -5285,6 +5350,8 @@ def _provenance(r: dict) -> str:
         return "skip:unverified"
     if source == SOURCE_SCHEMA_MISMATCH:
         return "skip:schema"
+    if source == SOURCE_LISTING_TITLE:
+        return "skip:title"
     if source == "skipped_rejected":
         return "skip:422"
     fmv = r.get("fmv") or {}
@@ -5563,6 +5630,11 @@ def _print_table(rows: list[dict]) -> None:
             # hand-priced skip. Distinct token, distinct source column; the
             # per-book reason is in the summary and the row's `error`.
             fmv_str = "skip:unverified"
+            med_str = "—"
+            mb_str = "—"
+        elif r.get("source") == SOURCE_LISTING_TITLE:
+            # BUI-1225: listing-style title refused before any fetch/write.
+            fmv_str = "skip:title"
             med_str = "—"
             mb_str = "—"
         elif r.get("source") == SOURCE_SCHEMA_MISMATCH:
@@ -6486,7 +6558,7 @@ def run_unpriced_rerun(*, server_url: str | None,
             n_skipped_hand += 1
             continue
         if src in ("skipped_lookup_error", "skipped_rejected",
-                   SOURCE_SCHEMA_MISMATCH):
+                   SOURCE_SCHEMA_MISMATCH, SOURCE_LISTING_TITLE):
             failures.append(f"{src}: {who}")
             continue
         if src != "fresh":  # "error", ledger advisory, ...: nothing was written

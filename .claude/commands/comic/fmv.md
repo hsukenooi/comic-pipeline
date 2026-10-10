@@ -35,6 +35,8 @@ comic-fmv --batch <working_list.json> --out <results.json> --brief
 
 `--batch` JSON shape: `[{item_id, title, issue, year, publisher?, variant?, grade, grade_confidence?, locg_id?, locg_variant_id?, notes?}, ...]`
 
+`title` must be the series name only (BUI-1225): a listing-style title (a grade word like `Cond`/`NM-`/`VF`, or a spaced ` - ` tagline) is refused per row with `source: "skipped_listing_title"` before any fetch or write; clean rows in the batch still price.
+
 Literal example (build it directly — the shape is documented here, don't grep `apps/fmv` source for it): `[{"item_id": "115834720199", "title": "Fantastic Four", "issue": "16", "year": 1963, "publisher": "Marvel", "grade": "VG 4.0", "grade_confidence": "medium"}]`
 
 `publisher` and `variant` are optional but **load-bearing** (BUI-161). `variant` (e.g. `Newsstand`, `Direct`) gives base vs variant editions distinct `comic_id`s (BUI-28), so omitting it conflates two sub-markets onto one comic.
