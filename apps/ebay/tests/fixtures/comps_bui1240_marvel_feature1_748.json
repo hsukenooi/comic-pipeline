@@ -1,0 +1,731 @@
+{
+ "_source": "BUI-1240: comic 748's stored comps (Marvel Feature #1, 1975, the Red Sonja series) as held by the comics server on 2026-10-12 (BUI-1237 investigation). Titles naming 1971 are the 1971 Defenders book admitted by yearless queries.",
+ "target": {
+  "title": "Marvel Feature",
+  "issue": "1",
+  "year": 1975
+ },
+ "comps": [
+  {
+   "product_id": "398425613652",
+   "title": "Marvel Feature #1 (Marvel Comics November 1975)",
+   "pool": "raw",
+   "tier": "base",
+   "price": 15.0
+  },
+  {
+   "product_id": "137748049025",
+   "title": "Marvel Feature #1 (Marvel Comics November 1975) VF- condition",
+   "pool": "raw",
+   "tier": "base",
+   "price": 10.5
+  },
+  {
+   "product_id": "398428341896",
+   "title": "Marvel Feature #1 Marvel 1975 Red Sonja She-Devil With a Sword 1st Issue",
+   "pool": "raw",
+   "tier": "base",
+   "price": 15.0
+  },
+  {
+   "product_id": "147582208074",
+   "title": "Marvel Feature #1 ! MARVEL 1975 ! RED SONJA by DICK GIORDANO ! NICE ! hayfamzone",
+   "pool": "raw",
+   "tier": "base",
+   "price": 13.29
+  },
+  {
+   "product_id": "227501048585",
+   "title": "Marvel Feature #1 Red Sonja! John Romita and Neal Adams Art! Marvel 1975",
+   "pool": "raw",
+   "tier": "base",
+   "price": 12.5
+  },
+  {
+   "product_id": "237056123298",
+   "title": "Red Sonja Marvel Feature #1 1975 Roy Thomas",
+   "pool": "raw",
+   "tier": "base",
+   "price": 4.25
+  },
+  {
+   "product_id": "306803854489",
+   "title": "Marvel Feature #1 Red Sonja comic book 1975 Bruce Jones story, Gil Kane cover",
+   "pool": "raw",
+   "tier": "base",
+   "price": 10.0
+  },
+  {
+   "product_id": "237013299241",
+   "title": "Marvel Feature #1 Red Sonja! John Romita and Neal Adams Art! Marvel 1975",
+   "pool": "raw",
+   "tier": "base",
+   "price": 16.19
+  },
+  {
+   "product_id": "227492963962",
+   "title": "Marvel Feature #1 1975 Red Sonja NM 9.4 beautiful copy!",
+   "pool": "raw",
+   "tier": "base",
+   "price": 15.5
+  },
+  {
+   "product_id": "188854567864",
+   "title": "Marvel Feature #1 FN 1975 RED SONJA #1 VG/FN 1977 MARVEL",
+   "pool": "raw",
+   "tier": "base",
+   "price": 12.99
+  },
+  {
+   "product_id": "137664307626",
+   "title": "Marvel Feature #1 (1975) Red Sonja She-Devil w/ a Sword Roy Thomas Thorne",
+   "pool": "raw",
+   "tier": "base",
+   "price": 5.75
+  },
+  {
+   "product_id": "800492433382",
+   "title": "Marvel Feature #1 Red Sonja! John Romita and Neal Adams Art! Marvel 1975",
+   "pool": "raw",
+   "tier": "base",
+   "price": 18.6
+  },
+  {
+   "product_id": "227465129184",
+   "title": "Marvel Feature #1 Red Sonja! John Romita and Neal Adams Art! Marvel 1975",
+   "pool": "raw",
+   "tier": "base",
+   "price": 7.0
+  },
+  {
+   "product_id": "227465141029",
+   "title": "Marvel Feature #1 Red Sonja 1975 (VG/FN 5.0)(Centerfold Detached Bottom Staple)",
+   "pool": "raw",
+   "tier": "base",
+   "price": 2.25
+  },
+  {
+   "product_id": "278243772137",
+   "title": "Marvel Feature #1 (1975) Red Sonja 1st Issue Comic NEAR MINT - NO RESERVE",
+   "pool": "raw",
+   "tier": "base",
+   "price": 20.5
+  },
+  {
+   "product_id": "298470930617",
+   "title": "Marvel Feature 1 Red Sonja 1975 Bronze Age Marvel Conan",
+   "pool": "raw",
+   "tier": "base",
+   "price": 13.99
+  },
+  {
+   "product_id": "147500009406",
+   "title": "Marvel Feature #1 (Marvel Comics November 1975) VF- condition",
+   "pool": "raw",
+   "tier": "grade-targeted",
+   "price": 7.5
+  },
+  {
+   "product_id": "137585732217",
+   "title": "Marvel Feature #1 (Marvel Comics November 1975) Featuring Red Sonja! VF-NM Cond!",
+   "pool": "raw",
+   "tier": "grade-targeted",
+   "price": 22.5
+  },
+  {
+   "product_id": "800646150467",
+   "title": "Marvel Feature #1 Marvel Comics November 1975 FN",
+   "pool": "raw",
+   "tier": "base",
+   "price": 10.55
+  },
+  {
+   "product_id": "398342043348",
+   "title": "Marvel Feature #1 1975 aka Red Sonja #1 VF Adams, Kane Bronze Age Marvel Comics",
+   "pool": "raw",
+   "tier": "base",
+   "price": 8.5
+  },
+  {
+   "product_id": "327148186196",
+   "title": "Marvel Feature #1 (Marvel Comics November 1975)",
+   "pool": "raw",
+   "tier": "base",
+   "price": 6.99
+  },
+  {
+   "product_id": "318636478445",
+   "title": "Marvel Feature #1 CGC 9.8 1975 4511227001",
+   "pool": "slab",
+   "tier": "base",
+   "price": 245.0
+  },
+  {
+   "product_id": "318812482105",
+   "title": "Marvel Feature #1 CGC 9.8 1975 4410605015",
+   "pool": "slab",
+   "tier": "base",
+   "price": 290.0
+  },
+  {
+   "product_id": "137572735916",
+   "title": "Marvel Feature #1 CGC 9.8 1975 4640505003",
+   "pool": "slab",
+   "tier": "base",
+   "price": 335.0
+  },
+  {
+   "product_id": "137505945057",
+   "title": "Marvel Feature #1 CGC 9.8 1975 4266478007",
+   "pool": "slab",
+   "tier": "base",
+   "price": 230.0
+  },
+  {
+   "product_id": "800424095728",
+   "title": "MARVEL FEATURE #1 CGC 9.6 (1975, 1st print) 1st title devoted to Red Sonja",
+   "pool": "slab",
+   "tier": "base",
+   "price": 93.0
+  },
+  {
+   "product_id": "267749651794",
+   "title": "Marvel Feature #1 CGC 9.6 - NM - WP - 1st Book Devoted to Red Sonja - 1975",
+   "pool": "slab",
+   "tier": "base",
+   "price": 115.0
+  },
+  {
+   "product_id": "257405734129",
+   "title": "Marvel Feature #1 CGC 9.6 - NM - WP - 1st Book Devoted to Red Sonja - 1975",
+   "pool": "slab",
+   "tier": "base",
+   "price": 105.0
+  },
+  {
+   "product_id": "366516622270",
+   "title": "Marvel Feature #1 CGC 9.6 1975 4512693013",
+   "pool": "slab",
+   "tier": "base",
+   "price": 125.0
+  },
+  {
+   "product_id": "800446878634",
+   "title": "Marvel Feature #1 CGC 9.0 OW-White Pages 1st Red Sonja Comic Marvel Comics 1975",
+   "pool": "slab",
+   "tier": "base",
+   "price": 29.0
+  },
+  {
+   "product_id": "389392139860",
+   "title": "Marvel Feature #1 (1975) Key 1st Solo Red Sonja   CGC 9.0 WHITE PAGES  SL4",
+   "pool": "slab",
+   "tier": "base",
+   "price": 69.95
+  },
+  {
+   "product_id": "137656426912",
+   "title": "MARVEL FEATURE #1 CGC 8.0 (1975) 1st Solo RED SONJA Headlining Series Marvel",
+   "pool": "slab",
+   "tier": "base",
+   "price": 60.0
+  },
+  {
+   "product_id": "196127431346",
+   "title": "MARVEL FEATURE #1 CGC 9.4 NM 1st RED SONJA Solo Series 1975 🔑",
+   "pool": "slab",
+   "tier": "base",
+   "price": 65.0
+  },
+  {
+   "product_id": "398309270518",
+   "title": "Marvel Feature #1 Red Sonja (Marvel Comics November 1975) CGC 9.4",
+   "pool": "slab",
+   "tier": "base",
+   "price": 79.99
+  },
+  {
+   "product_id": "287457218554",
+   "title": "Marvel Feature #1 CGC 8.5 1st Solo Red Sonja - 1975 Key",
+   "pool": "slab",
+   "tier": "base",
+   "price": 39.99
+  },
+  {
+   "product_id": "398154112795",
+   "title": "Marvel Feature 1 CGC 9.2 Red Sonja Marvel 1975",
+   "pool": "slab",
+   "tier": "base",
+   "price": 32.13
+  },
+  {
+   "product_id": "306980728616",
+   "title": "Marvel Feature #1 CGC 5.5 1st Defenders Appearance Marvel Comics 1971 Hulk",
+   "pool": "slab",
+   "tier": "broader",
+   "price": 135.0
+  },
+  {
+   "product_id": "188129674952",
+   "title": "Marvel Feature #1 (Marvel Comics December 1971) Cgc 9.6",
+   "pool": "slab",
+   "tier": "broader",
+   "price": 1900.0
+  },
+  {
+   "product_id": "358217355674",
+   "title": "Marvel Feature #1 (Marvel Comics November 1975) Red Sonja  Cgc  9.0",
+   "pool": "slab",
+   "tier": "broader",
+   "price": 55.0
+  },
+  {
+   "product_id": "147241567834",
+   "title": "Marvel Feature #1 CGC 5.5 OWTW 1st Defenders Appearance Marvel Comics 1971 Hulk",
+   "pool": "slab",
+   "tier": "broader",
+   "price": 124.99
+  },
+  {
+   "product_id": "397939357328",
+   "title": "Marvel Feature #1 (Marvel Comics December 1971) CGC 8.0 Key 🔑",
+   "pool": "slab",
+   "tier": "broader",
+   "price": 250.0
+  },
+  {
+   "product_id": "168502288918",
+   "title": "Marvel Feature #1 (1975) Red Sonja - Neal Adams, Roy Thomas Marvel Comics",
+   "pool": "raw",
+   "tier": "base",
+   "price": 12.12
+  },
+  {
+   "product_id": "366213417014",
+   "title": "Marvel Feature #1 1975 Marvel Comics 1st Headlining Red Sonja Title",
+   "pool": "raw",
+   "tier": "base",
+   "price": 15.0
+  },
+  {
+   "product_id": "188632105394",
+   "title": "1975 MARVEL COMICS MARVEL FEATURE #1 FN- VINTAGE RED SONJA SEXY FANTASY CONAN",
+   "pool": "raw",
+   "tier": "base",
+   "price": 5.99
+  },
+  {
+   "product_id": "389804909167",
+   "title": "Marvel Comics Marvel Feature #1 (1975) Red Sonja First Issue Fantasy Adventure",
+   "pool": "raw",
+   "tier": "base",
+   "price": 20.0
+  },
+  {
+   "product_id": "137487805271",
+   "title": "Marvel Feature #1 (Marvel Comics November 1975) FN/VF condition",
+   "pool": "raw",
+   "tier": "base",
+   "price": 21.89
+  },
+  {
+   "product_id": "147405444758",
+   "title": "Marvel Feature #1 (Marvel Comics November 1975) FN- condition",
+   "pool": "raw",
+   "tier": "base",
+   "price": 6.5
+  },
+  {
+   "product_id": "318148196092",
+   "title": "Marvel Feature #1 (Marvel Comics November 1975)",
+   "pool": "raw",
+   "tier": "base",
+   "price": 10.0
+  },
+  {
+   "product_id": "317887836145",
+   "title": "Marvel Feature #1 (Marvel Comics November 1975)",
+   "pool": "raw",
+   "tier": "base",
+   "price": 14.99
+  },
+  {
+   "product_id": "406710798102",
+   "title": "Marvel Feature #1 1975 Marvel Comics 1st Headlining Red Sonja Title",
+   "pool": "raw",
+   "tier": "base",
+   "price": 9.99
+  },
+  {
+   "product_id": "147337058922",
+   "title": "MARVEL FEATURE #1 - Red Sonja solo story - Marvel Comics 1975 NM-",
+   "pool": "raw",
+   "tier": "base",
+   "price": 18.0
+  },
+  {
+   "product_id": "236835214181",
+   "title": "MARVEL FEATURE # 1 RED SONYA (MARVEL COMICS, 1975), CHECK OUT OTHER AUCTIONS!",
+   "pool": "raw",
+   "tier": "base",
+   "price": 9.99
+  },
+  {
+   "product_id": "227350303374",
+   "title": "Marvel Feature #1 (Marvel Comics November 1975)",
+   "pool": "raw",
+   "tier": "base",
+   "price": 11.19
+  },
+  {
+   "product_id": "137334295881",
+   "title": "Marvel Feature #1 (Marvel Comics November 1975) FN+ Condition!",
+   "pool": "raw",
+   "tier": "base",
+   "price": 20.5
+  },
+  {
+   "product_id": "277992097128",
+   "title": "Marvel Feature #1 Red Sonja ~ VERY FINE - NEAR MINT NM ~ 1975 Marvel Comics",
+   "pool": "raw",
+   "tier": "base",
+   "price": 7.5
+  },
+  {
+   "product_id": "137301471227",
+   "title": "Marvel Feature #1 (Marvel Comics November 1975) VG- Condition",
+   "pool": "raw",
+   "tier": "base",
+   "price": 11.5
+  },
+  {
+   "product_id": "117182617287",
+   "title": "Marvel Feature #1 1975 Marvel Comics Raw VF 1st Issue of Red Sonja! Gil Kane CI",
+   "pool": "raw",
+   "tier": "base",
+   "price": 14.24
+  },
+  {
+   "product_id": "396929623008",
+   "title": "Marvel Feature 1 Red Sonja 1975 Marvel Comics",
+   "pool": "raw",
+   "tier": "base",
+   "price": 18.0
+  },
+  {
+   "product_id": "137502026292",
+   "title": "Marvel Feature #1 VG 4.0 1971 1st app. and origin Defenders",
+   "pool": "raw",
+   "tier": null,
+   "price": 82.0
+  },
+  {
+   "product_id": "158046096372",
+   "title": "MARVEL FEATURE #1 1971 MARVEL COMICS defenders hulk dr strange sub-mariner",
+   "pool": "raw",
+   "tier": null,
+   "price": 61.0
+  },
+  {
+   "product_id": "117277903194",
+   "title": "Marvel Feature (1st Series) #2 VG+ 4.5 1971 John Buscema Cover",
+   "pool": "raw",
+   "tier": null,
+   "price": 29.95
+  },
+  {
+   "product_id": "188632105394",
+   "title": "1975 MARVEL COMICS MARVEL FEATURE #1 FN- VINTAGE RED SONJA SEXY FANTASY CONAN",
+   "pool": "raw",
+   "tier": null,
+   "price": 5.99
+  },
+  {
+   "product_id": "389804909167",
+   "title": "Marvel Comics Marvel Feature #1 (1975) Red Sonja First Issue Fantasy Adventure",
+   "pool": "raw",
+   "tier": null,
+   "price": 20.0
+  },
+  {
+   "product_id": "236860350736",
+   "title": "Marvel Feature #1 FN+ 6.5 1st Appearance and Origin Defenders! Marvel 1971",
+   "pool": "raw",
+   "tier": null,
+   "price": 112.0
+  },
+  {
+   "product_id": "327263700936",
+   "title": "Marvel Feature #1 1971 VG Origin & 1st Appearance of Defenders Team",
+   "pool": "raw",
+   "tier": null,
+   "price": 40.29
+  },
+  {
+   "product_id": "137510222798",
+   "title": "Marvel Feature #1. VF+. 1970. 1st App Defenders. C Pix, Notes. Combo Ship.",
+   "pool": "raw",
+   "tier": null,
+   "price": 99.99
+  },
+  {
+   "product_id": "227411855664",
+   "title": "Marvel Feature #1 (FN- 5.5) 1971 (Origin of the Defenders)(Cover Corners Torn)",
+   "pool": "raw",
+   "tier": null,
+   "price": 14.5
+  },
+  {
+   "product_id": "137487805271",
+   "title": "Marvel Feature #1 (Marvel Comics November 1975) FN/VF condition",
+   "pool": "raw",
+   "tier": null,
+   "price": 21.89
+  },
+  {
+   "product_id": "206403552511",
+   "title": "Marvel Comics Marvel Feature #1 (1971) Defenders Roy Thomas Neal Adams 1st App",
+   "pool": "raw",
+   "tier": null,
+   "price": 99.0
+  },
+  {
+   "product_id": "366518068075",
+   "title": "Marvel Feature #1 Marvel 1971 1st Defenders Origin Hulk Namor Dr Strange",
+   "pool": "raw",
+   "tier": null,
+   "price": 84.0
+  },
+  {
+   "product_id": "147405444758",
+   "title": "Marvel Feature #1 (Marvel Comics November 1975) FN- condition",
+   "pool": "raw",
+   "tier": null,
+   "price": 6.5
+  },
+  {
+   "product_id": "206394186265",
+   "title": "Ff31 ASM 53 Marvel Feature 1 Champions 1",
+   "pool": "raw",
+   "tier": null,
+   "price": 135.04
+  },
+  {
+   "product_id": "298470930617",
+   "title": "Marvel Feature 1 Red Sonja 1975 Bronze Age Marvel Conan",
+   "pool": "raw",
+   "tier": null,
+   "price": 13.99
+  },
+  {
+   "product_id": "157951211120",
+   "title": "Marvel Feature #1 1st Appearance and Origin of the Defenders FN",
+   "pool": "raw",
+   "tier": null,
+   "price": 134.24
+  },
+  {
+   "product_id": "168507351515",
+   "title": "Marvel Feature #1 (Marvel Comics 1971) 1st Defenders Neal Adams Cover Nice Copy",
+   "pool": "raw",
+   "tier": null,
+   "price": 159.0
+  },
+  {
+   "product_id": "158000449311",
+   "title": "Red Sonja #1 (1977) & Marvel Feature #1 (1975) VF+ Free Ship",
+   "pool": "raw",
+   "tier": null,
+   "price": 30.0
+  },
+  {
+   "product_id": "307019316113",
+   "title": "MARVEL FEATURE # 1 - (VF-) -ORIGIN/1ST DEFENDERS-HULK-DR.STRANGE-NEAL ADAMS CVR",
+   "pool": "raw",
+   "tier": null,
+   "price": 87.0
+  },
+  {
+   "product_id": "147389647257",
+   "title": "Marvel Feature #1 VG/FN 5.0 Origin & 1st app. Defenders Giant 1971 No Resv",
+   "pool": "raw",
+   "tier": null,
+   "price": 61.0
+  },
+  {
+   "product_id": "800197852978",
+   "title": "Marvel Feature #1 FN (Qualified, 1st Defenders)",
+   "pool": "raw",
+   "tier": null,
+   "price": 48.89
+  },
+  {
+   "product_id": "267704096502",
+   "title": "Marvel Feature #1 Presents THE AWESOME ORIGIN OF THE DEFENDERS. FN -",
+   "pool": "raw",
+   "tier": null,
+   "price": 69.99
+  },
+  {
+   "product_id": "236711871592",
+   "title": "Marvel Feature 1 Vg Very Good 4.0 Marvel Comics",
+   "pool": "raw",
+   "tier": null,
+   "price": 10.0
+  },
+  {
+   "product_id": "196299466573",
+   "title": "Marvel Feature #1 Comic Book",
+   "pool": "raw",
+   "tier": null,
+   "price": 15.99
+  },
+  {
+   "product_id": "227403568801",
+   "title": "Marvel Comics Marvel Feature #1 (1971) Defenders Roy Thomas Neal Adams",
+   "pool": "raw",
+   "tier": null,
+   "price": 100.0
+  },
+  {
+   "product_id": "318496351852",
+   "title": "Marvel Comics Marvel Feature #1 (1971) Defenders Hulk Roy Thomas Neal Adams",
+   "pool": "raw",
+   "tier": null,
+   "price": 47.5
+  },
+  {
+   "product_id": "137443122698",
+   "title": "Marvel Feature #1. 7.0. 1st App of the Defenders. Neil Adams Art. C Pix, Notes",
+   "pool": "raw",
+   "tier": null,
+   "price": 99.99
+  },
+  {
+   "product_id": "358684994670",
+   "title": "Marvel Feature 1 Red Sonja VF/NM",
+   "pool": "raw",
+   "tier": null,
+   "price": 12.5
+  },
+  {
+   "product_id": "356148633919",
+   "title": "MARVEL FEATURE #1 1ST SOLO SERIES \"TEMPLE OF ABOMINATION\" GIL KANE COVER 1975",
+   "pool": "raw",
+   "tier": null,
+   "price": 10.0
+  },
+  {
+   "product_id": "236860417474",
+   "title": "Marvel Feature #1 Red Sonja! John Romita and Neal Adams Art! Marvel 1975",
+   "pool": "raw",
+   "tier": null,
+   "price": 13.5
+  },
+  {
+   "product_id": "127806640670",
+   "title": "Marvel Feature 1-7 Presents Red Sonja Vs Conan The Barbarian Marvel 1975 34",
+   "pool": "raw",
+   "tier": null,
+   "price": 69.99
+  },
+  {
+   "product_id": "336637759429",
+   "title": "MARVEL FEATURE #1 THE DEFENDERS MARVEL COMICS 1971 ORIGIN 1ST APP OF DEFENDERS",
+   "pool": "raw",
+   "tier": null,
+   "price": 38.0
+  },
+  {
+   "product_id": "405758633657",
+   "title": "Marvel Feature #1 1971 1st. Appearance of Defenders Lower Grade Comic",
+   "pool": "raw",
+   "tier": null,
+   "price": 65.0
+  },
+  {
+   "product_id": "236879613917",
+   "title": "Marvel Feature #1 (Marvel Comics December 1971)",
+   "pool": "raw",
+   "tier": null,
+   "price": 20.0
+  },
+  {
+   "product_id": "198010156140",
+   "title": "Marvel Feature #1 VG/FN to FN- Neal Adams Roy Thomas, Gil Kane Red Sonja 1975 B",
+   "pool": "raw",
+   "tier": null,
+   "price": 14.02
+  },
+  {
+   "product_id": "377248842112",
+   "title": "Marvel Feature #1 Marvel 1971 1st Defenders Origin Hulk Namor Key",
+   "pool": "raw",
+   "tier": null,
+   "price": 87.01
+  },
+  {
+   "product_id": "236880398344",
+   "title": "Marvel Feature #1 FN/VF 7.0 1st Appearance and Origin Defenders! Marvel 1971",
+   "pool": "raw",
+   "tier": null,
+   "price": 139.0
+  },
+  {
+   "product_id": "157982576042",
+   "title": "MARVEL FEATURE #1 1971 MARVEL COMICS defenders hulk dr strange sub-mariner",
+   "pool": "raw",
+   "tier": null,
+   "price": 143.5
+  },
+  {
+   "product_id": "327037321974",
+   "title": "Marvel Feature #1 (Marvel Comics December 1971)",
+   "pool": "raw",
+   "tier": null,
+   "price": 50.0
+  },
+  {
+   "product_id": "168354149554",
+   "title": "🔥🔥MARVEL FEATURE#1 1ST SOLO RED SONJA/ KANE,ADAMS, SANJULIAN, THOMAS 1975 🔥🔥",
+   "pool": "raw",
+   "tier": null,
+   "price": 20.0
+  },
+  {
+   "product_id": "227374804217",
+   "title": "Marvel Comics Marvel Feature #1 1971 Defenders Hulk Namor Dr Strange Neal Adams",
+   "pool": "raw",
+   "tier": null,
+   "price": 50.0
+  },
+  {
+   "product_id": "318372704701",
+   "title": "Marvel Feature #1 1971 Marvel Comics 1st appearance of The Defenders",
+   "pool": "raw",
+   "tier": null,
+   "price": 51.0
+  },
+  {
+   "product_id": "318148196092",
+   "title": "Marvel Feature #1 (Marvel Comics November 1975)",
+   "pool": "raw",
+   "tier": null,
+   "price": 10.0
+  },
+  {
+   "product_id": "227363859613",
+   "title": "Marvel Feature #1 Red Sonja! John Romita and Neal Adams Art! Marvel 1975",
+   "pool": "raw",
+   "tier": null,
+   "price": 14.5
+  },
+  {
+   "product_id": "327190849784",
+   "title": "Marvel Feature #1facsimile Vol. 1 2019 Marvel Comics Variant High Grade X243-173",
+   "pool": "raw",
+   "tier": null,
+   "price": 9.99
+  }
+ ]
+}

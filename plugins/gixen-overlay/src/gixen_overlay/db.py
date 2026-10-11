@@ -27,8 +27,12 @@ _comps_provenances_sql = ", ".join(f"'{p}'" for p in COMPS_PROVENANCES)
 # (`graded_identity_exclude`, BUI-922/938), `hard_exclude` (BUI-962: the
 # rest of `hard_exclude`'s own bare-bool verdict — previously an un-coded,
 # un-stampable drop the BUI-947 sweep could only report as
-# `uncoded_hard_exclude`) and `printing` (BUI-929). `manual` is the
-# operator's own stamp, for a row no automated guard names.
+# `uncoded_hard_exclude`), `printing` (BUI-929) and `title_year` (BUI-1240:
+# a vintage target's comp whose title names only years more than one away
+# from the target's). `manual` is the operator's own stamp, for a row no
+# automated guard names. Adding a code here needs no migration (no CHECK, see
+# below), but the server must deploy before a client that emits it, or the
+# client's stamp 422s (fail-soft: the in-memory merge filter still applies).
 #
 # Deliberately NOT a DDL CHECK, unlike `pool`/`provenance` above and exactly
 # like `fmv.flag_reason`: BUI-947's premise is that EVERY future guard grows
@@ -42,7 +46,7 @@ COMPS_EXCLUSION_POOLS = ("slab", "raw")
 
 COMPS_EXCLUSION_CODES = (
     "multibook_lot", "cross_title", "store_variant", "hard_exclude",
-    "printing", "manual",
+    "printing", "title_year", "manual",
 )
 COMPS_EXCLUSION_CODE_MANUAL = "manual"
 

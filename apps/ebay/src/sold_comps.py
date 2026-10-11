@@ -1684,6 +1684,58 @@ def _store_variant_comp(title: str) -> bool:
 GRADED_IDENTITY_CODES = ("cross_title", "store_variant")
 
 
+# BUI-1240: the title-year guard. A yearless query (the tier-2 `broader`
+# query, or a replayed cached response whose query had no year, BUI-656)
+# admits any sale under the same name + issue, and a reused vintage masthead
+# then blends two different books: comic 748 (Marvel Feature #1, 1975, the
+# Red Sonja series) took 1971 Marvel Feature #1 (Defenders) sales. The year
+# written in the listing title is the one identity signal those sales carry.
+#
+# Vintage targets only (`_VINTAGE_YEAR_CUTOFF`): modern listings rarely name
+# a year, and a modern title that does is as likely a release/printing year
+# as a cover year. A comp is rejected only when its title names at least one
+# plausible year and NONE is within `_TITLE_YEAR_TOLERANCE` of the target —
+# a yearless title stays, and so does a multi-year title that includes a
+# near year (a two-book lot naming both years; the lot guards own that).
+# The tolerance of 1 absorbs cover-date vs release-date drift (a December
+# cover on sale in the prior year — the year-gate false-negative class).
+TITLE_YEAR_CODE = "title_year"
+_TITLE_YEAR_MIN = 1930
+_TITLE_YEAR_TOLERANCE = 1
+# A bare 4-digit token that reads as a year. Rejected contexts: part of a
+# longer digit run (a cert number), right after `$`/`#` (a price or an issue
+# number), or inside a decimal/thousands number ("$1,975", "1975.00").
+# Slashes, hyphens and sentence periods stay allowed: "12/1971", "1975-1977"
+# and "VF+. 1970." are real years.
+_TITLE_YEAR_RE = re.compile(r'(?<![\d$#])(?<!\d[.,])((?:19|20)\d\d)(?!\d)(?![.,]\d)')
+
+
+def _title_years(title: str | None) -> list[int]:
+    """Every plausible year (`_TITLE_YEAR_MIN`..this year) named in *title*."""
+    if not title:
+        return []
+    this_year = datetime.now(timezone.utc).year
+    years = []
+    for m in _TITLE_YEAR_RE.finditer(title):
+        y = int(m.group(1))
+        if _TITLE_YEAR_MIN <= y <= this_year:
+            years.append(y)
+    return years
+
+
+def title_year_mismatch(title: str | None, year: int | None) -> bool:
+    """True when a VINTAGE target's comp title names only other years
+    (BUI-1240) — see the block comment above. False for an unknown or modern
+    target year, a yearless title, or any title naming a year within
+    `_TITLE_YEAR_TOLERANCE` of the target."""
+    if year is None or year >= _VINTAGE_YEAR_CUTOFF:
+        return False
+    years = _title_years(title)
+    if not years:
+        return False
+    return all(abs(y - year) > _TITLE_YEAR_TOLERANCE for y in years)
+
+
 def graded_identity_exclude(title: str, *, issue=None,
                             target_is_variant: bool = False) -> str | None:
     """The BUI-922/938 code for a comp that must not enter a GRADED pool, or
@@ -2261,7 +2313,8 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
     # BUI-946/961/962: per-comp record of every graded-identity guard drop
     # this call makes — the ampersand-lot guard (`multibook_lot`), the two
     # `graded_identity_exclude` codes, `hard_exclude`'s own verdict
-    # (`HARD_EXCLUDE_CODE`), and the printing guard (`printing`) — so a
+    # (`HARD_EXCLUDE_CODE`), the printing guard (`printing`), and the
+    # BUI-1240 title-year guard (`TITLE_YEAR_CODE`) — so a
     # downstream caller (fmv_runner's ledger merge) can drop the SAME
     # listing out of a stored ledger comp by product_id, not just see a
     # count. Only comps with a product_id can be listed here (every slab/
@@ -2279,6 +2332,11 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
     # this is NOT a fetch failure). This total is how a caller tells that
     # shape apart from a book that genuinely has no sold history.
     non_usd_dropped_total = 0
+    # BUI-1240: product_ids the title-year guard rejected, across tiers (a
+    # set, so a listing several tiers return counts once), and the subset
+    # already reported in `graded_identity_dropped_ids` (reported once).
+    title_year_dropped: set[str] = set()
+    title_year_reported: set[str] = set()
 
     def _breaker_tripped() -> bool:
         return bool(breaker is not None and breaker.tripped)
@@ -2438,6 +2496,19 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
                         graded_identity_dropped_ids.append(
                             {"product_id": comp["product_id"], "code": code})
                         continue
+                # BUI-1240: the title-year guard — every tier, raw and graded
+                # (see `title_year_mismatch`). The id is reported under the
+                # same admits_graded gate as the codes above: that list feeds
+                # only the slab-ledger merge, and a call whose pool never
+                # admits a graded comp keeps its documented empty list.
+                if title_year_mismatch(comp["title"], year):
+                    title_year_dropped.add(comp["product_id"])
+                    if admits_graded and comp["product_id"] not in title_year_reported:
+                        title_year_reported.add(comp["product_id"])
+                        graded_identity_dropped_ids.append(
+                            {"product_id": comp["product_id"],
+                             "code": TITLE_YEAR_CODE})
+                    continue
                 seen_ids.add(comp["product_id"])
                 # BUI-657/KTD6: stamp provenance on the comp at the point it
                 # joins the pool — provider/tier/query are already in scope
@@ -2757,12 +2828,15 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
             # BUI-922/938: {code: count} for the graded-only identity guards
             # (cross_title, store_variant). All zeros on every raw call.
             "graded_identity_dropped": graded_identity_dropped,
+            # BUI-1240: comps the title-year guard rejected (any tier, raw or
+            # graded). 0 for a modern or yearless target.
+            "title_year_dropped": len(title_year_dropped),
             # BUI-946/962: [{"product_id", "code"}] for EVERY graded-only
             # guard drop this call made — multibook_lot, cross_title,
-            # store_variant, hard_exclude, printing — so a caller
-            # (fmv_runner's ledger merge) can drop the same listing's stored
-            # ledger copy by id. Always empty on a raw call, which never runs
-            # these guards.
+            # store_variant, hard_exclude, printing, title_year (BUI-1240) —
+            # so a caller (fmv_runner's ledger merge) can drop the same
+            # listing's stored ledger copy by id. Always empty on a raw call
+            # whose pool never admits a graded comp.
             "graded_identity_dropped_ids": graded_identity_dropped_ids,
         }
     except Exception as e:  # noqa: BLE001 — BUI-537: preserve the partial
@@ -2793,6 +2867,7 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
             "printing_dropped": printing_dropped,
             "printing_unverified": printing_unverified,
             "graded_identity_dropped": graded_identity_dropped,
+            "title_year_dropped": len(title_year_dropped),
             "graded_identity_dropped_ids": graded_identity_dropped_ids,
             "error": str(e),
         }

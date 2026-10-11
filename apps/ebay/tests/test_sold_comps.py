@@ -2223,7 +2223,7 @@ class TestTieredStrategy:
         monkeypatch.setattr(sc, "fetch_sold_comps", fake_fetch)
         return calls
 
-    def _comp(self, pid, title="ASM #142 FN+ Marvel 1975", price=10.0):
+    def _comp(self, pid, title="ASM #142 FN+ Marvel", price=10.0):
         return {
             "product_id": pid,
             "title": title,
@@ -4144,7 +4144,10 @@ class TestAltMastheadTier:
             assert "Uncanny" not in nkw
 
     def test_healthy_pool_never_probes(self, tmp_path, monkeypatch):
-        results = [[self._comp(str(i)) for i in range(12)]]
+        # BUI-1240: the comps name the target's own year, so the title-year
+        # guard keeps them (the class default names 1970, the #69 fixture).
+        results = [[self._comp(str(i), title="Uncanny X-Men #142 FN 6.0 Marvel 1981")
+                    for i in range(12)]]
         calls = self._wire(tmp_path, monkeypatch, results)
         out = sc.fetch_book_comps(
             {"title": "Uncanny X-Men", "issue": "142", "year": 1981}, "key",
@@ -5321,8 +5324,11 @@ class TestGradedIdentityGuardsInFetch:
 
     def test_a_variant_target_keeps_its_own_variant_comps(self, tmp_path, monkeypatch):
         self._wire(tmp_path, monkeypatch, self._results())
+        # BUI-1240: the store variant's own cover year (2003, as its title
+        # says). With the original's 1970 the title-year guard would drop
+        # the variant comp before the store-variant guard is consulted.
         out = sc.fetch_book_comps(
-            {"title": "Batman", "issue": "227", "year": 1970, "grade": 4.5,
+            {"title": "Batman", "issue": "227", "year": 2003, "grade": 4.5,
              "certifier": "cgc", "variant": "Larry's Wonderful World"},
             "key",
         )
@@ -5408,3 +5414,138 @@ class TestGradedIdentityGuardsInFetch:
 def test_hard_exclude_keeps_retold_key_description_bui1236():
     assert sc.hard_exclude("Amazing Spider-Man #94 Origin Retold 1971") is False
     assert sc.hard_exclude("Amazing Spider-Man #94 Origin Retold Reprint") is True
+
+
+# ─── BUI-1240: the title-year guard ─────────────────────────────────────────
+
+class TestTitleYearGuard:
+    """A vintage target's comp is dropped when its title names only years
+    more than one away from the target's (comic 748: 1971 Marvel Feature #1
+    sales in the 1975 Red Sonja row)."""
+
+    FIXTURE = "comps_bui1240_marvel_feature1_748.json"
+
+    def test_comic_748_pool_drops_exactly_the_wrong_year_rows(self):
+        data = json.loads((FIXTURES / self.FIXTURE).read_text())
+        year = data["target"]["year"]
+        dropped = [c for c in data["comps"]
+                   if sc.title_year_mismatch(c["title"], year)]
+        kept = [c for c in data["comps"]
+                if not sc.title_year_mismatch(c["title"], year)]
+        # Every row whose title says 1971 drops, slab broader-tier copies
+        # included; the other two are a "1970" Defenders sale and the 2019
+        # facsimile.
+        with_1971 = [c for c in data["comps"] if "1971" in c["title"]]
+        assert len(with_1971) == 25
+        assert all(c in dropped for c in with_1971)
+        assert len(dropped) == 27
+        assert sum(c["pool"] == "slab" for c in dropped) == 4
+        # Nothing kept names a year other than the target's.
+        for c in kept:
+            years = sc._title_years(c["title"])
+            assert not years or 1975 in years, c["title"]
+
+    @pytest.mark.parametrize("title", [
+        "Marvel Feature #1 (Marvel Comics December 1971)",
+        "Marvel Feature #1 CGC 5.5 1st Defenders Appearance Marvel Comics 1971 Hulk",
+        "MARVEL FEATURE #1 1971 MARVEL COMICS defenders hulk dr strange sub-mariner",
+        "Marvel Feature #1. VF+. 1970. 1st App Defenders. C Pix, Notes.",
+        "Marvel Feature #1 (1971) Defenders 12/1971",
+    ])
+    def test_wrong_year_titles_drop(self, title):
+        assert sc.title_year_mismatch(title, 1975) is True
+
+    @pytest.mark.parametrize("title", [
+        "Marvel Feature #1 (1975) Red Sonja First Issue",
+        "Marvel Feature #1 Red Sonja VF/NM",                     # no year
+        "Red Sonja #1 (1977) & Marvel Feature #1 (1975)",          # includes 1975
+        "Marvel Feature #1 FN 1975 RED SONJA #1 VG/FN 1977 MARVEL",
+        "Marvel Feature #1 (Marvel Comics November 1974)",        # within 1
+        "Marvel Feature #1 1976 newsstand",                       # within 1
+        "Marvel Feature #1 CGC 9.0 4123456019",                   # cert number
+        "Marvel Feature #1 sold for $1971",                       # price
+        "Marvel Feature #1 $1,971.00 FN",                         # price
+        "Marvel Feature #1 19.71",                                # decimal
+        "Marvel Feature #1971",                                   # issue number
+        "Marvel Feature #1 Red Sonja 2099 cover",                 # future year
+        "Marvel Feature #1 1899",                                 # pre-1930
+    ])
+    def test_titles_that_stay(self, title):
+        assert sc.title_year_mismatch(title, 1975) is False
+
+    def test_modern_or_unknown_target_year_is_never_gated(self):
+        title = "Invincible #1 Image 2003"
+        assert sc.title_year_mismatch(title, 2010) is False
+        assert sc.title_year_mismatch(title, sc._VINTAGE_YEAR_CUTOFF) is False
+        assert sc.title_year_mismatch("Marvel Feature #1 1971", None) is False
+
+    _comp = TestGradedFetchMode._comp
+    _wire = TestGradedFetchMode._wire
+
+    WRONG = ("Marvel Feature #1 (Marvel Comics December 1971) CGC 9.6", 900.0)
+    RIGHT = ("Marvel Feature #1 CGC 9.6 Red Sonja Marvel 1975", 300.0)
+    YEARLESS = ("Marvel Feature 1 CGC 9.6 Red Sonja", 310.0)
+
+    def _results(self):
+        return [[self._comp("wrong", *self.WRONG),
+                 self._comp("right", *self.RIGHT),
+                 self._comp("yearless", *self.YEARLESS)]]
+
+    def test_graded_fetch_drops_and_reports_the_wrong_year(
+            self, tmp_path, monkeypatch):
+        self._wire(tmp_path, monkeypatch, self._results())
+        out = sc.fetch_book_comps(
+            {"title": "Marvel Feature", "issue": "1", "year": 1975,
+             "grade": 9.6, "certifier": "cgc"},
+            "key",
+        )
+        assert {c["product_id"] for c in out["slab_comps"]} == {"right", "yearless"}
+        assert out["title_year_dropped"] == 1
+        # Reported by id so fmv_runner's _merge_slab_pool drops the stored
+        # ledger copy of the same listing too.
+        assert out["graded_identity_dropped_ids"] == [
+            {"product_id": "wrong", "code": sc.TITLE_YEAR_CODE}]
+        assert sc.TITLE_YEAR_CODE == "title_year"
+
+    def test_raw_fetch_drops_the_wrong_year(self, tmp_path, monkeypatch):
+        self._wire(tmp_path, monkeypatch, self._results())
+        out = sc.fetch_book_comps(
+            {"title": "Marvel Feature", "issue": "1", "year": "1975"},
+            "key",
+        )
+        assert "wrong" not in {c["product_id"] for c in out["comps"]}
+        assert {"right", "yearless"} <= {c["product_id"] for c in out["comps"]}
+        assert out["title_year_dropped"] == 1
+
+    def test_yearless_broader_tier_is_guarded_too(self, tmp_path, monkeypatch):
+        """The 748 slab rows came in on the yearless tier-2 query."""
+        base = [self._comp(f"b{i}", "Marvel Feature #1 Red Sonja 1975", 20.0)
+                for i in range(2)]
+        broader = [self._comp("w", "Marvel Feature #1 Defenders 1971", 90.0),
+                   self._comp("k", "Marvel Feature #1 Red Sonja", 21.0)]
+        calls = self._wire(tmp_path, monkeypatch, [base, broader])
+        out = sc.fetch_book_comps(
+            {"title": "Marvel Feature", "issue": "1", "year": 1975,
+             "grade": 6.0},
+            "key",
+        )
+        assert "1975" not in calls[1]  # the broader query really is yearless
+        ids = {c["product_id"] for c in out["comps"]}
+        assert "k" in ids and "w" not in ids
+
+    def test_a_listing_two_tiers_return_counts_and_reports_once(
+            self, tmp_path, monkeypatch):
+        wrong = self._comp("w", "Marvel Feature #1 Defenders 1971 CGC 6.0", 90.0)
+        base = [self._comp("b0", "Marvel Feature #1 Red Sonja 1975", 20.0), wrong]
+        broader = [dict(wrong)]
+        calls = self._wire(tmp_path, monkeypatch, [base, broader])
+        out = sc.fetch_book_comps(
+            {"title": "Marvel Feature", "issue": "1", "year": 1975,
+             "grade": 6.0, "include_graded": True},
+            "key",
+        )
+        assert len(calls) >= 2  # the broader tier ran and re-served "w"
+        assert out["title_year_dropped"] == 1
+        assert [d for d in out["graded_identity_dropped_ids"]
+                if d["code"] == sc.TITLE_YEAR_CODE] == [
+            {"product_id": "w", "code": "title_year"}]

@@ -490,13 +490,13 @@ def test_stamp_refuses_an_unknown_code(db):
 
 
 def test_the_code_vocabulary_covers_every_live_guard_code():
-    """The five codes `ebay-sold-comps` emits in `graded_identity_dropped_ids`
-    (BUI-946/962), plus the operator's own. `comic-fmv` forwards those codes
+    """The six codes `ebay-sold-comps` emits in `graded_identity_dropped_ids`
+    (BUI-946/962, `title_year` BUI-1240), plus the operator's own. `comic-fmv` forwards those codes
     verbatim across an HTTP-only package boundary, so a code missing here is
     a 422 that discards the whole stamp at runtime."""
     assert set(COMPS_EXCLUSION_CODES) == {
         "multibook_lot", "cross_title", "store_variant", "hard_exclude",
-        "printing", "manual",
+        "printing", "title_year", "manual",
     }
 
 
