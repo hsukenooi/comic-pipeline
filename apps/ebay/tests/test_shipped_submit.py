@@ -391,6 +391,26 @@ def test_clearing_marker_releases_the_hold(monkeypatch, tmp_path):
     assert env.ezship_calls[-1] == ONE
 
 
+def test_clear_refused_while_run_lock_held_and_marker_untouched(monkeypatch, tmp_path):
+    env = Env(monkeypatch, tmp_path, one_order(), ezship=lambda g: (1, "Network error"))
+    env.go()
+    before = env.inflight.read_text()
+    holder = ss.acquire_run_lock(env.inflight)  # simulates a live run
+    try:
+        with pytest.raises(ss.InflightLocked, match="in progress"):
+            ss.clear_inflight(env.inflight, ONE)
+    finally:
+        holder.close()
+    assert env.inflight.read_text() == before
+    assert ss.clear_inflight(env.inflight, ONE) is True  # lock released: proceeds
+
+
+def test_clear_releases_lock_when_marker_absent(monkeypatch, tmp_path):
+    path = tmp_path / "auto-submit-inflight.json"
+    assert ss.clear_inflight(path, ONE) is False
+    ss.acquire_run_lock(path).close()  # not left held
+
+
 def test_confirmed_submit_clears_marker_and_marker_exists_before_call(monkeypatch, tmp_path):
     seen = {}
 

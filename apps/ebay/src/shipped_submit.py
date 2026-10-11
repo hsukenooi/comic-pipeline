@@ -389,13 +389,46 @@ def save_inflight(path, data):
         raise InflightError(f"cannot write {path}: {exc}") from None
 
 
+class InflightLocked(InflightError):
+    """The auto-submit run lock is held by a live run."""
+
+
+def acquire_run_lock(inflight_path):
+    """Take the non-blocking exclusive run lock shared by --auto-submit and
+    --clear-inflight. Returns the open lock file (closing it releases the lock).
+    Raises BlockingIOError if another process holds it, OSError on other failures.
+    Non-blocking on purpose: a run holds the lock for minutes, so a waiter would
+    appear hung; callers fail fast instead."""
+    inflight_path = Path(inflight_path)
+    inflight_path.parent.mkdir(parents=True, exist_ok=True)
+    lock = open(inflight_path.with_name(inflight_path.name + ".lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BaseException:
+        lock.close()
+        raise
+    return lock
+
+
 def clear_inflight(path, tracking):
-    """Human-invoked: drop one tracking number's marker. Returns True if present."""
-    data = load_inflight(path)
-    if data.pop(tracking.upper(), None) is None:
-        return False
-    save_inflight(path, data)
-    return True
+    """Human-invoked: drop one tracking number's marker. Returns True if present.
+    Takes the run lock so it cannot race a live --auto-submit run over the marker
+    file (BUI-1248); raises InflightLocked if a run holds it."""
+    try:
+        lock = acquire_run_lock(path)
+    except BlockingIOError:
+        raise InflightLocked("an ebay-shipped --auto-submit run is in progress; "
+                             "marker left untouched. Retry when it finishes.") from None
+    except OSError as exc:
+        raise InflightError(f"cannot take run lock: {exc}") from None
+    try:
+        data = load_inflight(path)
+        if data.pop(tracking.upper(), None) is None:
+            return False
+        save_inflight(path, data)
+        return True
+    finally:
+        lock.close()
 
 
 def _now_iso():
@@ -477,9 +510,7 @@ def run(*, ledger_path, load_ledger, dry_run, holds_path=DEFAULT_HOLDS_STATE,
     lock = None
     if not dry_run:
         try:
-            inflight_path.parent.mkdir(parents=True, exist_ok=True)
-            lock = open(inflight_path.with_name(inflight_path.name + ".lock"), "w")
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock = acquire_run_lock(inflight_path)
         except BlockingIOError:
             print("another ebay-shipped --auto-submit run holds the lock; nothing done",
                   file=sys.stderr)
@@ -550,7 +581,9 @@ def _run_locked(ledger_path, load_ledger, dry_run, holds_path, inflight_path,
                          server_url, dry_run)
         code, detail = run_ezship(d)
         if code in (EXIT_SESSION_EXPIRED, -1):
-            # Provably nothing was submitted (login redirect / never launched).
+            # Treated as nothing submitted: exit 3 comes from the SubmitNewOrder
+            # response (apps/ezship/src/api.ts), so this relies on EZShip rejecting
+            # an unauthenticated request, not on proof; -1 means never launched.
             inflight.pop(key, None)
             _save_or_warn(inflight_path, inflight)
         if code == EXIT_SESSION_EXPIRED:
