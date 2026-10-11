@@ -5979,3 +5979,8 @@ class TestGradedIdentityGuardsInFetch:
         )
         assert out_raw["graded_identity_dropped_ids"] == []
         assert psa_title not in {c["title"] for c in out_raw["comps"]}
+
+
+def test_hard_exclude_keeps_retold_key_description_bui1236():
+    assert sc.hard_exclude("Amazing Spider-Man #94 Origin Retold 1971") is False
+    assert sc.hard_exclude("Amazing Spider-Man #94 Origin Retold Reprint") is True

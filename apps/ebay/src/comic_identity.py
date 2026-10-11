@@ -1529,6 +1529,26 @@ def _comp_later_printing_reject(title: str) -> bool:
     return bool(_LATER_PRINTING_ORDINAL_RE.search(title or ""))
 
 
+_RETOLD_REPRINT_CONTEXT_RE = re.compile(r"(?<!\w)(?:reprint(?:s|ed)?|retold\s+edition)(?!\w)", re.IGNORECASE)
+_REPRINT_MARKERS_NO_RETOLD: frozenset[str] = _REPRINT_MARKERS - {"retold"}
+
+
+def _comp_reprint_reject(title: str) -> bool:
+    """Comp-pool reprint check (BUI-1236).  Same as _reprint_reject except a
+    bare "retold" is a KEY DESCRIPTION, not a reprint ("Amazing Spider-Man
+    #94 Origin Retold" — the issue retells Spider-Man's origin).  "retold"
+    counts only alongside reprint context: any other reprint marker
+    (facsimile, Marvel Tales, ...) or the word "reprint".  The purchase path
+    (should_reject / _reprint_reject) keeps the stricter bare-"retold" rule.
+    """
+    if _marker_hit(title, _REPRINT_MARKERS_NO_RETOLD):
+        return True
+    return bool(
+        _marker_hit(title, frozenset({"retold"}))
+        and _RETOLD_REPRINT_CONTEXT_RE.search(title or "")
+    )
+
+
 def is_comp_excluded(title: str) -> bool:
     """Return True if *title* should be excluded as an eBay-sold-listing FMV
     comparable (BUI-269 — the single source of truth for
@@ -1554,7 +1574,7 @@ def is_comp_excluded(title: str) -> bool:
         return True
     if _fmv_copy_count_lot(title or ""):  # BUI-1009: "#239 X2", "18 X2 BOTH"
         return True
-    if _reprint_reject(title):
+    if _comp_reprint_reject(title):  # BUI-1236: "retold" needs reprint context
         return True
     if _comp_later_printing_reject(title):  # BUI-645: "#15 2nd Print"
         return True
