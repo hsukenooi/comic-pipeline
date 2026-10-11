@@ -1759,6 +1759,17 @@ def compute_fmv(comps: list[dict], target_grade: float,
 # Ages are measured against the CALENDAR `as_of` date `graded_pool`'s caller
 # supplies, not against the pool's own newest sale (BUI-948). See that
 # function's docstring for the measurement that replaced the newest-comp rule.
+#
+# BUI-1234: sold-comps.com `soldPrice` on a best-offer sale is the LISTING'S
+# ASKING PRICE, not the accepted offer (BUI-1222: equal to eBay's StartPrice on
+# 25 of 25). PriceCharting records both prices on the same sales; accepted is a
+# median 0.889 of list over 907 eBay best-offer sales dated before 2026-08-01.
+# `graded_pool` scales a comp flagged `best_offer` by this ratio. On the
+# BUI-1229 PriceCharting slab test set it lowered Winkler 0.765 to 0.716
+# (paired -0.047 [-0.074, -0.029]); dropping flagged comps scored worse than
+# baseline. See docs/audit/2026-10-11-best-offer-comp-basis.md. The raw pool
+# is NOT scaled: it has no accepted-price truth to backtest against yet.
+BEST_OFFER_ACCEPTED_RATIO = 0.89
 GRADED_FRESH_MAX_AGE_DAYS = 90     # weight 1.0 up to here
 GRADED_STALE_MAX_AGE_DAYS = 365    # weight GRADED_STALE_WEIGHT up to here
 GRADED_STALE_WEIGHT = 0.5          # 91–365 days
@@ -1881,7 +1892,8 @@ def graded_pool(comps: Iterable[dict], *,
     Returns `(kept, undated_dropped, stale_dropped)`. Each kept comp is a
     SHALLOW COPY carrying a `weight` key — copies so the caller's own list
     (which it also posts to the comps ledger) is never mutated with a field
-    that is not part of the `CompItem` contract.
+    that is not part of the `CompItem` contract. A copy flagged `best_offer`
+    is priced at the accepted basis (`_accepted_basis`, BUI-1234).
 
     `as_of` is the reference date every comp's age is measured from, and it is
     REQUIRED — no default, no clock in this module. `comic-fmv` passes
@@ -1921,8 +1933,30 @@ def graded_pool(comps: Iterable[dict], *,
         if weight is None:
             stale += 1
             continue
-        kept.append({**comp, "weight": weight})
+        kept.append(_accepted_basis({**comp, "weight": weight}))
     return kept, undated, stale
+
+
+def _is_best_offer(value: object) -> bool:
+    """True for a comp flagged as a best-offer sale. The flag arrives as a
+    bool from the parser and as SQLite's 0/1 from a ledger read; anything
+    else (None, a string) is not a flag."""
+    return value is True or (type(value) is int and value == 1)
+
+
+def _accepted_basis(comp: dict) -> dict:
+    """Scale a best-offer comp's list price to the accepted basis (BUI-1234).
+
+    `comp` is already `graded_pool`'s own copy, so the caller's list (posted
+    to the ledger at the provider's price) is never touched. The original
+    price is kept on `best_offer_list_price`, and its presence makes a second
+    pass a no-op: a pool fed back through `graded_pool` is never scaled twice.
+    """
+    if not _is_best_offer(comp.get("best_offer")) or "best_offer_list_price" in comp:
+        return comp
+    comp["best_offer_list_price"] = comp["price"]
+    comp["price"] = round(float(comp["price"]) * BEST_OFFER_ACCEPTED_RATIO, 2)
+    return comp
 
 
 def bucket_weighted_medians(comps: Iterable[dict]) -> dict[float, float]:

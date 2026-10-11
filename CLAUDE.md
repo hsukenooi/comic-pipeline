@@ -84,6 +84,8 @@ Unlike the host's `POLICY_EXPOSURE_CEILING` (no default — unset disables that 
 
 **Median bid cap (BUI-1219)** — a raw direct row in the VERY HIGH, HIGH, or MEDIUM bid tier with no photo haircut bids `clean_round(1.00 x median)`, at most `fmv_high`; every other row keeps `bid_factor x fmv_high` (spec §6). The median and tier persist in `fmv.median`/`fmv.bid_tier`, which `comic-fmv`'s cache hit and `recomputed_cap` (`max(rung x high, min(median, high))`) read; `plugins/gixen-overlay/tests/test_fmv_rung_parity.py` pins the two against `fmv_math`. Deploy the comics server first: an older server drops both fields, so its rows stay on `0.80 x fmv_high` and `recomputed_cap` advises on median bids.
 
+**Best-offer comps (BUI-1234)** — sold-comps.com `soldPrice` on a best-offer sale is the LIST price (BUI-1222). The parser carries `bestOfferAccepted` as `best_offer`, the ledger stores it in `comps.best_offer` (filled on a later sighting, never overwritten), and `fmv_math.graded_pool` scales flagged slab comps by `BEST_OFFER_ACCEPTED_RATIO` (0.89) at pricing time. Stored prices stay the provider's number. The raw pool is not scaled (no accepted-price backtest yet). Deploy order is free; until the server is deployed, ledger re-reads stay at list.
+
 **Soak gate:** do not set any `POLICY_BLOCK_*` flag until reviewing `GET /api/decisions` after real buys; keep `POLICY_BLOCK_OVER_FMV` off while lot briefs remain single-identity.
 
 ### The collection + wish-list are served from the comics server (BUI-87)

@@ -3788,7 +3788,22 @@ class TestParseCompSoldComps:
             "sold_date": "2026-07-25",  # ISO passthrough — fmv_math parses it
             "buying_format": "auction",
             "link": "https://www.ebay.com/itm/111",
+            "best_offer": None,  # the fixture item carries no bestOfferAccepted
         }
+
+    def test_best_offer_flag_rides_along_and_price_is_untouched(self):
+        """BUI-1234: soldPrice on a best-offer sale is the LIST price
+        (BUI-1222), so the parser must carry the flag for the pricing math —
+        and must NOT adjust the price itself (fmv_math does, once)."""
+        for flag in (True, False):
+            item = {**_sc_item(price=1275.0), "bestOfferAccepted": flag}
+            comp = sc.parse_comp_sold_comps(item)
+            assert comp["best_offer"] is flag
+            assert comp["price"] == 1275.0
+
+    def test_best_offer_non_bool_is_none(self):
+        item = {**_sc_item(), "bestOfferAccepted": "true"}
+        assert sc.parse_comp_sold_comps(item)["best_offer"] is None
 
     def test_item_id_falls_back_to_url(self):
         item = _sc_item()

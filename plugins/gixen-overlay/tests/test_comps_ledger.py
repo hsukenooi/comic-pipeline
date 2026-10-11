@@ -864,3 +864,48 @@ def test_get_comps_limit_respected(api):
     })
     r = api.get("/api/comics/comps", params={"comic_id": comic_id, "limit": 2})
     assert len(r.json()) == 2
+
+
+# ---------------------------------------------------------------------------
+# BUI-1234: best_offer flag (price on a best-offer sale is the LIST price)
+# ---------------------------------------------------------------------------
+
+
+def test_best_offer_flag_persists_as_int_and_absent_is_null(db):
+    comic_id = _comic(db)
+    upsert_comps(db, comic_id, [_comp(product_id="a", best_offer=True),
+                                _comp(product_id="b", best_offer=False),
+                                _comp(product_id="c")])
+    got = {r["product_id"]: r["best_offer"]
+           for r in db.execute("SELECT product_id, best_offer FROM comps")}
+    assert got == {"a": 1, "b": 0, "c": None}
+
+
+def test_best_offer_null_is_filled_on_a_later_sighting_but_never_overwritten(db):
+    comic_id = _comic(db)
+    upsert_comps(db, comic_id, [_comp(product_id="a"), _comp(product_id="b", best_offer=False)])
+    upsert_comps(db, comic_id, [_comp(product_id="a", best_offer=True),
+                                _comp(product_id="b", best_offer=True)])
+    upsert_comps(db, comic_id, [_comp(product_id="a")])  # a SerpApi-shaped re-post
+    got = {r["product_id"]: (r["best_offer"], r["price"], r["conflict_count"])
+           for r in db.execute("SELECT product_id, best_offer, price, conflict_count FROM comps")}
+    assert got == {"a": (1, 500.0, 0), "b": (0, 500.0, 0)}
+
+
+def test_best_offer_column_is_added_to_a_pre_bui1234_db():
+    conn = _make_db()
+    create_tables(conn)
+    conn.execute("ALTER TABLE comps DROP COLUMN best_offer")
+    assert "best_offer" not in {r[1] for r in conn.execute("PRAGMA table_info(comps)")}
+    create_tables(conn)
+    assert "best_offer" in {r[1] for r in conn.execute("PRAGMA table_info(comps)")}
+    conn.close()
+
+
+def test_ingest_comps_round_trips_best_offer(api):
+    comic_id = _create_comic(api)
+    r = api.post("/api/comics/comps",
+                 json={"comic_id": comic_id, "comps": [_comp(product_id="bo", best_offer=True)]})
+    assert r.status_code == 200
+    got = api.get("/api/comics/comps", params={"comic_id": comic_id}).json()
+    assert [c["best_offer"] for c in got if c["product_id"] == "bo"] == [1]

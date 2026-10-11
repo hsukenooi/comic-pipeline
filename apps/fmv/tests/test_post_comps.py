@@ -177,6 +177,13 @@ class TestCompToLedgerItem:
         assert item["label"] == "signature_series"
         assert item["page_quality"] == "ow_w"
 
+    def test_best_offer_flag_rides_along_to_the_ledger_and_slab_pool(self):
+        """BUI-1234: without the flag in both projections, a ledger re-read
+        (and the live slab pool) prices a best-offer comp at its LIST price."""
+        comp = {**_make_comp(1275.0, 6.5), "best_offer": True}
+        assert fmv_runner._comp_to_ledger_item(comp, pool="slab")["best_offer"] is True
+        assert fmv_runner._slab_pool_comp(comp)["best_offer"] is True
+
     def test_a_raw_comp_sends_the_three_as_none(self):
         """`CompItem`'s `mode="before"` validators normalize None to the raw
         sentinels ('none'/'universal'/'unknown'), so the fields can be listed

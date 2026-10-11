@@ -770,6 +770,10 @@ class CompItem(BaseModel):
     certifier: str = FMV_CERTIFIER_NONE
     label: str = FMV_LABEL_UNIVERSAL
     page_quality: str | None = COMP_PAGE_QUALITY_UNKNOWN
+    # BUI-1234: the provider's best-offer badge. On a best-offer sale `price`
+    # is the LIST price (BUI-1222), so the pricing math needs the flag to
+    # scale it. NULL means "never reported" (SerpApi rows, pre-BUI-1234 rows).
+    best_offer: bool | None = None
 
     @field_validator("pool")
     @classmethod

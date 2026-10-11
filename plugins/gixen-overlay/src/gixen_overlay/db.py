@@ -476,6 +476,7 @@ def create_tables(conn: sqlite3.Connection) -> None:
             -- `certifier` above — so nothing reads position here.)
             excluded_code  TEXT,
             excluded_at    TEXT,
+            best_offer     INTEGER,
             first_seen_at  TEXT NOT NULL,
             last_seen_at   TEXT NOT NULL,
             seen_count     INTEGER NOT NULL DEFAULT 1,
@@ -560,6 +561,8 @@ def create_tables(conn: sqlite3.Connection) -> None:
     # that existed before this column did. Ordered after the certifier pair
     # only for readability; the two touch disjoint columns.
     _migrate_add_comps_exclusion_columns(conn)
+    # BUI-1234: additive, nullable, no backfill (NULL = "never reported").
+    _migrate_add_comps_best_offer_column(conn)
     _migrate_lowercase_title_indexes(conn)
     # Partial unique indexes go AFTER migrations so the legacy duplicate-row
     # cleanup (fmv-split collapses (title, issue, year, grade) duplicates into
@@ -1289,6 +1292,21 @@ def _migrate_add_comps_exclusion_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE comps ADD COLUMN excluded_code TEXT")
     if "excluded_at" not in cols:
         conn.execute("ALTER TABLE comps ADD COLUMN excluded_at TEXT")
+
+
+def _migrate_add_comps_best_offer_column(conn: sqlite3.Connection) -> None:
+    """Add comps.best_offer if absent (BUI-1234).
+
+    The provider's best-offer badge: 1, 0, or NULL when no provider reported
+    it (SerpApi rows and every row stored before this column). Nullable with
+    no backfill, the same reasoning as `excluded_code`: NULL states the truth
+    for every pre-existing row. `upsert_comps` fills a NULL on the next
+    sighting of the same listing. `fmv_math.graded_pool` reads a 1 as "this
+    price is the asking price" and scales it to the accepted basis.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(comps)")}
+    if cols and "best_offer" not in cols:
+        conn.execute("ALTER TABLE comps ADD COLUMN best_offer INTEGER")
 
 
 def _migrate_backfill_comps_certifier(conn: sqlite3.Connection) -> None:
@@ -3262,13 +3280,17 @@ def upsert_comps(
                 comic_id, pool, provider, product_id, title, price, sold_date,
                 grade, buying_format, link, query, tier, from_cache,
                 observed_at, provenance, certifier, label, page_quality,
+                best_offer,
                 first_seen_at, last_seen_at, seen_count, conflict_count
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0)
             ON CONFLICT(provider, product_id, COALESCE(comic_id, -1), pool)
             DO UPDATE SET
                 last_seen_at   = excluded.last_seen_at,
                 seen_count     = seen_count + 1,
-                conflict_count = conflict_count + ?
+                conflict_count = conflict_count + ?,
+                -- BUI-1234: fill a never-reported flag on a later sighting,
+                -- never overwrite a stored one (KTD4: stored facts stand).
+                best_offer     = COALESCE(comps.best_offer, excluded.best_offer)
             """,
             (
                 comic_id, pool, provider, product_id,
@@ -3283,6 +3305,7 @@ def upsert_comps(
                 comp.get("certifier") or FMV_CERTIFIER_NONE,
                 comp.get("label") or FMV_LABEL_UNIVERSAL,
                 comp.get("page_quality") or COMP_PAGE_QUALITY_UNKNOWN,
+                None if comp.get("best_offer") is None else int(bool(comp["best_offer"])),
                 now, now,
                 1 if conflict else 0,
             ),

@@ -2126,12 +2126,18 @@ def parse_comp_sold_comps(item: dict) -> dict | None:
     self-exclusion both work without translation; the URL regex is only a
     fallback. `soldPrice` (not totalPrice or bestOfferAccepted) matches
     SerpApi's price.extracted semantics — 66/70 exact matches in the BUI-545
-    fidelity test. `soldPrice` is the actual accepted amount, including on an
-    OBO sale — sold-comps.com's own documentation says so verbatim, and
-    BUI-552 confirmed it experimentally (OBO share ~22.3% of the sample, no
-    price bias measured). `bestOfferAccepted` is a boolean badge flag only;
-    the item schema has no separate accepted-amount field at all. BUI-552
-    closed that option — this is settled, not an open question.
+    fidelity test. On a best-offer sale `soldPrice` is the LISTING'S ASKING
+    PRICE, not the accepted offer: BUI-1222 matched it to eBay's own
+    `StartPrice` (Trading API GetItem) on 25 of 25 `bestOfferAccepted` sales,
+    to the cent, with offers made on 20 (docs/audit/2026-10-11-best-offer-
+    list-price.md). That corrects BUI-552, which read the vendor docs and a
+    badge-only toggle and called `soldPrice` the accepted amount. eBay hides
+    the accepted amount and the item schema has no field for it, so the price
+    passes through verbatim and `bestOfferAccepted` rides along as
+    `best_offer` (True/False, or None when the item omits it). The slab pool
+    scales a best-offer comp to the accepted basis at pricing time
+    (`fmv_math.BEST_OFFER_ACCEPTED_RATIO`, BUI-1234); the stored price stays
+    the provider's number so a re-read can never adjust it twice.
     `endedAt` (ISO YYYY-MM-DD) passes through verbatim:
     fmv_math._parse_sold_date already accepts ISO-8601.
 
@@ -2172,6 +2178,8 @@ def parse_comp_sold_comps(item: dict) -> dict | None:
         "sold_date": item.get("endedAt", ""),
         "buying_format": item.get("buyingFormat", ""),
         "link": item.get("url", ""),
+        "best_offer": (item.get("bestOfferAccepted")
+                       if isinstance(item.get("bestOfferAccepted"), bool) else None),
     }
 
 
