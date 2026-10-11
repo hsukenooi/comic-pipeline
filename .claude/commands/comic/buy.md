@@ -379,6 +379,23 @@ Warn-only — don't block. The pipeline is done; the goal is to tell the user *n
 
 ---
 
+## Step 7: Record watchlist outcomes (BUI-1253)
+
+Applies only when the working list came from `watchlist.md`; a bare URL or `seller-scan` input skips this step. Record each watchlist item as soon as the user has decided it at its gate (do not batch the calls to the end of the run), never at listing time and never for an item nobody decided on (a run that dies partway must not hide undecided items):
+
+```bash
+ebay-watchlist --record "$ITEM_ID" --outcome "$OUTCOME"  # OUTCOME: sniped, skipped, over_cap, or non_comic
+```
+
+- `sniped`: the row landed (`added`/`updated`) in Step 5. A `failed`, `blocked`, `not_attempted`, or `indeterminate` row is not recorded.
+- `over_cap`: the user declined at the Step 4 or Step 5 gate because the bid or current price exceeded the max bid.
+- `non_comic`: identify or the Step 1 gate dropped it as a non-comic.
+- `skipped`: any other user decision to pass (owned at Step 2, condition gate, needs-manual, BIN).
+
+A non-zero exit from `--record` (exit 6 means a corrupt seen-store) is reported to the user, never ignored. This step does not depend on Step 6's verdicts.
+
+---
+
 ## Subagent Strategy (30+ books)
 
 `comic-fmv` fans out internally and caches hits, so one CLI call handles 50+ books — reach for subagents only if eBay identification itself is rate-limited/large, or you want the orchestrator's context tight above 50+ books. FMV always stays a single CLI call regardless — parallelize identification, not FMV. That single call is also the budget-cheapest shape: per Step 3's provider request budget (BUI-570), splitting the batch re-arms the BUI-535 breaker per chunk, and a large batch on the live provider takes minutes, not seconds.

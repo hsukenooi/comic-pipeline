@@ -76,6 +76,13 @@ def http(monkeypatch):
     return calls
 
 
+@pytest.fixture(autouse=True)
+def seen_store(tmp_path, monkeypatch):
+    path = tmp_path / "seen.json"
+    monkeypatch.setenv(wl.SEEN_PATH_ENV, str(path))
+    return path
+
+
 def run(capsys, *argv):
     code = wl.main(list(argv))
     out = capsys.readouterr()
@@ -308,3 +315,90 @@ def test_trading_auth_rejection_exits_3(http, capsys, code_):
     assert code == 3
     assert out == ""
     assert "ebay-auth login" in err
+
+
+# --- Seen-store (BUI-1253) ---
+
+
+def test_record_then_hide_then_all_shows(http, capsys, seen_store):
+    code, out, _ = run(capsys, "--record", "1001", "--outcome", "skipped")
+    assert code == 0 and "recorded 1001" in out
+    stored = json.loads(seen_store.read_text())
+    assert stored["1001"]["outcome"] == "skipped" and stored["1001"]["date"]
+    http.queue.append(FakeResp(page_xml(ALL)))
+    code, out, err = run(capsys, "--json")
+    assert [i["item_id"] for i in json.loads(out)] == ["1003", "1004"]
+    assert "seen_hidden=1" in err
+    http.queue.append(FakeResp(page_xml(ALL)))
+    _, out, _ = run(capsys, "--json", "--all")
+    items = json.loads(out)
+    assert [i["item_id"] for i in items] == ["1001", "1003", "1004"]
+    assert items[0]["seen"]["outcome"] == "skipped" and items[1]["seen"] is None
+
+
+def test_record_overwrites_with_latest_outcome(capsys, seen_store):
+    run(capsys, "--record", "1001", "--outcome", "over_cap")
+    run(capsys, "--record", "1001", "--outcome", "sniped")
+    assert json.loads(seen_store.read_text())["1001"]["outcome"] == "sniped"
+
+
+def test_forget_clears_one_and_it_reappears(http, capsys, seen_store):
+    run(capsys, "--record", "1001", "--outcome", "non_comic")
+    run(capsys, "--record", "1003", "--outcome", "skipped")
+    code, out, _ = run(capsys, "--forget", "1001")
+    assert code == 0 and "forgot 1001" in out
+    assert list(json.loads(seen_store.read_text())) == ["1003"]
+    http.queue.append(FakeResp(page_xml(ALL)))
+    _, out, _ = run(capsys, "--json")
+    assert [i["item_id"] for i in json.loads(out)] == ["1001", "1004"]
+
+
+def test_forget_unknown_is_reported_not_an_error(capsys):
+    code, out, _ = run(capsys, "--forget", "9999")
+    assert code == 0 and "was not in the seen-store" in out
+
+
+def test_record_requires_valid_outcome(capsys):
+    with pytest.raises(SystemExit):
+        wl.main(["--record", "1001"])
+    with pytest.raises(SystemExit):
+        wl.main(["--record", "1001", "--outcome", "bogus"])
+
+
+def test_missing_store_is_empty(http, capsys, seen_store):
+    assert not seen_store.exists()
+    http.queue.append(FakeResp(page_xml(ALL)))
+    code, out, err = run(capsys, "--json")
+    assert code == 0 and len(json.loads(out)) == 3 and "seen_hidden=0" in err
+
+
+@pytest.mark.parametrize(
+    "content", ["{not json", "[]", '{"1001": "skipped"}', '{"1001": {"outcome": "x"}}']
+)
+def test_corrupt_store_hard_fails_before_fetch(http, capsys, seen_store, content):
+    seen_store.write_text(content)
+    code, out, err = run(capsys, "--json")
+    assert code == wl.EXIT_STORE and out == "" and "seen-store" in err
+    assert http == []  # never reached the network
+
+
+def test_corrupt_store_fails_all_record_and_forget(http, capsys, seen_store):
+    seen_store.write_text("{not json")
+    http.queue.append(FakeResp(page_xml(ALL)))
+    assert run(capsys, "--json", "--all")[0] == wl.EXIT_STORE
+    assert run(capsys, "--record", "1001", "--outcome", "skipped")[0] == wl.EXIT_STORE
+    assert run(capsys, "--forget", "1001")[0] == wl.EXIT_STORE
+    assert seen_store.read_text() == "{not json"  # never overwritten
+
+
+def test_unreadable_store_hard_fails(capsys, seen_store):
+    seen_store.mkdir()  # a directory: read raises OSError, not FileNotFoundError
+    assert run(capsys, "--json")[0] == wl.EXIT_STORE
+
+
+def test_empty_item_id_is_rejected_not_a_fetch(http, capsys):
+    with pytest.raises(SystemExit):
+        wl.main(["--record", "", "--outcome", "skipped"])
+    with pytest.raises(SystemExit):
+        wl.main(["--forget", " "])
+    assert http == []

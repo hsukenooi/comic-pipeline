@@ -1,6 +1,6 @@
 ---
 name: comic:watchlist
-description: Hand live watched eBay auctions to /comic:buy. Reads the eBay watchlist, drops auctions that already have a snipe, separates auctions ending soon as likely too late, and passes the auctions you pick to /comic:buy. Never bids.
+description: Hand live watched eBay auctions to /comic:buy. Reads the eBay watchlist, hides auctions already decided in an earlier /comic:buy run, drops auctions that already have a snipe, separates auctions ending soon as likely too late, and passes the auctions you pick to /comic:buy. Never bids.
 ---
 
 # Comic Watchlist
@@ -11,17 +11,25 @@ Turn the eBay watchlist into `/comic:buy` input without copying URLs by hand. Th
 
 Optional `--min-minutes <N>` (default 30). An auction ending within N minutes goes in the "likely too late" list. Gixen has no add cutoff, but identify, grade, and FMV take minutes.
 
+Optional `--all` shows items an earlier `/comic:buy` run already decided (BUI-1253). Optional `--forget <item_id>` clears one item from the seen-store: run `ebay-watchlist --forget <item_id>`, report its output, and stop.
+
 ## Step 1: Read the watchlist
 
 ```bash
-WATCH_JSON="$(ebay-watchlist --type auction --json)"; rc=$?
+WATCH_ERR="$(mktemp)"
+WATCH_JSON="$(ebay-watchlist --type auction --json 2>"$WATCH_ERR")"; rc=$?
 ```
 
-`ebay-watchlist` is a console script (run `./scripts/install.sh` if it is not on PATH). It returns live auctions only. Read the exit code before anything else:
+Add `--all` to the command when the user passed `--all`.
+
+`ebay-watchlist` is a console script (run `./scripts/install.sh` if it is not on PATH). It returns live auctions only, minus items recorded in the seen-store (`buy.md` Step 7 records them). Read the exit code before anything else:
 
 - **0:** parse the JSON array. Each item has `item_id`, `title`, `listing_type`, `end_time`, `current_price`, `bid_count`, `seller`, and `url`. An empty array `[]` means the watchlist has no live auctions, and nothing else.
 - **3:** stop. Tell the user to run `ebay-auth login`, then rerun this skill.
 - **4 or 5:** stop and show the stderr message. Never treat a failure as an empty watchlist.
+- **6:** stop and show the stderr message. The seen-store (`~/.config/ebay/watchlist-seen.json`, override `EBAY_WATCHLIST_SEEN_PATH`) is unreadable or corrupt. Never fall back to showing everything or to an empty store. Tell the user to fix or delete the file, then rerun this skill. `--all` does not bypass this stop.
+
+On exit 0, stderr carries a `seen_hidden=N` line: the count of watched items hidden because an earlier run decided them. Read `$WATCH_ERR` for N. With `--all`, each item instead carries a `seen` field (`{outcome, date}` or `null`).
 
 ## Step 2: Drop auctions that already have a snipe
 
@@ -42,7 +50,9 @@ Compute minutes to `end_time` from the current UTC time. Drop any item whose end
 
 ## Step 4: Show the lists
 
-Lead with the counts: watched, already sniped, candidates, likely too late. Then show each list as a table sorted by end time, soonest first, with columns `#`, Title, Ends, Current Price, Bids, Seller, and Link (`url`). Number rows continuously across both lists so the user can pick by number.
+Lead with the counts: watched, seen-hidden (from `seen_hidden=N`, shown as its own count and never folded into the others), already sniped, candidates, likely too late. Then show each list as a table sorted by end time, soonest first, with columns `#`, Title, Ends, Current Price, Bids, Seller, and Link (`url`). Number rows continuously across both lists so the user can pick by number.
+
+With `--all`, mark each row whose `seen` is non-null with its outcome and date.
 
 If there are no candidates and no flagged auctions, say so and stop.
 
@@ -52,10 +62,12 @@ Ask which rows to buy. Candidates are offered by default. A likely-too-late row 
 
 Read `buy.md` and follow it, passing each chosen `url` as the Step 1 input (see `buy.md` Step 1). The watchlist data is an `item_id` source only. `/comic:buy` fetches each listing fresh, so never carry forward the title, price, bid count, or end time shown here (the BUI-572 staleness trap).
 
-Identify flags non-comics. The watchlist holds novels and other items. Drop any row identify flags as a non-comic before pricing, and tell the user which rows you dropped.
+Pass `buy.md` each chosen row's `item_id` too: `buy.md` Step 7 records the outcome per item_id after the user decides at its gate (BUI-1253). Record only there, never at listing time and never for rows the user did not pick.
+
+Identify flags non-comics. The watchlist holds novels and other items. Drop any row identify flags as a non-comic before pricing, and tell the user which rows you dropped. Those drops are recorded as `non_comic` in `buy.md` Step 7.
 
 ## Rules
 
 - **Never bid, snipe, or buy.** `/comic:buy` owns every gate and the user approves each snipe there.
-- **A failed read is never an empty list.** Exit 3, 4, or 5 from `ebay-watchlist`, or any `gixen list` failure, stops the skill.
+- **A failed read is never an empty list.** Exit 3, 4, 5, or 6 from `ebay-watchlist`, or any `gixen list` failure, stops the skill.
 - **Do not skip `/comic:buy` gates** because an item came from the watchlist.
