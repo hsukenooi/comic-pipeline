@@ -701,23 +701,41 @@ def _verify_query_echo(sc: types.ModuleType, raw: RawResponse) -> bool:
     the two counts together, not the failure count alone.
     """
     if raw.provider == sc.PROVIDER_SOLD_COMPS:
-        # sold-comps.com is never paginated by us (BUI-523's page-2 gate is
-        # SerpApi-shaped), so there is exactly one canonical URL per query.
+        # sold-comps.com is never paginated by us, so there is exactly one
+        # canonical URL per query.
         candidates = [sc.canonical_sold_comps_url(raw.query)]
     else:
-        # BUI-523: a page-2 fetch of the SAME nkw caches under its own key
+        # BUI-523: a page-2 fetch of the SAME nkw cached under its own key
         # (`_pgn`), so both pages are legitimate origins for one echoed query.
-        candidates = [sc.canonical_serpapi_url(raw.query, page=p) for p in (1, 2)]
+        candidates = [_historic_serpapi_url(raw.query, page=p) for p in (1, 2)]
     if raw.source == "capture":
         return bool(raw.captured_url) and raw.captured_url in candidates
     return raw.ident in [sc._cache_path(url).name for url in candidates]
+
+
+# HISTORIC (BUI-1239): sold_comps.py no longer fetches SerpApi, so the
+# canonical-URL builder that keyed its cache moved here, the one place that
+# still has to recognize those pre-BUI-1239 cache entries and captures. It
+# must stay byte-identical to the deleted sold_comps.canonical_serpapi_url,
+# or every historic SerpApi entry stops verifying.
+_HISTORIC_SERPAPI_ENDPOINT = "https://serpapi.com/search.json"
+
+
+def _historic_serpapi_url(nkw: str, *, page: int = 1) -> str:
+    """Rebuild the canonical SerpApi URL a historic response was cached and
+    captured under (BUI-523: `_pgn` only for page 2+)."""
+    params = {"engine": "ebay", "_nkw": nkw, "show_only": "Sold"}
+    if page and page > 1:
+        params["_pgn"] = page
+    canonical = urllib.parse.urlencode(sorted(params.items()))
+    return f"{_HISTORIC_SERPAPI_ENDPOINT}?{canonical}"
 
 
 def _replay_live(sc: types.ModuleType, raw: RawResponse) -> tuple[list[dict], list[dict]]:
     """Drive one raw response through the LIVE ``fetch_book_comps`` with the
     network stubbed, and return its (raw pool, slab pool).
 
-    Zero network calls: ``_fetch_with_fallback`` — the single seam every tier
+    Zero network calls: ``_fetch_query`` — the single seam every tier
     funnels through — is swapped for a stub that serves these bytes. Reaching
     for a private function is deliberate; it is the narrowest possible seam
     that leaves the whole parse → hard_exclude → dedupe → stamp → route chain
@@ -747,8 +765,8 @@ def _replay_live(sc: types.ModuleType, raw: RawResponse) -> tuple[list[dict], li
         served.append(nkw)
         return raw.data, False, raw.provider, raw.observed_at
 
-    original = sc._fetch_with_fallback
-    sc._fetch_with_fallback = _stub
+    original = sc._fetch_query
+    sc._fetch_query = _stub
     try:
         result = sc.fetch_book_comps(
             {
@@ -760,7 +778,7 @@ def _replay_live(sc: types.ModuleType, raw: RawResponse) -> tuple[list[dict], li
             api_key="replay-no-network",
         )
     finally:
-        sc._fetch_with_fallback = original
+        sc._fetch_query = original
     if result.get("error"):
         raise RuntimeError(f"live replay errored: {result['error']}")
     pooled = result["comps"] + result["slab_comps"]

@@ -1,7 +1,7 @@
-"""Tests for sold_comps.py — eBay sold-listings via SerpApi.
+"""Tests for sold_comps.py — eBay sold listings via sold-comps.com.
 
 Pure-function tests only. Network calls are exercised through fetch() with
-a mocked requests.get; no real SerpApi calls happen in CI.
+a mocked requests.get; no real provider calls happen in CI.
 """
 
 import gzip
@@ -16,6 +16,46 @@ import requests
 
 import comic_identity
 import sold_comps as sc
+
+
+# ─── BUI-1239: SerpApi-shaped fixtures served as sold-comps.com bodies ─────────
+
+def _as_sold_comps_item(r):
+    """Translate one SerpApi-shaped organic_result fixture into the
+    sold-comps.com item parse_comp_sold_comps() reads.
+
+    Most tier fixtures predate BUI-545 and are written in SerpApi's shape;
+    sold-comps.com is now the only live provider (BUI-1239), so the fakes
+    serve them in its shape instead. Field for field: product_id -> itemId,
+    price.extracted (or raw) -> soldPrice, a non-USD raw price -> a non-USD
+    soldCurrency, sold_date -> endedAt (a fixed date when blank, since
+    _verify_sold_comps_shape requires one), buying_format -> buyingFormat.
+    """
+    price = r.get("price") or {}
+    if isinstance(price, dict):
+        sold_price = price.get("extracted") or price.get("raw")
+        currency = "USD" if sc._is_usd_serpapi_price(price) else "GBP"
+    else:
+        sold_price, currency = price, "USD"
+    item = {
+        "itemId": r.get("product_id", ""),
+        "title": r.get("title", ""),
+        "soldPrice": sold_price,
+        "soldCurrency": currency,
+        "endedAt": r.get("sold_date") or "2026-07-01",
+        "listingType": "sold",
+    }
+    if r.get("buying_format"):
+        item["buyingFormat"] = r["buying_format"]
+    if r.get("link"):
+        item["url"] = r["link"]
+    return item
+
+
+def _as_sold_comps_body(results):
+    """A sold-comps.com response body holding the translated fixtures."""
+    return {"items": [_as_sold_comps_item(r) for r in results]}
+
 
 
 # ─── Grade parsing ────────────────────────────────────────────────────────────
@@ -1027,18 +1067,15 @@ class TestNonUsdDropCounting:
     successful fetch), so it correctly stays OUTSIDE the fetch-err count.
     """
 
-    def test_serpapi_mixed_response_counts_only_currency_drops(
+    def test_historic_serpapi_response_counts_only_currency_drops(
             self, tmp_path, monkeypatch):
         """One USD comp kept, one BRL and one RMB comp dropped — the count
         must be exactly 2, not 3 (a genuinely malformed result in the same
-        response must not inflate it).
+        response must not inflate it). SerpApi is historic since BUI-1239,
+        so this replays its body through the `_fetch_query` seam, as the
+        comps-ledger backfill does.
 
-        Deliberately omits `year`/`grade`/`variant` from the book so ONLY the
-        base tier fires (tiers 2-5 are each gated on one of those being
-        present/thin) — otherwise the mock's fixed `return_value` would
-        re-serve the same currency-rejected results to every tier's query
-        (each a distinct cache key) and inflate the book-level total, which
-        is not what this test is isolating."""
+        Omits `year`/`grade`/`variant` so ONLY the base tier fires."""
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         results = [
             {"product_id": "1", "title": "ASM #142 FN Marvel 1975",
@@ -1054,9 +1091,11 @@ class TestNonUsdDropCounting:
             {"product_id": "9", "title": "",
              "price": {"raw": "$1.0", "extracted": 1.0}},
         ]
-        with patch("sold_comps.requests.get",
-                   return_value=_serpapi_good(results)):
-            out = sc.fetch_book_comps({"title": "ASM", "issue": "142"}, "key")
+        monkeypatch.setattr(
+            sc, "_fetch_query",
+            lambda nkw, api_key, **kw: ({"organic_results": results}, False,
+                                        sc.PROVIDER_SERPAPI, 1.0))
+        out = sc.fetch_book_comps({"title": "ASM", "issue": "142"}, "key")
         assert len(out["queries_used"]) == 1, out["queries_used"]
         assert [c["product_id"] for c in out["comps"]] == ["1"]
         entry = out["queries_used"][0]
@@ -1065,17 +1104,15 @@ class TestNonUsdDropCounting:
         assert entry["non_usd_dropped"] == 2
         assert out["non_usd_dropped"] == 2
 
-    def test_serpapi_all_usd_response_counts_zero(self, tmp_path, monkeypatch):
+    def test_all_usd_response_counts_zero(self, tmp_path, monkeypatch):
         """The overwhelming common case: the field must be present and 0,
         never absent — a consumer doing `.get("non_usd_dropped")` needs a
         real 0 to distinguish "checked, none dropped" from "field missing"."""
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         with patch("sold_comps.requests.get",
-                   return_value=_serpapi_good([
-                       {"product_id": "1", "title": "ASM #142 FN Marvel 1975",
-                        "price": {"raw": "$10.0", "extracted": 10.0}},
-                   ])):
+                   return_value=_sold_comps_good([_sc_item(item_id="1")])):
             out = sc.fetch_book_comps({"title": "ASM", "issue": "142"}, "key")
+        assert out["queries_used"][0]["new_comps"] == 1
         assert out["queries_used"][0]["non_usd_dropped"] == 0
         assert out["non_usd_dropped"] == 0
 
@@ -1090,10 +1127,8 @@ class TestNonUsdDropCounting:
             _sc_item(item_id="2", currency="BRL"),
         ]
         with patch("sold_comps.requests.get",
-                   side_effect=_route(sold_comps=lambda: _sold_comps_good(items))):
-            out = sc.fetch_book_comps(
-                {"title": "ASM", "issue": "142"}, "key", sold_comps_key="sc_k",
-            )
+                   return_value=_sold_comps_good(items)):
+            out = sc.fetch_book_comps({"title": "ASM", "issue": "142"}, "key")
         assert [c["product_id"] for c in out["comps"]] == ["1"]
         entry = out["queries_used"][0]
         assert entry["provider"] == "sold-comps.com"
@@ -1550,40 +1585,6 @@ class TestStringYearCoercion:
                 == '"Amazing Spider-Man 50" 2018 -cgc -cbcs -graded -slab')
 
 
-class TestCanonicalUrl:
-    def test_excludes_api_key(self):
-        url = sc.canonical_serpapi_url('"X-Men 1"')
-        assert "secret-key" not in url
-        assert "show_only=Sold" in url
-        assert "engine=ebay" in url
-
-    def test_deterministic(self):
-        url1 = sc.canonical_serpapi_url('"X-Men 1"')
-        url2 = sc.canonical_serpapi_url('"X-Men 1"')
-        assert url1 == url2
-
-    def test_page1_omits_pgn_param(self):
-        """BUI-523: page 1 (the default) must NOT gain a `_pgn` param — the
-        canonical URL (and therefore the cache key) stays byte-for-byte
-        identical to pre-BUI-523 output so the existing 7-day cache isn't
-        invalidated for the overwhelmingly common single-page case."""
-        assert "_pgn" not in sc.canonical_serpapi_url('"X-Men 1"')
-        assert "_pgn" not in sc.canonical_serpapi_url('"X-Men 1"', page=1)
-        assert sc.canonical_serpapi_url('"X-Men 1"') == sc.canonical_serpapi_url('"X-Men 1"', page=1)
-
-    def test_page2_includes_pgn_param(self):
-        """BUI-523 AC: the page param must join the canonical cache key."""
-        url = sc.canonical_serpapi_url('"X-Men 1"', page=2)
-        assert "_pgn=2" in url
-
-    def test_page1_and_page2_are_different_cache_keys(self):
-        """BUI-523 AC: each page caches independently under the same TTL —
-        this is what makes that true at the cache-path layer."""
-        url1 = sc.canonical_serpapi_url('"X-Men 1"', page=1)
-        url2 = sc.canonical_serpapi_url('"X-Men 1"', page=2)
-        assert sc._cache_path(url1) != sc._cache_path(url2)
-
-
 class TestCanonicalSoldCompsUrl:
     def test_pins_sold_and_include_complete_listing(self):
         """BUI-557: both `sold` and `includeCompleteListing` are pinned
@@ -1672,115 +1673,6 @@ class TestCache:
         assert not list(tmp_path.glob(f"{path.name}.*.tmp"))
 
 
-# ─── Fetch with verification ──────────────────────────────────────────────────
-
-class TestFetch:
-    def _mock_response(self, organic_results=None, ebay_url=None, error=None):
-        m = MagicMock()
-        m.raise_for_status = MagicMock()
-        m.status_code = 200  # BUI-333: retry_request() reads status_code directly
-        body = {}
-        if error:
-            body["error"] = error
-        else:
-            body["organic_results"] = organic_results or []
-            body["search_metadata"] = {"ebay_url": ebay_url or ""}
-        m.json = MagicMock(return_value=body)
-        return m
-
-    def test_rejects_when_lh_sold_missing(self, tmp_path, monkeypatch):
-        # If SerpApi silently dropped show_only=Sold, the returned eBay URL
-        # won't contain LH_Sold=1 — we must fail loudly.
-        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
-        bad_url = "https://www.ebay.com/sch/i.html?_nkw=test"  # no LH_Sold=1
-        with patch("sold_comps.requests.get",
-                   return_value=self._mock_response(ebay_url=bad_url)):
-            with pytest.raises(sc.SerpApiError, match="LH_Sold=1"):
-                sc.fetch("test", "key")
-
-    def test_accepts_when_lh_sold_present(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
-        good_url = "https://www.ebay.com/sch/i.html?_nkw=test&LH_Sold=1"
-        with patch("sold_comps.requests.get",
-                   return_value=self._mock_response(ebay_url=good_url,
-                                                    organic_results=[{"product_id": "1"}])):
-            before = time.time()
-            data, cache_hit, response_fetched_at = sc.fetch("test", "key")
-            after = time.time()
-            assert cache_hit is False
-            assert data["organic_results"] == [{"product_id": "1"}]
-            # BUI-657/KTD7: a live fetch stamps "now", not any earlier time.
-            assert before <= response_fetched_at <= after
-
-    def test_cache_hit_returns_the_entrys_mtime(self, tmp_path, monkeypatch):
-        """BUI-657/KTD7: a cache hit must report the cache entry's own file
-        mtime as response_fetched_at, never "now" — a re-run of a stable book
-        must not restate three-month-old comps as observed today."""
-        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
-        good_url = "https://www.ebay.com/sch/i.html?_nkw=test&LH_Sold=1"
-        with patch("sold_comps.requests.get",
-                   return_value=self._mock_response(ebay_url=good_url,
-                                                    organic_results=[{"product_id": "1"}])):
-            sc.fetch("test", "key")  # populate cache
-
-        # Backdate the cache entry (but stay within the default TTL, or
-        # _cache_get would legitimately treat it as expired) so a "now"
-        # stamp would be trivially wrong.
-        path = sc._cache_path(sc.canonical_serpapi_url("test"))
-        old = time.time() - (2 * 24 * 3600)
-        import os
-        os.utime(path, (old, old))
-
-        with patch("sold_comps.requests.get") as m:
-            data, cache_hit, response_fetched_at = sc.fetch("test", "key")
-            assert m.call_count == 0, "must be a pure cache hit, no live call"
-        assert cache_hit is True
-        assert response_fetched_at == pytest.approx(old, abs=1)
-
-    def test_serves_from_cache(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
-        good_url = "https://www.ebay.com/sch/i.html?_nkw=t&LH_Sold=1"
-        # First call: real fetch
-        with patch("sold_comps.requests.get",
-                   return_value=self._mock_response(ebay_url=good_url)) as m:
-            sc.fetch("t", "key")
-            assert m.call_count == 1
-            # Second call: should hit cache
-            sc.fetch("t", "key")
-            assert m.call_count == 1, "expected cache hit, but a second HTTP call happened"
-
-    def test_force_bypasses_cache(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
-        good_url = "https://www.ebay.com/sch/i.html?_nkw=t&LH_Sold=1"
-        with patch("sold_comps.requests.get",
-                   return_value=self._mock_response(ebay_url=good_url)) as m:
-            sc.fetch("t", "key")
-            sc.fetch("t", "key", force=True)
-            assert m.call_count == 2
-
-    def test_serpapi_error_raises(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
-        with patch("sold_comps.requests.get",
-                   return_value=self._mock_response(error="Invalid API key")):
-            with pytest.raises(sc.SerpApiError, match="Invalid API key"):
-                sc.fetch("t", "key")
-
-    def test_page2_caches_independently_of_page1(self, tmp_path, monkeypatch):
-        """BUI-523 AC: page param joins the cache key so each page caches
-        independently under the same TTL. Money invariant: a repeat fetch of
-        either page within the TTL window must be a cache hit, not a re-bill."""
-        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
-        good_url = "https://www.ebay.com/sch/i.html?_nkw=t&LH_Sold=1"
-        with patch("sold_comps.requests.get",
-                   return_value=self._mock_response(ebay_url=good_url)) as m:
-            sc.fetch("t", "key", page=1)
-            sc.fetch("t", "key", page=2)
-            assert m.call_count == 2, "page 2 must not be served from page 1's cache entry"
-            sc.fetch("t", "key", page=1)
-            sc.fetch("t", "key", page=2)
-            assert m.call_count == 2, "a repeat fetch of either page must be a cache hit"
-
-
 # ─── BUI-614: Tier-0 raw response capture ─────────────────────────────────────
 
 def _read_capture_lines(path):
@@ -1794,22 +1686,6 @@ class TestRawResponseCapture:
     redirects CAPTURE_DIR/CAPTURE_PATH to a per-test tmp path — no explicit
     monkeypatch needed here for that half; CACHE_DIR still needs its own
     per-test isolation like every other TestFetch case."""
-
-    def test_serpapi_success_appends_one_record(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
-        good_url = "https://www.ebay.com/sch/i.html?_nkw=t&LH_Sold=1"
-        with patch("sold_comps.requests.get",
-                   return_value=self._mock_serpapi(good_url, [{"product_id": "1"}])):
-            sc.fetch("test query", "key")
-
-        records = _read_capture_lines(sc.CAPTURE_PATH)
-        assert len(records) == 1
-        record = records[0]
-        assert record["provider"] == sc.PROVIDER_SERPAPI
-        assert record["query"] == "test query"
-        assert isinstance(record["canonical_url"], str) and record["canonical_url"]
-        assert isinstance(record["timestamp"], (int, float))
-        assert record["response"]["organic_results"] == [{"product_id": "1"}]
 
     def test_sold_comps_success_appends_one_record(self, tmp_path, monkeypatch):
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
@@ -1829,37 +1705,16 @@ class TestRawResponseCapture:
         canonical-URL key on a re-query (same digest path); the capture file
         must instead accumulate BOTH responses as separate lines."""
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
-        good_url = "https://www.ebay.com/sch/i.html?_nkw=t&LH_Sold=1"
         with patch("sold_comps.requests.get",
-                   return_value=self._mock_serpapi(good_url, [{"product_id": "1"}])):
-            sc.fetch("same query", "key")
-            sc.fetch("same query", "key", force=True)  # bypasses cache -> re-fetch
+                   return_value=_sold_comps_good([_sc_item()])):
+            sc.fetch_sold_comps("same query", "key")
+            sc.fetch_sold_comps("same query", "key", force=True)  # bypasses cache -> re-fetch
 
         # Cache still holds exactly one file (the second fetch overwrote it).
         assert len(list(tmp_path.glob("*.json"))) == 1
         # Capture file has both, in append order.
         records = _read_capture_lines(sc.CAPTURE_PATH)
         assert len(records) == 2
-
-    def test_capture_failure_does_not_break_the_fetch(self, tmp_path, monkeypatch, capsys):
-        """Hard constraint (BUI-614): a capture failure must never fail the
-        fetch it's shadowing. Force _capture_raw_response's write to blow up
-        and confirm fetch() still returns normally with the right data."""
-        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
-        monkeypatch.setattr(sc, "CAPTURE_DIR", tmp_path / "unwritable-capture")
-
-        def boom(*a, **k):
-            raise OSError("disk full (simulated)")
-
-        monkeypatch.setattr(sc.os, "open", boom)
-        good_url = "https://www.ebay.com/sch/i.html?_nkw=t&LH_Sold=1"
-        with patch("sold_comps.requests.get",
-                   return_value=self._mock_serpapi(good_url, [{"product_id": "1"}])):
-            data, cache_hit, _response_fetched_at = sc.fetch("test", "key")
-
-        assert cache_hit is False
-        assert data["organic_results"] == [{"product_id": "1"}]
-        assert "BUI-614" in capsys.readouterr().err
 
     def test_capture_failure_does_not_break_sold_comps_fetch(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
@@ -1877,16 +1732,6 @@ class TestRawResponseCapture:
         assert len(data["items"]) == 1
         assert "BUI-614" in capsys.readouterr().err
 
-    @staticmethod
-    def _mock_serpapi(ebay_url, organic_results):
-        m = MagicMock()
-        m.raise_for_status = MagicMock()
-        m.status_code = 200
-        m.json = MagicMock(return_value={
-            "organic_results": organic_results,
-            "search_metadata": {"ebay_url": ebay_url},
-        })
-        return m
 
 
 def _read_all_capture_records(capture_dir):
@@ -1907,22 +1752,15 @@ def _read_all_capture_records(capture_dir):
 class TestCaptureRotation:
     """BUI-628/KTD1/R16: size-based rotation of CAPTURE_PATH, never pruned."""
 
-    def _serpapi_ok(self, product_id="1"):
-        m = MagicMock()
-        m.raise_for_status = MagicMock()
-        m.status_code = 200
-        m.json = MagicMock(return_value={
-            "organic_results": [{"product_id": product_id}],
-            "search_metadata": {"ebay_url": "ok&LH_Sold=1"},
-        })
-        return m
+    def _ok(self, product_id="1"):
+        return _sold_comps_good([_sc_item(product_id)])
 
     def test_below_threshold_no_rotation(self, tmp_path, monkeypatch):
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         monkeypatch.setattr(sc, "CAPTURE_ROTATE_BYTES", 10_000_000)
-        with patch("sold_comps.requests.get", return_value=self._serpapi_ok()):
-            sc.fetch("q1", "key")
-            sc.fetch("q2", "key", force=True)
+        with patch("sold_comps.requests.get", return_value=self._ok()):
+            sc.fetch_sold_comps("q1", "key")
+            sc.fetch_sold_comps("q2", "key", force=True)
 
         assert sc.CAPTURE_PATH.exists()
         assert list(sc.CAPTURE_DIR.glob("raw_responses.*.jsonl")) == [], \
@@ -1942,10 +1780,10 @@ class TestCaptureRotation:
         that actually matters."""
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         monkeypatch.setattr(sc, "CAPTURE_ROTATE_BYTES", 200)  # tiny — a couple records crosses it
-        with patch("sold_comps.requests.get", return_value=self._serpapi_ok()):
-            sc.fetch("q1", "key")
-            sc.fetch("q2", "key", force=True)
-            sc.fetch("q3", "key", force=True)
+        with patch("sold_comps.requests.get", return_value=self._ok()):
+            sc.fetch_sold_comps("q1", "key")
+            sc.fetch_sold_comps("q2", "key", force=True)
+            sc.fetch_sold_comps("q3", "key", force=True)
 
         rotated = list(sc.CAPTURE_DIR.glob("raw_responses.*-*.jsonl"))
         assert rotated, "the threshold-crossing write should have retired a segment"
@@ -1966,10 +1804,10 @@ class TestCaptureRotation:
         monkeypatch.setattr(sc, "CAPTURE_ROTATE_BYTES", 1)  # every write is "over threshold"
         monkeypatch.setattr(sc, "CAPTURE_COMPRESS_DELAY_SEC", 0.0)  # "long enough ago" = always
 
-        with patch("sold_comps.requests.get", return_value=self._serpapi_ok()):
-            sc.fetch("q1", "key")               # creates the current file
-            sc.fetch("q2", "key", force=True)   # rotates q1's segment (not compressed yet)
-            sc.fetch("q3", "key", force=True)   # rotates q2's; sweeps q1's
+        with patch("sold_comps.requests.get", return_value=self._ok()):
+            sc.fetch_sold_comps("q1", "key")               # creates the current file
+            sc.fetch_sold_comps("q2", "key", force=True)   # rotates q1's segment (not compressed yet)
+            sc.fetch_sold_comps("q3", "key", force=True)   # rotates q2's; sweeps q1's
 
         gzipped = list(sc.CAPTURE_DIR.glob("raw_responses.*-*.jsonl.gz"))
         rotated = list(sc.CAPTURE_DIR.glob("raw_responses.*-*.jsonl"))
@@ -1989,10 +1827,10 @@ class TestCaptureRotation:
         monkeypatch.setattr(sc, "CAPTURE_ROTATE_BYTES", 1)
         monkeypatch.setattr(sc, "CAPTURE_COMPRESS_DELAY_SEC", 3600.0)
 
-        with patch("sold_comps.requests.get", return_value=self._serpapi_ok()):
-            sc.fetch("q1", "key")
-            sc.fetch("q2", "key", force=True)
-            sc.fetch("q3", "key", force=True)
+        with patch("sold_comps.requests.get", return_value=self._ok()):
+            sc.fetch_sold_comps("q1", "key")
+            sc.fetch_sold_comps("q2", "key", force=True)
+            sc.fetch_sold_comps("q3", "key", force=True)
 
         assert list(sc.CAPTURE_DIR.glob("*.gz")) == [], \
             "no segment is old enough to compress yet"
@@ -2009,18 +1847,18 @@ class TestCaptureRotation:
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         monkeypatch.setattr(sc, "CAPTURE_ROTATE_BYTES", 1)  # every write is "over threshold"
 
-        with patch("sold_comps.requests.get", return_value=self._serpapi_ok()):
-            sc.fetch("q1", "key")  # first write: CAPTURE_PATH doesn't exist yet, no rotation
+        with patch("sold_comps.requests.get", return_value=self._ok()):
+            sc.fetch_sold_comps("q1", "key")  # first write: CAPTURE_PATH doesn't exist yet, no rotation
 
         def boom_rename(*a, **k):
             raise PermissionError("simulated unwritable capture dir")
 
         monkeypatch.setattr(sc.os, "rename", boom_rename)
-        with patch("sold_comps.requests.get", return_value=self._serpapi_ok()):
-            data, cache_hit, _fetched_at = sc.fetch("q2", "key", force=True)
+        with patch("sold_comps.requests.get", return_value=self._ok()):
+            data, cache_hit, _fetched_at = sc.fetch_sold_comps("q2", "key", force=True)
 
         assert cache_hit is False
-        assert data["organic_results"] == [{"product_id": "1"}]
+        assert len(data["items"]) == 1
         assert "BUI-628" in capsys.readouterr().err
         # No rotation happened (rename raised) — both records landed in the
         # SAME still-over-threshold current file, and nothing was lost.
@@ -2040,21 +1878,21 @@ class TestCaptureRotation:
         monkeypatch.setattr(sc, "CAPTURE_ROTATE_BYTES", 1)
         monkeypatch.setattr(sc, "CAPTURE_COMPRESS_DELAY_SEC", 0.0)
 
-        with patch("sold_comps.requests.get", return_value=self._serpapi_ok()):
-            sc.fetch("q1", "key")               # seed one record into what will be rotated away
-            sc.fetch("q2", "key", force=True)   # rotates it; BUI-677 defers its compression
+        with patch("sold_comps.requests.get", return_value=self._ok()):
+            sc.fetch_sold_comps("q1", "key")               # seed one record into what will be rotated away
+            sc.fetch_sold_comps("q2", "key", force=True)   # rotates it; BUI-677 defers its compression
 
         def boom_gzip(*a, **k):
             raise OSError("simulated compress failure")
 
         monkeypatch.setattr(sc.gzip, "open", boom_gzip)
-        with patch("sold_comps.requests.get", return_value=self._serpapi_ok()):
+        with patch("sold_comps.requests.get", return_value=self._ok()):
             # This rotation's sweep is the one that tries (and fails) to
             # compress q1's now-eligible segment.
-            data, cache_hit, _fetched_at = sc.fetch("q3", "key", force=True)
+            data, cache_hit, _fetched_at = sc.fetch_sold_comps("q3", "key", force=True)
 
         assert cache_hit is False
-        assert data["organic_results"] == [{"product_id": "1"}]
+        assert len(data["items"]) == 1
         assert "BUI-628" in capsys.readouterr().err
 
         rotated = list(sc.CAPTURE_DIR.glob("raw_responses.*-*.jsonl"))
@@ -2077,9 +1915,9 @@ class TestCaptureRotation:
         monkeypatch.setattr(sc, "CAPTURE_ROTATE_BYTES", 1)
         monkeypatch.setattr(sc, "CAPTURE_COMPRESS_DELAY_SEC", 0.0)
 
-        with patch("sold_comps.requests.get", return_value=self._serpapi_ok()):
-            sc.fetch("q1", "key")               # seed one record into what will be rotated away
-            sc.fetch("q2", "key", force=True)   # rotates it; BUI-677 defers its compression
+        with patch("sold_comps.requests.get", return_value=self._ok()):
+            sc.fetch_sold_comps("q1", "key")               # seed one record into what will be rotated away
+            sc.fetch_sold_comps("q2", "key", force=True)   # rotates it; BUI-677 defers its compression
 
         real_replace = sc.os.replace
 
@@ -2094,11 +1932,11 @@ class TestCaptureRotation:
             return real_replace(src, dst, *a, **k)
 
         monkeypatch.setattr(sc.os, "replace", boom_replace_for_gz_only)
-        with patch("sold_comps.requests.get", return_value=self._serpapi_ok()):
-            data, cache_hit, _fetched_at = sc.fetch("q3", "key", force=True)
+        with patch("sold_comps.requests.get", return_value=self._ok()):
+            data, cache_hit, _fetched_at = sc.fetch_sold_comps("q3", "key", force=True)
 
         assert cache_hit is False
-        assert data["organic_results"] == [{"product_id": "1"}]
+        assert len(data["items"]) == 1
         assert "BUI-628" in capsys.readouterr().err
 
         assert list(sc.CAPTURE_DIR.glob("*.tmp")) == [], "no orphaned .tmp file"
@@ -2120,11 +1958,11 @@ class TestCaptureRotation:
             raise OSError(28, "No space left on device")  # ENOSPC
 
         monkeypatch.setattr(sc.os, "write", boom_write)
-        with patch("sold_comps.requests.get", return_value=self._serpapi_ok()):
-            data, cache_hit, _fetched_at = sc.fetch("q1", "key")
+        with patch("sold_comps.requests.get", return_value=self._ok()):
+            data, cache_hit, _fetched_at = sc.fetch_sold_comps("q1", "key")
 
         assert cache_hit is False
-        assert data["organic_results"] == [{"product_id": "1"}]
+        assert len(data["items"]) == 1
         assert "BUI-614" in capsys.readouterr().err
 
     def test_concurrent_appenders_during_rotation_no_record_lost(self, tmp_path, monkeypatch):
@@ -2143,7 +1981,7 @@ class TestCaptureRotation:
             try:
                 for i in range(calls_per_thread):
                     sc._capture_raw_response(
-                        sc.PROVIDER_SERPAPI, f"t{thread_id}-{i}", "https://x", {"n": i},
+                        sc.PROVIDER_SOLD_COMPS, f"t{thread_id}-{i}", "https://x", {"n": i},
                     )
             except Exception as exc:  # noqa: BLE001  # captured for the assertion below, not swallowed
                 errors.append(exc)
@@ -2184,7 +2022,7 @@ class TestCaptureRotation:
         """
         monkeypatch.setattr(sc, "CAPTURE_ROTATE_BYTES", 1)  # every write is "over threshold"
 
-        sc._capture_raw_response(sc.PROVIDER_SERPAPI, "seed", "https://x", {"n": 0})
+        sc._capture_raw_response(sc.PROVIDER_SOLD_COMPS, "seed", "https://x", {"n": 0})
 
         # Step 1-2 of the ticket's sequence: the straggler's fd is resolved
         # BEFORE the rotation, so it names the inode that is about to be
@@ -2194,13 +2032,13 @@ class TestCaptureRotation:
         try:
             # Step 3: a full rotation (+ whatever compression it chooses to
             # do) happens while the straggler holds its fd.
-            sc._capture_raw_response(sc.PROVIDER_SERPAPI, "after-rotation", "https://x", {"n": 1})
+            sc._capture_raw_response(sc.PROVIDER_SOLD_COMPS, "after-rotation", "https://x", {"n": 1})
             assert list(sc.CAPTURE_DIR.glob("raw_responses.*-*.jsonl*")), \
                 "precondition: the second capture must have rotated a segment"
 
             # Step 4: the straggler finally writes, into the retired inode.
             line = (json.dumps({
-                "timestamp": time.time(), "provider": sc.PROVIDER_SERPAPI,
+                "timestamp": time.time(), "provider": sc.PROVIDER_SOLD_COMPS,
                 "query": "straggler", "canonical_url": "https://x",
                 "validation": "ok", "response": {"n": 2},
             }) + "\n").encode("utf-8")
@@ -2236,8 +2074,8 @@ class TestCaptureRotation:
         monkeypatch.setattr(sc, "CAPTURE_ROTATE_BYTES", 1)
         monkeypatch.setattr(sc, "CAPTURE_COMPRESS_DELAY_SEC", 0.0)
 
-        sc._capture_raw_response(sc.PROVIDER_SERPAPI, "q1", "https://x", {"n": 1})
-        sc._capture_raw_response(sc.PROVIDER_SERPAPI, "q2", "https://x", {"n": 2})  # rotates q1's
+        sc._capture_raw_response(sc.PROVIDER_SOLD_COMPS, "q1", "https://x", {"n": 1})
+        sc._capture_raw_response(sc.PROVIDER_SOLD_COMPS, "q2", "https://x", {"n": 2})  # rotates q1's
         [segment] = list(sc.CAPTURE_DIR.glob("raw_responses.*-*.jsonl"))
 
         real_replace = sc.os.replace
@@ -2276,8 +2114,8 @@ class TestCaptureRotation:
         monkeypatch.setattr(sc, "CAPTURE_ROTATE_BYTES", 1)
         monkeypatch.setattr(sc, "CAPTURE_COMPRESS_DELAY_SEC", 0.0)
 
-        sc._capture_raw_response(sc.PROVIDER_SERPAPI, "q1", "https://x", {"n": 1})
-        sc._capture_raw_response(sc.PROVIDER_SERPAPI, "q2", "https://x", {"n": 2})  # rotates q1's
+        sc._capture_raw_response(sc.PROVIDER_SOLD_COMPS, "q1", "https://x", {"n": 1})
+        sc._capture_raw_response(sc.PROVIDER_SOLD_COMPS, "q2", "https://x", {"n": 2})  # rotates q1's
         [segment] = list(sc.CAPTURE_DIR.glob("raw_responses.*-*.jsonl"))
 
         real_gzip_open = sc.gzip.open
@@ -2313,52 +2151,20 @@ class TestCaptureInvalidResponse:
     captured, tagged with the validation outcome — moved ahead of validation
     so provider drift is diagnosable instead of silently discarded."""
 
-    def test_serpapi_missing_lh_sold_still_captures_with_error(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
-        bad_url = "https://www.ebay.com/sch/i.html?_nkw=test"  # no LH_Sold=1
-        m = MagicMock()
-        m.raise_for_status = MagicMock()
-        m.status_code = 200
-        m.json = MagicMock(return_value={
-            "organic_results": [{"product_id": "1"}],
-            "search_metadata": {"ebay_url": bad_url},
-        })
-        with patch("sold_comps.requests.get", return_value=m):
-            with pytest.raises(sc.SerpApiError, match="LH_Sold=1"):
-                sc.fetch("test", "key")
-
-        # The fetch still raised (unchanged) and nothing was cached...
-        assert list(tmp_path.glob("*.json")) == []
-        # ...but the raw body IS captured, tagged with the validation error.
-        records = _read_capture_lines(sc.CAPTURE_PATH)
-        assert len(records) == 1
-        assert "LH_Sold=1" in records[0]["validation"]
-        assert records[0]["response"]["organic_results"] == [{"product_id": "1"}]
-
-    def test_serpapi_error_field_still_captures_with_error(self, tmp_path, monkeypatch):
+    def test_sold_comps_error_field_still_captures_with_error(self, tmp_path, monkeypatch):
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         m = MagicMock()
         m.raise_for_status = MagicMock()
         m.status_code = 200
         m.json = MagicMock(return_value={"error": "Invalid API key"})
         with patch("sold_comps.requests.get", return_value=m):
-            with pytest.raises(sc.SerpApiError, match="Invalid API key"):
-                sc.fetch("test", "key")
+            with pytest.raises(sc.SoldCompsError, match="Invalid API key"):
+                sc.fetch_sold_comps("test", "key")
 
+        assert list(tmp_path.glob("*.json")) == []
         records = _read_capture_lines(sc.CAPTURE_PATH)
         assert len(records) == 1
         assert "Invalid API key" in records[0]["validation"]
-
-    def test_serpapi_success_still_captures_ok(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
-        good_url = "https://www.ebay.com/sch/i.html?_nkw=t&LH_Sold=1"
-        with patch("sold_comps.requests.get",
-                   return_value=self.__class__._mock_serpapi_ok(good_url)):
-            sc.fetch("test", "key")
-
-        records = _read_capture_lines(sc.CAPTURE_PATH)
-        assert len(records) == 1
-        assert records[0]["validation"] == "ok"
 
     def test_sold_comps_shape_invalid_still_captures_with_error(self, tmp_path, monkeypatch):
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
@@ -2386,19 +2192,9 @@ class TestCaptureInvalidResponse:
         assert len(records) == 1
         assert records[0]["validation"] == "ok"
 
-    def test_network_error_captures_nothing(self, tmp_path, monkeypatch):
-        """A connection error with no body must still capture nothing — this
-        was already true before BUI-628 and must stay true: there is no body
-        to tag with a validation outcome."""
-        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
-        with patch("sold_comps.requests.get",
-                   side_effect=requests.ConnectionError("simulated network failure")):
-            with pytest.raises(requests.ConnectionError):
-                sc.fetch("test", "key")
-
-        assert _read_capture_lines(sc.CAPTURE_PATH) == []
-
     def test_sold_comps_network_error_captures_nothing(self, tmp_path, monkeypatch):
+        """A connection error with no body must still capture nothing: there
+        is no body to tag with a validation outcome."""
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         with patch("sold_comps.requests.get",
                    side_effect=requests.ConnectionError("simulated network failure")):
@@ -2406,17 +2202,6 @@ class TestCaptureInvalidResponse:
                 sc.fetch_sold_comps("test", "sc_key")
 
         assert _read_capture_lines(sc.CAPTURE_PATH) == []
-
-    @staticmethod
-    def _mock_serpapi_ok(ebay_url):
-        m = MagicMock()
-        m.raise_for_status = MagicMock()
-        m.status_code = 200
-        m.json = MagicMock(return_value={
-            "organic_results": [{"product_id": "1"}],
-            "search_metadata": {"ebay_url": ebay_url},
-        })
-        return m
 
 
 # ─── Tiered query strategy ────────────────────────────────────────────────────
@@ -2429,16 +2214,13 @@ class TestTieredStrategy:
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         calls = []
 
-        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1, record_attempt=None, breaker=None):
+        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, record_attempt=None, breaker=None):
             calls.append(nkw)
             idx = len(calls) - 1
             results = results_per_query[idx] if idx < len(results_per_query) else []
-            return ({
-                "organic_results": results,
-                "search_metadata": {"ebay_url": "ok&LH_Sold=1"},
-            }, False, 1234567890.0)
+            return _as_sold_comps_body(results), False, 1234567890.0
 
-        monkeypatch.setattr(sc, "fetch", fake_fetch)
+        monkeypatch.setattr(sc, "fetch_sold_comps", fake_fetch)
         return calls
 
     def _comp(self, pid, title="ASM #142 FN+ Marvel 1975", price=10.0):
@@ -2682,165 +2464,6 @@ class TestTieredStrategy:
             assert term in broader_nkw, f"{term!r} missing from broader query: {broader_nkw}"
 
 
-# ─── Gated pagination (BUI-523) ──────────────────────────────────────────────
-#
-# The gate is a spend protection against the 250/month SerpApi quota: page 2
-# of the base query may fire ONLY when SerpApi confirms page 1 was full (a
-# next page genuinely exists) AND the comp pool is still short on
-# grade-tagged comps. Every test below is really pinning a money invariant,
-# not just an output shape — a false-positive gate silently doubles SerpApi
-# spend on every liquid-book fetch.
-
-class TestGatedPagination:
-    def _comp(self, pid, title="ASM #142 Marvel 1975", price=10.0):
-        return {
-            "product_id": pid,
-            "title": title,
-            "price": {"raw": f"${price}", "extracted": price},
-            "sold_date": "",
-            "buying_format": "auction",
-        }
-
-    def _page(self, results, *, has_next=False):
-        body = {
-            "organic_results": results,
-            "search_metadata": {"ebay_url": "ok&LH_Sold=1"},
-        }
-        if has_next:
-            body["serpapi_pagination"] = {
-                "current": 1,
-                "next": "https://serpapi.com/search.json?engine=ebay&_nkw=x&_pgn=2",
-            }
-        return body
-
-    def test_page2_fires_when_full_and_grade_thin(self, tmp_path, monkeypatch):
-        """Page 1 full (SerpApi says a next page exists) + comp pool still
-        short on grade-tagged comps -> page 2 is fetched, reusing the exact
-        same base query text (only the page differs)."""
-        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
-        calls = []
-
-        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1, record_attempt=None, breaker=None):
-            calls.append({"nkw": nkw, "page": page})
-            if page == 1:
-                # No grade tokens in the titles -> 0 grade-tagged, well under
-                # GRADE_TAGGED_THRESHOLD.
-                results = [self._comp(str(i)) for i in range(55)]
-                return self._page(results, has_next=True), False, 1234567890.0
-            results = [self._comp(str(100 + i)) for i in range(10)]
-            return self._page(results, has_next=False), False, 1234567890.0
-
-        monkeypatch.setattr(sc, "fetch", fake_fetch)
-        out = sc.fetch_book_comps(
-            {"title": "ASM", "issue": "142", "year": 1975, "grade": 6.5}, "key",
-        )
-
-        page2_calls = [c for c in calls if c["page"] == 2]
-        assert len(page2_calls) == 1, f"expected exactly one page-2 fetch, got: {calls}"
-        assert page2_calls[0]["nkw"] == calls[0]["nkw"], (
-            "page 2 must reuse the SAME base query text as page 1 — a "
-            "different nkw would miss the intended cache key / query pairing"
-        )
-        assert len(out["comps"]) == 65  # 55 (page 1) + 10 (page 2)
-        page2_entries = [q for q in out["queries_used"] if q.get("page") == 2]
-        assert len(page2_entries) == 1
-        assert page2_entries[0]["tier"] == "base"
-
-    def test_page2_skipped_when_page1_not_full(self, tmp_path, monkeypatch):
-        """Money invariant: a thin vintage book (no next page) must NEVER
-        trigger a page-2 fetch — zero quota increase for it, regardless of
-        how few grade-tagged comps it has."""
-        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
-        calls = []
-
-        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1, record_attempt=None, breaker=None):
-            calls.append(page)
-            assert page == 1, "must never request page 2 when page 1 wasn't full"
-            results = [self._comp(str(i)) for i in range(3)]
-            return self._page(results, has_next=False), False, 1234567890.0
-
-        monkeypatch.setattr(sc, "fetch", fake_fetch)
-        sc.fetch_book_comps(
-            {"title": "X", "issue": "1", "year": 1965, "grade": 9.0}, "key",
-        )
-        assert 2 not in calls
-        assert all(p == 1 for p in calls)
-
-    def test_page2_skipped_when_grade_pool_already_thick(self, tmp_path, monkeypatch):
-        """Page 1 full (next page exists) but already >= GRADE_TAGGED_THRESHOLD
-        grade-tagged comps -> the extra page isn't worth the spend, skip it."""
-        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
-        calls = []
-
-        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1, record_attempt=None, breaker=None):
-            calls.append(page)
-            n = sc.GRADE_TAGGED_THRESHOLD + 2  # comfortably >= threshold
-            results = [self._comp(str(i), title="ASM #142 NM Marvel 1975")
-                       for i in range(n)]
-            return self._page(results, has_next=True), False, 1234567890.0
-
-        monkeypatch.setattr(sc, "fetch", fake_fetch)
-        sc.fetch_book_comps(
-            {"title": "ASM", "issue": "142", "year": 1975, "grade": 9.2}, "key",
-        )
-        assert 2 not in calls, (
-            "grade-tagged pool already thick enough — page 2 must not fire "
-            "even though SerpApi says more pages exist"
-        )
-
-    def test_page2_dedup_via_seen_ids(self, tmp_path, monkeypatch):
-        """Cross-page dedup reuses the existing seen_ids set: product_ids
-        that reappear on page 2 must not be double-counted."""
-        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
-
-        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1, record_attempt=None, breaker=None):
-            if page == 1:
-                results = [self._comp(str(i)) for i in range(55)]
-                return self._page(results, has_next=True), False, 1234567890.0
-            # 5 duplicates of page-1 ids + 5 genuinely new ones
-            dup = [self._comp(str(i)) for i in range(5)]
-            new = [self._comp(str(200 + i)) for i in range(5)]
-            return self._page(dup + new, has_next=False), False, 1234567890.0
-
-        monkeypatch.setattr(sc, "fetch", fake_fetch)
-        out = sc.fetch_book_comps(
-            {"title": "ASM", "issue": "142", "year": 1975, "grade": 6.5}, "key",
-        )
-        ids = [c["product_id"] for c in out["comps"]]
-        assert len(ids) == len(set(ids)), "product_ids must be unique across pages"
-        assert len(out["comps"]) == 60  # 55 + 5 new (5 dupes correctly dropped)
-
-    def test_page2_fetch_error_recorded_not_crash(self, tmp_path, monkeypatch):
-        """A transient failure fetching page 2 must degrade gracefully:
-        page-1 comps are kept, the error is recorded, nothing crashes."""
-        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
-
-        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1, record_attempt=None, breaker=None):
-            if page == 1:
-                results = [self._comp(str(i)) for i in range(55)]
-                return self._page(results, has_next=True), False, 1234567890.0
-            raise requests.ConnectionError("refused")
-
-        monkeypatch.setattr(sc, "fetch", fake_fetch)
-        out = sc.fetch_book_comps(
-            {"title": "ASM", "issue": "142", "year": 1975, "grade": 6.5}, "key",
-        )
-        assert len(out["comps"]) == 55
-        page2_errors = [q for q in out["queries_used"]
-                        if q.get("page") == 2 and "error" in q]
-        assert len(page2_errors) == 1
-        assert "refused" in page2_errors[0]["error"]
-
-    def test_has_next_page_fails_closed_on_missing_pagination(self):
-        """No serpapi_pagination key at all (e.g. an unusual/edge-case
-        response) must resolve to 'no next page' — fail closed toward NOT
-        spending extra quota, never fail open toward spending it."""
-        assert sc._has_next_page({"organic_results": []}) is False
-        assert sc._has_next_page({"serpapi_pagination": {}}) is False
-        assert sc._has_next_page({"serpapi_pagination": {"next": None}}) is False
-        assert sc._has_next_page({"serpapi_pagination": {"current": 1, "next": "url"}}) is True
-
-
 # ─── Conditional inclusive tier (BUI-524) ────────────────────────────────────
 #
 # A 4th tier that fires ONLY for a vintage book whose raw pool is still thin
@@ -2879,16 +2502,13 @@ class TestInclusiveTier:
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         calls = []
 
-        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1, record_attempt=None, breaker=None):
+        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, record_attempt=None, breaker=None):
             calls.append(nkw)
             idx = len(calls) - 1
             results = results_per_query[idx] if idx < len(results_per_query) else []
-            return ({
-                "organic_results": results,
-                "search_metadata": {"ebay_url": "ok&LH_Sold=1"},
-            }, False, 1234567890.0)
+            return _as_sold_comps_body(results), False, 1234567890.0
 
-        monkeypatch.setattr(sc, "fetch", fake_fetch)
+        monkeypatch.setattr(sc, "fetch_sold_comps", fake_fetch)
         return calls
 
     def test_fires_for_vintage_thin_book_and_splits_raw_vs_slab(self, tmp_path, monkeypatch):
@@ -3017,16 +2637,10 @@ class TestInclusiveTier:
 class TestBatch:
     def test_runs_all(self, tmp_path, monkeypatch):
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
-        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1, record_attempt=None, breaker=None):
-            return ({
-                "organic_results": [{
-                    "product_id": "1",
-                    "title": "ASM #142 FN+",
-                    "price": {"raw": "$12.0", "extracted": 12.0},
-                }],
-                "search_metadata": {"ebay_url": "ok&LH_Sold=1"},
-            }, False, 1234567890.0)
-        monkeypatch.setattr(sc, "fetch", fake_fetch)
+        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, record_attempt=None, breaker=None):
+            return ({"items": [_sc_item("1", title="ASM #142 FN+", price=12.0)]},
+                    False, 1234567890.0)
+        monkeypatch.setattr(sc, "fetch_sold_comps", fake_fetch)
 
         books = [
             {"title": "ASM", "issue": "142", "year": 1975, "grade": 6.5},
@@ -3038,7 +2652,7 @@ class TestBatch:
 
     def test_records_errors_per_book(self, tmp_path, monkeypatch):
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
-        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1, record_attempt=None, breaker=None):
+        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, record_attempt=None, breaker=None):
             raise RuntimeError("kaboom")
         monkeypatch.setattr(sc, "fetch_book_comps",
                             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
@@ -3052,15 +2666,12 @@ class TestBatch:
 # ─── Retry / transient-error tests ───────────────────────────────────────────
 
 class TestFetchRetry:
-    """Tests for the bounded retry/backoff added to fetch() for transient errors."""
+    """Bounded retry/backoff in fetch_sold_comps() for transient errors."""
 
-    def _mock_response(self, organic_results=None, ebay_url=None, status_code=200):
+    def _mock_response(self, organic_results=None, status_code=200):
         """Build a mock requests.Response for a successful (2xx) reply."""
         m = MagicMock()
-        body = {
-            "organic_results": organic_results or [],
-            "search_metadata": {"ebay_url": ebay_url or "https://www.ebay.com/?LH_Sold=1"},
-        }
+        body = {"items": [_sc_item(r["product_id"]) for r in (organic_results or [])]}
         m.json = MagicMock(return_value=body)
         if status_code == 200:
             m.raise_for_status = MagicMock()  # no-op
@@ -3071,12 +2682,11 @@ class TestFetchRetry:
         return m
 
     def test_retry_then_succeed_timeout(self, tmp_path, monkeypatch):
-        """fetch() retries on Timeout and returns data when the second call succeeds."""
+        """fetch_sold_comps() retries on Timeout and returns data when the second call succeeds."""
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         monkeypatch.setattr(sc.time, "sleep", lambda *_: None)
 
         good_response = self._mock_response(
-            ebay_url="https://www.ebay.com/?LH_Sold=1",
             organic_results=[{"product_id": "42"}],
         )
         call_count = {"n": 0}
@@ -3088,19 +2698,18 @@ class TestFetchRetry:
             return good_response
 
         with patch("sold_comps.requests.get", side_effect=fake_get):
-            data, cache_hit, _response_fetched_at = sc.fetch("test", "key")
+            data, cache_hit, _response_fetched_at = sc.fetch_sold_comps("test", "key")
 
         assert cache_hit is False
-        assert data["organic_results"] == [{"product_id": "42"}]
+        assert [i["itemId"] for i in data["items"]] == ["42"]
         assert call_count["n"] == 2  # failed once, then succeeded
 
     def test_retry_then_succeed_503(self, tmp_path, monkeypatch):
-        """fetch() retries on a 503 HTTPError and returns data on the second call."""
+        """fetch_sold_comps() retries on a 503 HTTPError and returns data on the second call."""
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         monkeypatch.setattr(sc.time, "sleep", lambda *_: None)
 
         good_response = self._mock_response(
-            ebay_url="https://www.ebay.com/?LH_Sold=1",
             organic_results=[{"product_id": "7"}],
         )
         call_count = {"n": 0}
@@ -3113,31 +2722,31 @@ class TestFetchRetry:
                 err = requests.HTTPError(response=bad)
                 bad.raise_for_status = MagicMock(side_effect=err)
                 bad.json = MagicMock(return_value={})
-                # raise_for_status is called by fetch() on the response
+                # raise_for_status is called by fetch_sold_comps() on the response
                 bad.raise_for_status.side_effect = err
                 # Return the bad mock so fetch calls raise_for_status on it
                 return bad
             return good_response
 
         with patch("sold_comps.requests.get", side_effect=fake_get):
-            data, cache_hit, _response_fetched_at = sc.fetch("test", "key")
+            data, cache_hit, _response_fetched_at = sc.fetch_sold_comps("test", "key")
 
-        assert data["organic_results"] == [{"product_id": "7"}]
+        assert [i["itemId"] for i in data["items"]] == ["7"]
         assert call_count["n"] == 2
 
     def test_exhausted_transient_error_reraises(self, tmp_path, monkeypatch):
-        """fetch() re-raises after exhausting all retries."""
+        """fetch_sold_comps() re-raises after exhausting all retries."""
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         monkeypatch.setattr(sc.time, "sleep", lambda *_: None)
 
         with patch("sold_comps.requests.get",
                    side_effect=requests.ConnectionError("no route to host")):
             with pytest.raises(requests.ConnectionError):
-                sc.fetch("test", "key")
+                sc.fetch_sold_comps("test", "key")
 
     def test_exhausted_retryable_status_reraises_http_error(self, tmp_path, monkeypatch):
         """BUI-333: a persistent 503 across every retry attempt exercises the
-        RetryExhausted(response=...) branch — fetch() must still raise an
+        RetryExhausted(response=...) branch — fetch_sold_comps() must still raise an
         HTTPError carrying the original status code, and requests.get must be
         called exactly FETCH_MAX_RETRIES times (no over/under-retrying)."""
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
@@ -3151,7 +2760,7 @@ class TestFetchRetry:
 
         with patch("sold_comps.requests.get", side_effect=lambda *a, **k: make_bad()) as mock_get:
             with pytest.raises(requests.HTTPError) as excinfo:
-                sc.fetch("test", "key")
+                sc.fetch_sold_comps("test", "key")
             assert excinfo.value.response.status_code == 503
             assert mock_get.call_count == sc.FETCH_MAX_RETRIES
 
@@ -3165,7 +2774,6 @@ class TestFetchRetry:
         monkeypatch.setattr(sc.time, "sleep", lambda *_: None)
 
         good_response = self._mock_response(
-            ebay_url="https://www.ebay.com/?LH_Sold=1",
             organic_results=[{"product_id": "99"}],
         )
         call_count = {"n": 0}
@@ -3177,9 +2785,9 @@ class TestFetchRetry:
             return good_response
 
         with patch("sold_comps.requests.get", side_effect=fake_get):
-            data, cache_hit, _response_fetched_at = sc.fetch("test", "key")
+            data, cache_hit, _response_fetched_at = sc.fetch_sold_comps("test", "key")
 
-        assert data["organic_results"] == [{"product_id": "99"}]
+        assert [i["itemId"] for i in data["items"]] == ["99"]
         assert call_count["n"] == 2
 
     def test_non_retryable_4xx_not_retried(self, tmp_path, monkeypatch):
@@ -3195,7 +2803,7 @@ class TestFetchRetry:
 
         with patch("sold_comps.requests.get", return_value=bad) as mock_get:
             with pytest.raises(requests.HTTPError):
-                sc.fetch("test", "key")
+                sc.fetch_sold_comps("test", "key")
             assert mock_get.call_count == 1
 
     def test_run_records_connection_error_not_crash(self, tmp_path, monkeypatch):
@@ -3204,10 +2812,10 @@ class TestFetchRetry:
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         monkeypatch.setattr(sc.time, "sleep", lambda *_: None)
 
-        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1, record_attempt=None, breaker=None):
+        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, record_attempt=None, breaker=None):
             raise requests.ConnectionError("refused")
 
-        monkeypatch.setattr(sc, "fetch", fake_fetch)
+        monkeypatch.setattr(sc, "fetch_sold_comps", fake_fetch)
 
         out = sc.fetch_book_comps(
             {"title": "ASM", "issue": "142", "year": 1975, "grade": 6.5},
@@ -3232,13 +2840,12 @@ class TestAttemptTrail:
         bad.raise_for_status = MagicMock(side_effect=requests.HTTPError(response=bad))
         return bad
 
-    def _good(self, organic_results=None, ebay_url=None):
+    def _good(self, organic_results=None):
         good = MagicMock()
         good.status_code = 200
         good.raise_for_status = MagicMock()
         good.json = MagicMock(return_value={
-            "organic_results": organic_results or [],
-            "search_metadata": {"ebay_url": ebay_url or "ok&LH_Sold=1"},
+            "items": [_sc_item(r["product_id"]) for r in (organic_results or [])],
         })
         return good
 
@@ -3274,7 +2881,7 @@ class TestAttemptTrail:
 
     def test_fetch_err_book_records_full_attempt_trail(self, tmp_path, monkeypatch):
         """BUI-537 acceptance: a fetch-err book shows its full attempt trail —
-        every physical SerpApi charge for the (only) tier that fires, not
+        every physical provider attempt for the (only) tier that fires, not
         just the last one. `title`/`issue` only (no year/grade) keeps tiers
         2-4 from firing so the count is exactly FETCH_MAX_RETRIES."""
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
@@ -3295,7 +2902,7 @@ class TestAttemptTrail:
     ):
         """BUI-537 adversarial check: a query that fails twice then succeeds
         must produce exactly 3 queries_used entries (2 error + 1 live) — one
-        per physical SerpApi charge, never double-counting the winning
+        per physical provider attempt, never double-counting the winning
         (terminal) attempt via both the retry-attempt hook AND the normal
         success path."""
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
@@ -3322,7 +2929,7 @@ class TestAttemptTrail:
     def test_record_attempt_only_fires_for_superseded_attempts(
         self, tmp_path, monkeypatch,
     ):
-        """Unit-level check directly on fetch(): record_attempt must be
+        """Unit-level check directly on fetch_sold_comps(): record_attempt must be
         called for the 503 that gets retried, but NOT for the eventual
         successful (terminal) attempt — that one is reported via the normal
         return value instead, so the caller (here, a plain collector) must
@@ -3337,7 +2944,7 @@ class TestAttemptTrail:
             return self._good()
 
         with patch("sold_comps.requests.get", side_effect=fake_get):
-            data, cache_hit, _response_fetched_at = sc.fetch(
+            data, cache_hit, _response_fetched_at = sc.fetch_sold_comps(
                 "t", "key", record_attempt=lambda outcome, detail: calls.append((outcome, detail)),
             )
         assert cache_hit is False
@@ -3347,9 +2954,9 @@ class TestAttemptTrail:
     def test_exhausted_retryable_status_not_double_recorded_by_run(
         self, tmp_path, monkeypatch,
     ):
-        """The terminal (exhausted) attempt inside fetch() is recorded ONCE
+        """The terminal (exhausted) attempt inside fetch_sold_comps() is recorded ONCE
         by _run's except-clause, not also by record_attempt — this test
-        exercises fetch_book_comps end to end (not fetch() directly) so both
+        exercises fetch_book_comps end to end (not fetch_sold_comps() directly) so both
         recording paths are live simultaneously; a double-count bug would
         show up as FETCH_MAX_RETRIES + 1 entries instead of exactly
         FETCH_MAX_RETRIES."""
@@ -3387,7 +2994,7 @@ class TestCircuitBreakerUnit:
         assert breaker.tripped is True
 
     def test_cache_hits_never_trip_or_reset(self, tmp_path, monkeypatch):
-        """Cache hits must not touch the breaker at all — fetch() should
+        """Cache hits must not touch the breaker at all — fetch_sold_comps() should
         never call record_error/record_success on a cache hit."""
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         breaker = sc._CircuitBreaker(threshold=1)
@@ -3395,11 +3002,11 @@ class TestCircuitBreakerUnit:
         good.status_code = 200
         good.raise_for_status = MagicMock()
         good.json = MagicMock(return_value={
-            "organic_results": [], "search_metadata": {"ebay_url": "ok&LH_Sold=1"},
+            "items": [],
         })
         with patch("sold_comps.requests.get", return_value=good) as mock_get:
-            sc.fetch("t", "key", breaker=breaker)  # live — resets/no-ops
-            sc.fetch("t", "key", breaker=breaker)  # cache hit
+            sc.fetch_sold_comps("t", "key", breaker=breaker)  # live — resets/no-ops
+            sc.fetch_sold_comps("t", "key", breaker=breaker)  # cache hit
         assert mock_get.call_count == 1
         assert breaker.tripped is False
 
@@ -3411,7 +3018,7 @@ class TestCircuitBreakerUnit:
         for _ in range(10):
             breaker.record_error()
         captured = capsys.readouterr()
-        assert captured.err.count("SerpApi appears down") == 1
+        assert captured.err.count("sold-comps.com appears down") == 1
 
     def test_success_after_trip_does_not_untrip(self):
         breaker = sc._CircuitBreaker(threshold=2)
@@ -3442,7 +3049,7 @@ class TestCircuitBreakerUnit:
 
         assert breaker.tripped is True
         captured = capsys.readouterr()
-        assert captured.err.count("SerpApi appears down") == 1
+        assert captured.err.count("sold-comps.com appears down") == 1
 
     def test_concurrent_success_and_error_interleaving_stays_consistent(self):
         """Adversarial: threads calling record_error() and record_success()
@@ -3483,12 +3090,12 @@ class TestCircuitBreakerFetchIntegration:
         bad.raise_for_status = MagicMock(side_effect=requests.HTTPError(response=bad))
         return bad
 
-    def _good(self, ebay_url=None):
+    def _good(self):
         good = MagicMock()
         good.status_code = 200
         good.raise_for_status = MagicMock()
         good.json = MagicMock(return_value={
-            "organic_results": [], "search_metadata": {"ebay_url": ebay_url or "ok&LH_Sold=1"},
+            "items": [],
         })
         return good
 
@@ -3496,11 +3103,11 @@ class TestCircuitBreakerFetchIntegration:
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         breaker = sc._CircuitBreaker(threshold=1)
         with patch("sold_comps.requests.get", return_value=self._good()) as mock_get:
-            sc.fetch("t", "key")  # populate cache (no breaker on this one)
+            sc.fetch_sold_comps("t", "key")  # populate cache (no breaker on this one)
             assert mock_get.call_count == 1
             breaker.record_error()  # trips immediately (threshold=1)
             assert breaker.tripped is True
-            data, cache_hit, _response_fetched_at = sc.fetch("t", "key", breaker=breaker)
+            data, cache_hit, _response_fetched_at = sc.fetch_sold_comps("t", "key", breaker=breaker)
         assert cache_hit is True
         assert mock_get.call_count == 1, "tripped breaker must not issue a live call on a cache hit"
 
@@ -3511,7 +3118,7 @@ class TestCircuitBreakerFetchIntegration:
         assert breaker.tripped is True
         with patch("sold_comps.requests.get", return_value=self._good()) as mock_get:
             with pytest.raises(sc.BreakerTrippedError):
-                sc.fetch("uncached query", "key", breaker=breaker)
+                sc.fetch_sold_comps("uncached query", "key", breaker=breaker)
         assert mock_get.call_count == 0, "no live charge for a breaker-tripped cache miss"
 
     def test_force_does_not_bypass_tripped_breaker(self, tmp_path, monkeypatch):
@@ -3519,17 +3126,17 @@ class TestCircuitBreakerFetchIntegration:
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         breaker = sc._CircuitBreaker(threshold=1)
         with patch("sold_comps.requests.get", return_value=self._good()) as mock_get:
-            sc.fetch("t", "key")  # populate cache
+            sc.fetch_sold_comps("t", "key")  # populate cache
             assert mock_get.call_count == 1
             breaker.record_error()
             assert breaker.tripped is True
             # force=True would normally bypass the cache and go live — the
             # breaker must still win, serving the cache instead.
-            data, cache_hit, _response_fetched_at = sc.fetch("t", "key", force=True, breaker=breaker)
+            data, cache_hit, _response_fetched_at = sc.fetch_sold_comps("t", "key", force=True, breaker=breaker)
             assert cache_hit is True
             assert mock_get.call_count == 1, "force must not buy a live call past a tripped breaker"
             with pytest.raises(sc.BreakerTrippedError):
-                sc.fetch("uncached and forced", "key", force=True, breaker=breaker)
+                sc.fetch_sold_comps("uncached and forced", "key", force=True, breaker=breaker)
             assert mock_get.call_count == 1, "force must not buy a live call on an uncached query either"
 
     def test_breaker_tripped_field_on_fetch_book_comps_result(self, tmp_path, monkeypatch):
@@ -3568,8 +3175,7 @@ class TestCircuitBreakerFetchIntegration:
                 good.status_code = 200
                 good.raise_for_status = MagicMock()
                 good.json = MagicMock(return_value={
-                    "organic_results": [],
-                    "search_metadata": {"ebay_url": "ok&LH_Sold=1"},
+                    "items": [],
                 })
                 return good
             raise AssertionError(
@@ -3603,7 +3209,7 @@ class TestCircuitBreakerBatchIntegration:
         good.status_code = 200
         good.raise_for_status = MagicMock()
         good.json = MagicMock(return_value={
-            "organic_results": [], "search_metadata": {"ebay_url": "ok&LH_Sold=1"},
+            "items": [],
         })
         return good
 
@@ -3655,7 +3261,7 @@ class TestCircuitBreakerBatchIntegration:
         )
 
     def test_tripped_breaker_does_not_recover_mid_batch(self, tmp_path, monkeypatch):
-        """Reliability: even if SerpApi 'recovers' partway through the batch
+        """Reliability: even if the provider 'recovers' partway through the batch
         (later requests would succeed), once tripped this run_batch() call
         stays cache-only for the remainder — no in-batch auto-heal. Recovery
         is a fresh run (a new run_batch() call, a new breaker), matching the
@@ -3673,7 +3279,7 @@ class TestCircuitBreakerBatchIntegration:
             call_state["n"] += 1
             # Once several books have exhausted retries the breaker will have
             # tripped (threshold=5, single-tier books, no cache) — from that
-            # point on, fetch() must never even call this again for a live
+            # point on, fetch_sold_comps() must never even call this again for a live
             # attempt (it should short-circuit to BreakerTrippedError first).
             if call_state["n"] > sc.CIRCUIT_BREAKER_THRESHOLD * sc.FETCH_MAX_RETRIES:
                 raise AssertionError(
@@ -3698,7 +3304,7 @@ class TestCircuitBreakerBatchIntegration:
 
 
 
-# ─── BUI-545: secondary provider (sold-comps.com) failover ───────────────────
+# ─── sold-comps.com provider (BUI-545; sole provider since BUI-1239) ─────────
 
 def _sc_item(item_id="111", title="ASM #142 FN+ Marvel 1975", price=25.0,
              ended="2026-07-25", listing_type="sold", currency="USD"):
@@ -3725,56 +3331,6 @@ def _sold_comps_good(items):
     m.raise_for_status = MagicMock()
     m.json = MagicMock(return_value={"items": items})
     return m
-
-
-def _serpapi_down():
-    """SerpApi's post-login-wall failure mode: HTTP 200 with an error field."""
-    m = MagicMock()
-    m.status_code = 200
-    m.raise_for_status = MagicMock()
-    m.json = MagicMock(return_value={"error": "eBay hasn't returned any results"})
-    return m
-
-
-def _serpapi_good(results):
-    m = MagicMock()
-    m.status_code = 200
-    m.raise_for_status = MagicMock()
-    m.json = MagicMock(return_value={
-        "organic_results": results,
-        "search_metadata": {"ebay_url": "ok&LH_Sold=1"},
-    })
-    return m
-
-
-def _route(serpapi=None, sold_comps=None):
-    """A requests.get side_effect that answers each provider's endpoint with
-    its factory — and fails LOUDLY if a provider that shouldn't be called is
-    (factory left as None)."""
-    def fake_get(url, **kwargs):
-        if url.startswith(sc.SERPAPI_ENDPOINT):
-            assert serpapi is not None, f"unexpected SerpApi call: {url}"
-            return serpapi()
-        if url.startswith(sc.SOLD_COMPS_ENDPOINT):
-            assert sold_comps is not None, f"unexpected sold-comps.com call: {url}"
-            return sold_comps()
-        raise AssertionError(f"unexpected URL: {url}")
-    return fake_get
-
-
-class TestProviderOrder:
-    def test_default(self, monkeypatch):
-        monkeypatch.delenv(sc.PROVIDERS_ENV_VAR, raising=False)
-        assert sc._provider_order() == sc.DEFAULT_PROVIDER_ORDER
-
-    def test_override_reorders(self, monkeypatch):
-        monkeypatch.setenv(sc.PROVIDERS_ENV_VAR, "sold-comps.com")
-        assert sc._provider_order() == ("sold-comps.com",)
-
-    def test_unknown_name_fails_loudly(self, monkeypatch):
-        monkeypatch.setenv(sc.PROVIDERS_ENV_VAR, "serpapi,typo-provider")
-        with pytest.raises(ValueError, match="typo-provider"):
-            sc._provider_order()
 
 
 class TestParseCompSoldComps:
@@ -3877,10 +3433,6 @@ class TestFetchSoldComps:
         args, kwargs = m.call_args
         assert "sc_key" not in args[0], "API key must never enter the URL"
         assert kwargs["headers"]["Authorization"] == "Bearer sc_key"
-
-    def test_cache_key_disjoint_from_serpapi(self):
-        assert (sc._cache_path(sc.canonical_sold_comps_url("t"))
-                != sc._cache_path(sc.canonical_serpapi_url("t")))
 
     def test_active_item_in_sold_response_is_provider_failure(self, tmp_path, monkeypatch):
         """The generalized LH_Sold=1 trap: one active-shaped item in a
@@ -4296,19 +3848,17 @@ class TestSoldCompsSemaphoreBackoffInterplay:
         assert calls["n"] == 2, "expected exactly one retry after the 429"
 
 
-class TestProviderFallback:
-    """End-to-end failover at the fetch_book_comps level, through
-    _fetch_with_fallback, with requests.get routed per endpoint."""
+class TestSoldCompsOnlyFetch:
+    """BUI-1239: every tier fetches from sold-comps.com, the only provider.
+    No SerpApi call is ever made, and every trail entry stays tagged."""
 
-    def test_default_order_serves_sold_comps_directly(self, tmp_path, monkeypatch):
-        """Default order is sold-comps.com FIRST (SerpApi's sold engine is
-        login-walled indefinitely): a healthy primary serves with ZERO
-        SerpApi calls — the router asserts none happen."""
+    def test_serves_sold_comps_and_tags_the_trail(self, tmp_path, monkeypatch):
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         with patch("sold_comps.requests.get",
-                   side_effect=_route(sold_comps=lambda: _sold_comps_good([_sc_item()]))):
-            out = sc.fetch_book_comps({"title": "ASM", "issue": "142"}, "key",
-                                      sold_comps_key="sc_k")
+                   return_value=_sold_comps_good([_sc_item()])) as m:
+            out = sc.fetch_book_comps({"title": "ASM", "issue": "142"}, "key")
+        assert all(c.args[0].startswith(sc.SOLD_COMPS_ENDPOINT)
+                   for c in m.call_args_list)
         assert len(out["comps"]) == 1
         comp = out["comps"][0]
         assert comp["product_id"] == "111"
@@ -4317,195 +3867,111 @@ class TestProviderFallback:
         assert len(entries) == 1, entries
         assert entries[0]["provider"] == "sold-comps.com"
         assert entries[0]["outcome"] == "live"
+        assert entries[0]["page"] == 1
         assert "error" not in entries[0]
 
-    def test_sold_comps_failure_falls_back_to_serpapi(self, tmp_path, monkeypatch):
-        """Reverse failover under the default order: a sold-comps.com failure
-        falls through to SerpApi, with both attempts provider-tagged."""
-        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
-
-        def sold_comps_403():
-            bad = MagicMock()
-            bad.status_code = 403
-            bad.raise_for_status = MagicMock(
-                side_effect=requests.HTTPError("quota", response=bad))
-            return bad
-
-        with patch("sold_comps.requests.get",
-                   side_effect=_route(serpapi=lambda: _serpapi_good([{
-                       "product_id": "555",
-                       "title": "ASM #142 FN Marvel",
-                       "price": {"raw": "$20.0", "extracted": 20.0},
-                   }]), sold_comps=sold_comps_403)):
-            out = sc.fetch_book_comps({"title": "ASM", "issue": "142"}, "key",
-                                      sold_comps_key="sc_k")
-        assert [c["product_id"] for c in out["comps"]] == ["555"]
-        entries = out["queries_used"]
-        assert len(entries) == 2, entries
-        assert entries[0]["provider"] == "sold-comps.com"
-        assert "error" in entries[0]
-        assert entries[1]["provider"] == "serpapi"
-        assert entries[1]["outcome"] == "live"
-        assert "error" not in entries[1]
-
-    def test_explicit_serpapi_first_order_fails_over(self, tmp_path, monkeypatch):
-        """The pre-flip order still works when pinned explicitly (the
-        EBAY_SOLD_COMPS_PROVIDERS revert path if eBay drops the wall):
-        SerpApi errors → sold-comps.com serves, trail tagged in order."""
-        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
-        with patch("sold_comps.requests.get",
-                   side_effect=_route(serpapi=_serpapi_down,
-                                      sold_comps=lambda: _sold_comps_good([_sc_item()]))):
-            out = sc.fetch_book_comps({"title": "ASM", "issue": "142"}, "key",
-                                      sold_comps_key="sc_k",
-                                      providers=("serpapi", "sold-comps.com"))
-        assert len(out["comps"]) == 1
-        entries = out["queries_used"]
-        assert len(entries) == 2, entries
-        assert entries[0]["provider"] == "serpapi"
-        assert "error" in entries[0]
-        assert entries[1]["provider"] == "sold-comps.com"
-        assert entries[1]["outcome"] == "live"
-
-    def test_both_fail_still_classifies_fetch_err(self, tmp_path, monkeypatch):
-        """BUI-545 AC: a batch where BOTH providers fail must keep the
-        BUI-536 fetch-err signal — zero comps AND every queries_used entry
-        carrying an 'error' key."""
+    def test_failure_classifies_fetch_err_with_provider_tag(self, tmp_path, monkeypatch):
+        """BUI-536: a failed fetch leaves zero comps and every queries_used
+        entry carrying an 'error' key, tagged sold-comps.com — never a
+        fallback to another provider."""
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         monkeypatch.setattr(sc.time, "sleep", lambda *_: None)
 
-        def sold_comps_403():
+        def sold_comps_403(*a, **k):
             bad = MagicMock()
             bad.status_code = 403
             bad.raise_for_status = MagicMock(
                 side_effect=requests.HTTPError("quota", response=bad))
             return bad
 
-        with patch("sold_comps.requests.get",
-                   side_effect=_route(serpapi=_serpapi_down,
-                                      sold_comps=sold_comps_403)):
-            out = sc.fetch_book_comps({"title": "ASM", "issue": "142"}, "key",
-                                      sold_comps_key="sc_k")
+        with patch("sold_comps.requests.get", side_effect=sold_comps_403) as m:
+            out = sc.fetch_book_comps({"title": "ASM", "issue": "142"}, "key")
+        assert m.call_count == 1, "a 403 is terminal: one call, no fallback"
         assert out["comps"] == []
         assert out["queries_used"], "trail must not be empty"
         assert all("error" in q for q in out["queries_used"])
-        assert ({q["provider"] for q in out["queries_used"]}
-                == {"serpapi", "sold-comps.com"})
+        assert all(q["provider"] == "sold-comps.com" for q in out["queries_used"])
 
-    def test_no_key_means_no_failover(self, tmp_path, monkeypatch):
-        """Absent SOLD_COMPS_KEY → byte-for-byte pre-BUI-545 behavior: the
-        SerpApi failure surfaces as the only trail entry and the router
-        asserts no sold-comps.com call was ever attempted."""
+    def test_genuine_zero_results_is_not_an_error(self, tmp_path, monkeypatch):
+        """BUI-536's error-vs-empty distinction: a 200 with zero items is a
+        genuine n=0 with a real success entry, not a swallowed error."""
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
-        with patch("sold_comps.requests.get",
-                   side_effect=_route(serpapi=_serpapi_down)):
-            out = sc.fetch_book_comps({"title": "ASM", "issue": "142"}, "key")
-        assert out["comps"] == []
-        assert all("error" in q for q in out["queries_used"])
-        assert all(q["provider"] == "serpapi" for q in out["queries_used"])
-
-    def test_serpapi_breaker_tripped_goes_straight_to_secondary(self, tmp_path, monkeypatch):
-        """A tripped SerpApi breaker must not dead-end the query (the old
-        BreakerTrippedError path) — it should fail over with zero SerpApi
-        HTTP calls, and the output must still flag breaker_tripped."""
-        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
-        breaker = sc._CircuitBreaker(threshold=1)
-        breaker.record_error()
-        assert breaker.tripped is True
-        with patch("sold_comps.requests.get",
-                   side_effect=_route(sold_comps=lambda: _sold_comps_good([_sc_item()]))):
-            out = sc.fetch_book_comps({"title": "ASM", "issue": "142"}, "key",
-                                      breaker=breaker, sold_comps_key="sc_k",
-                                      providers=("serpapi", "sold-comps.com"))
-        assert len(out["comps"]) == 1
-        assert out["breaker_tripped"] is True
-        assert "BreakerTrippedError" in out["queries_used"][0]["outcome"]
-        assert out["queries_used"][0]["provider"] == "serpapi"
-        assert out["queries_used"][1]["provider"] == "sold-comps.com"
-
-    def test_genuine_zero_results_does_not_failover(self, tmp_path, monkeypatch):
-        """BUI-536's error-vs-empty distinction survives the failover: a
-        200 with zero items from the primary is a genuine n=0, never a
-        second-provider probe (the router asserts no SerpApi call — and the
-        trail must show a real success entry, not a swallowed error)."""
-        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
-        with patch("sold_comps.requests.get",
-                   side_effect=_route(sold_comps=lambda: _sold_comps_good([]))):
-            out = sc.fetch_book_comps({"title": "Obscurity", "issue": "1"}, "key",
-                                      sold_comps_key="sc_k")
+        with patch("sold_comps.requests.get", return_value=_sold_comps_good([])):
+            out = sc.fetch_book_comps({"title": "Obscurity", "issue": "1"}, "key")
         assert "error" not in out, out.get("error")
         assert out["comps"] == []
         assert len(out["queries_used"]) == 1
         entry = out["queries_used"][0]
         assert entry["provider"] == "sold-comps.com"
-        assert entry["outcome"] == "hit" or entry["outcome"] == "live"
         assert "error" not in entry
 
-    def test_provider_order_override_skips_serpapi(self, tmp_path, monkeypatch):
+    def test_tripped_breaker_flags_the_book(self, tmp_path, monkeypatch):
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
-        with patch("sold_comps.requests.get",
-                   side_effect=_route(sold_comps=lambda: _sold_comps_good([_sc_item()]))):
+        breaker = sc._CircuitBreaker(threshold=1)
+        breaker.record_error()
+        with patch("sold_comps.requests.get") as m:
             out = sc.fetch_book_comps({"title": "ASM", "issue": "142"}, "key",
-                                      sold_comps_key="sc_k",
-                                      providers=("sold-comps.com",))
-        assert len(out["comps"]) == 1
-        assert all(q["provider"] == "sold-comps.com" for q in out["queries_used"])
+                                      breaker=breaker)
+        assert m.call_count == 0
+        assert out["breaker_tripped"] is True
+        assert out["queries_used"][0]["outcome"] == "error:BreakerTrippedError"
+        assert out["queries_used"][0]["provider"] == "sold-comps.com"
 
-    def test_cross_provider_dedupe_shares_item_id_namespace(self, tmp_path, monkeypatch):
-        """SerpApi product_id and sold-comps.com itemId are both the eBay
-        /itm/ number: a comp served by SerpApi in tier 1 must dedupe the same
-        item served by sold-comps.com in a later tier."""
+    def test_run_batch_passes_the_key_to_sold_comps(self, tmp_path, monkeypatch):
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
-        serpapi_calls = {"n": 0}
-
-        def serpapi_then_down():
-            serpapi_calls["n"] += 1
-            if serpapi_calls["n"] == 1:
-                return _serpapi_good([{
-                    "product_id": "111",
-                    "title": "ASM #142 FN Marvel",
-                    "price": {"raw": "$20.0", "extracted": 20.0},
-                }, {
-                    "product_id": "999",
-                    "title": "ASM #142 VG Marvel",
-                    "price": {"raw": "$8.0", "extracted": 8.0},
-                }])
-            return _serpapi_down()
-
         with patch("sold_comps.requests.get",
-                   side_effect=_route(serpapi=serpapi_then_down,
-                                      sold_comps=lambda: _sold_comps_good([_sc_item()]))):
-            # year present → tier 2 (broaden) fires because tier 1 found <5;
-            # SerpApi pinned first so tier 1 = SerpApi live, tier 2 = SerpApi
-            # down → sold-comps.com serves the overlapping item.
-            out = sc.fetch_book_comps(
-                {"title": "ASM", "issue": "142", "year": 1975}, "key",
-                sold_comps_key="sc_k",
-                providers=("serpapi", "sold-comps.com"))
-        ids = [c["product_id"] for c in out["comps"]]
-        assert ids.count("111") == 1, "same eBay item must not appear twice"
-        assert "999" in ids
-
-    def test_run_batch_threads_secondary_config(self, tmp_path, monkeypatch):
-        """run_batch resolves the key + default order itself — and under the
-        sold-comps-first default a healthy batch spends ZERO SerpApi calls
-        (the router asserts none happen)."""
-        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
-        monkeypatch.setattr(sc, "load_sold_comps_key", lambda: "sc_k")
-        with patch("sold_comps.requests.get",
-                   side_effect=_route(sold_comps=lambda: _sold_comps_good([_sc_item()]))):
-            results = sc.run_batch([{"title": "ASM", "issue": "142"}], "key",
+                   return_value=_sold_comps_good([_sc_item()])) as m:
+            results = sc.run_batch([{"title": "ASM", "issue": "142"}], "sc_k",
                                    max_workers=1)
         assert len(results[0]["comps"]) == 1
-        assert results[0]["queries_used"][-1]["provider"] == "sold-comps.com"
+        assert m.call_args.kwargs["headers"]["Authorization"] == "Bearer sc_k"
 
-    def test_run_batch_without_key_warns_once(self, tmp_path, monkeypatch, capsys):
+    def test_historic_serpapi_response_still_parses(self, tmp_path, monkeypatch):
+        """HISTORIC DATA STAYS READABLE: the comps-ledger backfill replays
+        pre-BUI-1239 SerpApi bodies through fetch_book_comps by stubbing the
+        `_fetch_query` seam. Those bodies must still pool, tagged serpapi."""
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
-        with patch("sold_comps.requests.get",
-                   side_effect=_route(serpapi=lambda: _serpapi_good([]))):
-            sc.run_batch([{"title": "X", "issue": "1"}], "key", max_workers=1)
-        err = capsys.readouterr().err
-        assert err.count("SOLD_COMPS_KEY not set") == 1
+        body = {"organic_results": [{
+            "product_id": "555", "title": "ASM #142 FN Marvel",
+            "price": {"raw": "$20.0", "extracted": 20.0},
+        }]}
+        monkeypatch.setattr(
+            sc, "_fetch_query",
+            lambda nkw, api_key, **kw: (body, False, sc.PROVIDER_SERPAPI, 1.0))
+        out = sc.fetch_book_comps({"title": "ASM", "issue": "142"}, "key")
+        assert [c["product_id"] for c in out["comps"]] == ["555"]
+        assert out["comps"][0]["provider"] == "serpapi"
+        assert out["queries_used"][0]["provider"] == "serpapi"
+
+
+class TestSoldCompsKeyRequired:
+    """BUI-1239: SOLD_COMPS_KEY is required — a missing key fails loudly
+    instead of degrading to the dead SerpApi path."""
+
+    def test_missing_key_exits_loudly(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr(sc, "__file__", str(tmp_path / "src" / "sold_comps.py"))
+        with pytest.raises(SystemExit) as excinfo:
+            sc.load_sold_comps_key()
+        assert excinfo.value.code == 2
+        assert "SOLD_COMPS_KEY not found" in capsys.readouterr().err
+
+    def test_main_without_key_exits_before_any_fetch(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr(sc, "__file__", str(tmp_path / "src" / "sold_comps.py"))
+        with patch("sold_comps.requests.get") as m:
+            with pytest.raises(SystemExit) as excinfo:
+                sc.main(["--title", "ASM", "--issue", "142", "--quiet"])
+        assert excinfo.value.code == 2
+        assert m.call_count == 0
+        assert "SOLD_COMPS_KEY" in capsys.readouterr().err
+
+    def test_env_key_is_used(self, monkeypatch):
+        monkeypatch.setenv("SOLD_COMPS_KEY", "from-env")
+        assert sc.load_sold_comps_key() == "from-env"
+
+    def test_dotenv_key_is_used(self, tmp_path, monkeypatch):
+        (tmp_path / ".env").write_text("SOLD_COMPS_KEY=from-file\n")
+        monkeypatch.setattr(sc, "__file__", str(tmp_path / "src" / "sold_comps.py"))
+        assert sc.load_sold_comps_key() == "from-file"
 
 
 # ─── BUI-581: masthead-rename probe ───────────────────────────────────────────
@@ -4567,17 +4033,14 @@ class TestAltMastheadTier:
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         calls = []
 
-        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1,
+        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0,
                        record_attempt=None, breaker=None):
             calls.append(nkw)
             idx = len(calls) - 1
             results = results_per_query[idx] if idx < len(results_per_query) else []
-            return ({
-                "organic_results": results,
-                "search_metadata": {"ebay_url": "ok&LH_Sold=1"},
-            }, False, 1234567890.0)
+            return _as_sold_comps_body(results), False, 1234567890.0
 
-        monkeypatch.setattr(sc, "fetch", fake_fetch)
+        monkeypatch.setattr(sc, "fetch_sold_comps", fake_fetch)
         return calls
 
     def test_deeper_alias_pool_replaces_a_collapsed_one(self, tmp_path, monkeypatch):
@@ -4774,17 +4237,14 @@ class TestVariantDropRetry:
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         calls = []
 
-        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1,
+        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0,
                        record_attempt=None, breaker=None):
             calls.append(nkw)
             idx = len(calls) - 1
             results = results_per_query[idx] if idx < len(results_per_query) else []
-            return ({
-                "organic_results": results,
-                "search_metadata": {"ebay_url": "ok&LH_Sold=1"},
-            }, False, 1234567890.0)
+            return _as_sold_comps_body(results), False, 1234567890.0
 
-        monkeypatch.setattr(sc, "fetch", fake_fetch)
+        monkeypatch.setattr(sc, "fetch_sold_comps", fake_fetch)
         return calls
 
     def test_dead_descriptor_is_dropped_and_reported(self, tmp_path, monkeypatch):
@@ -4888,25 +4348,18 @@ class TestCompProvenance:
     entry's own mtime on a hit, this query's own live fetch time otherwise,
     never "now" for a cache hit."""
 
-    def _serpapi_response(self, results, ebay_url="ok&LH_Sold=1"):
-        m = MagicMock()
-        m.status_code = 200
-        m.raise_for_status = MagicMock()
-        m.json = MagicMock(return_value={
-            "organic_results": results,
-            "search_metadata": {"ebay_url": ebay_url},
-        })
-        return m
+    def _response(self, results):
+        return _sold_comps_good([_as_sold_comps_item(r) for r in results])
 
     def test_live_fetch_stamps_provenance_on_each_comp(self, tmp_path, monkeypatch):
         """A live (uncached) fetch stamps from_cache=False, an observed_at
         within the run, and the provider/tier/query that produced it — going
-        through the REAL fetch()/_cache_get() machinery, not a monkeypatched
-        sc.fetch shortcut."""
+        through the REAL fetch_sold_comps()/_cache_get() machinery, not a
+        monkeypatched shortcut."""
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         before = time.time()
         with patch("sold_comps.requests.get",
-                   return_value=self._serpapi_response(
+                   return_value=self._response(
                        [{"product_id": "1", "title": "ASM #142 FN+ Marvel 1975",
                          "price": {"raw": "$12.0", "extracted": 12.0}}])):
             out = sc.fetch_book_comps(
@@ -4915,7 +4368,7 @@ class TestCompProvenance:
         after = time.time()
         assert len(out["comps"]) == 1
         comp = out["comps"][0]
-        assert comp["provider"] == sc.PROVIDER_SERPAPI
+        assert comp["provider"] == sc.PROVIDER_SOLD_COMPS
         assert comp["tier"] == "base"
         assert comp["query"] == out["queries_used"][0]["nkw"]
         assert comp["from_cache"] is False
@@ -4930,7 +4383,7 @@ class TestCompProvenance:
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         book = {"title": "ASM", "issue": "142", "year": 1975}
         with patch("sold_comps.requests.get",
-                   return_value=self._serpapi_response(
+                   return_value=self._response(
                        [{"product_id": "1", "title": "ASM #142 FN+ Marvel 1975",
                          "price": {"raw": "$12.0", "extracted": 12.0}}])):
             sc.fetch_book_comps(book, "key")  # populates the cache
@@ -4961,19 +4414,15 @@ class TestCompProvenance:
 
         # Prime the cache for the BASE query only, with an old mtime, holding
         # a single (thin) comp so tier 2 (broader) is guaranteed to fire live.
-        base_path = sc._cache_path(sc.canonical_serpapi_url(base_nkw))
-        sc._cache_put(base_path, {
-            "organic_results": [{"product_id": "cached1",
-                                  "title": "ASM #142 FN Marvel 1975",
-                                  "price": {"raw": "$10.0", "extracted": 10.0}}],
-            "search_metadata": {"ebay_url": "ok&LH_Sold=1"},
-        })
+        base_path = sc._cache_path(sc.canonical_sold_comps_url(base_nkw))
+        sc._cache_put(base_path, {"items": [_sc_item(
+            "cached1", title="ASM #142 FN Marvel 1975", price=10.0)]})
         old = time.time() - (5 * 24 * 3600)
         import os
         os.utime(base_path, (old, old))
 
         with patch("sold_comps.requests.get",
-                   return_value=self._serpapi_response(
+                   return_value=self._response(
                        [{"product_id": "live1", "title": "ASM #142 FN Marvel",
                          "price": {"raw": "$10.0", "extracted": 10.0}}])) as m:
             out = sc.fetch_book_comps(book, "key")
@@ -4997,7 +4446,7 @@ class TestCompProvenance:
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         calls = []
 
-        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1,
+        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0,
                        record_attempt=None, breaker=None):
             calls.append(nkw)
             results_per_query = [
@@ -5008,12 +4457,9 @@ class TestCompProvenance:
             ]
             idx = len(calls) - 1
             results = results_per_query[idx] if idx < len(results_per_query) else []
-            return ({
-                "organic_results": results,
-                "search_metadata": {"ebay_url": "ok&LH_Sold=1"},
-            }, False, 1234567890.0)
+            return _as_sold_comps_body(results), False, 1234567890.0
 
-        monkeypatch.setattr(sc, "fetch", fake_fetch)
+        monkeypatch.setattr(sc, "fetch_sold_comps", fake_fetch)
         out = sc.fetch_book_comps(
             {"title": "ASM", "issue": "142", "year": 1975}, "key",
         )
@@ -5024,38 +4470,6 @@ class TestCompProvenance:
         assert by_id["w1"]["query"] == calls[1]
         assert calls[0] != calls[1], "broadened query must differ from the base one"
 
-    def test_failover_stamps_the_provider_that_actually_served(
-        self, tmp_path, monkeypatch,
-    ):
-        """AC: a failover from sold-comps.com to SerpApi stamps the provider
-        that actually returned the comp — SerpApi here — never the first
-        one attempted (sold-comps.com)."""
-        monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
-
-        def sold_comps_403():
-            bad = MagicMock()
-            bad.status_code = 403
-            bad.raise_for_status = MagicMock(
-                side_effect=requests.HTTPError("quota", response=bad))
-            return bad
-
-        with patch("sold_comps.requests.get",
-                   side_effect=_route(
-                       serpapi=lambda: _serpapi_good([{
-                           "product_id": "555",
-                           "title": "ASM #142 FN Marvel",
-                           "price": {"raw": "$20.0", "extracted": 20.0},
-                       }]),
-                       sold_comps=sold_comps_403)):
-            out = sc.fetch_book_comps(
-                {"title": "ASM", "issue": "142"}, "key", sold_comps_key="sc_k",
-            )
-        assert len(out["comps"]) == 1
-        comp = out["comps"][0]
-        assert comp["product_id"] == "555"
-        assert comp["provider"] == sc.PROVIDER_SERPAPI
-        assert comp["provider"] != sc.PROVIDER_SOLD_COMPS
-
     def test_slab_comps_carry_the_same_stamps(self, tmp_path, monkeypatch):
         """The tier-4 inclusive pass routes genuine CGC/CBCS comps into
         slab_comps instead of comps — they must carry the same five
@@ -5064,7 +4478,7 @@ class TestCompProvenance:
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         calls = []
 
-        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1,
+        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0,
                        record_attempt=None, breaker=None):
             calls.append(nkw)
             idx = len(calls) - 1
@@ -5083,12 +4497,9 @@ class TestCompProvenance:
                 ],
             ]
             results = results_per_query[idx] if idx < len(results_per_query) else []
-            return ({
-                "organic_results": results,
-                "search_metadata": {"ebay_url": "ok&LH_Sold=1"},
-            }, False, 1234567890.0)
+            return _as_sold_comps_body(results), False, 1234567890.0
 
-        monkeypatch.setattr(sc, "fetch", fake_fetch)
+        monkeypatch.setattr(sc, "fetch_sold_comps", fake_fetch)
         out = sc.fetch_book_comps(
             {"title": "ASM", "issue": "142", "year": 1975}, "key",
         )
@@ -5097,13 +4508,13 @@ class TestCompProvenance:
         assert slab["product_id"] == "s1"
         for field in ("provider", "tier", "query", "from_cache", "observed_at"):
             assert field in slab, f"slab comp missing {field!r}"
-        assert slab["provider"] == sc.PROVIDER_SERPAPI
+        assert slab["provider"] == sc.PROVIDER_SOLD_COMPS
         assert slab["tier"] == "inclusive"
         assert slab["observed_at"] == 1234567890.0
 
     def test_fields_are_additive_queries_used_unchanged(self, tmp_path, monkeypatch):
         """AC: fields are additive; queries_used is unchanged. The provenance
-        stamp must not remove or alter any pre-existing comp key (parse_comp's
+        stamp must not remove or alter any pre-existing comp key (the parser's
         own output is untouched), and queries_used keeps its exact pre-BUI-657
         key set."""
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
@@ -5113,20 +4524,21 @@ class TestCompProvenance:
             "buying_format": "auction", "link": "https://x",
         }
         with patch("sold_comps.requests.get",
-                   return_value=self._serpapi_response([raw_item])):
+                   return_value=self._response([raw_item])):
             out = sc.fetch_book_comps(
                 {"title": "ASM", "issue": "142", "year": 1975}, "key",
             )
         comp = out["comps"][0]
-        parsed_alone = sc.parse_comp(raw_item)
+        parsed_alone = sc.parse_comp_sold_comps(_as_sold_comps_item(raw_item))
         for k, v in parsed_alone.items():
             assert comp[k] == v, f"pre-existing field {k!r} was altered"
         new_keys = set(comp) - set(parsed_alone)
         assert new_keys == {"provider", "tier", "query", "from_cache", "observed_at"}
-        # queries_used entries keep their pre-BUI-657 key set exactly, plus
-        # BUI-678's additive `non_usd_dropped` count.
+        # queries_used entries keep their pre-BUI-657 key set, plus BUI-678's
+        # additive `non_usd_dropped` count, minus the SerpApi-only `ebay_url`
+        # that BUI-1239 dropped (no consumer read it).
         entry = out["queries_used"][0]
-        assert {"tier", "nkw", "raw_results", "new_comps", "cached", "ebay_url",
+        assert {"tier", "nkw", "raw_results", "new_comps", "cached",
                 "page", "outcome", "provider", "non_usd_dropped"} == set(entry)
 
 
@@ -5263,17 +4675,14 @@ class TestGradedFetchMode:
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         calls = []
 
-        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1,
+        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0,
                        record_attempt=None, breaker=None):
             calls.append(nkw)
             idx = len(calls) - 1
             results = results_per_query[idx] if idx < len(results_per_query) else []
-            return ({
-                "organic_results": results,
-                "search_metadata": {"ebay_url": "ok&LH_Sold=1"},
-            }, False, 1234567890.0)
+            return _as_sold_comps_body(results), False, 1234567890.0
 
-        monkeypatch.setattr(sc, "fetch", fake_fetch)
+        monkeypatch.setattr(sc, "fetch_sold_comps", fake_fetch)
         return calls
 
     def test_runs_exactly_one_query_never_widening_tiers(self, tmp_path, monkeypatch):
@@ -5394,11 +4803,11 @@ class TestGradedFetchMode:
         monkeypatch.setattr(sc, "CACHE_DIR", tmp_path)
         monkeypatch.setattr(sc.time, "sleep", lambda *_: None)
 
-        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0, page=1,
+        def fake_fetch(nkw, api_key, *, force=False, ttl_sec=0,
                        record_attempt=None, breaker=None):
             raise requests.ConnectionError("refused")
 
-        monkeypatch.setattr(sc, "fetch", fake_fetch)
+        monkeypatch.setattr(sc, "fetch_sold_comps", fake_fetch)
 
         out = sc.fetch_book_comps(
             {"title": "Amazing Spider-Man", "issue": "50", "year": 1967,

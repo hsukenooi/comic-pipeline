@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """ebay-sold-comps: fetch eBay sold listings for a comic.
 
-Runs each query through a provider chain (BUI-545): sold-comps.com is the
-default primary — eBay's 2026-07-23 login wall killed SerpApi's logged-out
-sold engine indefinitely — with SerpApi's eBay engine (show_only=Sold) as the
-fallback tier, failing over per query on error or a tripped breaker. Order is
-configurable via EBAY_SOLD_COMPS_PROVIDERS. Caches responses per provider,
+Runs each query against sold-comps.com, the one sold-comps provider (BUI-1239
+removed the SerpApi fallback: eBay's 2026-07-23 login wall killed SerpApi's
+logged-out sold engine, and BUI-545 had already made sold-comps.com the
+primary). SOLD_COMPS_KEY is required. Caches responses,
 dedupes by product_id, applies hard-excludes, parses grades, and returns
 clean comp lists. Consumed by comic-pipeline-fmv (apps/fmv) to compute fair
 market value. Every raw provider response that HAS A BODY is also appended,
@@ -21,7 +20,7 @@ it cannot grow into a full disk.
 
 Why this lives in apps/ebay (alongside ebay-fetch):
     All eBay data fetching — live (Browse API, ebay_fetch.py) and sold
-    (SerpApi, this file) — belongs in the same app. Comic-specific FMV math
+    (sold-comps.com, this file) — belongs in the same app. Comic-specific FMV math
     and DB upsert live in apps/fmv; this file is the eBay side of that pipeline.
 """
 
@@ -79,8 +78,6 @@ def _version_string() -> str:
 
 CACHE_DIR = Path.home() / ".cache" / "ebay-sold-comps"
 DEFAULT_CACHE_TTL_SEC = 7 * 24 * 3600  # 7 days
-SERPAPI_ENDPOINT = "https://serpapi.com/search.json"
-SERPAPI_TIMEOUT_SEC = 30
 DEFAULT_MAX_WORKERS = 10
 
 # BUI-614: Tier-0 raw response capture — deliberately separate from CACHE_DIR.
@@ -137,43 +134,41 @@ CAPTURE_COMPRESS_DELAY_SEC = 60.0
 THIN_RESULTS_THRESHOLD = 5     # auto-broaden (drop year) if base returns fewer
 GRADE_TAGGED_THRESHOLD = 10    # add grade-targeted query if base returns fewer
 
-# Retry policy for transient SerpApi failures (network errors, 429/5xx). The
-# backoff schedule itself (2 ** attempt seconds) now lives in the shared
-# ebay_fetch.retry_request() helper (BUI-333) — only the attempt count stays
-# a fetch()-local knob.
+# Retry policy for transient provider failures (network errors, 429/5xx). The
+# backoff schedule itself lives in the shared ebay_fetch.retry_request()
+# helper (BUI-333), overridden for a 429 by _sold_comps_backoff_seconds
+# (BUI-701) — only the attempt count stays a local knob.
 FETCH_MAX_RETRIES = 3
 
-# BUI-535: consecutive LIVE (charged) SerpApi errors — since the last live
+# BUI-535: consecutive terminal provider errors — since the last live
 # success, across the whole batch — before the circuit breaker trips and the
 # rest of the batch is served cache-only. Calibrated against the 2026-07-24
-# outage replay (~48 charged searches, every one erroring): tripping at 5
+# SerpApi outage replay (~48 charged searches, every one erroring): tripping at 5
 # keeps total spend on a full-outage batch in the low tens rather than the
 # high forties. Some overshoot beyond exactly 5 is expected and fine — with
 # DEFAULT_MAX_WORKERS concurrent workers, several requests can already be in
 # flight before any of them observes the newly-tripped state.
 CIRCUIT_BREAKER_THRESHOLD = 5
 
-# ─── BUI-545: secondary provider (sold-comps.com) ────────────────────────────
+# ─── The sold-comps provider (sold-comps.com) ────────────────────────────────
 #
 # eBay login-walled its Sold/Completed search filters ~2026-07-23 (SerpApi
-# public-roadmap#4064), killing every logged-out scraper — SerpApi's eBay sold
-# engine included, with recovery contingent on eBay reverting. sold-comps.com
-# is the one provider with verified post-wall sold data (smoke-tested
-# 2026-07-28 against pre-wall cached SerpApi controls: 66/70 exact price
-# matches, post-wall endedAt dates, structurally distinct sold/active modes —
-# full trail on BUI-545). It is the DEFAULT PRIMARY provider behind
-# _fetch_with_fallback() (see DEFAULT_PROVIDER_ORDER below); SerpApi remains
-# in the chain as the fallback tier, taking a query only when sold-comps.com
-# errors or its breaker has tripped.
+# public-roadmap#4064), killing every logged-out scraper, SerpApi's eBay sold
+# engine included. sold-comps.com is the one provider with verified post-wall
+# sold data (smoke-tested 2026-07-28 against pre-wall cached SerpApi
+# controls: 66/70 exact price matches, post-wall endedAt dates, structurally
+# distinct sold/active modes — full trail on BUI-545). BUI-545 made it the
+# primary behind a SerpApi fallback; BUI-1239 removed that dead fallback, so
+# it is now the only live provider.
 SOLD_COMPS_ENDPOINT = "https://api.sold-comps.com/v1/scrape"
 # Their scrape is a live retrieval with observed latencies in the tens of
-# seconds — far above SerpApi's; sized to the smoke-test budget.
+# seconds; sized to the smoke-test budget.
 SOLD_COMPS_TIMEOUT_SEC = 180
-# One request at their max count replaces SerpApi's ~60/page, so the BUI-523
-# page-2 logic stays SerpApi-only (page>1 never routes to this provider).
+# One request at their max count (SerpApi returned ~60/page and needed the
+# BUI-523 page-2 fetch, removed with SerpApi in BUI-1239).
 SOLD_COMPS_COUNT = 240
 # eBay's own sold-search window is ~90 days; matching it keeps the comp
-# pool's recency profile at SerpApi parity.
+# pool's recency profile at parity with eBay's own sold search.
 SOLD_COMPS_DAYS_TO_SCRAPE = 90
 # sold-comps.com rate-limits at 60 req/min. DEFAULT_MAX_WORKERS books × up to
 # 4 tiers can burst past that on a big batch, and this semaphore ALONE only
@@ -258,22 +253,16 @@ class _RateLimiter:
 # next-slot clock that keeps ticking.
 _SOLD_COMPS_RATE_LIMITER = _RateLimiter(_SOLD_COMPS_RATE_LIMIT_PER_MIN)
 
-PROVIDER_SERPAPI = "serpapi"
 PROVIDER_SOLD_COMPS = "sold-comps.com"
-# sold-comps.com FIRST: with SerpApi's sold engine dead indefinitely behind
-# the login wall, a SerpApi-primary order would pay ~CIRCUIT_BREAKER_THRESHOLD
-# charged SerpApi errors at 30s+ apiece per batch before its breaker tripped.
-# SerpApi stays in the chain as the fallback tier, so failover remains
-# signal-driven in both directions (the BUI-545 AC); if eBay ever reverts the
-# wall, set EBAY_SOLD_COMPS_PROVIDERS=serpapi,sold-comps.com to restore
-# SerpApi primacy. (A no-key run still degrades to SerpApi-only.)
-DEFAULT_PROVIDER_ORDER = (PROVIDER_SOLD_COMPS, PROVIDER_SERPAPI)
-# Comma-ordered provider override — reorder ("serpapi,sold-comps.com") or
-# restrict to one ("sold-comps.com").
-PROVIDERS_ENV_VAR = "EBAY_SOLD_COMPS_PROVIDERS"
+# HISTORIC ONLY (BUI-1239): SerpApi is no longer fetched, but comps-ledger
+# rows, cache entries, and tier-0 captures written before BUI-1239 carry this
+# tag, and apps/fmv/scripts/backfill_comps_ledger.py replays those SerpApi-
+# shaped bodies through fetch_book_comps. The tag and its parser
+# (parse_comp) stay so that history stays readable.
+PROVIDER_SERPAPI = "serpapi"
 
 
-# ─── SERPAPI_KEY loader ──────────────────────────────────────────────────────
+# ─── SOLD_COMPS_KEY loader ───────────────────────────────────────────────────
 
 def _load_dotenv(path: Path) -> dict[str, str]:
     """Minimal .env parser (KEY=VALUE per line, no quoting). Comments + blanks ok."""
@@ -289,31 +278,13 @@ def _load_dotenv(path: Path) -> dict[str, str]:
     return out
 
 
-def load_serpapi_key() -> str:
-    """Resolve SERPAPI_KEY from env, then apps/ebay/.env."""
-    key = os.environ.get("SERPAPI_KEY")
-    if key:
-        return key
-    app_root = Path(__file__).parent.parent
-    for env_path in (app_root / ".env", app_root / ".env.local"):
-        env = _load_dotenv(env_path)
-        if env.get("SERPAPI_KEY"):
-            return env["SERPAPI_KEY"]
-    print(
-        "Error: SERPAPI_KEY not found.\n"
-        f"Set the env var or put it in {app_root}/.env",
-        file=sys.stderr,
-    )
-    sys.exit(2)
+def load_sold_comps_key() -> str:
+    """Resolve SOLD_COMPS_KEY from env, then apps/ebay/.env — or exit 2.
 
-
-def load_sold_comps_key() -> str | None:
-    """Resolve SOLD_COMPS_KEY from env, then apps/ebay/.env — or None.
-
-    Unlike load_serpapi_key() this never exits: the secondary provider is
-    optional (BUI-545). Absent key → no failover tier, and the pipeline
-    behaves exactly as the SerpApi-only one did (a SerpApi outage fetch-errs
-    instead of failing over).
+    Required since BUI-1239: sold-comps.com is the only provider, so a run
+    without its key cannot fetch anything. Failing loudly here beats the old
+    degrade-to-SerpApi path, which fetch-erred every book behind eBay's
+    login wall.
     """
     key = os.environ.get("SOLD_COMPS_KEY")
     if key:
@@ -323,25 +294,14 @@ def load_sold_comps_key() -> str | None:
         env = _load_dotenv(env_path)
         if env.get("SOLD_COMPS_KEY"):
             return env["SOLD_COMPS_KEY"]
-    return None
-
-
-def _provider_order() -> tuple[str, ...]:
-    """Resolve the provider order from PROVIDERS_ENV_VAR (default:
-    sold-comps.com primary, SerpApi fallback — see DEFAULT_PROVIDER_ORDER).
-    Unknown names fail loudly — a typo that silently dropped a provider
-    would be an invisible config bug."""
-    raw = os.environ.get(PROVIDERS_ENV_VAR, "").strip()
-    if not raw:
-        return DEFAULT_PROVIDER_ORDER
-    order = tuple(p.strip() for p in raw.split(",") if p.strip())
-    unknown = [p for p in order if p not in DEFAULT_PROVIDER_ORDER]
-    if unknown or not order:
-        raise ValueError(
-            f"{PROVIDERS_ENV_VAR} names unknown provider(s) {unknown!r} — "
-            f"valid: {', '.join(DEFAULT_PROVIDER_ORDER)}"
-        )
-    return order
+    print(
+        "Error: SOLD_COMPS_KEY not found. sold-comps.com is the only "
+        "sold-comps provider (BUI-1239), so ebay-sold-comps cannot run "
+        "without it.\n"
+        f"Set the env var or put it in {app_root}/.env",
+        file=sys.stderr,
+    )
+    sys.exit(2)
 
 
 # ─── Cache layer ──────────────────────────────────────────────────────────────
@@ -371,7 +331,7 @@ def _cache_get(path: Path, ttl_sec: int) -> tuple[dict, float] | tuple[None, Non
 
 
 def _cache_put(path: Path, data: dict) -> None:
-    """Write *data* to the SerpApi response cache (BUI-333: routed through the
+    """Write *data* to the sold-comps response cache (BUI-333: routed through the
     shared ebay_fetch.atomic_write_json() rather than a hand-rolled
     tmp→rename copy)."""
     atomic_write_json(path, data)
@@ -1058,44 +1018,11 @@ def build_query(title: str, issue: str, year: int | str | None = None,
     return " ".join(parts)
 
 
-def canonical_serpapi_url(nkw: str, *, page: int = 1) -> str:
-    """Build the SerpApi URL with deterministic param order (for cache key).
-
-    Excludes api_key from the canonical form so we don't tie cache to a
-    specific user's key. The actual request URL adds api_key separately.
-
-    BUI-523: `page` selects SerpApi's eBay-engine page-number param (`_pgn`).
-    It's omitted entirely for `page=1` — the default, and the only page any
-    pre-BUI-523 caller ever requested — so the canonical URL (and therefore
-    the cache key) is byte-for-byte unchanged for the common case; the
-    existing 7-day cache isn't invalidated by this change. Page 2+ appends
-    `_pgn` to the params, giving each page its own cache key so a page-2
-    fetch caches independently of page 1 under the same TTL (required so a
-    repeat FMV run within the TTL window doesn't re-bill SerpApi for a page
-    it already paid for).
-    """
-    params = {
-        "engine": "ebay",
-        "_nkw": nkw,
-        "show_only": "Sold",
-    }
-    if page and page > 1:
-        params["_pgn"] = page
-    canonical = urllib.parse.urlencode(sorted(params.items()))
-    return f"{SERPAPI_ENDPOINT}?{canonical}"
-
-
-def request_url(canonical: str, api_key: str) -> str:
-    sep = "&" if "?" in canonical else "?"
-    return f"{canonical}{sep}api_key={api_key}"
-
-
 def canonical_sold_comps_url(nkw: str) -> str:
     """Build the sold-comps.com request URL with deterministic param order.
 
     Doubles as the cache key (BUI-545). The API key rides the Authorization
-    header, never the URL, so unlike SerpApi there is no separate
-    request_url() step. `sold=true` is their default but is pinned explicitly
+    header, never the URL, so the cache key never ties to one user's key. `sold=true` is their default but is pinned explicitly
     so the cache key documents the semantics it was fetched under (the
     generalized LH_Sold=1 lesson). `includeCompleteListing=true` is pinned the
     same way (BUI-557) — also their default, so this is no behavior change,
@@ -1105,8 +1032,7 @@ def canonical_sold_comps_url(nkw: str) -> str:
     while `soldPrice` stayed byte-identical across those 73 OBO items and 150
     non-OBO controls. An unpinned vendor-side default flip would be a silent
     drift risk, so pin it rather than rely on the default. The endpoint host
-    makes these sha256 cache keys disjoint from every SerpApi entry — nothing
-    pre-BUI-545 is invalidated.
+    makes these sha256 cache keys disjoint from every historic SerpApi entry.
     """
     params = {
         "count": SOLD_COMPS_COUNT,
@@ -1121,42 +1047,33 @@ def canonical_sold_comps_url(nkw: str) -> str:
 
 # ─── Fetch (with cache + URL verification) ────────────────────────────────────
 
-class SerpApiError(Exception):
-    pass
+class SoldCompsError(Exception):
+    """A sold-comps fetch failure: a non-2xx after retries, an unparseable
+    body, or a response that fails sold-shape validation. BUI-1239 folded
+    the old SerpApiError base into this one class when SerpApi went away."""
 
 
-class BreakerTrippedError(SerpApiError):
-    """BUI-535: raised by fetch() when the batch circuit breaker has already
-    tripped and no cache entry covers this query. Subclasses SerpApiError so
-    every existing `except (SerpApiError, requests.RequestException)` site
-    (fetch_book_comps._run, in particular) keeps catching it unchanged — from
-    every caller's point of view this is an ordinary fetch failure, just one
-    that never actually reached SerpApi."""
-
-
-class SoldCompsError(SerpApiError):
-    """BUI-545: a sold-comps.com (secondary provider) failure. Subclasses
-    SerpApiError for the same reason BreakerTrippedError does — every
-    existing `except (SerpApiError, requests.RequestException)` site keeps
-    catching it unchanged; from a caller's point of view it is an ordinary
-    fetch failure that happens to come from the other provider."""
+class BreakerTrippedError(SoldCompsError):
+    """BUI-535: raised when the batch circuit breaker has already tripped
+    and no cache entry covers this query. Subclasses SoldCompsError so every
+    `except (SoldCompsError, requests.RequestException)` site
+    (fetch_book_comps._run, in particular) catches it as an ordinary fetch
+    failure, just one that never reached the provider."""
 
 
 class _CircuitBreaker:
-    """BUI-535: batch-scoped SerpApi outage circuit breaker.
+    """BUI-535: batch-scoped provider outage circuit breaker.
 
     One instance is created per `run_batch()` call and threaded explicitly
-    into every `fetch_book_comps()`/`fetch()` call for that batch (via the
+    into every `fetch_book_comps()`/`fetch_sold_comps()` call for that batch (via the
     `breaker=` kwarg) — NOT a module-level singleton, so each fresh batch
     starts clean regardless of what happened in a previous run.
 
     "Consecutive" is defined globally across the whole batch, not per-thread
-    or per-book: K live (charged) SerpApi errors with no live success in
-    between, counted since the last live success (or since the batch began).
-    A cache hit neither trips nor resets it — only a genuine live SerpApi
-    round trip counts, whether it's the winning attempt of a `fetch()` call or
-    one of that call's own superseded internal retries (see `fetch()`'s
-    `record_attempt`/`on_attempt` wiring) — each one is a real SerpApi charge.
+    or per-book: K terminal live errors with no live success in between,
+    counted since the last live success (or since the batch began). A cache
+    hit neither trips nor resets it, and neither does an interim retry
+    attempt (see `fetch_sold_comps()` for why only terminal failures count).
 
     Thread-safety: every read/mutation of the counter and `tripped` happens
     under one lock, so two threads whose live-errors land at the same instant
@@ -1166,21 +1083,20 @@ class _CircuitBreaker:
     impossible for two threads to both print it.
 
     Once tripped, stays tripped for the rest of this batch — it does not
-    un-trip if SerpApi recovers mid-batch (see record_success()). Recovery is
+    un-trip if the provider recovers mid-batch (see record_success()). Recovery is
     a fresh process/run_batch() call (a new, untripped breaker), matching the
     "re-run later" guidance in the printed warning.
     """
 
     def __init__(self, threshold: int = CIRCUIT_BREAKER_THRESHOLD, *,
-                 total_books: int = 0, provider_name: str = "SerpApi"):
+                 total_books: int = 0, provider_name: str = "sold-comps.com"):
         self.threshold = threshold
         self._lock = threading.Lock()
         self._consecutive_errors = 0
         self.tripped = False
         self._total_books = total_books
         self._completed_books = 0
-        # BUI-545: names the provider in the trip warning — each provider gets
-        # its own breaker instance now, so the message must say which one died.
+        # BUI-545: names the provider in the trip warning.
         self._provider_name = provider_name
 
     def should_skip_live(self) -> bool:
@@ -1188,14 +1104,14 @@ class _CircuitBreaker:
             return self.tripped
 
     def record_success(self) -> None:
-        """A genuine LIVE (charged) SerpApi call succeeded — resets the
+        """A genuine LIVE provider call succeeded — resets the
         streak. Does not clear `tripped`: once tripped, this batch stays
         cache-only for the remainder (see class docstring)."""
         with self._lock:
             self._consecutive_errors = 0
 
     def record_error(self) -> None:
-        """A genuine LIVE (charged) SerpApi call failed. Trips the breaker
+        """A genuine LIVE provider call failed terminally. Trips the breaker
         and prints the one-time loud stderr warning the instant the
         threshold is crossed — see class docstring for why this can only
         ever fire once."""
@@ -1224,177 +1140,12 @@ class _CircuitBreaker:
             self._completed_books += 1
 
 
-def fetch(nkw: str, api_key: str, *, force: bool = False,
-          ttl_sec: int = DEFAULT_CACHE_TTL_SEC, page: int = 1,
-          record_attempt=None, breaker: "_CircuitBreaker | None" = None,
-          ) -> tuple[dict, bool, float]:
-    """Fetch a SerpApi response with caching. Returns
-    (data, cache_hit, response_fetched_at).
-
-    BUI-523: `page` (default 1) selects the SerpApi page — see
-    canonical_serpapi_url for why page 1 stays byte-for-byte identical to
-    pre-BUI-523 behavior and page 2+ gets its own cache entry.
-
-    BUI-537: `record_attempt`, when given, is called as
-    `record_attempt(outcome: str, detail: str)` once for every internal retry
-    attempt this call supersedes with a further attempt — i.e. every SerpApi
-    charge that would otherwise be invisible to the caller. It is NOT called
-    for the terminal attempt (the one this function ultimately returns/raises
-    for) — the caller already learns that outcome from the normal return
-    value / raised exception, so calling the hook there too would double-
-    count that one charge.
-
-    BUI-535: `breaker`, when given, gates every live (charged) attempt through
-    the batch-scoped circuit breaker (see `_CircuitBreaker`): every charged
-    attempt (interim retry or terminal) reports success/failure to it, and a
-    tripped breaker short-circuits this call to a cache-only lookup (raising
-    `BreakerTrippedError` on a miss) — even under `force=True`, which
-    otherwise means "bypass the cache," but does not mean "bypass the
-    breaker."
-
-    BUI-657/KTD7: `response_fetched_at` is the cache entry's mtime on a hit,
-    or `time.time()` at the moment the live response was validated on a live
-    fetch — never "now" for a cache hit. A re-run of a stable book must not
-    restate three-month-old comps as observed today.
-    """
-    canonical = canonical_serpapi_url(nkw, page=page)
-    path = _cache_path(canonical)
-
-    cache_checked = False
-    if not force:
-        cached, cached_mtime = _cache_get(path, ttl_sec)
-        cache_checked = True
-        if cached is not None:
-            return cached, True, cached_mtime
-
-    if breaker is not None and breaker.should_skip_live():
-        # BUI-535: the breaker overrides --force too — once tripped, no more
-        # live SerpApi charges for the rest of this batch. Still serve a
-        # cache hit if one exists ("breaker-tripped mode must still allow
-        # cache reads") — re-check here since the `not force` branch above
-        # may have skipped the cache lookup entirely (force=True).
-        if not cache_checked:
-            cached, cached_mtime = _cache_get(path, ttl_sec)
-            if cached is not None:
-                return cached, True, cached_mtime
-        raise BreakerTrippedError(
-            "SerpApi circuit breaker tripped (BUI-535) — no cache entry for "
-            "this query; skipping the live fetch for the rest of this batch."
-        )
-
-    def _on_retry_attempt(attempt, resp, exc):
-        # BUI-535: every physical charge (interim or terminal) reports to the
-        # breaker — retry_request only invokes this hook when about to retry,
-        # which by construction is always an error signal.
-        if breaker is not None:
-            breaker.record_error()
-        if record_attempt is None:
-            return
-        # BUI-537: translate this superseded attempt into a trail entry. A
-        # retryable-status response has no exception object yet (retry_request
-        # only inspects status_code, never calls raise_for_status() itself) —
-        # synthesize the same HTTPError raise_for_status() would raise so the
-        # recorded outcome/class matches exactly what the terminal path would
-        # have recorded had THIS attempt been the last one.
-        if exc is not None:
-            record_attempt(f"error:{type(exc).__name__}", str(exc))
-        else:
-            try:
-                resp.raise_for_status()
-            except requests.exceptions.RequestException as http_exc:
-                record_attempt(f"error:{type(http_exc).__name__}", str(http_exc))
-
-    # BUI-333: retry/backoff routed through the shared ebay_fetch.retry_request()
-    # helper rather than the hand-rolled loop this used to have. retry_request()
-    # only classifies retryable vs. non-retryable *status codes* — it never calls
-    # resp.raise_for_status() itself — so raise_for_status() is still called
-    # explicitly below, reproducing the original "raise HTTPError on any non-2xx"
-    # behavior exactly, including an un-retried 4xx raising immediately. One
-    # intentional widening: the original narrowly caught (requests.Timeout,
-    # requests.ConnectionError) as the retryable network-error types;
-    # retry_request's retry_network_errors=True catches any
-    # requests.exceptions.RequestException, matching the broader catch
-    # get_token()/fetch_item_with_status() already use in ebay_fetch.py. The
-    # extra types that catch admits (TooManyRedirects, ChunkedEncodingError,
-    # ...) can't arise from this internally-built URL in practice; treating
-    # them as retryable rather than immediately fatal is strictly safer.
-    try:
-        resp = retry_request(
-            lambda: requests.get(request_url(canonical, api_key), timeout=SERPAPI_TIMEOUT_SEC),
-            retries=FETCH_MAX_RETRIES,
-            is_retryable_status=lambda code: code == 429 or code >= 500,
-            retry_network_errors=True,
-            on_attempt=_on_retry_attempt,
-        )
-    except RetryExhausted as exc:
-        if exc.network_error is not None:
-            # BUI-535: this IS the terminal attempt (on_attempt above is never
-            # called for it) — record it here, exactly once, before re-raising.
-            if breaker is not None:
-                breaker.record_error()
-            raise exc.network_error from exc
-        # Retries exhausted on a persistently retryable (429/5xx) status —
-        # fall through to the same raise_for_status() call below, which
-        # raises the equivalent HTTPError (same status/message a caller
-        # would have seen from the original hand-rolled loop). breaker.
-        # record_error() for THIS terminal attempt happens there (not here)
-        # to avoid double-counting it.
-        resp = exc.response
-
-    try:
-        resp.raise_for_status()
-
-        data = resp.json()
-
-        # BUI-628/KTD12: capture the raw body BEFORE deciding whether it's
-        # shape-valid — a response that fails our own checks (an "error" key,
-        # a dropped LH_Sold=1) is exactly the provider-drift signal tier 0
-        # exists to preserve, and it was previously discarded here. Compute
-        # the validation outcome first, capture unconditionally with it, THEN
-        # raise if invalid — a network error with no body (raise_for_status()
-        # above, or resp.json() itself) never reaches this point, so it still
-        # captures nothing, unchanged from before.
-        validation_error = None
-        if "error" in data:
-            validation_error = f"SerpApi error: {data['error']}"
-        else:
-            # Verify the eBay URL actually has LH_Sold=1 — SerpApi silently
-            # drops LH_* params if you pass them directly, and a missing sold
-            # filter returns active listings (FMV will be wrong, typically
-            # far too low).
-            ebay_url = data.get("search_metadata", {}).get("ebay_url", "")
-            if "LH_Sold=1" not in ebay_url:
-                validation_error = (
-                    f"Sold filter not applied — eBay URL missing LH_Sold=1.\n"
-                    f"  ebay_url={ebay_url}\n"
-                    f"  query={nkw}\n"
-                    "Use show_only=Sold (LH_Sold=1 / LH_Complete=1 are silently dropped)."
-                )
-        _capture_raw_response(
-            PROVIDER_SERPAPI, nkw, canonical, data,
-            validation=validation_error or "ok",
-        )
-        if validation_error is not None:
-            raise SerpApiError(validation_error)
-    except (SerpApiError, requests.RequestException):
-        if breaker is not None:
-            breaker.record_error()
-        raise
-
-    if breaker is not None:
-        breaker.record_success()
-
-    fetched_at = time.time()
-    _cache_put(path, data)
-    return data, False, fetched_at
-
-
-# ─── Secondary provider fetch + failover orchestration (BUI-545) ─────────────
+# ─── sold-comps.com fetch (BUI-545) ───────────────────────────────────────────
 
 def _verify_sold_comps_shape(nkw: str, data: dict) -> None:
     """R11-style structural sold-verification for a sold-comps.com response.
 
-    The analog of fetch()'s LH_Sold=1 check: every item in a sold=true
+    The analog of the old SerpApi LH_Sold=1 check: every item in a sold=true
     response must be sold-SHAPED — listingType "sold" with a soldPrice and an
     endedAt. One active listing blended into a comp pool corrupts FMV
     silently (the generalized LH_Sold=1 silently-dropped trap), so any
@@ -1454,20 +1205,26 @@ def fetch_sold_comps(nkw: str, api_key: str, *, force: bool = False,
     """Fetch a sold-comps.com response with caching. Returns
     (data, cache_hit, response_fetched_at).
 
-    Mirrors fetch()'s contract (own cache key → breaker gate → live with the
-    same retry policy) with one deliberate asymmetry: this breaker counts
-    TERMINAL failures only, never interim retry attempts. sold-comps.com
-    rate-limits at 60 req/min, so a concurrent batch can 429 transiently and
-    recover on the existing backoff — an interim 429 is neither charged nor
-    outage evidence, and counting it would trip the breaker spuriously on any
-    large batch. (SerpApi's breaker counts every attempt because every
-    attempt IS a charge there.) `record_attempt` still fires for superseded
-    retry attempts — the trail stays a full attempt trail (BUI-537); trail
-    recording and breaker accounting are simply decoupled here.
+    Contract: own cache key → breaker gate → live with retries. The breaker
+    counts TERMINAL failures only, never interim retry attempts.
+    sold-comps.com rate-limits at 60 req/min, so a concurrent batch can 429
+    transiently and recover on the backoff — an interim 429 is neither
+    charged nor outage evidence, and counting it would trip the breaker
+    spuriously on any large batch. `record_attempt`, when given, is called as
+    `record_attempt(outcome: str, detail: str)` once for every superseded
+    retry attempt — the trail stays a full attempt trail (BUI-537); trail
+    recording and breaker accounting are decoupled. It is NOT called for the
+    terminal attempt: the caller learns that outcome from the return value
+    or the raised exception.
 
-    BUI-657/KTD7: `response_fetched_at` mirrors fetch()'s contract — the
-    cache entry's mtime on a hit, `time.time()` at successful validation on a
-    live fetch.
+    BUI-535: a tripped `breaker` short-circuits this call to a cache-only
+    lookup (raising `BreakerTrippedError` on a miss) — even under
+    `force=True`, which means "bypass the cache", not "bypass the breaker".
+
+    BUI-657/KTD7: `response_fetched_at` is the cache entry's mtime on a hit,
+    or `time.time()` at successful validation on a live fetch — never "now"
+    for a cache hit, so a re-run of a stable book does not restate old comps
+    as observed today.
     """
     canonical = canonical_sold_comps_url(nkw)
     path = _cache_path(canonical)
@@ -1480,7 +1237,8 @@ def fetch_sold_comps(nkw: str, api_key: str, *, force: bool = False,
             return cached, True, cached_mtime
 
     if breaker is not None and breaker.should_skip_live():
-        # Same force-does-not-bypass-the-breaker semantics as fetch().
+        # force does not bypass the breaker; still serve a cache hit if one
+        # exists (the `not force` branch above may have skipped the lookup).
         if not cache_checked:
             cached, cached_mtime = _cache_get(path, ttl_sec)
             if cached is not None:
@@ -1543,8 +1301,8 @@ def fetch_sold_comps(nkw: str, api_key: str, *, force: bool = False,
         resp.raise_for_status()
         data = resp.json()
 
-        # BUI-628/KTD12: capture ahead of the shape check — mirrors fetch()'s
-        # matching comment above. A shape-invalid body is provider-drift
+        # BUI-628/KTD12: capture ahead of the shape check. A shape-invalid
+        # body is provider-drift
         # evidence tier 0 exists to keep, tagged with the validation outcome
         # instead of being silently discarded as it was before. A non-2xx or
         # unparseable body never reaches this point, so it still captures
@@ -1560,9 +1318,8 @@ def fetch_sold_comps(nkw: str, api_key: str, *, force: bool = False,
         )
         if validation_error is not None:
             raise SoldCompsError(validation_error)
-    except (SerpApiError, requests.RequestException):
-        # (SoldCompsError subclasses SerpApiError.) A terminal failure — the
-        # one kind this provider's breaker counts. Covers a non-2xx after
+    except (SoldCompsError, requests.RequestException):
+        # A terminal failure — the one kind the breaker counts. Covers a non-2xx after
         # retries (incl. 401 bad key / 403 quota exhausted), an unparseable
         # body, and a shape violation.
         if breaker is not None:
@@ -1577,80 +1334,40 @@ def fetch_sold_comps(nkw: str, api_key: str, *, force: bool = False,
     return data, False, fetched_at
 
 
-def _fetch_with_fallback(nkw: str, api_key: str, *, force: bool = False,
-                         ttl_sec: int = DEFAULT_CACHE_TTL_SEC, page: int = 1,
-                         record_attempt=None,
-                         breaker: "_CircuitBreaker | None" = None,
-                         sold_comps_key: str | None = None,
-                         sold_comps_breaker: "_CircuitBreaker | None" = None,
-                         providers: tuple = DEFAULT_PROVIDER_ORDER,
-                         ) -> tuple[dict, bool, str, float]:
-    """Run one query through the provider chain (BUI-545). Returns
-    (data, cache_hit, provider, response_fetched_at): `provider` names who
-    served, so the caller can parse the raw response with the right
-    extractor and tag the trail; `response_fetched_at` (BUI-657/KTD7) is
-    whichever provider's own fetch time — cache mtime on a hit, live fetch
-    time otherwise.
+def _fetch_query(nkw: str, api_key: str, *, force: bool = False,
+                 ttl_sec: int = DEFAULT_CACHE_TTL_SEC,
+                 record_attempt=None,
+                 breaker: "_CircuitBreaker | None" = None,
+                 ) -> tuple[dict, bool, str, float]:
+    """Fetch one query from sold-comps.com. Returns
+    (data, cache_hit, provider, response_fetched_at).
 
-    Failover fires on EXCEPTION only — a 200 with zero results from either
-    provider is a genuine n=0 (BUI-536's error-vs-empty distinction), never
-    a second-provider probe: anything else would double-spend on every
-    legitimately thin vintage query. A provider failure that a further
-    provider supersedes is recorded through `record_attempt(outcome, detail,
-    provider)` — exactly the BUI-537 superseded-attempt semantics, extended
-    with a provider tag. The LAST provider's failure is NOT recorded here:
-    the caller learns it from the raised exception (which carries a
-    `.provider` attribute for its trail entry), so recording it too would
-    double-count. A no-key run degrades to the SerpApi-only chain, byte-for-
-    byte pre-BUI-545 behavior.
+    The single seam every fetch_book_comps tier funnels through.
+    `provider` names whose bytes `data` is, so `_run` parses with the right
+    extractor and stamps the trail. Live fetches are always sold-comps.com
+    (BUI-1239); the provider slot stays because
+    apps/fmv/scripts/backfill_comps_ledger.py stubs this seam to replay
+    historic SerpApi-shaped responses through the live pooling code.
+
+    `record_attempt`, when given, is called as
+    `record_attempt(outcome, detail, provider)` for each superseded retry
+    attempt (BUI-537). A terminal failure is raised with a `.provider`
+    attribute so the caller can tag its own trail entry.
     """
-    active = []
-    for p in providers:
-        if p == PROVIDER_SOLD_COMPS:
-            if not sold_comps_key:
-                continue
-            if page > 1:
-                # BUI-523 pagination is SerpApi-shaped; one SOLD_COMPS_COUNT
-                # request already covers what a page 2 would add.
-                continue
-        active.append(p)
-    if not active:
-        raise SerpApiError(
-            "no sold-comps provider available for this query "
-            f"(providers={providers!r}, page={page})"
+    if record_attempt is None:
+        hook = None
+    else:
+        def hook(outcome, detail):
+            record_attempt(outcome, detail, PROVIDER_SOLD_COMPS)
+    try:
+        data, cache_hit, response_fetched_at = fetch_sold_comps(
+            nkw, api_key, force=force, ttl_sec=ttl_sec,
+            record_attempt=hook, breaker=breaker,
         )
-
-    last_exc: Exception | None = None
-    for i, provider in enumerate(active):
-        if record_attempt is None:
-            hook = None
-        else:
-            # Bind this provider into the 2-arg hook fetch()/fetch_sold_comps()
-            # expect, so their interim-retry entries carry the provider tag too.
-            def hook(outcome, detail, _provider=provider):
-                record_attempt(outcome, detail, _provider)
-        try:
-            if provider == PROVIDER_SERPAPI:
-                data, cache_hit, response_fetched_at = fetch(
-                    nkw, api_key, force=force, ttl_sec=ttl_sec, page=page,
-                    record_attempt=hook, breaker=breaker,
-                )
-            else:
-                data, cache_hit, response_fetched_at = fetch_sold_comps(
-                    nkw, sold_comps_key, force=force, ttl_sec=ttl_sec,
-                    record_attempt=hook, breaker=sold_comps_breaker,
-                )
-            return data, cache_hit, provider, response_fetched_at
-        except (SerpApiError, requests.RequestException) as e:
-            e.provider = provider
-            if i == len(active) - 1:
-                if last_exc is not None:
-                    raise e from last_exc
-                raise
-            if record_attempt is not None:
-                record_attempt(f"error:{type(e).__name__}", str(e), provider)
-            last_exc = e
-    raise AssertionError("unreachable: the loop always returns or raises")
+    except (SoldCompsError, requests.RequestException) as e:
+        e.provider = PROVIDER_SOLD_COMPS
+        raise
+    return data, cache_hit, PROVIDER_SOLD_COMPS, response_fetched_at
 
 
 # ─── Hard excludes ────────────────────────────────────────────────────────────
@@ -2089,7 +1806,11 @@ def _is_non_usd_serpapi_result(result: dict) -> bool:
 
 
 def parse_comp(result: dict) -> dict | None:
-    """Convert a SerpApi organic_result into our normalized comp shape."""
+    """Convert a SerpApi organic_result into our normalized comp shape.
+
+    HISTORIC ONLY since BUI-1239: no live fetch returns SerpApi data. Kept
+    so pre-BUI-1239 SerpApi responses (cache, tier-0 captures, the comps
+    ledger backfill) stay parseable."""
     title = result.get("title", "")
     if not title:
         return None
@@ -2196,22 +1917,6 @@ def _is_non_usd_sold_comps_item(item: dict) -> bool:
         return False
     currency = str(item.get("soldCurrency") or "").strip()
     return bool(currency) and currency.upper() != "USD"
-
-
-def _has_next_page(data: dict) -> bool:
-    """True when SerpApi's response indicates a further result page exists.
-
-    BUI-523: SerpApi's eBay engine echoes both eBay's own `pagination` object
-    and its own `serpapi_pagination` mirror; the latter's `next` field is the
-    authoritative "is page 1 full, i.e. does page 2 exist" signal. This
-    trusts SerpApi's own pagination resolution rather than reverse-engineering
-    a "full page" guess from a raw result-count threshold (eBay's per-page
-    count isn't a fixed constant we control, since `_ipg` is left at its
-    default). A missing/empty pagination object fails CLOSED — no page-2
-    fetch, no extra SerpApi spend — rather than guessing there's more.
-    """
-    pagination = data.get("serpapi_pagination") or {}
-    return bool(pagination.get("next"))
 
 
 # A genuine slab listing names its certifier (CGC/CBCS) in the title. BUI-524's
@@ -2474,10 +2179,7 @@ def _should_broaden(comps: list[dict], year: int | None) -> bool:
 
 def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
                      ttl_sec: int = DEFAULT_CACHE_TTL_SEC,
-                     breaker: "_CircuitBreaker | None" = None,
-                     sold_comps_key: str | None = None,
-                     sold_comps_breaker: "_CircuitBreaker | None" = None,
-                     providers: tuple = DEFAULT_PROVIDER_ORDER) -> dict:
+                     breaker: "_CircuitBreaker | None" = None) -> dict:
     """Run the three-tier query strategy for one book.
 
     1. Base query (always): "title issue" year publisher
@@ -2485,16 +2187,8 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
     3. Grade-targeted (if <10 grade-tagged comps after parsing base): add grade label
 
     Tiers 2 and 3 are conditional. Most modern books need only tier 1.
-
-    BUI-523: after tier 1, a gated page-2 fetch of the SAME base query fires
-    ONLY when SerpApi confirms page 1 was full (a next page exists — see
-    _has_next_page) AND the comp pool is still short on grade-tagged comps
-    (< GRADE_TAGGED_THRESHOLD) — i.e. only when a liquid book's comp supply
-    is genuinely capped by the single-page fetch AND the extra page is
-    likely to help. A thin (non-full) page 1 — the common vintage-book case
-    — never has a next page, so it costs zero extra SerpApi searches. Capped
-    at exactly one extra page (never page 3+) to bound spend against the
-    250/month SerpApi quota.
+    (BUI-1239 removed BUI-523's gated page-2 fetch: it was SerpApi-only, and
+    one sold-comps.com request at SOLD_COMPS_COUNT already covers it.)
 
     BUI-524: after tiers 1-3, a conditional 4th "inclusive" tier fires ONLY for
     a vintage book (pre-_VINTAGE_YEAR_CUTOFF) whose raw pool is still thin
@@ -2527,7 +2221,7 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
     letting a variant-blind number be written silently.
 
     BUI-537/535: every tier routes through the same `_run` closure, so every
-    fetch attempt — including retry attempts that fire *inside* `fetch()` and
+    fetch attempt — including retry attempts that fire *inside* the fetch and
     the always-on cross-check/inclusive tier — gets the same trail recording
     and the same circuit-breaker gating. The whole body below is wrapped in a
     try/except so an unexpected exception (e.g. a malformed `book`) still
@@ -2536,15 +2230,10 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
     per-book exception boundary used to zero this to `[]` because a raised
     exception never reached this function's normal `return` below.
 
-    BUI-545: every tier also routes through `_fetch_with_fallback`, so each
-    query runs the provider chain — sold-comps.com primary by default (see
-    DEFAULT_PROVIDER_ORDER), SerpApi as the fallback tier — failing over
-    per query on error when `sold_comps_key` is provided (see that
-    function's docstring). Every
-    `queries_used` entry now carries a `provider` tag; `breaker_tripped` in
-    the output is the OR of both providers' breakers ("this book was affected
-    by an outage" keeps its meaning for consumers). Default kwargs (no key,
-    DEFAULT_PROVIDER_ORDER) reproduce pre-BUI-545 behavior exactly.
+    BUI-545/1239: every tier routes through `_fetch_query` (sold-comps.com;
+    `api_key` is the SOLD_COMPS_KEY). Every `queries_used` entry carries a
+    `provider` tag, and every entry carries `page: 1` for back-compat with
+    readers of the BUI-537 trail shape.
     """
     queries_used: list[dict] = []
     seen_ids: set[str] = set()
@@ -2591,10 +2280,7 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
     non_usd_dropped_total = 0
 
     def _breaker_tripped() -> bool:
-        # BUI-545: OR of both providers' breakers — either one tripping means
-        # this book was (at least partly) served under outage conditions.
-        return bool(breaker is not None and breaker.tripped) or bool(
-            sold_comps_breaker is not None and sold_comps_breaker.tripped)
+        return bool(breaker is not None and breaker.tripped)
 
     try:
         title = book["title"]
@@ -2634,61 +2320,51 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
         if self_id:
             seen_ids.add(self_id)
 
-        def _run(tier: str, nkw: str, *, page: int = 1, route_slabs: bool = False) -> dict:
+        def _run(tier: str, nkw: str, *, route_slabs: bool = False) -> int:
             def _record_retry_attempt(outcome: str, detail: str,
                                       provider: str) -> None:
                 # BUI-537: an attempt this call's own fetch superseded with a
-                # further attempt (an internal retry, or — BUI-545 — a failed
-                # provider a later provider replaced): a real charge/attempt
-                # that would otherwise be invisible.
+                # further attempt (an internal retry): a real attempt that
+                # would otherwise be invisible.
                 queries_used.append({
                     "tier": tier,
                     "nkw": nkw,
-                    "page": page,
+                    "page": 1,
                     "outcome": outcome,
                     "error": detail,
                     "provider": provider,
                 })
 
             try:
-                # BUI-523 note: page defaults to 1, so always forwarding
-                # page=page is byte-identical to the old page==1 branch that
-                # omitted the kwarg — collapsed now that this call also needs
-                # to thread record_attempt/breaker uniformly.
-                data, cache_hit, provider, response_fetched_at = _fetch_with_fallback(
-                    nkw, api_key, force=force, ttl_sec=ttl_sec, page=page,
+                data, cache_hit, provider, response_fetched_at = _fetch_query(
+                    nkw, api_key, force=force, ttl_sec=ttl_sec,
                     record_attempt=_record_retry_attempt, breaker=breaker,
-                    sold_comps_key=sold_comps_key,
-                    sold_comps_breaker=sold_comps_breaker,
-                    providers=providers,
                 )
-            except (SerpApiError, requests.RequestException) as e:
-                # BUI-537: page (int) and outcome are now always present,
-                # including on page-1 entries — tier/nkw/error unchanged for
-                # back-compat (BUI-536's _is_fetch_error keys on 'error').
-                # BUI-545: provider = whose terminal failure this was
-                # (attached by _fetch_with_fallback; None only for an
-                # availability error raised before any provider ran).
+            except (SoldCompsError, requests.RequestException) as e:
+                # BUI-537: page and outcome are always present — tier/nkw/
+                # error unchanged for back-compat (BUI-536's _is_fetch_error
+                # keys on 'error').
                 queries_used.append({
                     "tier": tier,
                     "nkw": nkw,
-                    "page": page,
+                    "page": 1,
                     "outcome": f"error:{type(e).__name__}",
                     "error": str(e),
-                    "provider": getattr(e, "provider", None),
+                    "provider": getattr(e, "provider", PROVIDER_SOLD_COMPS),
                 })
-                return {"added": 0, "has_next_page": False}
-            # BUI-545: parse the raw response with the serving provider's
-            # extractor — the comp shape downstream of this point is
-            # provider-independent.
-            if provider == PROVIDER_SOLD_COMPS:
-                raw_results = data.get("items", [])
-                parse = parse_comp_sold_comps
-                is_non_usd = _is_non_usd_sold_comps_item
-            else:
+                return 0
+            # Parse with the serving provider's extractor — the comp shape
+            # downstream of this point is provider-independent. Live data is
+            # always sold-comps.com; the SerpApi branch only serves the
+            # backfill's historic replay (see PROVIDER_SERPAPI).
+            if provider == PROVIDER_SERPAPI:
                 raw_results = data.get("organic_results", [])
                 parse = parse_comp
                 is_non_usd = _is_non_usd_serpapi_result
+            else:
+                raw_results = data.get("items", [])
+                parse = parse_comp_sold_comps
+                is_non_usd = _is_non_usd_sold_comps_item
             added = 0
             # BUI-678: counted separately from the ordinary "no title" / "bad
             # price" None-returns above, so a currency-specific rejection has
@@ -2843,17 +2519,11 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
                 # this gate never touched (the common case).
                 "non_usd_dropped": non_usd_dropped,
                 "cached": cache_hit,
-                # SerpApi-only field; "" for a sold-comps.com response (its
-                # data has no search_metadata).
-                "ebay_url": data.get("search_metadata", {}).get("ebay_url", ""),
-                "page": page,
+                "page": 1,
                 "outcome": "hit" if cache_hit else "live",
                 "provider": provider,
             })
-            # _has_next_page fails closed on a sold-comps.com response (no
-            # serpapi_pagination object) — the BUI-523 page-2 gate stays
-            # SerpApi-only without a special case here.
-            return {"added": added, "has_next_page": _has_next_page(data)}
+            return added
 
         # Tier 1 — base. BUI-929: a certified target passes `graded_target`
         # (see build_query's docstring) and routes every `_is_slab_comp` hit
@@ -2864,25 +2534,15 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
         base_nkw = build_query(title, issue, year=year, publisher=publisher,
                                variant=variant, exclude_graded=exclude_graded,
                                graded_target=graded_target)
-        base_result = _run("base", base_nkw, route_slabs=bool(graded_target))
+        _run("base", base_nkw, route_slabs=bool(graded_target))
 
-        # BUI-929: a certified target runs the base tier ONLY — no page-2,
-        # no broaden, no alt-masthead, no grade-targeted, no variant-drop.
+        # BUI-929: a certified target runs the base tier ONLY — no broaden, no alt-masthead, no grade-targeted, no variant-drop.
         # Those tiers all exist to widen a RAW pool; a certified target's
         # pool is the certifier's own sale history, which the base query
         # above already queries inclusively (no excludes, certifier as a
         # positive term), so widening further would only spend extra
         # provider quota without changing what's being searched for.
         if not graded_target:
-            # BUI-523: gated page-2 fetch of the SAME base query — see the
-            # fetch_book_comps docstring for the full spend-gate rationale.
-            # Placed here (before tiers 2/3) so any comps it adds are already
-            # in `comps` when tiers 2/3 recompute their own thin/grade-tagged
-            # counts below.
-            grade_tagged_after_base = sum(1 for c in comps if c["grade"] is not None)
-            if base_result["has_next_page"] and grade_tagged_after_base < GRADE_TAGGED_THRESHOLD:
-                _run("base", base_nkw, page=2)
-
             # Tier 2 — auto-broaden if thin. BUI-350: pass the real
             # `vintage_year` (even though the query text drops `year`) so a
             # rebootable-masthead vintage key's broadened query keeps the
@@ -2972,7 +2632,7 @@ def fetch_book_comps(book: dict, api_key: str, *, force: bool = False,
 
         # Tier 4 — conditional inclusive pass (BUI-524). See the
         # fetch_book_comps docstring for the full rationale. Gated tightly
-        # against the 250/month SerpApi quota: fires only for a vintage book
+        # against provider spend: fires only for a vintage book
         # (own cover year, not the query-text year tiers 2/3 may have
         # dropped) whose raw pool is STILL thin after tiers 1-3, and only on
         # a normal (non-`include_graded`) call — an explicit graded-only pass
@@ -3165,40 +2825,20 @@ def run_batch(books: list[dict], api_key: str, *, force: bool = False,
     BUI-535: one `_CircuitBreaker` is created here and threaded explicitly
     into every `fetch_book_comps()` call for this batch — scoped to this one
     `run_batch()` call, not a module-level singleton, so a fresh invocation
-    (e.g. a re-run after "SerpApi appears down") always starts with a clean,
-    untripped breaker. `force` does not exempt a book from it (see fetch()).
-
-    BUI-545: the secondary provider's config resolves ONCE per batch here —
-    provider order from the env, key from load_sold_comps_key(), and its own
-    breaker (same threshold, terminal-failures-only accounting; see
-    fetch_sold_comps). No key → no failover tier (pre-BUI-545 behavior), with
-    a one-line stderr nudge so the degradation is visible.
+    (e.g. a re-run after "sold-comps.com appears down") always starts with a
+    clean, untripped breaker. `force` does not exempt a book from it (see
+    fetch_sold_comps()). `api_key` is the SOLD_COMPS_KEY (see
+    load_sold_comps_key()).
     """
     results: list[dict] = [None] * len(books)
-    breaker = _CircuitBreaker(CIRCUIT_BREAKER_THRESHOLD, total_books=len(books))
-    providers = _provider_order()
-    sold_comps_key = (load_sold_comps_key()
-                      if PROVIDER_SOLD_COMPS in providers else None)
-    sold_comps_breaker = None
-    if sold_comps_key:
-        sold_comps_breaker = _CircuitBreaker(
-            CIRCUIT_BREAKER_THRESHOLD, total_books=len(books),
-            provider_name=PROVIDER_SOLD_COMPS,
-        )
-    elif PROVIDER_SOLD_COMPS in providers:
-        print(
-            "note: SOLD_COMPS_KEY not set — running without the "
-            "sold-comps.com provider (BUI-545). SerpApi's sold engine has "
-            "been login-walled since 2026-07-23, so expect fetch-errs until "
-            "a key is configured (apps/ebay/.env).",
-            file=sys.stderr,
-        )
+    breaker = _CircuitBreaker(
+        CIRCUIT_BREAKER_THRESHOLD, total_books=len(books),
+        provider_name=PROVIDER_SOLD_COMPS,
+    )
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {
             pool.submit(fetch_book_comps, b, api_key, force=force, ttl_sec=ttl_sec,
-                       breaker=breaker, sold_comps_key=sold_comps_key,
-                       sold_comps_breaker=sold_comps_breaker,
-                       providers=providers): i
+                        breaker=breaker): i
             for i, b in enumerate(books)
         }
         for fut in as_completed(futures):
@@ -3221,9 +2861,7 @@ def run_batch(books: list[dict], api_key: str, *, force: bool = False,
                     "input": book,
                     "queries_used": [],
                     "comps": [],
-                    "breaker_tripped": bool(breaker.tripped) or bool(
-                        sold_comps_breaker is not None
-                        and sold_comps_breaker.tripped),
+                    "breaker_tripped": bool(breaker.tripped),
                     "error": str(e),
                 }
     return results
@@ -3242,26 +2880,7 @@ def _print_human(results: list[dict]) -> None:
             continue
         n_total = len(r["comps"])
         n_graded = sum(1 for c in r["comps"] if c["grade"] is not None)
-        # BUI-523: a page-2 entry shares its tier's name (e.g. "base") with
-        # its own page-1 entry — tag it "(pN)" here so a human skimming
-        # --quiet=false output can see the gated extra-page fetch fired,
-        # without changing the stored "tier"/"page" fields other consumers
-        # read. BUI-537 made `page` always present (including page 1) — only
-        # tag when it's not the implicit default, or every entry would show
-        # "(p1)". BUI-545: likewise tag entries the non-default provider
-        # served (e.g. "base[serpapi]") so a failover is visible at a
-        # glance; the default primary stays untagged to keep the common
-        # case terse.
-        def _tier_label(q: dict) -> str:
-            label = q["tier"]
-            if q.get("page", 1) != 1:
-                label += f'(p{q["page"]})'
-            prov = q.get("provider")
-            if prov and prov != DEFAULT_PROVIDER_ORDER[0]:
-                label += f"[{prov}]"
-            return label
-
-        tiers = ",".join(_tier_label(q) for q in r["queries_used"])
+        tiers = ",".join(q["tier"] for q in r["queries_used"])
         cached = sum(1 for q in r["queries_used"] if q.get("cached"))
         breaker_note = " [breaker-tripped]" if r.get("breaker_tripped") else ""
         # BUI-678: name it inline on the book's own line — this is the count
@@ -3279,13 +2898,10 @@ def _print_human(results: list[dict]) -> None:
     # even if they missed the stderr line.
     n_breaker_tripped = sum(1 for r in results if r.get("breaker_tripped"))
     if n_breaker_tripped:
-        # BUI-545: breaker_tripped is now the OR of both providers' breakers,
-        # so this line names neither — the one-time stderr warning from
-        # _CircuitBreaker.record_error() already said which provider died.
         print(
-            f"\n  A provider circuit breaker tripped during this batch — "
-            f"{n_breaker_tripped} book(s) affected (failover, cache-only, "
-            "or fetch-err); re-run later."
+            f"\n  The sold-comps.com circuit breaker tripped during this "
+            f"batch — {n_breaker_tripped} book(s) affected (cache-only or "
+            "fetch-err); re-run later."
         )
 
     # BUI-678: a currency-rejected comp (BUI-675's gate) is a SUCCESSFUL fetch
@@ -3327,7 +2943,7 @@ def _write_out(path: str | None, data) -> None:
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(
         prog="sold-comps",
-        description="Fetch eBay sold listings for a comic via SerpApi.",
+        description="Fetch eBay sold listings for a comic via sold-comps.com.",
     )
     p.add_argument(
         "--version",
@@ -3360,7 +2976,7 @@ def main(argv=None) -> int:
                    help="Suppress human summary on stdout.")
     args = p.parse_args(argv)
 
-    api_key = load_serpapi_key()
+    api_key = load_sold_comps_key()
     ttl_sec = int(args.cache_ttl_days * 24 * 3600)
 
     if args.batch:

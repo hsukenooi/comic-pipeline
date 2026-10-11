@@ -216,11 +216,11 @@ Raw reasons: `one_sided`, `too_wide`, `too_sparse`, `variant_dropped`. **Certifi
 
 Flags worth knowing:
 - `--max-age-days N` (default 7) — reuses FMVs already in the comics server's DB if `fmv_updated_at` is recent; rarely engages inside `/comic:buy` since this flow never resolves a `locg_id` (BUI-153 — see the doc link above for why).
-- `--force` — bypasses both SerpApi and DB caches; use only when you suspect a stale comp pool
+- `--force` — bypasses both the sold-comps response cache and the DB cache; use only when you suspect a stale comp pool
 
 **Provider request budget (BUI-570).** The sold-comps providers are a shared, finite budget, and this step is where a run spends it. Before a batch above ~50 books:
 
-- **A book is not one request.** `ebay-sold-comps` runs up to five conditional query tiers per book, and each can cost two provider requests when sold-comps.com fails over to SerpApi (BUI-545). A 66-book batch is a low-hundreds-of-requests batch.
+- **A book is not one request.** `ebay-sold-comps` runs a base query plus up to five conditional query tiers per book. A 66-book batch is a low-hundreds-of-requests batch.
 - **Run the whole surviving list in ONE `comic-fmv --batch` call.** The BUI-535 circuit breaker is scoped to a single invocation, so splitting the batch re-arms its 5-consecutive-error trip cost once per chunk instead of paying it once. There is **no `--max-workers` on `comic-fmv`** (it's an `ebay-sold-comps` flag this path can't set) — don't offer throttling that doesn't exist.
 - **Re-runs compound; the breaker resets but the quota does not.** A fresh run starting with an untripped breaker is not a fresh budget. Re-running identical books inside 7 days hits the query cache and is free — but **`--force`, or any changed query input (adding `publisher`, filling in `year`, fixing a `title`), misses the cache and re-spends the batch at full price.**
 - **Design one diagnostic pass.** If a price looks wrong, work out what would answer the question and ask it once over the full set. A small probe followed by a large re-run is what exhausted the budget on 2026-07-31: ~107 book-queries across four runs tripped both providers' breakers, and the final fetch returned `comps=0` for 27 of 30 books.

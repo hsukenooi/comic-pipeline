@@ -23,8 +23,8 @@
              comic-fmv process itself, and launchd does not inherit an
              interactive shell's exports, so it is set here explicitly. Without
              it a re-run would leave one_sided/too_wide refusals uncapped.
-             Provider keys (SERPAPI_KEY / SOLD_COMPS_KEY) are NOT set here:
-             ebay-sold-comps resolves them itself (env, then apps/ebay/.env),
+             The provider key (SOLD_COMPS_KEY) is NOT set here:
+             ebay-sold-comps resolves it itself (env, then apps/ebay/.env),
              the same way it does for slab-watch-collect. -->
         <key>FMV_CEILING_CAP</key>
         <string>1</string>

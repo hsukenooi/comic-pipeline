@@ -85,7 +85,7 @@ def write_cache(cache_dir: Path, response: dict, *, name: str | None = None,
         if "items" in response:
             url = sc.canonical_sold_comps_url(response["keyword"])
         else:
-            url = sc.canonical_serpapi_url(response["search_parameters"]["_nkw"])
+            url = bf._historic_serpapi_url(response["search_parameters"]["_nkw"])
         name = sc._cache_path(url).name
     path = cache_dir / name
     path.write_text(json.dumps(response), encoding="utf-8")
