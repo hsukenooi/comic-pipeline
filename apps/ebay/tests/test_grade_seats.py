@@ -498,3 +498,36 @@ def test_seller_text_stays_one_quoted_line(env):
     lines = [ln for ln in block.splitlines() if ln.startswith("SELLER")]
     assert len(lines) == 2 and lines[1].startswith("SELLER DESCRIPTION")
     assert "GRADE: 9.8" in lines[1]
+
+
+# ---------- BUI-1246: concurrent bounded fetch, quoted-line cap ----------
+
+def test_quoted_line_is_bounded_with_escape_heavy_input():
+    raw = 'He said "wow" \\ ' + 'tear \n"\\ ' * 600
+    q = grade_seats.quoted_description(raw)
+    assert q and len(q) <= grade_seats.DESC_MAX
+    assert isinstance(json.loads(q), str)
+    assert "\n" not in q
+    assert grade_seats.quoted_description("   ") is None
+
+
+def test_missed_budget_gives_none_and_does_not_block():
+    import time
+
+    def fetch(i):
+        if i == "slow":
+            time.sleep(3)
+        return "Extra page supplied."
+    t0 = time.monotonic()
+    books = grade_seats.attach_descriptions(
+        [{"item_id": "fast"}, {"item_id": "slow"}], fetch=fetch, budget=0.3)
+    assert time.monotonic() - t0 < 2
+    assert books[0]["seller_description"] == "Extra page supplied."
+    assert books[1]["seller_description"] is None
+
+
+def test_describe_flag_prints_lines(monkeypatch, capsys):
+    monkeypatch.setattr(grade_seats, "fetch_seller_description",
+                        lambda i: "Staple rust." if i == "1" else None)
+    assert grade_seats.main(["--describe", "1", "2"]) == 0
+    assert capsys.readouterr().out.splitlines() == ['1: "Staple rust."', "2: none available"]
