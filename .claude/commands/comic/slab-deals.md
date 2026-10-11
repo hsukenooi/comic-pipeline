@@ -35,7 +35,7 @@ slab-deals --title "<series>" --issue <N> --year <YYYY> --comic-id <ID> \
 
 It prints, in order:
 
-1. **The CGC ladder.** One row per grade from the Universal (blue label) CGC sales in the comps ledger: sale count, median, low, high. A rung with 1 or 2 sales is thin. Say so when you quote it.
+1. **The CGC ladder.** One row per grade from the Universal (blue label) CGC sales in the comps ledger: sale count, median, low, high. Best-offer sales count at 0.89 x their list price (the accepted-price scale `comic-fmv` uses), so the medians match its bands. A rung with 1 or 2 sales is thin. Say so when you quote it.
 2. **A ranked table.** Each surviving listing with grade, type, ask, that grade's median, ask over median, the rung's sale count, and the link. Auctions show the end time, Buy It Now rows show the seller. A starred row is on the shortlist.
 
 The script drops, and counts in the header line: foreign editions, moderns and reprints, variants and incentive covers, homages, lots, signed copies, and Qualified, Restored, and Conserved labels, plus anything that is not CGC or has no readable grade. A listing at a grade with no sales ranks last with `n/a`. No sales means no honest comparison, not a cheap one.

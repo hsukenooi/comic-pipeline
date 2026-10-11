@@ -1081,6 +1081,7 @@ def cgc_proxy_fmv(graded_comps: list[dict], target_grade: float,
       * or the slab price is below CGC_PROXY_MIN_SLAB_PRICE (cheap book — the
         method doesn't apply, fmv.md §7a's >$200 floor).
     """
+    graded_comps = accepted_basis_pool(graded_comps)
     ladder = bucket_medians(graded_comps)
     counts = bucket_counts(graded_comps)
     total = sum(counts.values())
@@ -1232,6 +1233,7 @@ def cgc_cross_check(graded_comps: list[dict], target_grade: float,
     """
     if not raw_median:
         return None
+    graded_comps = accepted_basis_pool(graded_comps)
     ladder = bucket_medians(graded_comps)
     counts = bucket_counts(graded_comps)
     total = sum(counts.values())
@@ -1957,6 +1959,17 @@ def _accepted_basis(comp: dict) -> dict:
     comp["best_offer_list_price"] = comp["price"]
     comp["price"] = round(float(comp["price"]) * BEST_OFFER_ACCEPTED_RATIO, 2)
     return comp
+
+
+def accepted_basis_pool(comps: Iterable[dict]) -> list[dict]:
+    """Copies of slab `comps` with best-offer prices on the accepted basis
+    (BUI-1247). The CGC-proxy ladder and its cross-check bucket raw
+    provider comps that never pass through `graded_pool`, so they scale here.
+    Never touches the caller's dicts (they are posted to the ledger at the
+    provider's price), and a comp already scaled is left alone. Slab comps
+    only: the raw pool stays unscaled.
+    """
+    return [_accepted_basis(dict(c)) for c in comps]
 
 
 def bucket_weighted_medians(comps: Iterable[dict]) -> dict[float, float]:

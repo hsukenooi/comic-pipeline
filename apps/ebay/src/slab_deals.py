@@ -46,6 +46,12 @@ _READ_TIMEOUT = 30
 LADDER_CERTIFIER = "cgc"
 LADDER_LABEL = "universal"
 
+# BUI-1247: a best-offer sale's ledger price is the LIST price (BUI-1222). The
+# ladder scales it to the accepted basis exactly as comic-fmv does. apps/ebay
+# cannot import fmv_math, so this MIRRORS fmv_math.BEST_OFFER_ACCEPTED_RATIO
+# (0.89); apps/ebay/tests/test_slab_deals.py pins the two together.
+BEST_OFFER_ACCEPTED_RATIO = 0.89
+
 _LEADING_ARTICLE_RE = re.compile(r"^(?:the|a|an)\s+", re.IGNORECASE)
 
 # Slab-only extras on top of comic_identity.should_reject (BUI-1201), which
@@ -85,6 +91,8 @@ def build_ladder(rows: list[dict]) -> list[dict]:
     Returns rungs highest grade first: {grade, n, median, low, high}. Rows of
     another pool, certifier, or label, and rows missing a grade or price, are
     skipped. Excluded (stamped) rows never arrive: the endpoint hides them.
+    A best-offer sale (`best_offer` 1) is priced at 0.89 x its list price,
+    the same accepted-basis scale comic-fmv applies (BUI-1247).
     """
     by_grade: dict[float, list[float]] = {}
     for r in rows:
@@ -97,6 +105,9 @@ def build_ladder(rows: list[dict]) -> list[dict]:
         price, grade = r.get("price"), r.get("grade")
         if price is None or grade is None or price <= 0:
             continue
+        best_offer = r.get("best_offer")
+        if best_offer is True or (type(best_offer) is int and best_offer == 1):
+            price = round(float(price) * BEST_OFFER_ACCEPTED_RATIO, 2)
         by_grade.setdefault(float(grade), []).append(float(price))
     return [
         {
