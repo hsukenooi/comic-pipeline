@@ -132,6 +132,13 @@ MEDIAN_BID_FACTOR = 1.00                            # == fmv_math.MEDIAN_BID_FAC
 _MEDIAN_TIER_CONFIDENCE = {"VERY HIGH": "high", "HIGH": "high", "MEDIUM": "medium"}
 
 
+def _clean_round(value: float) -> int:
+    """== fmv_math.clean_round (BUI-1228, KTD5 duplicate; pinned by
+    tests/test_fmv_rung_parity.py): $5 below $50, $10 from $50-$200, $25 above."""
+    step = 5 if value < 50 else 10 if value < 200 else 25
+    return int(round(value / step) * step)
+
+
 def _median_cap(r: dict) -> float | None:
     """The BUI-1219 median-anchored cap for one fmv row, or None when the
     row cannot carry one (no stored median/tier — every pre-BUI-1219 row —
@@ -442,7 +449,11 @@ def _recomputed_link_cap(r: dict) -> dict:
     """
     high = _effective_high(r)
     factor = _factor(r)
-    rung_cap = factor * high
+    # BUI-1228: the writer bids clean_round(factor x high), which rounds UP as
+    # often as down, so the unrounded product alone false-advises a legitimate
+    # rounded-up bid. Take the larger of the two: the advisory still fires only
+    # on a bid no writer path could have produced, and never tightens.
+    rung_cap = max(factor * high, _clean_round(factor * high))
     median_cap = _median_cap(r)
     cap = rung_cap if median_cap is None else max(rung_cap, median_cap)
     return {

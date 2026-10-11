@@ -8834,3 +8834,54 @@ class TestListingTitleRefusal:
         assert all("Lilandra" not in str(c) for c in lookup_mock.call_args_list)
         assert out[1]["source"] == "fresh"
         assert "listing title" in capsys.readouterr().err
+
+
+class TestCachedMediumLowParity:
+    """BUI-1228: a stored 'low' collapses MEDIUM-LOW and LOW; the cache hit
+    must reproduce the fresh run's photo-grade haircut for MEDIUM-LOW."""
+
+    @staticmethod
+    def _comps(prices):
+        return [{"price": p, "grade": 8.0, "product_id": str(i), "title": ""}
+                for i, p in enumerate(prices)]
+
+    @staticmethod
+    def _row(fresh):
+        return {
+            "fmv_low": fresh["fmv_low"], "fmv_high": fresh["fmv_high"],
+            "fmv_comps": fresh["n"], "fmv_median": fresh["median"],
+            "fmv_bid_tier": fresh["bid_tier"],
+            "fmv_confidence": fmv_runner._confidence_to_db_label(
+                fresh["confidence"]),
+            "fmv_notes": "window=1.0 | cv=n/a | label=" + fresh["confidence"],
+        }
+
+    @pytest.mark.parametrize("gc", ["high", "medium", "medium-low", "low"])
+    def test_medium_low_cache_hit_matches_fresh(self, gc):
+        fresh = fmv_math.compute_fmv(self._comps([20, 50, 100]), 8.0,
+                                     grade_confidence=gc)
+        assert fresh["confidence"] == "MEDIUM-LOW"
+        cached = fmv_runner._fmv_from_db_row(self._row(fresh), gc)
+        assert cached["bid_factor"] == fresh["bid_factor"]
+        assert cached["max_bid"] == fresh["max_bid"]
+
+    def test_medium_low_photo_graded_bids_070(self):
+        fresh = fmv_math.compute_fmv(self._comps([20, 50, 100]), 8.0,
+                                     grade_confidence="high")
+        assert fresh["bid_factor"] == 0.70
+        cached = fmv_runner._fmv_from_db_row(self._row(fresh), "high")
+        assert cached["bid_factor"] == 0.70
+
+    def test_low_cache_hit_stays_060(self):
+        fresh = fmv_math.compute_fmv(self._comps([20, 50]), 8.0,
+                                     grade_confidence="high")
+        row = self._row(fresh)
+        assert row["fmv_bid_tier"] == "VERY LOW"
+        assert fmv_runner._fmv_from_db_row(row, "high")["bid_factor"] == 0.60
+
+    def test_low_row_without_tier_stays_conservative(self):
+        fresh = fmv_math.compute_fmv(self._comps([20, 50, 100]), 8.0,
+                                     grade_confidence="high")
+        row = self._row(fresh)
+        row["fmv_bid_tier"] = None  # row written before BUI-1219
+        assert fmv_runner._fmv_from_db_row(row, "high")["bid_factor"] == 0.60

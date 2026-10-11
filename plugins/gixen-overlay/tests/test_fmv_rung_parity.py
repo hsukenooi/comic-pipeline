@@ -69,6 +69,22 @@ def test_clean_round_is_idempotent_on_its_own_outputs():
         assert fm.clean_round(once) == once, cents / 100
 
 
+def test_policy_clean_round_matches_fmv_math():
+    for cents in range(0, 500_000, 7):
+        assert policy._clean_round(cents / 100) == fm.clean_round(cents / 100)
+
+
+def test_rounded_up_rung_bid_draws_no_recomputed_cap_advisory():
+    """BUI-1228: 0.80 x 69 = 55.2 rounds UP to $60 (a $10 step); the
+    unrounded cap 55.2 sat below the legitimate $60 bid."""
+    high = 69.0
+    assert fm.clean_round(0.80 * high) == 60
+    link = policy._recomputed_link_cap({
+        "id": 1, "high": high, "confidence": "high", "certifier": "none",
+        "pricing_basis": "direct", "median": None, "bid_tier": None})
+    assert link["cap"] >= 60
+
+
 def _comps(prices, grade=8.0):
     return [{"price": p, "grade": grade, "product_id": str(i), "title": ""}
             for i, p in enumerate(prices)]
@@ -103,9 +119,13 @@ def test_policy_recompute_never_sits_below_the_fmv_math_bid(grade_conf):
         if out["max_bid"] is None:
             continue
         link = policy._recomputed_link_cap(_stored_row(out))
-        # The pre-existing rung path compares the UNROUNDED rung x high, so
-        # clean_round's round-to-nearest can sit a step above it; that
-        # residual predates BUI-1219 and is only checked on the median path.
+        # BUI-1228: the rung path compares against the clean-rounded cap too,
+        # so a rounded-up bid never sits above the recomputed cap. Scoped to
+        # rows where the stored-label rung reads at least the writer's factor:
+        # a no-photo MEDIUM-LOW book bids 0.80 but stores 'low' (0.70), the
+        # separate collapse gap documented above _RUNG_BY_CONFIDENCE.
+        if out["bid_factor"] <= link["factor"]:
+            assert link["cap"] >= out["max_bid"], pool
         if out["bid_basis"] == "median":
             median_rows += 1
             assert link["median_cap"] == out["max_bid"], pool
