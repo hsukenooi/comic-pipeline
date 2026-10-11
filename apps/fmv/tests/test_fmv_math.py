@@ -3219,3 +3219,53 @@ class TestWidthFloor:
         out = fm.cgc_proxy_fmv(_ASM50_LADDER, target_grade=6.5)
         assert (out["fmv_low"], out["fmv_high"]) == (600, 650)
         assert out["width_floored"] is False
+
+
+class TestProxyLadderBestOfferAcceptedBasis:
+    """BUI-1247: the CGC-proxy ladder buckets raw provider comps that never
+    pass through graded_pool, so it scales best-offer comps itself, once."""
+
+    @staticmethod
+    def _ladder(flag):
+        def c(p, g, f=None):
+            d = {"price": p, "grade": g}
+            if f is not None:
+                d["best_offer"] = f
+            return d
+        return [c(1000, 6.5, flag), c(1000, 6.5, flag), c(1000, 6.5, flag),
+                c(2000, 8.0), c(2000, 8.0), c(2000, 8.0)]
+
+    def test_best_offer_rung_prices_at_accepted_basis_exactly_once(self):
+        out = fm.cgc_proxy_fmv(self._ladder(True), target_grade=6.5)
+        assert out["cgc_ladder"]["slab_price"] == 890.0
+        assert out["fmv_high"] == fm.clean_round(
+            890.0 * fm.CGC_PROXY_FACTOR_HIGH)
+
+    def test_unflagged_and_non_flag_values_untouched(self):
+        for flag in (None, False, 0, "true"):
+            out = fm.cgc_proxy_fmv(self._ladder(flag), target_grade=6.5)
+            assert out["cgc_ladder"]["slab_price"] == 1000
+
+    def test_caller_comps_not_mutated(self):
+        comps = self._ladder(True)
+        fm.cgc_proxy_fmv(comps, target_grade=6.5)
+        assert comps[0]["price"] == 1000
+        assert "best_offer_list_price" not in comps[0]
+
+    def test_already_scaled_comp_is_not_scaled_again(self):
+        pre = fm.accepted_basis_pool(self._ladder(True))
+        assert fm.accepted_basis_pool(pre)[0]["price"] == 890.0
+        out = fm.cgc_proxy_fmv(pre, target_grade=6.5)
+        assert out["cgc_ladder"]["slab_price"] == 890.0
+
+    def test_graded_pool_output_feeds_proxy_without_a_second_scale(self):
+        comps = [{**_slab_comp(1000 + i, 6.5, age=1), "best_offer": True}
+                 for i in range(3)]
+        comps += [_slab_comp(2000 + i, 8.0, age=1) for i in range(3)]
+        pooled = fm.graded_pool(comps, as_of=_GREF)[0]
+        out = fm.cgc_proxy_fmv(pooled, target_grade=6.5)
+        assert out["cgc_ladder"]["slab_price"] == round(1001 * 0.89, 2)
+
+    def test_cross_check_uses_accepted_basis(self):
+        chk = fm.cgc_cross_check(self._ladder(True), 6.5, raw_median=500)
+        assert chk["slab_price"] == 890.0

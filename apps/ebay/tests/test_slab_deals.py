@@ -181,3 +181,33 @@ def test_render_has_ladder_and_ranked_rows():
         "url": "https://www.ebay.com/itm/a"}], ladder)
     text = sd.render("ASM #50", ladder, ranked, {}, ranked)
     assert "6.5    1" in text and "50%" in text and "itm/a" in text
+
+
+class TestBuildLadderBestOffer:
+    """BUI-1247: best-offer ledger prices are LIST prices; scale once."""
+
+    def test_flagged_row_scaled_unflagged_and_raw_untouched(self):
+        rows = [dict(comp(6.5, 1000), best_offer=1),
+                dict(comp(6.5, 1000), best_offer=True),
+                dict(comp(6.5, 1000), best_offer=0),
+                dict(comp(6.5, 1000), best_offer=None),
+                comp(6.5, 1000),
+                dict(comp(6.5, 5000, pool="raw"), best_offer=1)]
+        (rung,) = sd.build_ladder(rows)
+        assert rung["n"] == 5
+        assert rung["low"] == 890.0 and rung["high"] == 1000.0
+        assert rung["median"] == 1000.0
+
+    def test_rows_not_mutated_so_a_second_build_does_not_rescale(self):
+        rows = [dict(comp(6.5, 1000), best_offer=1)]
+        assert sd.build_ladder(rows) == sd.build_ladder(rows)
+        assert rows[0]["price"] == 1000
+
+    def test_ratio_matches_fmv_math(self):
+        import importlib.util
+        path = (Path(__file__).resolve().parents[2] / "fmv" / "src"
+                / "fmv_math.py")
+        spec = importlib.util.spec_from_file_location("_parity_fm", path)
+        fm = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fm)
+        assert sd.BEST_OFFER_ACCEPTED_RATIO == fm.BEST_OFFER_ACCEPTED_RATIO
