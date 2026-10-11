@@ -1189,7 +1189,23 @@ def main(argv=None):
         help="With --auto-submit: print what would be submitted or held. "
              "Never calls ezship and writes no state.",
     )
+    parser.add_argument(
+        "--clear-inflight", metavar="TRACKING", default=None,
+        help="Release a tracking number that --auto-submit quarantined (after "
+             "you checked EZShip for the order). Does nothing else.",
+    )
     args = parser.parse_args(argv)
+    if args.clear_inflight:
+        import shipped_submit
+        try:
+            found = shipped_submit.clear_inflight(
+                shipped_submit.DEFAULT_INFLIGHT_STATE, args.clear_inflight)
+        except shipped_submit.InflightError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return _EXIT_HARD_FAILURE
+        print(f"cleared {args.clear_inflight}" if found
+              else f"{args.clear_inflight} was not quarantined")
+        return _EXIT_OK
     if args.dry_run and not args.auto_submit:
         parser.error("--dry-run only applies with --auto-submit")
     if args.auto_submit:

@@ -187,6 +187,7 @@ class Env:
         monkeypatch.setattr(ss, "notify", self.notes.append)
         monkeypatch.setattr(ss, "ping_heartbeat", lambda url, ok, d: self.pings.append((ok, d)))
         self.holds = tmp_path / "holds.json"
+        self.inflight = tmp_path / "auto-submit-inflight.json"
 
     def ok_ezship(self, group):
         self.ledger.add(group["tracking"].upper())  # ezship records on success
@@ -342,3 +343,129 @@ def test_heartbeat_job_is_registered():
     doc = (Path(__file__).resolve().parents[3] / "docs" / "reference"
            / "job-heartbeat-contract.md").read_text()
     assert f"`{ss.HEARTBEAT_JOB}`" in doc
+
+
+# ─── in-flight quarantine (review blockers) ───────────────────────────────────
+
+ONE = "9400111899223197428490"
+
+
+def one_order():
+    return rows_from(order("O1", [txn("1")]))
+
+
+def test_timeout_quarantines_and_rerun_holds(monkeypatch, tmp_path):
+    env = Env(monkeypatch, tmp_path, one_order(), ezship=lambda g: (None, "timed out"))
+    assert env.go() == 1
+    assert ONE in json.loads(env.inflight.read_text())
+    env.ezship_calls.clear()
+    env.ezship = lambda g: Env.ok_ezship(env, g)
+    env.go()
+    assert env.ezship_calls == []  # held, never resubmitted
+    assert any("ebay-shipped --clear-inflight" in n and ONE in n for n in env.notes)
+
+
+def test_exit_0_without_ledger_quarantines(monkeypatch, tmp_path):
+    env = Env(monkeypatch, tmp_path, one_order(), ezship=lambda g: (0, "ok"))
+    assert env.go() == 1
+    env.ezship_calls.clear()
+    env.go()
+    assert env.ezship_calls == []
+
+
+def test_exit_1_is_ambiguous_and_quarantined(monkeypatch, tmp_path):
+    env = Env(monkeypatch, tmp_path, one_order(), ezship=lambda g: (1, "Network error"))
+    assert env.go() == 4
+    env.ezship_calls.clear()
+    env.ezship = lambda g: Env.ok_ezship(env, g)
+    assert env.go() == 0  # a hold is a correct outcome
+    assert env.ezship_calls == []
+
+
+def test_clearing_marker_releases_the_hold(monkeypatch, tmp_path):
+    env = Env(monkeypatch, tmp_path, one_order(), ezship=lambda g: (1, "Network error"))
+    env.go()
+    assert ss.clear_inflight(env.inflight, ONE.lower()) is True
+    env.ezship = lambda g: Env.ok_ezship(env, g)
+    env.go()
+    assert env.ezship_calls[-1] == ONE
+
+
+def test_confirmed_submit_clears_marker_and_marker_exists_before_call(monkeypatch, tmp_path):
+    seen = {}
+
+    def ezship(group):
+        seen["during"] = json.loads(env.inflight.read_text())
+        return Env.ok_ezship(env, group)
+    env = Env(monkeypatch, tmp_path, one_order(), ezship=ezship)
+    assert env.go() == 0
+    assert ONE in seen["during"]
+    assert json.loads(env.inflight.read_text()) == {}
+
+
+def test_exit_3_and_launch_failure_clear_marker(monkeypatch, tmp_path):
+    for result in ((3, "Session expired"), (-1, "could not launch")):
+        env = Env(monkeypatch, tmp_path, one_order(), ezship=lambda g, r=result: r)
+        env.go()
+        assert json.loads(env.inflight.read_text()) == {}
+
+
+def test_crash_during_call_leaves_marker(monkeypatch, tmp_path):
+    def boom(group):
+        raise KeyboardInterrupt
+    env = Env(monkeypatch, tmp_path, one_order(), ezship=boom)
+    with pytest.raises(KeyboardInterrupt):
+        env.go()
+    env.ezship = lambda g: Env.ok_ezship(env, g)
+    env.ezship_calls.clear()
+    env.go()
+    assert env.ezship_calls == []
+
+
+def test_corrupt_marker_fails_closed(monkeypatch, tmp_path):
+    env = Env(monkeypatch, tmp_path, one_order())
+    env.inflight.write_text("{not json")
+    assert env.go() == 1
+    assert env.ezship_calls == []
+
+
+def test_unwritable_marker_blocks_submit(monkeypatch, tmp_path):
+    env = Env(monkeypatch, tmp_path, one_order())
+
+    def bad(*a, **k):
+        raise ss.InflightError("disk full")
+    monkeypatch.setattr(ss, "save_inflight", bad)
+    assert env.go() == 1
+    assert env.ezship_calls == []
+
+
+def test_dry_run_reports_quarantine_and_writes_no_marker(monkeypatch, tmp_path, capsys):
+    env = Env(monkeypatch, tmp_path, one_order())
+    assert env.go(dry_run=True) == 0
+    assert not env.inflight.exists()
+    env.inflight.write_text(json.dumps({ONE: {"since": "2026-10-01T00:00:00Z", "state": "x"}}))
+    capsys.readouterr()
+    assert env.go(dry_run=True) == 0
+    assert "[HOLD  ]" in capsys.readouterr().out and env.ezship_calls == []
+
+
+def test_concurrent_run_does_nothing(monkeypatch, tmp_path):
+    import fcntl
+    env = Env(monkeypatch, tmp_path, one_order())
+    with open(tmp_path / "auto-submit-inflight.json.lock", "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        assert env.go() == 0
+    assert env.ezship_calls == []
+
+
+def test_item_with_two_tracking_numbers_is_held():
+    t = ("<Transaction><ShippingDetails>"
+         "<ShipmentTrackingDetails><ShippingCarrierUsed>USPS</ShippingCarrierUsed>"
+         "<ShipmentTrackingNumber>AAA111</ShipmentTrackingNumber></ShipmentTrackingDetails>"
+         "<ShipmentTrackingDetails><ShippingCarrierUsed>USPS</ShippingCarrierUsed>"
+         "<ShipmentTrackingNumber>BBB222</ShipmentTrackingNumber></ShipmentTrackingDetails>"
+         "</ShippingDetails><Item><ItemID>9</ItemID><Location>Lake Forest, Illinois</Location>"
+         "<Title>T</Title></Item></Transaction>")
+    groups, _ = ss.group_by_tracking(rows_from(order("O1", [t])), {})
+    decisions = [ss.classify(g, set()) for g in groups]
+    assert len(decisions) == 2 and all(d["action"] == "hold" for d in decisions)

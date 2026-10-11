@@ -24,6 +24,15 @@ Rules, each pinned by a test:
   `ezship new` itself on success. This module re-reads it after every call: a
   tracking number missing from it after exit 0 stops the batch, because the
   next run would submit it again.
+* In-flight marker (`auto-submit-inflight.json`, atomic + fsync'd) is written for
+  a tracking number BEFORE `ezship new` runs. It is cleared only on a confirmed
+  ledger entry, or on an outcome that provably submitted nothing (exit 3 expired
+  cookie, or ezship failing to launch). Every other outcome is ambiguous (exit 1
+  also covers a connection dropped after EZShip accepted the order, BUI-180) and
+  leaves the marker: later runs HOLD that tracking number until a human checks
+  EZShip and clears it with `ebay-shipped --clear-inflight TRACKING`. An
+  unreadable marker file fails the run closed. A lock file stops concurrent runs.
+* An item with two or more distinct tracking numbers is held, not submitted.
 * The heartbeat is pinged only when the run finished with no failure. Holds are
   a correct outcome and do not withhold it.
 
@@ -35,6 +44,7 @@ orders were rejected by EZShip (the rest were still attempted).
 from __future__ import annotations
 
 import datetime as dt
+import fcntl
 import json
 import os
 import re
@@ -68,6 +78,7 @@ EZSHIP_DIR_ENV = "EZSHIP_DIR"
 EZSHIP_CMD_ENV = "EZSHIP_CMD"  # override of the whole launcher, shlex-split
 DEFAULT_EZSHIP_CMD = ["npx", "tsx", "src/cli.ts"]
 DEFAULT_HOLDS_STATE = Path.home() / ".config" / "ezship" / "auto-submit-holds.json"
+DEFAULT_INFLIGHT_STATE = Path.home() / ".config" / "ezship" / "auto-submit-inflight.json"
 HEARTBEAT_JOB = "ebay-shipped-submit"
 HEARTBEAT_PATH = "/api/heartbeat/ebay-shipped-submit"
 PRODUCT_NAME_MAX = 200
@@ -237,13 +248,16 @@ def group_by_tracking(rows, titles_by_item):
         if not r["trackings"]:
             skipped.append({**r, "reason": "no_tracking"})
             continue
+        multi = len({n.upper() for n, _ in r["trackings"]}) > 1
         for number, carrier in r["trackings"]:
             key = number.upper()
             g = groups.setdefault(key, {
                 "tracking": number, "carriers": set(), "item_ids": [],
                 "titles": [], "title_misses": [], "locations": set(),
-                "countries": set(), "order_ids": [], "sellers": [],
+                "countries": set(), "order_ids": [], "sellers": [], "multi_tracking_items": [],
             })
+            if multi and r["item_id"] not in g["multi_tracking_items"]:
+                g["multi_tracking_items"].append(r["item_id"])
             g["carriers"].add(carrier)
             if r["item_id"] in g["item_ids"]:
                 continue
@@ -279,6 +293,10 @@ def classify(group, submitted):
     out["product"] = product_name(group["titles"])
     if group["tracking"].upper() in submitted:
         return {**out, "action": "skip", "reason": "already_submitted"}
+    if group["multi_tracking_items"]:
+        return {**out, "action": "hold",
+                "reason": f"item(s) {group['multi_tracking_items']!r} carry several tracking "
+                          "numbers; cannot tell which parcel holds what"}
     if out["ezship_carrier"] is None:
         return {**out, "action": "hold",
                 "reason": f"unsupported carrier {sorted(carriers)!r} (EZShip: {', '.join(EZSHIP_CARRIERS)})"}
@@ -326,6 +344,62 @@ def save_holds_state(path, notified):
         os.replace(tmp, path)
     except OSError as exc:
         print(f"warning: could not save holds state: {exc}", file=sys.stderr)
+
+
+class InflightError(Exception):
+    pass
+
+
+def clear_command(tracking):
+    return f"ebay-shipped --clear-inflight {shlex.quote(tracking)}"
+
+
+def load_inflight(path):
+    """{TRACKING: {since, state}}. Missing file = {}. Any unreadable or malformed
+    file raises InflightError: unknown quarantine state must stop the run (fail
+    closed), never read as "nothing is quarantined"."""
+    try:
+        text = Path(path).read_text()
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        raise InflightError(f"cannot read {path}: {exc}") from None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        raise InflightError(f"{path} is not valid JSON") from None
+    if not isinstance(data, dict) or not all(isinstance(v, dict) for v in data.values()):
+        raise InflightError(f"{path} has an unexpected shape")
+    return data
+
+
+def save_inflight(path, data):
+    """Atomic, durable write. Raises InflightError on failure (callers must not
+    submit if the marker could not be written)."""
+    path = Path(path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w") as fh:
+            fh.write(json.dumps(data, indent=1, sort_keys=True) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except OSError as exc:
+        raise InflightError(f"cannot write {path}: {exc}") from None
+
+
+def clear_inflight(path, tracking):
+    """Human-invoked: drop one tracking number's marker. Returns True if present."""
+    data = load_inflight(path)
+    if data.pop(tracking.upper(), None) is None:
+        return False
+    save_inflight(path, data)
+    return True
+
+
+def _now_iso():
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # ─── Side effects: ezship, notify, heartbeat ──────────────────────────────────
@@ -395,11 +469,36 @@ def _render(decisions, skipped, warnings, dry_run):
 
 
 def run(*, ledger_path, load_ledger, dry_run, holds_path=DEFAULT_HOLDS_STATE,
-        server_url=None, days=WINDOW_DAYS, json_output=False):
+        inflight_path=None, server_url=None, days=WINDOW_DAYS, json_output=False):
     """Run the whole job. `load_ledger` is shipped_orders.load_ledger (injected
     to avoid a circular import). Returns the process exit code."""
+    inflight_path = Path(inflight_path) if inflight_path else Path(holds_path).with_name(
+        DEFAULT_INFLIGHT_STATE.name)
+    lock = None
+    if not dry_run:
+        try:
+            inflight_path.parent.mkdir(parents=True, exist_ok=True)
+            lock = open(inflight_path.with_name(inflight_path.name + ".lock"), "w")
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("another ebay-shipped --auto-submit run holds the lock; nothing done",
+                  file=sys.stderr)
+            return EXIT_OK
+        except OSError as exc:
+            return _fail(f"cannot take run lock: {exc}", server_url, dry_run)
+    try:
+        return _run_locked(ledger_path, load_ledger, dry_run, holds_path, inflight_path,
+                           server_url, days, json_output)
+    finally:
+        if lock:
+            lock.close()
+
+
+def _run_locked(ledger_path, load_ledger, dry_run, holds_path, inflight_path,
+                server_url, days, json_output):
     try:
         submitted = load_ledger(ledger_path)
+        inflight = load_inflight(inflight_path)
         token = eut.get_user_access_token()
         rows = fetch_transactions(token, days=days)
     except eut.UserTokenError as exc:
@@ -411,6 +510,12 @@ def run(*, ledger_path, load_ledger, dry_run, holds_path=DEFAULT_HOLDS_STATE,
     warnings = [gixen_warning] if gixen_warning else []
     groups, skipped = group_by_tracking(rows, titles)
     decisions = [classify(g, submitted) for g in groups]
+    for i, d in enumerate(decisions):
+        mark = inflight.get(d["tracking"].upper())
+        if mark and d["action"] == "submit":
+            decisions[i] = {**d, "action": "hold", "reason": (
+                f"QUARANTINED since {mark.get('since', '?')} ({mark.get('state', '?')}): "
+                f"check EZShip, then run: {clear_command(d['tracking'])}")}
     decisions.sort(key=lambda d: d["tracking"])
 
     if json_output:
@@ -436,7 +541,18 @@ def run(*, ledger_path, load_ledger, dry_run, holds_path=DEFAULT_HOLDS_STATE,
     for d in decisions:
         if d["action"] != "submit":
             continue
+        key = d["tracking"].upper()
+        inflight[key] = {"since": _now_iso(), "state": "in-flight"}
+        try:
+            save_inflight(inflight_path, inflight)  # BEFORE the call: crash-safe
+        except InflightError as exc:
+            return _fail(f"cannot record in-flight marker, not submitting {d['tracking']}: {exc}",
+                         server_url, dry_run)
         code, detail = run_ezship(d)
+        if code in (EXIT_SESSION_EXPIRED, -1):
+            # Provably nothing was submitted (login redirect / never launched).
+            inflight.pop(key, None)
+            _save_or_warn(inflight_path, inflight)
         if code == EXIT_SESSION_EXPIRED:
             notify("EZShip session expired. Run: ezship set-cookie. Batch stopped.")
             return _fail("EZShip session expired (exit 3); stopped before "
@@ -449,21 +565,32 @@ def run(*, ledger_path, load_ledger, dry_run, holds_path=DEFAULT_HOLDS_STATE,
         try:
             landed = d["tracking"].upper() in load_ledger(ledger_path)
         except Exception as exc:  # noqa: BLE001
-            return _fail(f"ledger unreadable after submitting {d['tracking']}: {exc}",
+            return _fail(f"ledger unreadable after submitting {d['tracking']} "
+                         f"(left quarantined: {clear_command(d['tracking'])}): {exc}",
                          server_url, dry_run)
         if code == 0 and landed:
+            inflight.pop(key, None)
+            _save_or_warn(inflight_path, inflight)
             submitted_count += 1
             print(f"submitted {d['tracking']}")
         elif code == 0 or code is None or landed:
             # exit 0 without a ledger entry, a timeout, or an error that still
             # wrote the ledger: the outcome is unknown, so stop before a rerun
             # can double-submit.
-            notify(f"EZShip submission of {d['tracking']} is unconfirmed; batch stopped.")
+            inflight[key] = {"since": inflight[key]["since"], "state": f"unconfirmed exit={code}"}
+            _save_or_warn(inflight_path, inflight)
+            notify(f"EZShip submission of {d['tracking']} is unconfirmed and quarantined; "
+                   f"batch stopped. Check EZShip, then: {clear_command(d['tracking'])}"[:250])
             return _fail(f"unconfirmed submission of {d['tracking']} (exit={code}, "
                          f"ledger={'yes' if landed else 'no'}): {detail}", server_url, dry_run)
         else:
+            # Exit 1 is ambiguous (a dropped connection can follow acceptance), so
+            # the marker stays: this tracking number is quarantined, not retried.
+            inflight[key] = {"since": inflight[key]["since"], "state": f"failed exit={code}"}
+            _save_or_warn(inflight_path, inflight)
             rejected.append(d["tracking"])
-            print(f"REJECTED {d['tracking']} (exit {code}): {detail}", file=sys.stderr)
+            print(f"FAILED {d['tracking']} (exit {code}), quarantined; verify on EZShip then: "
+                  f"{clear_command(d['tracking'])}: {detail}", file=sys.stderr)
 
     if rejected:
         notify(f"EZShip rejected {len(rejected)} order(s): {', '.join(rejected)}"[:200])
@@ -475,6 +602,15 @@ def run(*, ledger_path, load_ledger, dry_run, holds_path=DEFAULT_HOLDS_STATE,
     ping_heartbeat(server_url, True, detail)
     print(detail)
     return EXIT_OK
+
+
+def _save_or_warn(path, data):
+    # The in-flight entry already exists on disk from before the call, so a failed
+    # update here only loses detail or leaves a stale marker: both fail closed.
+    try:
+        save_inflight(path, data)
+    except InflightError as exc:
+        print(f"warning: {exc}", file=sys.stderr)
 
 
 def _fail(message, server_url, dry_run, code=EXIT_FAILURE):
