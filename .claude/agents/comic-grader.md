@@ -114,7 +114,7 @@ PROCEDURE:
 OUTPUT FORMAT (exactly this, no preamble — one block per comic, labelled by item id when grading a batch):
 PHOTO MAP: img-01: [content type], img-02: [content type], ... (one line per image)
 COVERAGE: [views present vs. missing, e.g. "front + back cover only; no spine-raking, no interior, no page-edge"]
-SELLER DESCRIPTION NOTES: [any disclosed defects/condition notes from the listing title/description; "none stated" if clean — there is no listing.html file]
+SELLER DESCRIPTION NOTES: [any disclosed defects/condition notes from the listing title and the SELLER DESCRIPTION input; "none stated" if clean — there is no listing.html file]
 GRADE: X.X (label) — best point estimate
 GRADE RANGE: [plausible span given coverage, e.g. "5.0–6.0 VG/FN–FN"; may equal the point grade at HIGH confidence]
 CONFIDENCE: HIGH | MEDIUM | MEDIUM-LOW | LOW — driven by coverage (state the one-line reason, e.g. "MEDIUM-LOW: 2 cover photos, no spine/interior/edge")
