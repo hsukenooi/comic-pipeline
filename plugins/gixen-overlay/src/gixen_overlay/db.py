@@ -6145,6 +6145,30 @@ JOB_CONTRACTS: dict[str, dict[str, Any]] = {
             "UNPRICED_RERUN_MAX_REQUESTS)."
         ),
     },
+    "ebay-shipped-submit": {
+        "cadence_hours": 72.0,
+        "success": (
+            "An `ebay-shipped --auto-submit` run (BUI-1238) that finished with "
+            "no failure: eBay GetOrders read cleanly and every order it chose "
+            "to submit was accepted by EZShip and confirmed in the EZShip "
+            "ledger. A run with nothing new to submit still pings ('zero "
+            "results is a success'), and so does a run that only held orders "
+            "(non-US ship-from or an unsupported carrier): a hold is the "
+            "correct outcome and notifies instead. An expired EZShip cookie "
+            "(exit 3), a rejected order (exit 4), an unconfirmable submission, "
+            "or an eBay failure must not ping; they POST /api/heartbeat/"
+            "ebay-shipped-submit/failure instead."
+        ),
+        "wired": True,
+        "ping": (
+            "apps/ebay/src/shipped_submit.py's run, via ping_heartbeat on the "
+            "no-failure branch: POST /api/heartbeat/ebay-shipped-submit "
+            "(failure branch: /failure). Best-effort: a failed ping never "
+            "changes the run's exit code. Scheduling: "
+            "scripts/launchd/com.comics.ebay-shipped-submit.plist (every 3 "
+            "days; the 30-day GetOrders window covers the gap)."
+        ),
+    },
 }
 
 # THE OUTER LAYER — WIRED (BUI-672). Read this before trusting the watchdog.

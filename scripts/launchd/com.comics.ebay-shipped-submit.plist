@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.comics.ebay-shipped-submit</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/hsukenooi/.local/bin/ebay-shipped</string>
+        <string>--auto-submit</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>COMICS_SERVER_URL</key>
+        <string>http://localhost:8080</string>
+        <!-- ebay-shipped shells out to `gixen` (~/.local/bin, for product
+             names) and `npx tsx` (ezship; the nvm node dir). launchd starts
+             jobs with a minimal PATH, so both are listed explicitly. -->
+        <key>PATH</key>
+        <string>/Users/hsukenooi/.local/bin:/Users/hsukenooi/.nvm/versions/node/v22.22.0/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>EZSHIP_DIR</key>
+        <string>/Users/hsukenooi/Projects/comic-pipeline/apps/ezship</string>
+    </dict>
+    <!-- BUI-1238: every 3 days (259200 s). The 30-day GetOrders window covers
+         the gap many times over, and the EZShip ledger makes a re-seen
+         tracking number a no-op. StartInterval counts time awake, so a sleeping
+         Mini runs it on wake rather than skipping it. -->
+    <key>StartInterval</key>
+    <integer>259200</integer>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/Users/hsukenooi/.comics-server/ebay-shipped-submit.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/hsukenooi/.comics-server/ebay-shipped-submit.error.log</string>
+</dict>
+</plist>

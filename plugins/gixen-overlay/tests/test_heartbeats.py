@@ -62,6 +62,7 @@ def test_the_six_named_jobs_are_declared():
         "sentinel-probe",
         "slab-watch-collect",
         "unpriced-rerun",
+        "ebay-shipped-submit",
     }
 
 

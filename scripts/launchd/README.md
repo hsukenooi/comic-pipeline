@@ -79,6 +79,33 @@ comics-api GET /api/comics/health/heartbeats
 `~/.comics-server/unpriced-rerun.log` for the counts and
 `unpriced-rerun.error.log` for failures.
 
+## com.comics.ebay-shipped-submit.plist (BUI-1238)
+
+Runs `ebay-shipped --auto-submit` every 3 days. It reads the buyer's eBay
+orders (Trading `GetOrders`, 30 days), groups them by tracking number, and
+runs `ezship new` once per tracking number the EZShip ledger has not seen.
+Non-US ship-from orders and carriers outside EZShip's seven are held with a
+macOS notification and never submitted. An expired EZShip cookie (exit 3)
+stops the batch and notifies. Heartbeat contract: `ebay-shipped-submit` in
+`docs/reference/job-heartbeat-contract.md`.
+
+Preconditions: `ebay-auth login` done (user token), `ezship` cookie set,
+`apps/ezship` dependencies installed (`npm install`), and `ebay-shipped`
+deployed by `scripts/deploy.sh` / `scripts/install.sh`.
+
+Rehearse first, then install. The dry run never calls ezship:
+
+```bash
+ebay-shipped --auto-submit --dry-run
+
+cp scripts/launchd/com.comics.ebay-shipped-submit.plist \
+  "$HOME/Library/LaunchAgents/com.comics.ebay-shipped-submit.plist"
+launchctl unload "$HOME/Library/LaunchAgents/com.comics.ebay-shipped-submit.plist" 2>/dev/null || true
+launchctl load -w "$HOME/Library/LaunchAgents/com.comics.ebay-shipped-submit.plist"
+```
+
+Logs: `~/.comics-server/ebay-shipped-submit.log` and `.error.log`.
+
 ## com.comics.em-batch-nightly.plist (BUI-972)
 
 Runs `scripts/em-batch-nightly.sh` at 01:00 every night: picks up to
