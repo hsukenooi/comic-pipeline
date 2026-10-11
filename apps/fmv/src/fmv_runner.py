@@ -2856,9 +2856,11 @@ def _compute_and_upsert_one(result: dict, original_book: dict, *,
 
 # Comp fields the slab pool needs beyond `price`/`grade`. `first_seen_at` is
 # ledger-only (a live comp always has `sold_date`); `page_quality` rides both.
+# `best_offer` (BUI-1234) is what `fmv_math.graded_pool` scales to the
+# accepted basis; dropping it here would price every best-offer comp at list.
 _SLAB_POOL_FIELDS = ("product_id", "title", "price", "grade", "sold_date",
                      "first_seen_at", "page_quality", "certifier", "label",
-                     "link", "buying_format")
+                     "link", "buying_format", "best_offer")
 
 # eBay's own listing-type token, as `ebay_fetch.parse_item` emits it on the
 # `listing_type` key (the other values are "Auction" and, rarely, a
@@ -4073,10 +4075,13 @@ def _upsert_fmv(server_url: str, inp: dict, fmv: dict,
 # `mode="before"` validators normalize that to the raw sentinels
 # ('none'/'universal'/'unknown') — which is why they can be listed
 # unconditionally instead of per-pool.
+# BUI-1234 adds `best_offer`, so a ledger re-read prices a best-offer comp at
+# the accepted basis too. An older server ignores the unknown key (pydantic's
+# default `extra='ignore'`), so this client is safe to run ahead of it.
 _COMP_LEDGER_FIELDS = (
     "product_id", "title", "price", "sold_date", "grade", "buying_format",
     "link", "query", "tier", "from_cache", "observed_at", "provider",
-    "certifier", "label", "page_quality",
+    "certifier", "label", "page_quality", "best_offer",
 )
 
 

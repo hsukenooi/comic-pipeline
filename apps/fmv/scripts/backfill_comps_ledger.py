@@ -662,7 +662,10 @@ VERIFIED_FIELDS = ("product_id", "title", "price", "grade", "sold_date",
                    "buying_format", "link", "provider",
                    # BUI-929: every slab-pool comp the live path returns carries
                    # these three, parsed from the title by `parse_slab_fields`.
-                   "certifier", "label", "page_quality")
+                   "certifier", "label", "page_quality",
+                   # BUI-1234: sold-comps.com's best-offer badge, parsed by the
+                   # same `parse_comp_sold_comps` on both sides.
+                   "best_offer")
 # Fields the backfill deliberately does NOT reproduce, each with its reason in
 # the module docstring. Listed so `verify_shape` can prove the live comp has
 # exactly VERIFIED_FIELDS + these and nothing else: a NEW stamped field on the

@@ -1810,6 +1810,47 @@ def _pool(comps, as_of=_GREF):
     return fm.graded_pool(comps, as_of=as_of)
 
 
+class TestGradedBestOfferAcceptedBasis:
+    """BUI-1234: a best-offer comp's stored price is the LIST price
+    (BUI-1222), so the slab pool prices it at the accepted basis."""
+
+    def _bo(self, price, grade, flag, **kw):
+        return {**_slab_comp(price, grade, **kw), "best_offer": flag}
+
+    def test_flagged_comp_is_scaled_in_the_pool(self):
+        kept = _pool([self._bo(1000, 9.4, True, age=1)])[0][0]
+        assert kept["price"] == round(1000 * fm.BEST_OFFER_ACCEPTED_RATIO, 2)
+        assert kept["best_offer_list_price"] == 1000
+
+    def test_sqlite_one_counts_as_a_flag_and_zero_none_string_do_not(self):
+        assert _pool([self._bo(1000, 9.4, 1, age=1)])[0][0]["price"] == 890.0
+        for flag in (0, False, None, "true"):
+            assert _pool([self._bo(1000, 9.4, flag, age=1)])[0][0]["price"] == 1000
+
+    def test_exact_tier_prices_off_the_accepted_basis(self):
+        comps = [self._bo(1000, 9.4, True, age=1), self._bo(1000, 9.4, True, age=2),
+                 _slab_comp(800, 9.2, age=3), _slab_comp(1400, 9.6, age=4)]
+        out = _graded(comps, 9.4)
+        same_at_accepted = _graded([_slab_comp(890, 9.4, age=1), _slab_comp(890, 9.4, age=2),
+                                    _slab_comp(800, 9.2, age=3), _slab_comp(1400, 9.6, age=4)], 9.4)
+        assert out["pricing_basis"] == "direct"
+        assert (out["fmv_low"], out["fmv_high"]) == (same_at_accepted["fmv_low"],
+                                                     same_at_accepted["fmv_high"])
+        assert out["fmv_high"] < _graded([_slab_comp(1000, 9.4, age=1), _slab_comp(1000, 9.4, age=2),
+                                          _slab_comp(800, 9.2, age=3),
+                                          _slab_comp(1400, 9.6, age=4)], 9.4)["fmv_high"]
+
+    def test_callers_list_is_never_mutated(self):
+        comp = self._bo(1000, 9.4, True, age=1)
+        _graded([comp, self._bo(1000, 9.4, True, age=2)], 9.4)
+        assert comp["price"] == 1000 and "best_offer_list_price" not in comp
+
+    def test_a_pool_fed_back_through_is_not_scaled_twice(self):
+        once = _pool([self._bo(1000, 9.4, True, age=1)])[0]
+        twice = _pool(once)[0]
+        assert twice[0]["price"] == once[0]["price"] == 890.0
+
+
 class TestGradedCompWeights:
     def test_fresh_stale_and_excluded_bands(self):
         assert fm.graded_comp_weight(0) == 1.0
