@@ -1176,7 +1176,32 @@ def main(argv=None):
         "--query", default=None,
         help="Override the Gmail search query entirely (advanced).",
     )
+    parser.add_argument(
+        "--auto-submit", action="store_true",
+        help="BUI-1238: read the buyer's eBay orders (Trading GetOrders, 30 "
+             "days), group by tracking number, and submit each new one to "
+             "EZShip via `ezship new`. Holds non-US and unsupported-carrier "
+             "orders. Exit 0 ok, 1 failure, 3 EZShip cookie expired, 4 some "
+             "orders rejected. See shipped_submit.py.",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="With --auto-submit: print what would be submitted or held. "
+             "Never calls ezship and writes no state.",
+    )
     args = parser.parse_args(argv)
+    if args.dry_run and not args.auto_submit:
+        parser.error("--dry-run only applies with --auto-submit")
+    if args.auto_submit:
+        import shipped_submit
+        if not args.dry_run and args.ledger != DEFAULT_LEDGER:
+            parser.error("--auto-submit writes the default ledger via ezship; "
+                         "--ledger is only honoured with --dry-run")
+        return shipped_submit.run(
+            ledger_path=args.ledger, load_ledger=load_ledger, dry_run=args.dry_run,
+            server_url=(os.environ.get("COMICS_SERVER_URL")
+                        or os.environ.get("GIXEN_SERVER_URL") or "").rstrip("/") or None,
+            json_output=args.json_output)
     if args.max_workers < 1:
         parser.error("--max-workers must be at least 1")
     if args.max_results < 1:

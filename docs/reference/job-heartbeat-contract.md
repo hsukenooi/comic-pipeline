@@ -32,6 +32,7 @@ a ping is the alarm.
 | `sentinel-probe` | 168h | 336h | A `comic-fmv --sentinel-probe` run (BUI-603) where every sentinel book **and** the negative control passed — exit 0. Stricter than the rest on purpose: exit 1 means the probe ran and found the comp pipeline miscalibrated, which already alarms via its own exit code. Exit 2 (could not complete) does not ping either. | yes |
 | `slab-watch-collect` | 672h | 1344h | A `comic-fmv --slab-watch-collect` run (BUI-951) where every comp fetch **and** every ledger write it attempted succeeded — exit 0. Mirrors `fmv-refresh`'s BUI-593 lesson: a fetch that ran clean while its ledger POST failed must not ping. A run where every watch-set book was already fresh (nothing fetched) still pings, and so does a run that hit its request cap as long as nothing it attempted failed. | yes |
 | `unpriced-rerun` | 672h | 1344h | A `comic-fmv --unpriced-rerun` run (BUI-1080) where every comp fetch **and** every fmv/ledger write it attempted succeeded — exit 0. Same rule as `slab-watch-collect`: a fetch that ran clean while its upsert or ledger POST failed must not ping, nor must a run where a row's hand-priced provenance could not be verified or the server rejected a write. A run with nothing unpriced still pings, and so does a run that hit its request cap as long as nothing it attempted failed. A failing run POSTs `/api/heartbeat/unpriced-rerun/failure` instead. | yes |
+| `ebay-shipped-submit` | 72h | 144h | An `ebay-shipped --auto-submit` run (BUI-1238) that finished with no failure: eBay GetOrders read cleanly, and every order it chose to submit was accepted by EZShip and confirmed in the EZShip ledger. A run with nothing new to submit still pings, and so does a run that only held orders (non-US ship-from or an unsupported carrier): a hold is the correct outcome, and it notifies instead. An expired EZShip cookie (exit 3), a rejected order (exit 4), an unconfirmable submission, or an eBay failure must not ping; they POST `/api/heartbeat/ebay-shipped-submit/failure` instead. | yes |
 
 Cadences are sized to the **slowest normal run**, not the average, and a job is
 only flagged once it is `HEARTBEAT_STALE_FACTOR` (2×) cadences late. A watchdog
@@ -71,9 +72,9 @@ The report's top-level `healthy` means *every job in the contract is verified
 to be running*, so an uninstrumented job makes it `false` exactly as a stale one
 does. Before BUI-624 that meant `healthy` was permanently `false`: nothing
 pinged, and a version that counted only wired jobs would have handed an external
-monitor a green light for a system observing almost nothing. All seven are wired
+monitor a green light for a system observing almost nothing. All eight are wired
 now (BUI-951 added the sixth, `slab-watch-collect`; BUI-1080 the seventh,
-`unpriced-rerun`), so `healthy: true` is
+`unpriced-rerun`; BUI-1238 the eighth, `ebay-shipped-submit`), so `healthy: true` is
 finally reachable — and still means what it said. A consumer wanting the
 narrower question ("is anything I *am* watching broken?") reads `stale_jobs`
 and `never_seen_jobs` directly.
@@ -163,8 +164,13 @@ instructive rather than incidental.
   `UNPRICED_RERUN_MAX_REQUESTS` books per run (default 150). Scheduled on the
   1st at 10:00, after slab-watch-collect's 09:30, by
   `scripts/launchd/com.comics.unpriced-rerun.plist`.
+- **`ebay-shipped-submit`** — `apps/ebay/src/shipped_submit.py`'s `run`
+  (BUI-1238), via `ping_heartbeat`, only when the run finished with no failure
+  (held orders do not count as failure; they notify). Any failure POSTs
+  `/api/heartbeat/ebay-shipped-submit/failure`. Scheduled every 3 days by
+  `scripts/launchd/com.comics.ebay-shipped-submit.plist`.
 
-Every ping is **advisory to its caller**: none of the seven may fail, block, or
+Every ping is **advisory to its caller**: none of the eight may fail, block, or
 alter the job it reports on. A watchdog that can break the work it watches has
 bought nothing.
 
