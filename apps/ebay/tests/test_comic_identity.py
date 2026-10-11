@@ -1432,3 +1432,29 @@ class TestShouldRejectSpacedRunLot:
     ])
     def test_kept(self, title, issue):
         assert not ci._LOT_RE.search(title)
+
+
+class TestBui1236RetoldKeyDescription:
+    """BUI-1236: comp pools keep "origin retold" key descriptions."""
+
+    @pytest.mark.parametrize("title", [
+        "Amazing Spider-Man #94 Origin Retold Marvel 1971 VG",
+        "AMAZING SPIDER-MAN #94 (1971) RETOLD ORIGIN OF SPIDER-MAN FN",
+        "Amazing Spider-Man 94 origin retold, Stan Lee",
+    ])
+    def test_key_description_kept(self, title):
+        assert ci.is_comp_excluded(title) is False
+
+    @pytest.mark.parametrize("title", [
+        "Amazing Spider-Man #94 Origin Retold Reprint",
+        "Amazing Spider-Man #94 Origin Retold Facsimile Edition",
+        "Marvel Tales #94 Spider-Man Origin Retold",
+        "Amazing Spider-Man #300 Retold Edition",
+    ])
+    def test_reprint_context_still_excluded(self, title):
+        assert ci.is_comp_excluded(title) is True
+
+    def test_purchase_path_unchanged(self):
+        assert ci.should_reject(
+            "Amazing Spider-Man #94 Origin Retold", "Amazing Spider-Man", "94"
+        ) is True
