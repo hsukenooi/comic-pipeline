@@ -122,13 +122,13 @@ The full math — the deploy-order probe, the exact/ladder decision, ledger weig
 
 ## Provider request budget (BUI-570)
 
-The sold-comps providers are a **shared, finite budget**, and a batch spends far more than one request per book. Read this before running anything above ~50 books.
+The sold-comps.com API is a **shared, finite budget**, and a batch spends far more than one request per book. Read this before running anything above ~50 books.
 
 **A book is not one request.** `ebay-sold-comps` runs a tiered strategy per book: a base query always, plus a broadened (year-dropped) tier, an alternate-masthead tier, a grade-targeted tier, a vintage "inclusive" tier, and a variant-drop tier — each conditional. A 66-book batch is a low-hundreds-of-requests batch, not a 66-request one.
 
 **The 7-day query cache is what makes a re-run cheap — but only for an *identical* query.** Re-running the same books inside 7 days is served from cache and costs nothing. Two things void that: `--force` bypasses the cache and re-spends the whole batch, every tier; and **changing any query input re-prices from scratch** — adding a `publisher`, filling in a `year`, or correcting a `title` builds a different query string, so it misses the cache by design. Budget a corrected batch as a full-price run, not a cheap retry. (Per the `--force` note above it also cannot clear a `one_sided`/`too_wide` flag, so a bare `--force` retry is a wasted no-op that drains the budget for nothing.)
 
-**Re-runs compound; the breaker resets.** The BUI-535 circuit breaker is scoped to **one** `ebay-sold-comps` invocation, so every fresh `comic-fmv` call starts with a clean, untripped breaker — but the providers' rate limit and monthly quota do **not** reset. This is the part that misleads operators: a new run re-arms the safety, not the budget. Four runs in a row can each pay the breaker's 5-consecutive-error trip cost on the way down while the quota drains straight through.
+**Re-runs compound; the breaker resets.** The BUI-535 circuit breaker is scoped to **one** `ebay-sold-comps` invocation, so every fresh `comic-fmv` call starts with a clean, untripped breaker — but the provider's rate limit and monthly quota do **not** reset. This is the part that misleads operators: a new run re-arms the safety, not the budget. Four runs in a row can each pay the breaker's 5-consecutive-error trip cost on the way down while the quota drains straight through.
 
 **So don't chop a batch up, and don't probe-then-re-run.** Because the breaker is per-invocation, splitting 60 books into three runs of 20 re-arms the trip cost three times instead of paying it once. Run the full set in **one** `comic-fmv --batch` call and read the result. When investigating a suspected pricing problem, design that single pass to answer the question — a small probe followed by a large re-run is exactly what exhausts the budget.
 

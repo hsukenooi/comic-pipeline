@@ -321,6 +321,8 @@ Slab grades are exact. A 9.6 and a 9.8 are different products, so there's no gra
 | 91–365 days | 0.5 |
 | > 365 days | Excluded |
 
+A best-offer sale reports the listing's asking price, not the accepted offer (BUI-1222). The slab pool prices those comps at 0.89× the reported price (BUI-1234). The raw pool is not scaled.
+
 ```mermaid
 flowchart TD
     S[Slab pool for certifier + label] --> E{Effective n ≥ 2<br/>at exact grade?}

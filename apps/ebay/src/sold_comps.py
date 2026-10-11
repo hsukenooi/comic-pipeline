@@ -1048,8 +1048,9 @@ def canonical_sold_comps_url(nkw: str) -> str:
 # ─── Fetch (with cache + URL verification) ────────────────────────────────────
 
 class SoldCompsError(Exception):
-    """A sold-comps fetch failure: a non-2xx after retries, an unparseable
-    body, or a response that fails sold-shape validation. BUI-1239 folded
+    """A sold-comps fetch failure: an unparseable body or a response that
+    fails sold-shape validation (a non-2xx after retries raises
+    requests.HTTPError instead; every caller catches both). BUI-1239 folded
     the old SerpApiError base into this one class when SerpApi went away."""
 
 
