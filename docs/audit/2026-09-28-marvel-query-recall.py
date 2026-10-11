@@ -7,7 +7,7 @@ Variants (all run through the real `fetch_book_comps` tier ladder):
      fmv_math.MIN_NARROW_POOL, the pool size build_pool widens toward)
   D  B + C
 
-Usage (from the repo root; needs apps/ebay/.env for the provider keys):
+Usage (from the repo root; needs SOLD_COMPS_KEY in apps/ebay/.env):
   uv run --project apps/ebay python docs/audit/2026-09-28-marvel-query-recall.py run A OUTDIR
   ... run B / C / D ...
   uv run --project apps/ebay python docs/audit/2026-09-28-marvel-query-recall.py analyze OUTDIR
@@ -53,7 +53,7 @@ def run(variant: str, outdir: Path) -> None:
     books = json.loads(BATCH.read_text())
     inputs = [{k: v for k, v in b.items() if k not in ("cohort", "batch_unpriced")}
               for b in books]
-    key = sold_comps.load_serpapi_key()
+    key = sold_comps.load_sold_comps_key()
     results = sold_comps.run_batch(inputs, key, max_workers=4)
     outdir.mkdir(parents=True, exist_ok=True)
     (outdir / f"{variant}.json").write_text(json.dumps(results, indent=1))

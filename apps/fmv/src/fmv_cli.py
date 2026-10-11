@@ -53,7 +53,7 @@ def _print_version(ctx: click.Context, param: click.Parameter, value: bool) -> N
               help="Reuse FMVs already in the Gixen DB if fmv_updated_at is "
                    "within N days. Default 7.")
 @click.option("--force", is_flag=True,
-              help="Bypass both the SerpApi response cache and the DB FMV cache; "
+              help="Bypass both the sold-comps response cache and the DB FMV cache; "
                    "recompute everything. Without --force, a hand-priced row "
                    "(fmv.provenance='hand', or — for a row that predates that "
                    "column — fmv_notes OPENING with 'hand' or 'manual', any "

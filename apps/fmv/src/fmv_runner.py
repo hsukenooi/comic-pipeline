@@ -7,7 +7,7 @@ Pipeline per book:
   1. Check Gixen DB for a recent FMV (GET /api/comics?locg_id=&grade=&max_age_days=N)
      — skipped if --force or if the book lacks locg_id/grade
   2. For books needing fresh comps: subprocess to ebay-sold-comps
-     (apps/ebay; that command itself caches SerpApi responses)
+     (apps/ebay; that command itself caches sold-comps.com responses)
   3. Run IQR + quartiles + confidence rubric (fmv_math, pure functions)
   4. POST /api/comics to upsert FMV; the gixen-overlay route stamps fmv_updated_at
   5. POST /api/comics/comps to record the raw+slab pool that produced the
@@ -44,7 +44,7 @@ EBAY_FETCH_BIN = "ebay-fetch"
 _ACTIVE_ASK_SUBPROCESS_TIMEOUT = 30  # seconds
 
 # BUI-184: ebay-sold-comps subprocess timeout, scaled with batch size. Each book
-# may run up to 3 SerpApi queries at a 15s HTTP timeout, fanned out across a
+# may run up to 3 provider queries at a 15s HTTP timeout, fanned out across a
 # thread pool, so a generous per-book budget plus a fixed base.
 _SUBPROCESS_TIMEOUT_BASE = 60       # seconds
 _SUBPROCESS_TIMEOUT_PER_BOOK = 60   # seconds per book in the batch
@@ -1837,7 +1837,7 @@ def _fetch_comps(books: list[dict], *, force: bool,
         if force:
             cmd.append("--force")
         # BUI-184: bound the child so a hung ebay-sold-comps can't hang comic-fmv
-        # forever. Scale with batch size (each book may run up to 3 SerpApi
+        # forever. Scale with batch size (each book may run up to 3 provider
         # queries at a 15s HTTP timeout, fanned out across a thread pool).
         timeout = _SUBPROCESS_TIMEOUT_BASE + _SUBPROCESS_TIMEOUT_PER_BOOK * len(books)
         try:
@@ -2721,7 +2721,7 @@ def _compute_and_upsert_one(result: dict, original_book: dict, *,
     # BUI-286: merge the user's own resolved auctions in as first-party comps
     # (KTD-1 — the merge happens at the pool stage, right before compute_fmv,
     # never inside fmv_math's pure math). `comps` itself is left untouched so
-    # `comp_count_total` below still reflects the SerpApi/ebay-sold-comps pool
+    # `comp_count_total` below still reflects the ebay-sold-comps pool
     # only (BUI-143's fetch-error signal keys off that count); first-party rows
     # are added only to the pool actually priced.
     first_party = _fetch_first_party_outcomes(
@@ -3505,7 +3505,7 @@ def _apply_cgc_proxy_rescue(fresh_fmvs: dict[int, dict], books: list[dict], *,
     band (MEDIUM-LOW, capped bid) and re-upserts it. A book whose ladder is too
     thin / cheap / out-of-range keeps its raw needs_manual result untouched.
 
-    The graded fetch soft-fails (a SerpApi outage on this second pass leaves the
+    The graded fetch soft-fails (a provider outage on this second pass leaves the
     candidates as needs_manual rather than aborting an otherwise-complete run —
     the proxy tier is a best-effort rescue, never a hard dependency).
 
@@ -3677,7 +3677,7 @@ def _apply_cgc_cross_check(fresh_fmvs: dict[int, dict], books: list[dict], *,
     (``/comic:calibration-report`` and a human reviewer).
 
     Reuses the slab comps ebay-sold-comps' BUI-524 inclusive tier may already
-    have fetched (``fresh_fmvs[idx]["slab_comps"]``) — zero extra SerpApi spend
+    have fetched (``fresh_fmvs[idx]["slab_comps"]``) — zero extra provider spend
     in the common case where that tier already fired. Falls back to a
     dedicated graded-only fetch (mirroring ``_apply_cgc_proxy_rescue``'s own
     second pass) only for a candidate BUI-524 didn't already supply a
@@ -4532,7 +4532,7 @@ def _build_notes(fmv: dict) -> str:
         parts.append(f"span={span:g}")
     # BUI-286: surface how many of the priced comps came from the user's own
     # resolved auctions, so a visible FMV shift is traceable to first-party
-    # data rather than looking like an unexplained SerpApi swing.
+    # data rather than looking like an unexplained market swing.
     fp_count = fmv.get("first_party_count") or 0
     if fp_count:
         parts.append(f"first_party={fp_count}")
@@ -4634,7 +4634,7 @@ def _build_notes(fmv: dict) -> str:
     #
     # BUI-350 (issue 2): also name `n` explicitly as the graded-ladder comp
     # count, not raw-market depth. `fmv_comps`/`n` is written to the DB
-    # unconditionally (same field a raw-priced book uses for its SerpApi/
+    # unconditionally (same field a raw-priced book uses for its sold-comps/
     # first-party comp count — see fmv.md's `fmv_comps` doc), so a machine
     # consumer reading it in isolation (e.g. the calibration report) would
     # otherwise misread a proxy row's `n` as raw liquidity. A human already
@@ -5519,7 +5519,7 @@ def _print_brief(rows: list[dict]) -> None:
 
 
 def _is_fetch_error(r: dict) -> bool:
-    """BUI-143: distinguish a SerpApi fetch FAILURE (quota exhausted / outage)
+    """BUI-143: distinguish a provider fetch FAILURE (quota exhausted / outage)
     from a book that genuinely has zero comps. Both yield n=0 and otherwise look
     identical, so without this an operator can mistake an API outage for "these
     books are illiquid" and bid blind. A fetch error leaves comps empty while
@@ -5672,7 +5672,7 @@ def _print_table(rows: list[dict]) -> None:
             med_str = "—"
             mb_str = "—"
         elif _is_fetch_error(r):
-            # BUI-143: the SerpApi fetch FAILED for this book — not zero comps.
+            # BUI-143: the sold-comps fetch FAILED for this book — not zero comps.
             # Render distinctly so it isn't mistaken for a legitimately empty pool.
             fmv_str = "fetch-err"
             med_str = "—"
@@ -5706,17 +5706,17 @@ def _print_table(rows: list[dict]) -> None:
             f"{mb_str:>7}  {r['source']}"
         )
 
-    # BUI-143: a whole batch run during a SerpApi outage/quota-exhaustion would
+    # BUI-143: a whole batch run during a provider outage/quota-exhaustion would
     # otherwise print every row as a bland 'n/a'. Surface the failure loudly so
     # the operator checks the key/quota and re-runs instead of bidding blind.
     n_fetch_err = sum(1 for r in rows if _is_fetch_error(r))
     if n_fetch_err:
         click.echo(
             f"\n⚠️  {n_fetch_err} book(s) marked 'fetch-err': the comp fetch "
-            f"FAILED (quota exhausted, outage, or — BUI-565 — a per-book error "
-            f"in ebay-sold-comps), NOT zero comps. Check each row's `error` "
-            f"plus the SerpApi key/quota and re-run — do not treat these as "
-            f"illiquid.",
+            f"FAILED (sold-comps.com quota exhausted, outage, or — BUI-565 — "
+            f"a per-book error in ebay-sold-comps), NOT zero comps. Check each "
+            f"row's `error` plus SOLD_COMPS_KEY and its quota, then re-run — "
+            f"do not treat these as illiquid.",
             err=True,
         )
 
@@ -5727,9 +5727,9 @@ def _print_table(rows: list[dict]) -> None:
     n_breaker_tripped = sum(1 for r in rows if r.get("breaker_tripped"))
     if n_breaker_tripped:
         click.echo(
-            f"\nSerpApi circuit breaker tripped during this run — "
+            f"\nsold-comps.com circuit breaker tripped during this run — "
             f"{n_breaker_tripped} book(s) affected (served cache-only or "
-            "fetch-err). Re-run later once SerpApi recovers."
+            "fetch-err). Re-run later once sold-comps.com recovers."
         )
 
 
@@ -5737,7 +5737,7 @@ def _print_table(rows: list[dict]) -> None:
 #
 # A consistency check over EXISTING `fmv` rows: same comic, higher grade priced
 # below a lower one. Costs zero provider requests — no sold-comps call, no
-# SerpApi quota, no rate-limit exposure — so unlike a re-price it is safe to run
+# quota, no rate-limit exposure — so unlike a re-price it is safe to run
 # over the whole table on demand.
 #
 # Rows are grouped by the comic_id the server returns (`id`), NOT by

@@ -85,7 +85,7 @@ def write_cache(cache_dir: Path, response: dict, *, name: str | None = None,
         if "items" in response:
             url = sc.canonical_sold_comps_url(response["keyword"])
         else:
-            url = sc.canonical_serpapi_url(response["search_parameters"]["_nkw"])
+            url = bf._historic_serpapi_url(response["search_parameters"]["_nkw"])
         name = sc._cache_path(url).name
     path = cache_dir / name
     path.write_text(json.dumps(response), encoding="utf-8")
@@ -125,6 +125,19 @@ def write_capture(capture_dir: Path, records, *, name="raw_responses.jsonl",
 # ---------------------------------------------------------------------------
 # Corpus reading
 # ---------------------------------------------------------------------------
+
+def test_historic_serpapi_url_matches_the_deleted_builder_byte_for_byte():
+    # Golden strings from the deleted sold_comps.canonical_serpapi_url
+    # (BUI-1239). Historic cache files and captures are keyed on these exact
+    # bytes, so any drift silently orphans the SerpApi corpus.
+    q = '"Uncanny X-Men 94" 1975 marvel comics -cgc'
+    assert bf._historic_serpapi_url(q) == (
+        "https://serpapi.com/search.json?_nkw=%22Uncanny+X-Men+94%22+1975"
+        "+marvel+comics+-cgc&engine=ebay&show_only=Sold")
+    assert bf._historic_serpapi_url(q, page=2) == (
+        "https://serpapi.com/search.json?_nkw=%22Uncanny+X-Men+94%22+1975"
+        "+marvel+comics+-cgc&_pgn=2&engine=ebay&show_only=Sold")
+
 
 def test_cache_recovers_query_and_provider_from_both_shapes(tmp_path):
     import collections

@@ -101,7 +101,7 @@ def ungraded_market_anchor(comps: Iterable[dict]) -> dict | None:
     anchor the grade-curve guards). Their price median is a cheap
     ungraded-market sanity anchor + liquidity signal (``n`` = how many raw
     copies actually traded), computed entirely from comps ALREADY fetched (zero
-    additional SerpApi calls, per BUI-522's first acceptance criterion).
+    additional provider calls, per BUI-522's first acceptance criterion).
 
     Returns ``{"median": float, "n": int}`` or ``None`` when the fetch held no
     grade-less priced comp. Purely INFORMATIONAL: this value does NOT enter the
@@ -440,13 +440,13 @@ def quartile(prices: list[float], q: float) -> float:
 RECENCY_HALF_LIFE_DAYS = 75  # empirical starting point (60-90 day range)
 
 _SOLD_DATE_PREFIX_RE = re.compile(r"^\s*sold\s+", re.IGNORECASE)
-_SOLD_DATE_FORMATS = ("%b %d, %Y", "%B %d, %Y")  # SerpApi free text, e.g. "Oct 12, 2026"
+_SOLD_DATE_FORMATS = ("%b %d, %Y", "%B %d, %Y")  # historic SerpApi free text, e.g. "Oct 12, 2026"
 
 
 def _parse_sold_date(value: object) -> date | None:
     """Parse a comp's `sold_date` into a comparable date, or None.
 
-    Handles the two known shapes in this codebase: SerpApi's "Sold Mon DD,
+    Handles the known shapes in this codebase: historic SerpApi "Sold Mon DD,
     YYYY" free text (apps/ebay/src/sold_comps.py `parse_comp`) and first-party
     comps' ISO-8601 `resolved_at` timestamp (apps/fmv/src/fmv_runner.py).
     Missing, blank, or unparseable values return None so the caller can fall

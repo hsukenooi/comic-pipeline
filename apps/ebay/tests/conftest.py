@@ -23,32 +23,26 @@ def _isolate_rejected_candidate_cache(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
-def _no_sold_comps_secondary(monkeypatch):
-    """BUI-545: pin the secondary-provider config to 'absent' for every test.
+def _no_real_sold_comps_key(monkeypatch):
+    """Pin SOLD_COMPS_KEY to 'absent' in the environment for every test.
 
-    run_batch() resolves SOLD_COMPS_KEY from the real environment/.env — on a
-    dev machine that file holds a real key, which would silently activate the
-    failover tier inside legacy SerpApi-failure tests (changing their
-    expected attempt counts and issuing mock calls the tests never routed)
-    and make local runs diverge from CI. Tests that exercise the failover
-    pass sold_comps_key explicitly to fetch_book_comps(), or re-patch
-    load_sold_comps_key after this fixture.
+    A dev machine's environment can hold the real key; a test that reaches
+    load_sold_comps_key() must not pick it up and diverge from CI. Tests
+    that need a key pass one explicitly or set it via monkeypatch.setenv().
     """
-    monkeypatch.setattr(sold_comps, "load_sold_comps_key", lambda: None)
-    monkeypatch.delenv(sold_comps.PROVIDERS_ENV_VAR, raising=False)
     monkeypatch.delenv("SOLD_COMPS_KEY", raising=False)
 
 
 @pytest.fixture(autouse=True)
 def _no_printing_guard_credentials(monkeypatch, tmp_path):
     """BUI-929: pin the printing guard's Browse API credentials to 'absent'
-    for every test, same reasoning as `_no_sold_comps_secondary` above — a
+    for every test, same reasoning as `_no_real_sold_comps_key` above — a
     dev machine's real environment/.env can hold real EBAY_CLIENT_ID/
     EBAY_CLIENT_SECRET values (ebay-fetch's own config needs them). Without
     this, any test whose slab_comps pool happens to contain a price outlier
     would have `_printing_guard` silently make a REAL OAuth token request
     and Browse API call instead of exercising the guard's own logic —
-    exactly the local-vs-CI divergence class `_no_sold_comps_secondary`
+    exactly the local-vs-CI divergence class `_no_real_sold_comps_key`
     exists to prevent, now for a different credential pair. Tests that
     exercise the guard's real-credential path set these explicitly via
     monkeypatch.setenv() after this fixture runs.
@@ -82,7 +76,7 @@ def _no_condition_defect_network_calls(monkeypatch):
 def _isolate_raw_response_capture(monkeypatch, tmp_path):
     """BUI-614: redirect the raw-response capture file to a per-test tmp path.
 
-    Without this, any test that drives fetch()/fetch_sold_comps() to a real
+    Without this, any test that drives fetch_sold_comps() to a real
     success path appends to the real
     ``~/.local/share/ebay-sold-comps-capture/raw_responses.jsonl`` — a stray
     write into the dev machine's real home directory on every test run.
@@ -90,3 +84,14 @@ def _isolate_raw_response_capture(monkeypatch, tmp_path):
     capture_dir = tmp_path / "raw-capture"
     monkeypatch.setattr(sold_comps, "CAPTURE_DIR", capture_dir)
     monkeypatch.setattr(sold_comps, "CAPTURE_PATH", capture_dir / "raw_responses.jsonl")
+
+
+@pytest.fixture(autouse=True)
+def _unpaced_sold_comps_limiter(monkeypatch):
+    """BUI-1239: every live-path test now drives fetch_sold_comps(), whose
+    module-level rate limiter spaces dispatches 1.25s apart. Swap in a fresh
+    effectively-unlimited limiter per test so the suite neither crawls nor
+    inherits pacing state from an earlier test. The BUI-701 pacing tests
+    install their own limiter after this fixture runs."""
+    monkeypatch.setattr(sold_comps, "_SOLD_COMPS_RATE_LIMITER",
+                        sold_comps._RateLimiter(1e9))

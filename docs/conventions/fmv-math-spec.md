@@ -26,9 +26,9 @@ unrelated commit elsewhere in the monorepo); if they don't match, re-run
 
 ## Manual fallback (only if the CLI is broken)
 
-If `comic-fmv` is unavailable, you can run the steps below by hand. SerpApi
-access requires `SERPAPI_KEY`; canonical location is
-`~/.config/ebay-fetch/config.json`.
+If `comic-fmv` is unavailable, you can run the steps below by hand. Sold comps
+come from sold-comps.com, the only provider since BUI-1239. Access requires
+`SOLD_COMPS_KEY`; canonical location is `apps/ebay/.env`.
 
 Before doing any research, resolve and health-gate the comics server through
 the shared comics-server call convention (BUI-172,
@@ -47,13 +47,14 @@ One or more comics, each with:
 **Default query pattern (use this first):**
 
 ```bash
-curl -s "https://serpapi.com/search.json?engine=ebay&_nkw=%22{title}+{issue}%22+{year}+-cgc+-cbcs+-graded+-slab&show_only=Sold&api_key=$SERPAPI_KEY"
+curl -s -H "Authorization: Bearer $SOLD_COMPS_KEY" \
+  "https://api.sold-comps.com/v1/scrape?count=240&daysToScrape=90&includeCompleteListing=true&keyword=%22{title}+{issue}%22+{year}+-cgc+-cbcs+-graded+-slab&sold=true"
 ```
 
 **Quote the series title + issue number** (`"Spawn 98"`, `"Amazing Spider-Man 300"`). This is the primary noise-reduction technique — eBay's index otherwise matches "Spawn" and "98" independently, pulling in Curse of Spawn, Spawn trading cards, and unrelated issues. URL-encode the quotes as `%22`.
 
-> ⚠️ **SerpApi gotcha — only `show_only=Sold` triggers the sold filter.**
-> Despite eBay's URL syntax, SerpApi's eBay engine **silently drops** the `LH_Sold=1` and `LH_Complete=1` params if you pass them directly. The only param that gets translated through to the eBay search is `show_only=Sold` (which sets `LH_Sold=1` server-side). After your first query, **verify** that `data["search_metadata"]["ebay_url"]` contains `LH_Sold=1` — if it doesn't, you're looking at active listings, not sold ones, and the FMV will be wrong (typically far too low).
+> ⚠️ **Verify every result is a sold sale.**
+> Pin `sold=true` explicitly. Then check that every item has `listingType: "sold"`, a `soldPrice`, and an `endedAt`. One active listing in the pool means you are pricing asks, not sales, and the FMV will be wrong (typically far too low). The CLI fails the whole response when any item is not sold-shaped (`_verify_sold_comps_shape`). Also drop any item whose `soldCurrency` is present and not `USD`.
 
 **Sanity check:** if the median price for a non-junk book in the target grade comes back implausibly low (e.g. <$5 for a Bronze-Age VF), suspect that the sold filter didn't apply. Re-verify the eBay URL before trusting the number.
 
@@ -66,13 +67,13 @@ curl -s "https://serpapi.com/search.json?engine=ebay&_nkw=%22{title}+{issue}%22+
 
 **Tiered query strategy** (the CLI does this automatically; replicate it manually if falling back):
 
-1. **Base** — always run: `"{title} {issue}" {year} {publisher_qualifier} -cgc -cbcs -graded -slab` + `show_only=Sold`. Dedupe by `product_id`. (`{publisher_qualifier}` per the per-publisher rule above: the name for indie, `marvel+comics` for Marvel, empty for DC.)
+1. **Base** — always run: `"{title} {issue}" {year} {publisher_qualifier} -cgc -cbcs -graded -slab` with `sold=true`. Dedupe by `itemId`. (`{publisher_qualifier}` per the per-publisher rule above: the name for indie, `marvel+comics` for Marvel, empty for DC.)
 2. **Auto-broaden** — only if base returns <5 total results: re-run without the year (`"{title} {issue}"` only). Common for thin-trade modern keys and oddball one-shots.
 3. **Grade-targeted** — only if base returns <10 grade-tagged comps after parsing: add a grade-label query (`"{title} {issue}" VG` or `FN` etc.). For Silver/Bronze keys this surfaces extra comps; for Copper-and-newer it almost always overlaps the base query and is wasted spend.
 
 Skip tiers 2 and 3 by default — they're conditional, not always-on.
 
-**Self-exclusion (best-effort — BUI-160):** if an active auction is being priced, drop any comp whose `item_id` matches the listing being valued. **Caveat:** comps are keyed by SerpApi `product_id`, which is a *different identifier namespace* from the eBay `item_id` the batch carries — so in the automated `comic-fmv --batch` path the seeded `item_id` usually won't match any comp's `product_id`, and a re-listed self-auction can survive into the comp pool and mildly self-bias the FMV upward. Self-exclusion is therefore reliable only when SerpApi happens to surface a matching `item_id` (or when you pass the actual SerpApi `product_id`); IQR trimming + the 80% bid haircut bound the residual bias. Don't rely on it as a hard guarantee.
+**Self-exclusion (best-effort — BUI-160):** if an active auction is being priced, drop any comp whose `item_id` matches the listing being valued. **Caveat:** a re-listed self-auction gets a new eBay item number, so it can survive into the comp pool under a different `product_id` and mildly self-bias the FMV upward. (Historic SerpApi comps were worse: their `product_id` was often not the eBay item number at all.) IQR trimming and the bid cap bound the residual bias. Don't rely on self-exclusion as a hard guarantee.
 
 **Parse results:**
 
@@ -80,9 +81,8 @@ Skip tiers 2 and 3 by default — they're conditional, not always-on.
 curl -s "..." | python3 -c "
 import json,sys
 data=json.load(sys.stdin)
-for r in data.get('organic_results',[]):
-    p=r.get('price',{})
-    print(f\"  {p.get('raw','?'):>10}  {r.get('sold_date',''):>15}  {r.get('title','')[:75]}\")
+for r in data.get('items',[]):
+    print(f\"  {r.get('soldPrice','?'):>10}  {r.get('endedAt',''):>12}  {r.get('title','')[:75]}\")
 "
 ```
 
@@ -267,7 +267,7 @@ curl -s "https://serpapi.com/search.json?engine=google&q={title}+{issue}+{year}+
 
 Extract realized prices from snippets. Target the grade nearest your raw target (within ±0.5) and bracket grades above and below for interpolation if needed.
 
-**Automation note:** Automating this step requires `engine=google` SerpApi queries. The current `ebay-sold-comps` subprocess only implements `engine=ebay` for raw-copy pricing. Adding §7a automation would require extending `apps/ebay/src/sold_comps.py` to support Google queries — this cannot reuse existing `apps/fmv` plumbing, which only makes `requests` against the comics server.
+**Automation note:** Automating this step requires `engine=google` SerpApi queries. The current `ebay-sold-comps` subprocess queries only sold-comps.com (eBay sold listings). Adding §7a automation would require a new Google-search client in `apps/ebay` — this cannot reuse existing `apps/fmv` plumbing, which only makes `requests` against the comics server.
 
 **Step 2 — Apply raw discount**
 
@@ -406,10 +406,10 @@ For an active auction with 30+ bids that has already crossed your computed Q75, 
 
 ## Caching layers
 
-Two caches insulate this skill from SerpApi's 250/month free tier and from re-running compute we already did. The CLI handles both automatically; the manual fallback should respect them.
+Two caches insulate this skill from the sold-comps.com request quota and from re-running compute we already did. The CLI handles both automatically; the manual fallback should respect them.
 
-1. **SerpApi response cache (`ebay-fetch sold-comps`)** — cache key `sha256(canonical_query_url)`, stored at `~/.cache/ebay-sold-comps/<sha>.json`, TTL 7 days. eBay sold prices for older books move slowly; one fresh fetch per book per week is plenty. Bypass with `--force`.
-2. **DB FMV cache (the comics server's `comics` table)** — before any SerpApi call, look up the existing row by `(locg_id, grade)` and reuse if `fmv_updated_at` is within `--max-age-days N` (default 7). Bypass with `--force`. The `POST /api/comics` endpoint always touches `fmv_updated_at` on FMV-field updates, so the freshness check is reliable.
+1. **sold-comps.com response cache (`ebay-sold-comps`)** — cache key `sha256(canonical_query_url)`, stored at `~/.cache/ebay-sold-comps/<sha>.json`, TTL 7 days. The API key rides the `Authorization` header, so it never enters the key. Historic SerpApi entries in the same directory are no longer read by the live path. eBay sold prices for older books move slowly; one fresh fetch per book per week is plenty. Bypass with `--force`.
+2. **DB FMV cache (the comics server's `comics` table)** — before any provider call, look up the existing row by `(locg_id, grade)` and reuse if `fmv_updated_at` is within `--max-age-days N` (default 7). Bypass with `--force`. The `POST /api/comics` endpoint always touches `fmv_updated_at` on FMV-field updates, so the freshness check is reliable.
 
 Manual fallback: skip these unless you're explicitly recomputing — re-running by hand spends API calls that the CLI would have served from cache.
 
@@ -457,7 +457,7 @@ curl -s -X POST $COMICS_SERVER_URL/api/comics \
 - `issue` — issue number as string; use a range for lots (e.g. `"337-339"`)
 - `grade` — numeric only (e.g. `8.5`); omit or `null` if unknown
 - `fmv_confidence` — must be `"high"`, `"medium"`, or `"low"`
-- `fmv_comps` — **(BUI-286)** the comp-pool count `N`. This is no longer a pure SerpApi/eBay-sold count: it may include first-party comps folded in from your own resolved auctions (WON and LOST outcomes for this `(comic, grade)`, pulled from the comics server). If any of `N` came from your own auctions, `fmv_notes` carries a `first_party=<count>` token — check there to see the SerpApi-vs-first-party split rather than assuming `fmv_comps` is all SerpApi. **(BUI-350)** For a CGC-proxy row (§7a above), `fmv_comps`/`N` reflects the **graded slab-ladder** comp count, not raw-market liquidity — `fmv_notes` carries the `CGC proxy: … n=<count> is graded-ladder comps, not raw-market depth` token; a machine consumer must not read a proxy row's `N` as raw depth.
+- `fmv_comps` — **(BUI-286)** the comp-pool count `N`. This is no longer a pure eBay-sold count: it may include first-party comps folded in from your own resolved auctions (WON and LOST outcomes for this `(comic, grade)`, pulled from the comics server). If any of `N` came from your own auctions, `fmv_notes` carries a `first_party=<count>` token — check there to see the market-vs-first-party split rather than assuming `fmv_comps` is all market comps. **(BUI-350)** For a CGC-proxy row (§7a above), `fmv_comps`/`N` reflects the **graded slab-ladder** comp count, not raw-market liquidity — `fmv_notes` carries the `CGC proxy: … n=<count> is graded-ladder comps, not raw-market depth` token; a machine consumer must not read a proxy row's `N` as raw depth.
 - `fmv_flag_reason` — **(BUI-132)** set to the `needs_manual` reason (`"one_sided"`, `"too_wide"`, `"too_sparse"`, or `"variant_dropped"`) when the book was flagged (§3); omit/`null` for an auto-priced book. This is now a **structured column**, not just a `manual_review=<reason>` token in `fmv_notes`. Posting it makes the row first-class `needs_manual`: `/comic:verify` reports it as `needs_manual` (not `fmv_stub`), and the upsert **clears any previously-cached price** for that comic+grade so a book that later flags can't keep a stale auto-priced number. (A plain n=0 no-comps stub posts with `fmv_flag_reason` omitted and so never wipes a real price.)
 - `locg_id` — from the LOCG ID resolved in `/comic:collection-check`; omit entirely if unresolved (don't pass null)
 - `locg_variant_id` — include only if a separate variant entry was found on LOCG
@@ -468,7 +468,7 @@ Confirm the `id` returned — that's the `comic_id` that will be linked to the b
 
 | Mistake | Fix |
 |---|---|
-| Passing `LH_Sold=1` / `LH_Complete=1` to SerpApi | SerpApi's eBay engine drops them silently — use `show_only=Sold`. Verify by grepping the returned `search_metadata.ebay_url` for `LH_Sold=1` |
+| Trusting the provider's sold filter without checking | Pin `sold=true` and verify every item is sold-shaped (`listingType: "sold"`, `soldPrice`, `endedAt`) — one active listing corrupts the pool |
 | Mixing quartile methods between IQR and FMV range | Use `statistics.quantiles(method='inclusive')` for both. The default `'exclusive'` over-dilates IQR on small samples and lets outliers survive |
 | Numeric grade regex `\b([0-9]\.[058])\b` (old) | Use `\b([0-9]\.[02-9])\b` — the old form silently dropped 9.2/9.4/9.6/9.9 comps |
 | Stating "Medium" confidence by feel | Use the rubric: n + CV decide it |

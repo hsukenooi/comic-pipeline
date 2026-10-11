@@ -149,7 +149,7 @@ def _token_cache_file(base_url):
 # used by the OAuth token cache and the item-aspects disk cache.
 #
 # BUI-333: a reuse review after BUI-323 found the same two idioms hand-copied
-# elsewhere in apps/ebay/src/ — sold_comps.py's SerpApi retry loop + JSON
+# elsewhere in apps/ebay/src/ — sold_comps.py's provider retry loop + JSON
 # cache write, ebay_search_cache.py's JSON cache write, and seller_scan.py's
 # rejected-candidate cache write. Those now call retry_request()/
 # atomic_write_json() too, so apps/ebay has one retry/backoff and one

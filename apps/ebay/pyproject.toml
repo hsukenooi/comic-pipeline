@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "ebay-tools"
 version = "0.2.0"
-description = "eBay data tools: live listings (Browse API) and sold comps (SerpApi)"
+description = "eBay data tools: live listings (Browse API) and sold comps (sold-comps.com)"
 requires-python = ">=3.11"
 dependencies = [
     "requests",
