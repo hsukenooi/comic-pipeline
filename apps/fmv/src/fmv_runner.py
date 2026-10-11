@@ -5023,7 +5023,19 @@ def _fmv_from_db_row(row: dict, grade_confidence: str | None = None) -> dict:
     if (window is not None and window > fmv_math.WIDE_GRADE_WINDOW
             and fmv_math._rank(fmv_conf) > fmv_math._CONF_RANK["MEDIUM"]):
         fmv_conf = "MEDIUM"
-    factor = fmv_math.bid_factor(fmv_conf, grade_confidence)
+    # BUI-1228: the stored label collapses MEDIUM-LOW and LOW onto 'low', and
+    # bid_factor reads the collapsed label as LOW (0.60), so a cache hit with a
+    # photo grade_confidence bid 0.60 where the fresh run bid 0.70. The stored
+    # `bid_tier` keeps the split ('LOW' = MEDIUM-LOW, 'VERY LOW' = LOW), so
+    # recover the finer label from it for the factor only. A missing or
+    # unrecognised tier keeps the conservative 'LOW' read (0.60).
+    factor_conf = fmv_conf
+    if (row.get("fmv_confidence") or "low").lower() == "low":
+        stored_tier = row.get("fmv_bid_tier")
+        if (isinstance(stored_tier, str)
+                and stored_tier.strip().upper() == fmv_math.TIER_LOW):
+            factor_conf = "MEDIUM-LOW"
+    factor = fmv_math.bid_factor(factor_conf, grade_confidence)
     # BUI-318: an interpolated book is cache-reusable, but its persisted
     # fmv_confidence is a plain "low" — bid_factor("LOW", None) would return the
     # full 0.80×, silently undoing the interpolated-LOW haircut on reuse. Recover
