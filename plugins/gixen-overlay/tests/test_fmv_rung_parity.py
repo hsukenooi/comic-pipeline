@@ -178,7 +178,7 @@ def _stored_slab_row(out: dict) -> dict:
 def test_slab_recompute_rides_bid_high_and_never_sits_below_the_bid():
     import random
     rng = random.Random(1242)
-    priced = naive_caught = 0
+    priced = naive_caught = collapsed_direct = 0
     for _ in range(3000):
         out = _slab_case(rng)
         if out["max_bid"] is None:
@@ -190,14 +190,22 @@ def test_slab_recompute_rides_bid_high_and_never_sits_below_the_bid():
         rung = link["factor"]
         assert link["cap"] == max(rung * out["bid_high"],
                                   fm.clean_round(rung * out["bid_high"]))
-        # No false advisory on the bid comic-fmv actually computed. Scoped
-        # like the raw sweep above: a direct MEDIUM-LOW slab bids 0.80 but
-        # stores 'low' (rung 0.70), the pre-existing collapse gap.
-        if out["bid_factor"] <= rung:
-            assert link["cap"] >= out["max_bid"]
+        # No false advisory on the bid comic-fmv actually computed, on any
+        # slab row. BUI-1261 removed the old scoping here: a direct slab
+        # bids 0.80 whatever its label (grade_confidence is pinned None),
+        # so its stored 'low' (MEDIUM-LOW or LOW) no longer reads 0.70.
+        assert rung >= out["bid_factor"], out["pricing_basis"]
+        assert link["cap"] >= out["max_bid"]
+        if out["pricing_basis"] == "direct":
+            assert rung == fm.BASE_BID_FACTOR
+            assert link["cap"] == max(out["max_bid"],
+                                      fm.BASE_BID_FACTOR * out["bid_high"])
+            if out["confidence"] in ("MEDIUM-LOW", "LOW"):
+                collapsed_direct += 1
         # A bid built off the widened high is caught on some rows.
         naive = fm.clean_round(out["fmv_high"] * out["bid_factor"])
         if naive > link["cap"]:
             naive_caught += 1
     assert priced > 500
     assert naive_caught > 50
+    assert collapsed_direct > 20  # the BUI-1261 rows are in the sweep

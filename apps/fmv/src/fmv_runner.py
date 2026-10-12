@@ -5036,6 +5036,16 @@ def _fmv_from_db_row(row: dict, grade_confidence: str | None = None) -> dict:
     grade at full 80% — the exact case the haircut exists to prevent.
     """
     fmv_high = row.get("fmv_high")
+    certifier = _identity_token(row.get("certifier"), _RAW_CERTIFIER)
+    label = _identity_token(row.get("label"), _RAW_LABEL)
+    # BUI-1261: a certified grade is not a photo judgement, so `graded_fmv`
+    # pins grade_confidence None and a fresh slab never takes the BUI-51
+    # haircut. Pin it here too. Otherwise a cached direct slab stored 'low'
+    # (MEDIUM-LOW and LOW collapse, and a slab has no `bid_tier` to recover
+    # the split) re-bid at 0.60 whenever the request carried any
+    # grade_confidence, where the fresh run bid 0.80.
+    if certifier != _RAW_CERTIFIER:
+        grade_confidence = None
     fmv_conf = (row.get("fmv_confidence") or "low").upper()
     # BUI-182: re-apply the wide-grade-window confidence cap on reuse. A pool
     # built past WIDE_GRADE_WINDOW can't claim HIGH/MEDIUM-HIGH (fmv_math R7).
@@ -5093,8 +5103,6 @@ def _fmv_from_db_row(row: dict, grade_confidence: str | None = None) -> dict:
         factor = min(factor, _PRICING_BASIS_BID_FACTORS[basis])
     if basis == "interpolated":
         interpolated = True
-    certifier = _identity_token(row.get("certifier"), _RAW_CERTIFIER)
-    label = _identity_token(row.get("label"), _RAW_LABEL)
     # BUI-1219: the median-anchored cap, re-derived from the STORED median and
     # tier through the same `fmv_math.median_bid_cap` compute_fmv uses, so a
     # cache hit bids what a fresh run would. `fmv_confidence` is stored
