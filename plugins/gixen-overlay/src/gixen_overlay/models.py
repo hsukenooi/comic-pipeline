@@ -184,6 +184,10 @@ class UpsertComicRequest(BaseModel):
     # unflagged row only; see `upsert_fmv` for the ON CONFLICT treatment.
     fmv_median: float | None = None
     fmv_bid_tier: str | None = None
+    # BUI-1242: a slab row's pre-widening band top, the basis its max_bid
+    # rides (`fmv_high` is the widened published band). Priced, unflagged,
+    # certified rows only, never above `fmv_high`.
+    fmv_bid_high: float | None = None
     locg_id: int | None = None
     locg_variant_id: int | None = None
 
@@ -300,6 +304,23 @@ class UpsertComicRequest(BaseModel):
                 "fmv_median/fmv_bid_tier require a priced, unflagged row")
         if self.certifier != FMV_CERTIFIER_NONE:
             raise ValueError("fmv_median/fmv_bid_tier are raw-row only")
+        return self
+
+    @model_validator(mode="after")
+    def validate_bid_high_shape(self) -> "UpsertComicRequest":
+        # BUI-1242: mirrors `upsert_fmv`'s guard as a 422.
+        bid_high = self.fmv_bid_high
+        if bid_high is None:
+            return self
+        if not bid_high >= 0:
+            raise ValueError("fmv_bid_high must be >= 0")
+        if (self.fmv_low is None or self.fmv_high is None
+                or self.fmv_flag_reason):
+            raise ValueError("fmv_bid_high requires a priced, unflagged row")
+        if self.certifier == FMV_CERTIFIER_NONE:
+            raise ValueError("fmv_bid_high is slab-row only")
+        if bid_high > self.fmv_high:
+            raise ValueError("fmv_bid_high cannot exceed fmv_high")
         return self
 
 

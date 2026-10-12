@@ -5622,7 +5622,9 @@ class TestBriefProjection:
                   "active_ask_low", "active_ask_n",
                   # BUI-1219: the median, five-tier bid tier, and what
                   # max_bid was built from. Additive.
-                  "median", "bid_tier", "bid_basis"}
+                  "median", "bid_tier", "bid_basis",
+                  # BUI-1242: a slab row's pre-widening band top. Additive.
+                  "bid_high"}
 
     def test_fresh_row_projects_top_level_ids(self):
         row = {
@@ -5651,7 +5653,8 @@ class TestBriefProjection:
                          # BUI-954: a priced row never fetches an ask ceiling.
                          "active_ask_low": None, "active_ask_n": None,
                          # BUI-1219: absent on this hand-built fmv dict.
-                         "median": None, "bid_tier": None, "bid_basis": None}
+                         "median": None, "bid_tier": None, "bid_basis": None,
+                         "bid_high": None}
 
     def test_fresh_row_fmv_notes_matches_upsert_notes(self):
         # BUI-505: the brief line's fmv_notes must be exactly what
@@ -6412,14 +6415,16 @@ class TestCertifierSupportProbe:
 
     def test_rows_carrying_certifier_pass(self, server_url):
         with patch("fmv_runner.requests.get",
-                   self._get([{"id": 1, "certifier": "none"}])):
+                   self._get([{"id": 1, "certifier": "none",
+                                "fmv_bid_high": None}])):
             assert fmv_runner._probe_certifier_support(server_url) is True
 
     def test_a_null_certifier_still_proves_the_column_is_served(self, server_url):
         """`list_comics` LEFT-JOINs `fmv`, so a comic with no price row at all
         comes back with `certifier: null`. The KEY is the proof, not a value."""
         with patch("fmv_runner.requests.get",
-                   self._get([{"id": 1, "certifier": None}])):
+                   self._get([{"id": 1, "certifier": None,
+                                "fmv_bid_high": None}])):
             assert fmv_runner._probe_certifier_support(server_url) is True
 
     def test_rows_without_the_key_fail(self, server_url):
@@ -6455,7 +6460,8 @@ class TestCertifierSupportProbe:
             resp = MagicMock()
             resp.raise_for_status.return_value = None
             resp.json.return_value = ([] if params.get("grade") is not None
-                                      else [{"id": 1, "certifier": "none"}])
+                                      else [{"id": 1, "certifier": "none",
+                                             "fmv_bid_high": None}])
             return resp
 
         with patch("fmv_runner.requests.get", _get):
@@ -7082,7 +7088,10 @@ class TestGradedRunEndToEnd:
                                    tmp_path, server_url)
         fmv = row["fmv"]
         assert fmv["pricing_basis"] == "lone_sale"
-        assert fmv["fmv_low"] == fmv["fmv_high"] == 1000
+        assert fmv["bid_high"] == fmv["median"] == 1000
+        # BUI-1242: published band is the sale +/-15%; the bid rides 1000.
+        assert (fmv["fmv_low"], fmv["fmv_high"]) == (850, 1150)
+        assert upsert.call_args.args[2]["bid_high"] == 1000
         assert fmv["bid_factor"] == 0.70
         assert fmv["max_bid"] == fmv_math.clean_round(1000 * 0.70)
         # The basis rides the brief line, which is what Step 4/5 of

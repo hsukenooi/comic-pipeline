@@ -140,3 +140,64 @@ def test_null_median_row_recomputes_todays_rung():
         "pricing_basis": "direct", "median": None, "bid_tier": None})
     assert link["median_cap"] is None
     assert link["cap"] == pytest.approx(0.80 * 140.0)
+
+
+# ─── BUI-1242: slab rows, published band vs bid basis ───────────────────────
+
+_SLAB_GRADES = (4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5, 9.0, 9.2,
+                9.4, 9.6, 9.8)
+
+
+def _slab_case(rng):
+    from datetime import date, timedelta
+    as_of = date(2026, 9, 1)
+    base = rng.choice((40, 150, 600, 2500, 9000))
+    comps = []
+    for i in range(rng.randint(2, 12)):
+        g = rng.choice(_SLAB_GRADES)
+        price = round(base * (1.25 ** _SLAB_GRADES.index(g))
+                      * rng.uniform(0.7, 1.4), 2)
+        comps.append({"product_id": f"r{i}", "title": "", "price": price,
+                      "grade": g, "page_quality": "unknown",
+                      "certifier": "cgc", "label": "universal",
+                      "sold_date": (as_of - timedelta(
+                          days=rng.randint(0, 300))).isoformat()})
+    return fm.graded_fmv(comps, rng.choice(_SLAB_GRADES), certifier="cgc",
+                         label="universal", as_of=as_of)
+
+
+def _stored_slab_row(out: dict) -> dict:
+    """The fmv row comic-fmv's upsert leaves for a priced slab result:
+    published low/high, the BUI-1242 `bid_high`, no median pair."""
+    return {"id": 1, "high": out["fmv_high"], "low": out["fmv_low"],
+            "confidence": _DB_LABEL[out["confidence"]], "certifier": "cgc",
+            "pricing_basis": out["pricing_basis"], "median": None,
+            "bid_tier": None, "ceiling_cap": None, "bid_high": out["bid_high"]}
+
+
+def test_slab_recompute_rides_bid_high_and_never_sits_below_the_bid():
+    import random
+    rng = random.Random(1242)
+    priced = naive_caught = 0
+    for _ in range(3000):
+        out = _slab_case(rng)
+        if out["max_bid"] is None:
+            continue
+        priced += 1
+        link = policy._recomputed_link_cap(_stored_slab_row(out))
+        # The basis is bid_high, exactly the number max_bid was built from.
+        assert link["high"] == out["bid_high"]
+        rung = link["factor"]
+        assert link["cap"] == max(rung * out["bid_high"],
+                                  fm.clean_round(rung * out["bid_high"]))
+        # No false advisory on the bid comic-fmv actually computed. Scoped
+        # like the raw sweep above: a direct MEDIUM-LOW slab bids 0.80 but
+        # stores 'low' (rung 0.70), the pre-existing collapse gap.
+        if out["bid_factor"] <= rung:
+            assert link["cap"] >= out["max_bid"]
+        # A bid built off the widened high is caught on some rows.
+        naive = fm.clean_round(out["fmv_high"] * out["bid_factor"])
+        if naive > link["cap"]:
+            naive_caught += 1
+    assert priced > 500
+    assert naive_caught > 50

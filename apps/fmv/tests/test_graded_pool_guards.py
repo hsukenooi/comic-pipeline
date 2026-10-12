@@ -118,8 +118,8 @@ class TestBatman227Replay:
         # $465 → $500, because a real sale at the exact grade earns 0.70 where
         # a line drawn over it earns 0.60.
         assert after["pricing_basis"] == "lone_sale"
-        assert after["fmv_high"] == 700
-        assert after["fmv_low"] == 700 and after["median"] == 700
+        assert after["bid_high"] == 700
+        assert after["median"] == 700
         assert after["lone_sale_bracket"] == {
             "lo": 500.0, "hi": 899.0, "lo_grade": 2.5, "hi_grade": 5.5}
         assert after["bid_factor"] == 0.70
@@ -162,7 +162,7 @@ class TestInvincible1Replay:
         # ($3,600 clean-rounded) rather than the $3,650 the ladder
         # interpolated across it.
         assert after["pricing_basis"] == "lone_sale"
-        assert after["fmv_high"] == 3600
+        assert after["bid_high"] == 3600
         assert after["pool_n"] == len(data["comps"]) - 5
 
     def test_the_target_s_own_neighbour_rung_stops_inverting(self):
@@ -227,7 +227,7 @@ class TestInvincible1Replay:
         assert after["page_quality_fallback"] is False
         assert after["page_quality_fallback_reason"] is None
         assert after["flag_reason"] is None
-        assert after["fmv_high"] == 3600
+        assert after["bid_high"] == 3600
         # Scoped and unscoped land on the same number here, as they did before:
         # the price is the one white sale either way.
         assert after["fmv_high"] == _price(
@@ -292,7 +292,7 @@ class TestLedgerHonoursGuards:
             _guarded(data), data["comps"], dropped_ids=dropped_ids)
         priced = _price(pool, target, page_quality=None)
         assert priced["flag_reason"] is None
-        assert priced["fmv_high"] == expected_fmv_high
+        assert priced["bid_high"] == expected_fmv_high
         # The honoured merge must equal the guarded-only pool exactly — the
         # ledger contributes nothing this run wasn't already going to keep.
         guarded_only = _price(_guarded(data), target, page_quality=None)

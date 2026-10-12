@@ -2044,7 +2044,7 @@ class TestGradedExactTier:
                  _slab_comp(1000, 9.2, age=3), _slab_comp(1400, 9.6, age=4)]
         out = _graded(comps, 9.4)
         assert out["envelope_clamped"] is False
-        assert out["fmv_high"] == 5000
+        assert out["bid_high"] == 5000
 
 
 class TestGradedLadderTier:
@@ -2078,7 +2078,7 @@ class TestGradedLadderTier:
         out = _graded(self._rungs() + [_slab_comp(700, 4.5, age=1)], 4.5)
         assert out["confidence"] == "LOW"
         assert out["bid_factor"] == 0.60
-        assert out["max_bid"] == fm.clean_round(out["fmv_high"] * 0.60)
+        assert out["max_bid"] == fm.clean_round(out["bid_high"] * 0.60)
 
     def test_no_exact_sale_at_all_still_interpolates(self):
         out = _graded(self._rungs(), 4.5)
@@ -2165,7 +2165,9 @@ class TestGradedLoneSaleTier:
         assert out["pricing_basis"] == "lone_sale"
         # The band is the sale, flat — no quartiles, because there is nothing
         # to take quartiles of.
-        assert out["fmv_low"] == out["fmv_high"] == out["median"] == 1000
+        assert out["bid_high"] == out["median"] == 1000
+        # BUI-1242: the published band is the sale +/-15%.
+        assert (out["fmv_low"], out["fmv_high"]) == (850, 1150)
         assert out["confidence"] == "LOW"
         assert out["bid_factor"] == 0.70
         assert out["max_bid"] == fm.clean_round(1000 * 0.70)
@@ -2301,10 +2303,10 @@ class TestGradedLoneSaleTier:
                  _slab_comp(1500, 6.0, age=14), _slab_comp(450, 2.5, age=16)]
         out = _graded(rungs + [_slab_comp(1013, 4.5, age=1)], 4.5)
         assert out["pricing_basis"] == "lone_sale"
-        assert out["fmv_high"] == 1025                    # the sale, rounded
+        assert out["bid_high"] == 1025                    # the sale, rounded
         assert out["lone_sale_bracket"]["hi"] == 1015.0
-        assert out["fmv_high"] - out["lone_sale_bracket"]["hi"] < fm._clean_step(
-            out["fmv_high"])
+        assert out["bid_high"] - out["lone_sale_bracket"]["hi"] < fm._clean_step(
+            out["bid_high"])
 
     def test_the_exact_tier_still_wins_at_effective_n_two(self):
         """Ordering: a bucket that clears the exact tier's gate never reaches
@@ -2409,7 +2411,7 @@ class TestGradedPageQuality:
         # `live=`/`ledger=`, so it has to count the same population they do.
         assert out["n"] == 2
         assert out["pool_n"] == 6
-        assert out["fmv_low"] >= 3000
+        assert out["median"] >= 3000
 
     def test_pool_n_counts_the_same_pool_whether_or_not_scoping_applied(self):
         """BUI-957: a scoped `direct` row used to report `pool_n=2` on a
@@ -2536,7 +2538,7 @@ class TestGradedPageQualityLadderFallback:
         # scoped-only (9.2/9.8) pair — proof the full pool, not just the two
         # white-only rungs, fed the rungs.
         assert out["graded_ladder"]["envelope_price"] == pytest.approx(2475.0)
-        assert out["fmv_high"] == 2475
+        assert out["bid_high"] == 2475
         assert out["max_bid"] == 1975
 
     def test_scoped_pool_pricing_direct_is_never_widened(self):
@@ -2558,7 +2560,7 @@ class TestGradedPageQualityLadderFallback:
         assert out["page_quality_fallback_reason"] is None
         assert out["n"] == 2          # the band: both white sales
         assert out["pool_n"] == 3     # the pool: every same-label sale
-        assert out["fmv_low"] >= 3000
+        assert out["median"] >= 3000
 
     def test_a_scoped_ladder_row_reads_every_quality_not_just_enough_rungs(self):
         """BUI-937 replaced BUI-939's rung count: the ladder reads the whole
@@ -2676,7 +2678,7 @@ class TestGradedExactTierIsNotReRunAfterAWiden:
         assert out["page_quality_fallback"] is True
         assert out["page_quality_fallback_reason"] == "exact_any_page_quality"
         assert out["exact_sales"] == [3400.0, 3600.0]
-        assert out["fmv_high"] == 2400   # same envelope-bounded band as before
+        assert out["bid_high"] == 2400   # same envelope-bounded band as before
         assert out["max_bid"] == 1925
 
     def test_the_exact_sales_are_reported_as_the_band(self):
@@ -2732,7 +2734,7 @@ class TestGradedExactAnyPageQualityBeforeLadder:
                       + [_slab_comp(2000, 7.0, age=2, product_id="u9")], 6.0,
                       page_quality="ow_w")
         assert out["pricing_basis"] == "lone_sale"
-        assert out["fmv_low"] == out["fmv_high"] == 1225  # rounded to $5
+        assert out["median"] == out["bid_high"] == 1225  # rounded to $5
         assert out["page_quality_fallback_reason"] == "exact_any_page_quality"
 
     def test_same_quality_exact_bucket_still_wins(self):
@@ -2769,7 +2771,7 @@ class TestGradedExactAnyPageQualityBeforeLadder:
                       + [_slab_comp(2000, 7.0, age=2, product_id="u9")], 6.0,
                       page_quality="ow_w")
         assert out["pricing_basis"] == "lone_sale"
-        assert out["fmv_high"] == 1225
+        assert out["bid_high"] == 1225
         assert out["page_quality_fallback"] is False
         assert out["page_quality_fallback_reason"] is None
         assert out["exact_sales"] == [1225.0]
@@ -2861,7 +2863,7 @@ class TestGradedExactAnyPageQualityBeforeLadder:
         out = _graded(base, 6.0, page_quality="ow_w")
         assert out["flag_reason"] is None
         assert out["pricing_basis"] == "lone_sale"
-        assert out["fmv_high"] == 1225
+        assert out["bid_high"] == 1225
         assert out["page_quality_fallback_reason"] is None
 
     def test_a_widened_bucket_below_the_gate_falls_through_unchanged(self):
@@ -2876,7 +2878,7 @@ class TestGradedExactAnyPageQualityBeforeLadder:
                 + [_slab_comp(2000, 7.0, age=2, product_id="u9")])
         out = _graded(base, 6.0, page_quality="ow_w")
         assert out["pricing_basis"] == "lone_sale"
-        assert out["fmv_high"] == 1225
+        assert out["bid_high"] == 1225
         assert out["bid_factor"] == 0.70
         assert out["page_quality_fallback"] is False
         assert out["page_quality_fallback_reason"] is None
@@ -2997,7 +2999,7 @@ class TestGradedPageQualityScopesTheExactBucketOnly:
         assert out["pool_n"] == 4
         # ... and the unscoped rungs bounded it.
         assert out["envelope_clamped"] is True
-        assert out["fmv_low"] == out["median"] == out["fmv_high"] == 1200
+        assert out["median"] == out["bid_high"] == 1200
         assert out["max_bid"] == 950
         assert sorted(out["graded_ladder"]["ladder"]) == [9.4, 9.6, 9.8]
 
@@ -3007,7 +3009,7 @@ class TestGradedPageQualityScopesTheExactBucketOnly:
         scoping had excluded and not from some new haircut."""
         out = _graded(self._WHITE_PAIR, 9.6, page_quality="white")
         assert out["envelope_clamped"] is False
-        assert out["fmv_high"] == 5150
+        assert out["bid_high"] == 5150
         assert out["max_bid"] == 4125
 
     def test_a_fat_other_quality_target_rung_does_not_disable_the_clamp(self):
@@ -3026,7 +3028,7 @@ class TestGradedPageQualityScopesTheExactBucketOnly:
                       page_quality="white")
         assert out["exact_effective_n"] == 2.0  # the white pair, not 6.0
         assert out["envelope_clamped"] is True
-        assert out["fmv_high"] == 1200
+        assert out["bid_high"] == 1200
 
     def test_a_divergent_scoped_pair_with_no_envelope_still_refuses(self):
         """BUI-930's dispersion guard is not regressed: at the TOP of the
@@ -3065,7 +3067,7 @@ class TestGradedPageQualityScopesTheExactBucketOnly:
         out = _graded(white + around, 9.6, page_quality="white")
         assert out["flag_reason"] is None
         assert out["envelope_clamped"] is True
-        assert out["fmv_high"] == 1200
+        assert out["bid_high"] == 1200
         assert out["max_bid"] == 950
 
 
