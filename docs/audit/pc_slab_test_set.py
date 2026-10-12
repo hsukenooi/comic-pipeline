@@ -342,28 +342,81 @@ def ledger_match(pc: dict, ledger: list[dict]) -> dict | None:
 OUTLIER_LO, OUTLIER_HI, OUTLIER_DAYS, OUTLIER_MIN_N = 0.25, 4.0, 365, 3
 
 
+# BUI-1243 fallback, used only when a row has fewer than OUTLIER_MIN_N same-grade
+# neighbours. Price rises with grade, so each direction is one-sided: a row under
+# ADJ_LO x the median of the book's sales within ADJ_SPAN grades below it, or over
+# ADJ_HI x the median within ADJ_SPAN grades above it, is junk. Big grade jumps at
+# the top (9.6 -> 9.8 can be 2.5x) only loosen this check, never falsely tighten it.
+ADJ_SPAN, ADJ_LO, ADJ_HI = 1.0, 0.5, 2.0
+
+
+def _median(xs: list[float]) -> float:
+    xs = sorted(xs)
+    n = len(xs)
+    return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
+
+
 def flag_price_outliers(rows: list[dict]) -> None:
     """Set `price_outlier` on each universal row: True when its price is below
     0.25x or above 4x the median of the OTHER same-grade universal sales of the
-    book within 365 days (at least 3 of them), False when inside, None when
-    there are too few neighbours to judge. It catches gross mis-reads (a raw
-    copy titled "CGC likely 9.6" sold for $0.71) without trimming real spread.
+    book within 365 days (at least 3 of them), False when inside. It catches
+    gross mis-reads (a raw copy titled "CGC likely 9.6" sold for $0.71) without
+    trimming real spread.
+
+    With fewer than 3 same-grade neighbours (BUI-1243) it falls back to the
+    adjacent-grade check (ADJ_*): True when the price is under 0.5x the median
+    of the book's other sales within 1.0 grade below, or over 2x the median
+    within 1.0 grade above (each side needs 3 sales in the same 365 days).
+    False when neither fires and a side had enough sales, None when neither did.
     Rows are kept; scorers decide whether to drop them."""
-    uni = [(r, date.fromisoformat(r["sold_date"])) for r in rows if r["universal"]]
+    uni = [(r, date.fromisoformat(r["sold_date"]), float(r["grade"]))
+           for r in rows if r["universal"]]
     for r in rows:
         r["price_outlier"] = None
-    for r, d in uni:
-        nb = sorted(o["price"] for o, od in uni if o is not r and o["grade"] == r["grade"]
-                    and abs((od - d).days) <= OUTLIER_DAYS)
-        if len(nb) < OUTLIER_MIN_N:
+    for r, d, g in uni:
+        near = [(o["price"], og) for o, od, og in uni
+                if o is not r and abs((od - d).days) <= OUTLIER_DAYS]
+        nb = [p for p, og in near if og == g]
+        if len(nb) >= OUTLIER_MIN_N:
+            med = _median(nb)
+            r["price_outlier"] = not (OUTLIER_LO * med <= r["price"] <= OUTLIER_HI * med)
             continue
-        med = nb[len(nb) // 2] if len(nb) % 2 else (nb[len(nb) // 2 - 1] + nb[len(nb) // 2]) / 2
-        r["price_outlier"] = not (OUTLIER_LO * med <= r["price"] <= OUTLIER_HI * med)
+        below = [p for p, og in near if g - ADJ_SPAN <= og <= g]
+        above = [p for p, og in near if g <= og <= g + ADJ_SPAN]
+        verdict = None
+        if len(below) >= OUTLIER_MIN_N:
+            verdict = r["price"] < ADJ_LO * _median(below)
+        if len(above) >= OUTLIER_MIN_N:
+            verdict = bool(verdict) or r["price"] > ADJ_HI * _median(above)
+        r["price_outlier"] = verdict
+
+
+def self_check_outliers() -> None:
+    """BUI-1243 guard, run by `build`: a 9.8 at $5 (Silver Surfer #4) and a 9.8 at
+    $415 (Invincible #1) over a thousands-dollar lower-grade ladder must flag, and a
+    plausible 9.8 over the same ladder must not."""
+    def mk(grade, price, day):
+        return {"universal": True, "grade": grade, "price": price, "sold_date": day}
+    ladder = [mk(9.0, 2900.0, "2024-05-14"), mk(9.0, 3000.0, "2024-08-16"),
+              mk(9.2, 3100.0, "2024-06-01"), mk(9.2, 3300.0, "2024-07-01"),
+              mk(9.4, 5000.0, "2024-04-01")]
+    junk, ok = mk(9.8, 5.0, "2024-04-22"), mk(9.8, 7767.5, "2024-04-22")
+    flag_price_outliers(ladder + [junk, ok])
+    assert junk["price_outlier"] is True, "9.8 at $5 over a $3k ladder must flag"
+    assert ok["price_outlier"] is False, "a plausible 9.8 over the same ladder must not"
+    # $415 is 0.30x the lower-grade median (inside the 0.25x same-grade band)
+    # but under the 0.5x adjacent floor
+    inv = [mk(9.0, 1400.0, "2025-08-05"), mk(9.0, 1200.0, "2025-06-18"),
+           mk(9.0, 995.87, "2025-03-02"), mk(9.2, 1500.0, "2025-04-13")]
+    low = mk(9.8, 415.0, "2024-08-26")
+    flag_price_outliers(inv + [low])
+    assert low["price_outlier"] is True, "9.8 at $415 over a ~$1.2k ladder must flag"
 
 
 # ─── build / load ───────────────────────────────────────────────────────────
 
 def build() -> dict:
+    self_check_outliers()
     conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
     books, sales, skipped = [], [], []
     for cid, (slug, series, issue, year, known) in BOOKS.items():
