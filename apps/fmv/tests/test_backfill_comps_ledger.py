@@ -953,3 +953,31 @@ def test_sweep_requires_a_server_url(sweep_server, monkeypatch):
     monkeypatch.delenv("GIXEN_SERVER_URL", raising=False)
     with pytest.raises(SystemExit):
         bf.main(["--sweep-excluded"])
+
+
+# BUI-1256: stored yearless-tier slab rows the live title_year guard never
+# re-sees must be stampable by the sweep.
+def test_sweep_verdict_stamps_title_year_mismatch():
+    assert bf.sweep_verdict(
+        sc, title="Amazing Spider-Man #100 CGC 6.0 1971 Marvel", issue="100",
+        target_is_variant=False, certifier="cgc",
+        year=1980) == sc.TITLE_YEAR_CODE == "title_year"
+
+
+def test_sweep_verdict_keeps_matching_or_yearless_title_year():
+    kw = dict(issue="100", target_is_variant=False, certifier="cgc", year=1971)
+    assert bf.sweep_verdict(
+        sc, title="Amazing Spider-Man #100 CGC 6.0 1971 Marvel", **kw) is None
+    assert bf.sweep_verdict(
+        sc, title="Amazing Spider-Man #100 CGC 6.0 Marvel", **kw) is None
+    # no target year / modern target: guard off
+    kw["year"] = None
+    assert bf.sweep_verdict(
+        sc, title="Amazing Spider-Man #100 CGC 6.0 1980", **kw) is None
+
+
+def test_sweep_verdict_title_year_applies_to_variant_targets_like_live():
+    assert bf.sweep_verdict(
+        sc, title="Amazing Spider-Man #100 CGC 6.0 1980 Marvel", issue="100",
+        target_is_variant=True, certifier="cgc",
+        year=1971) == "title_year"

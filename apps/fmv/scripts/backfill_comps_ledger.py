@@ -921,7 +921,8 @@ SWEEP_COMPS_READ_LIMIT = 1000
 
 
 def sweep_verdict(sc: types.ModuleType, *, title: str, issue,
-                  target_is_variant: bool, certifier: str) -> str | None:
+                  target_is_variant: bool, certifier: str,
+                  year=None) -> str | None:
     """Replay the live graded guards over ONE stored slab row's title.
 
     Returns an exclusion code, or None to keep. (`UNCODED_HARD_EXCLUDE` was
@@ -942,6 +943,12 @@ def sweep_verdict(sc: types.ModuleType, *, title: str, issue,
     `certifier` is passed as the live `graded_target`. Both accepted values
     take the identical branch of `hard_exclude`; what matters is that it is
     one of them, which the caller has already established.
+
+    `year` is the target book's `comics.year` (BUI-1256) — the live
+    `fetch_book_comps` `year`. The BUI-1240 title-year guard runs LAST, as
+    live, and only for a vintage target (`title_year_mismatch` owns the rule).
+    It applies to variant targets too, exactly as live: the sweep must never
+    stamp a row today's live guard would keep.
     """
     if not title:
         return None
@@ -949,8 +956,13 @@ def sweep_verdict(sc: types.ModuleType, *, title: str, issue,
         return "multibook_lot"
     if sc.hard_exclude(title, graded_target=certifier):
         return sc.HARD_EXCLUDE_CODE
-    return sc.graded_identity_exclude(
+    code = sc.graded_identity_exclude(
         title, issue=issue, target_is_variant=target_is_variant)
+    if code:
+        return code
+    if sc.title_year_mismatch(title, sc._coerce_year(year)):
+        return sc.TITLE_YEAR_CODE
+    return None
 
 
 def _sweep_books(comics: list[dict]) -> dict[int, dict]:
@@ -1015,6 +1027,7 @@ def sweep_excluded(sc: types.ModuleType, server_url: str, *,
                 issue=book.get("issue"),
                 target_is_variant=bool(book.get("variant")),
                 certifier=certifier,
+                year=book.get("year"),
             )
             if verdict is None:
                 totals["kept"] += 1
