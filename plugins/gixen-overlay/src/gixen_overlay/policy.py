@@ -352,6 +352,19 @@ def _effective_high(r: dict) -> float | None:
     return r.get("ceiling_cap")
 
 
+def _bid_basis_high(r: dict) -> float | None:
+    """The number a row's bid was BUILT from (BUI-1242). A slab row's `high`
+    is the widened published band; its bid rides the stored pre-widening
+    `bid_high`. Every other row (raw, ceiling, or a slab row priced before
+    BUI-1242) bids off `_effective_high`. Never above `high`, so a stale
+    value can only tighten the check, mirroring comic-fmv's cache hit."""
+    high, bid_high = r.get("high"), r.get("bid_high")
+    if (high is not None and bid_high is not None
+            and (r.get("certifier") or FMV_CERTIFIER_NONE) != FMV_CERTIFIER_NONE):
+        return min(bid_high, high)
+    return _effective_high(r)
+
+
 def _factor(r: dict) -> float:
     """The rung applied to `_effective_high`. A ceiling cap already carries
     its 0.60 haircut (it is the FINAL cap), so no confidence rung applies on
@@ -439,6 +452,8 @@ def _check_over_fmv(conn: sqlite3.Connection, intent: Any) -> dict | None:
 def _recomputed_link_cap(r: dict) -> dict:
     """One link's recomputed cap: the confidence rung x high, or, on a row
     carrying a BUI-1219 median tier, the LARGER of that and the median cap.
+    On a BUI-1242 slab row, "high" is the stored `bid_high` (see
+    `_bid_basis_high`), not the widened published band.
 
     The larger, because grade_confidence is not stored: a median-tier book
     bids at the median cap with no photo haircut and at rung x high (or
@@ -447,7 +462,7 @@ def _recomputed_link_cap(r: dict) -> dict:
     have produced — and both terms are at most `high`, so the median rule
     never widens the cap past the band's top.
     """
-    high = _effective_high(r)
+    high = _bid_basis_high(r)
     factor = _factor(r)
     # BUI-1228: the writer bids clean_round(factor x high), which rounds UP as
     # often as down, so the unrounded product alone false-advises a legitimate
@@ -460,6 +475,7 @@ def _recomputed_link_cap(r: dict) -> dict:
         "fmv_id": r.get("id"),
         "confidence": r.get("confidence"),
         "high": high,
+        "published_high": r.get("high"),  # BUI-1242: != high on a widened slab row
         "factor": factor,
         "bid_tier": r.get("bid_tier"),
         "median_cap": median_cap,

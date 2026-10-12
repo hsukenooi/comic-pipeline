@@ -1837,6 +1837,21 @@ GRADED_LONE_SALE_MIN_WEIGHT = 1.0
 # interpolation runs, so no single sale can ever be the answer.
 GRADED_LADDER_MIN_BUCKET_N = 1
 
+# BUI-1242: the PUBLISHED slab band's width (BUI-1230 audit,
+# docs/audit/2026-10-11-graded-fmv-band-tuning.md). The ladder and lone-sale
+# tiers print one point, so their band was zero-width and held 2-3% of sales;
+# the exact tier's Q25..Q75 was ~10% wide and held 24%. A +/-15% half-width on
+# the point tiers and a +/-15% floor (relative to the median) on the exact
+# tier cut holdout Winkler 0.843 -> 0.686 with coverage unchanged.
+#
+# The widened band is PUBLISHED ONLY. `max_bid` rides `bid_high`, the
+# pre-widening top (today's `fmv_high`), never the widened one: widening lifts
+# `fmv_high` a median 13.6%, and the exact-tier floor can lift it above the
+# envelope clamp's cap. `bid_high` is persisted (`fmv.bid_high`) so a cache
+# hit and the overlay's recomputed_cap check read the same basis.
+GRADED_POINT_BAND_HALF_WIDTH = 0.15
+GRADED_DIRECT_BAND_HALF_WIDTH_FLOOR = 0.15
+
 # The graded mode's own `fmv_flag_reason` vocabulary. Must stay a subset of
 # `gixen_overlay.models.FMV_FLAG_REASONS` — a value that validator rejects
 # 422s and the server discards the WHOLE upsert (the BUI-588 failure mode).
@@ -2100,6 +2115,10 @@ def _graded_result(**over) -> dict:
         "fmv_high": None,
         "median": None,
         "max_bid": None,
+        # BUI-1242: the pre-widening band top `max_bid` is built from. The
+        # published `fmv_low`/`fmv_high` are widened (see
+        # GRADED_POINT_BAND_HALF_WIDTH); this is not. None when unpriced.
+        "bid_high": None,
         "cv": None,
         "cv_pct": "n/a",
         "confidence": "LOW",
@@ -2189,6 +2208,18 @@ def _graded_result(**over) -> dict:
     }
     base.update(over)
     return base
+
+
+def _graded_published_band(low: float, high: float, center: float,
+                           half_width: float) -> tuple[int, int]:
+    """BUI-1242: the published slab band, widened to at least
+    `center x (1 +/- half_width)` and clean-rounded. Only ever widens
+    (`min`/`max`), so the published high is never below the unwidened one.
+    Matches the BUI-1230 audit's `_finish`. Never the bid basis: callers
+    build `max_bid` from the unwidened high.
+    """
+    return (clean_round(min(low, center * (1 - half_width))),
+            clean_round(max(high, center * (1 + half_width))))
 
 
 def _graded_page_quality_filter(
@@ -2297,7 +2328,8 @@ def graded_fmv(comps: list[dict], target_grade: float, *,
         EXACTLY ONE fresh sale (weight 1.0) and the nearest anchor-eligible
         rungs below and above BRACKET that sale while sitting within
         SMALL_POOL_MAX_RATIO of each other, the row is priced AT the sale
-        (`fmv_low == fmv_high == median`), at LOW/0.70. The bracket is the
+        (`median == bid_high == sale`; the published band is sale +/-15%,
+        BUI-1242), at LOW/0.70. The bracket is the
         whole warrant: the two rungs that would otherwise have a straight line
         drawn between them instead vouch for the neighbourhood the observed
         sale already sits in, so the tier prints an observation rather than an
@@ -2673,15 +2705,21 @@ def _graded_direct(exact_comps: list[dict], ladder: dict[float, float],
     # `bid_factor` anyway so the graded path cannot drift from the one
     # function that owns the haircut ladder.
     factor = bid_factor(conf, None)
-    low_i, high_i, med_i = (clean_round(fmv_low), clean_round(fmv_high),
-                            clean_round(med))
+    # BUI-1242: `bid_high` is the clamped Q75 exactly as before, and the bid
+    # rides it. The published band gets the +/-15% floor around the (clamped)
+    # median AFTER the clamp, so it can sit above the envelope cap; that is
+    # why it must never reach `max_bid`.
+    bid_high, med_i = clean_round(fmv_high), clean_round(med)
+    low_i, high_i = _graded_published_band(
+        fmv_low, fmv_high, med, GRADED_DIRECT_BAND_HALF_WIDTH_FLOOR)
     return _graded_result(
         n=len(exact_comps),
         effective_n=effective_n,
         fmv_low=low_i,
         fmv_high=high_i,
         median=med_i,
-        max_bid=clean_round(high_i * factor),
+        bid_high=bid_high,
+        max_bid=clean_round(bid_high * factor),
         cv=cv_val,
         cv_pct=f"{cv_val * 100:.0f}%" if cv_val is not None else "n/a",
         confidence=conf,
@@ -2789,15 +2827,19 @@ def _graded_lone_sale(exact_comps: list[dict], ladder: dict[float, float],
     point = clean_round(sale)
     factor = min(bid_factor(GRADED_LONE_SALE_CONFIDENCE, None),
                  GRADED_LONE_SALE_BID_FACTOR)
+    # BUI-1242: publish sale +/-15%; the bid still rides the point.
+    low_p, high_p = _graded_published_band(
+        sale, sale, sale, GRADED_POINT_BAND_HALF_WIDTH)
     return _graded_result(
         # `n`/`effective_n` are the EXACT bucket's, not the pool's: this band
         # rests on one sale and says so. (`_graded_ladder` reports the whole
         # pool there because a ladder point rests on the whole ladder.)
         n=1,
         effective_n=weight,
-        fmv_low=point,
-        fmv_high=point,
+        fmv_low=low_p,
+        fmv_high=high_p,
         median=point,
+        bid_high=point,
         max_bid=clean_round(point * factor),
         confidence=GRADED_LONE_SALE_CONFIDENCE,
         bid_factor=factor,
@@ -2864,6 +2906,9 @@ def _graded_ladder(pool: list[dict], ladder: dict[float, float],
     point = clean_round(price)
     factor = min(bid_factor(GRADED_LADDER_CONFIDENCE, None),
                  GRADED_LADDER_BID_FACTOR)
+    # BUI-1242: publish point +/-15%; the bid still rides the point.
+    low_p, high_p = _graded_published_band(
+        point, point, point, GRADED_POINT_BAND_HALF_WIDTH)
     return _graded_result(
         # `n` is LADDER depth, not exact-grade depth — the same caveat
         # `cgc_proxy_fmv` carries, and `_build_notes` states it in words so a
@@ -2871,9 +2916,10 @@ def _graded_ladder(pool: list[dict], ladder: dict[float, float],
         # liquidity at the target grade.
         n=len(pool),
         effective_n=sum(eff_n.values()),
-        fmv_low=point,
-        fmv_high=point,
+        fmv_low=low_p,
+        fmv_high=high_p,
         median=point,
+        bid_high=point,
         max_bid=clean_round(point * factor),
         confidence=GRADED_LADDER_CONFIDENCE,
         bid_factor=factor,

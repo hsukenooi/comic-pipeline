@@ -993,3 +993,52 @@ def test_duplicate_comic_stays_comic_keyed_and_names_both_certifiers(conn):
     dup = r["data"]["duplicates"][0]
     assert dup["existing_certifier"] == "none"
     assert dup["new_certifier"] == "cgc"
+
+
+# ---------------------------------------------------------------------------
+# BUI-1242: a slab row's recomputed cap rides `bid_high`, not the widened high.
+# ---------------------------------------------------------------------------
+
+
+def _slab_setup(conn, item_id, bid_amount, *, high=1150.0, bid_high=1000.0,
+                confidence="low", pricing_basis="lone_sale"):
+    _comic_id, fmv_id = _insert_comic_fmv(
+        conn, low=850.0, high=high, confidence=confidence, certifier="cgc")
+    conn.execute("UPDATE fmv SET bid_high=?, pricing_basis=? WHERE id=?",
+                 (bid_high, pricing_basis, fmv_id))
+    conn.commit()
+    bid = _insert_bid(conn, item_id, bid_amount, certifier="cgc")
+    _link(conn, bid["id"], fmv_id)
+    return _intent(item_id=item_id, max_bid=bid_amount, trigger="edit",
+                   prior_row=bid)
+
+
+def test_recomputed_cap_on_a_widened_slab_row_rides_bid_high(conn):
+    """lone_sale at $1,000 bids 0.70 x 1000 = $700. The published high is
+    $1,150; the stored 'low' rung (0.70) x that would wave $805 through."""
+    r = _by_code(policy.check_bid_write(
+        conn, _slab_setup(conn, "900100090", 700.0)), "recomputed_cap")
+    assert r["outcome"] == "pass"
+    assert r["data"]["recomputed_cap"] == pytest.approx(700.0)
+    link = r["data"]["per_link"][0]
+    assert (link["high"], link["published_high"]) == (1000.0, 1150.0)
+
+
+def test_recomputed_cap_advises_a_bid_built_off_the_widened_high(conn):
+    r = _by_code(policy.check_bid_write(
+        conn, _slab_setup(conn, "900100091", 800.0)), "recomputed_cap")
+    assert r["outcome"] == "advise"
+
+
+def test_recomputed_cap_on_a_pre_bui1242_slab_row_keeps_high(conn):
+    """NULL bid_high: the row was never widened, so `high` is the basis."""
+    r = _by_code(policy.check_bid_write(conn, _slab_setup(
+        conn, "900100092", 700.0, high=1000.0, bid_high=None)), "recomputed_cap")
+    assert r["outcome"] == "pass"
+    assert r["data"]["recomputed_cap"] == pytest.approx(700.0)
+
+
+def test_recomputed_cap_never_reads_bid_high_above_high(conn):
+    r = _by_code(policy.check_bid_write(conn, _slab_setup(
+        conn, "900100093", 700.0, high=1000.0, bid_high=5000.0)), "recomputed_cap")
+    assert r["data"]["recomputed_cap"] == pytest.approx(700.0)

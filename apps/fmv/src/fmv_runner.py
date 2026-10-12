@@ -376,7 +376,13 @@ def _probe_certifier_support(server_url: str, *, grade: float | None = None) -> 
         )
         if rows is _LOOKUP_FAILED or not isinstance(rows, list) or not rows:
             continue
-        return all(isinstance(r, dict) and "certifier" in r for r in rows)
+        # BUI-1242: `fmv_bid_high` too. A server that predates it drops the
+        # field, so a slab row's widened `fmv_high` would be the only number
+        # left for a later cache hit (and recomputed_cap) to bid off — a bid
+        # up to ~15% higher than the fresh run's. Same presence test, same
+        # fail-closed refusal: deploy the server first.
+        return all(isinstance(r, dict) and "certifier" in r
+                   and "fmv_bid_high" in r for r in rows)
     return False
 
 
@@ -751,7 +757,8 @@ def run(*, batch_path: str | None, out_path: str | None,
     if schema_mismatch:
         click.echo(
             f"⚠️  skipped {len(schema_mismatch)} certified (CGC/CBCS) book(s): "
-            "this comics server does not report a price's `certifier`, so it "
+            "this comics server does not report a price's `certifier` (or, "
+            "since BUI-1242, its `fmv_bid_high`), so it "
             "predates the graded pricing schema (BUI-924/925). Nothing was "
             "fetched or written for them — a slab price written to such a "
             "server would land on the RAW row and set a raw bid cap off a "
@@ -4006,6 +4013,10 @@ def _upsert_fmv(server_url: str, inp: dict, fmv: dict,
         body["certifier"] = fmv.get("certifier") or _RAW_CERTIFIER
         body["label"] = fmv.get("label") or _RAW_LABEL
         body["pricing_basis"] = fmv.get("pricing_basis")
+        # BUI-1242: the pre-widening band top `max_bid` rides. `fmv_high` is
+        # the PUBLISHED (widened) band, so without this a cache hit would bid
+        # off the widened high. None on a refused row.
+        body["fmv_bid_high"] = fmv.get("bid_high")
     elif fmv.get("pricing_basis") == _CEILING_BASIS:
         # BUI-1028: a refused raw row's bid cap. Stays FLAGGED with
         # fmv_low/fmv_high null (a cap in `fmv_high` would be read as a fair
@@ -4486,7 +4497,7 @@ def _graded_note_parts(fmv: dict) -> list[str]:
         # named so an auditor can re-check the admission rule from the note
         # alone, without the pool.
         parts.append(
-            f"lone_sale=${fmv.get('fmv_high') or 0:g} bracket "
+            f"lone_sale=${_lone_sale_price(fmv) or 0:g} bracket "
             f"${bracket['lo']:g}-${bracket['hi']:g} "
             f"(rungs {bracket['lo_grade']:g}→{bracket['hi_grade']:g}, within "
             f"{fmv_math.SMALL_POOL_MAX_RATIO:g}x); the single fresh sale at the "
@@ -4786,8 +4797,9 @@ def _stitch(books: list[dict], cached: dict[int, dict],
                 "breaker_tripped": False,
                 "error": (
                     "BUI-930: skipped, this comics server does not report a "
-                    "price's `certifier` (it predates BUI-924/925), so a slab "
-                    "price written to it would land on the RAW row. Nothing "
+                    "price's `certifier` (it predates BUI-924/925) or its "
+                    "`fmv_bid_high` (BUI-1242), so a slab price written to it "
+                    "could land on the RAW row or bid off a widened band. Nothing "
                     "was fetched, computed, or written. Deploy the server and "
                     "re-run."
                 ),
@@ -5006,6 +5018,14 @@ def _cached_bid_tier(stored: object, fmv_conf: str,
     return tier
 
 
+def _lone_sale_price(fmv: dict) -> float | None:
+    """The one sale a `lone_sale` row is priced at: `bid_high` (BUI-1242
+    widened the published `fmv_high` to sale +15%), or `fmv_high` on an fmv
+    dict built before BUI-1242, when the two were the same number."""
+    sale = fmv.get("bid_high")
+    return fmv.get("fmv_high") if sale is None else sale
+
+
 def _fmv_from_db_row(row: dict, grade_confidence: str | None = None) -> dict:
     """Project a gixen-overlay `comics` row back into the fmv dict shape.
 
@@ -5088,6 +5108,15 @@ def _fmv_from_db_row(row: dict, grade_confidence: str | None = None) -> dict:
     tier = _cached_bid_tier(row.get("fmv_bid_tier"), fmv_conf, window)
     max_bid: int | None = None
     bid_basis: str | None = None
+    # BUI-1242: a slab row's published `fmv_high` is widened; its bid rides
+    # the stored pre-widening `bid_high`. A row priced before BUI-1242 has
+    # none and its `fmv_high` IS the unwidened top, so it keeps that. Never
+    # above `fmv_high`: a stale or bad value can only lower the bid.
+    bid_high: float | None = None
+    if certifier != _RAW_CERTIFIER and fmv_high is not None:
+        stored_bid_high = row.get("fmv_bid_high")
+        bid_high = (fmv_high if stored_bid_high is None
+                    else min(stored_bid_high, fmv_high))
     if fmv_high is not None:
         median_cap = None
         if (certifier == _RAW_CERTIFIER and basis in (None, "direct")
@@ -5098,7 +5127,8 @@ def _fmv_from_db_row(row: dict, grade_confidence: str | None = None) -> dict:
         else:
             # BUI-182: `is not None`, not a falsy check — a legitimate
             # fmv_high of 0 must round to a 0 max_bid, not be nulled out.
-            max_bid, bid_basis = fmv_math.clean_round(fmv_high * factor), "high"
+            base = fmv_high if bid_high is None else bid_high
+            max_bid, bid_basis = fmv_math.clean_round(base * factor), "high"
     return {
         "n": row.get("fmv_comps") or 0,
         # Shape parity with compute_fmv (effective_n exists there for the
@@ -5117,6 +5147,7 @@ def _fmv_from_db_row(row: dict, grade_confidence: str | None = None) -> dict:
         "fmv_high": fmv_high,
         "median": median,  # BUI-1219: stored; None on a pre-BUI-1219 row
         "max_bid": max_bid,
+        "bid_high": bid_high,  # BUI-1242: slab rows only
         "cv": None,
         "cv_pct": "n/a",
         "confidence": fmv_conf,
@@ -5260,9 +5291,10 @@ def _certified_provenance(fmv: dict) -> str:
         # BUI-952: the number IS the one exact-grade sale, so name it — that
         # single price is the whole evidence, and an operator reading
         # "lone sale $900" knows at a glance not to expect a band behind it.
-        # Read off `fmv_high` (== `fmv_low` == `median` on this basis) rather
-        # than `lone_sale_bracket`, which a cache hit does not carry.
-        sale = fmv.get("fmv_high")
+        # Read off `bid_high` (the sale itself; BUI-1242 widened the
+        # published `fmv_high` to sale +15%) rather than
+        # `lone_sale_bracket`, which a cache hit does not carry.
+        sale = _lone_sale_price(fmv)
         tokens.append(f"lone sale ${sale:g}" if sale is not None else "lone sale")
     else:
         # Closed vocabulary (BUI-930/952): a priced graded row's basis is
@@ -5499,6 +5531,9 @@ def _brief_row(r: dict) -> dict:
         "median": fmv.get("median"),
         "bid_tier": fmv.get("bid_tier"),
         "bid_basis": fmv.get("bid_basis"),
+        # BUI-1242: on a slab row, the pre-widening band top `max_bid` was
+        # built from (the published `fmv_high` is widened). Null on raw rows.
+        "bid_high": fmv.get("bid_high"),
         "source": r.get("source"),
         # BUI-949: additive — every key above is unchanged, so an existing
         # `--brief` consumer that ignores unknown keys sees no drift.
@@ -5609,7 +5644,9 @@ def _print_table(rows: list[dict]) -> None:
             basis = fmv.get("pricing_basis")
             certifier = fmv.get("certifier") or "?"
             if basis == "ladder":
-                fmv_str = f"${fmv['fmv_high']} {certifier}-ldr"
+                # BUI-1242: the published ladder band is the point +/-15%.
+                fmv_str = (f"${fmv['fmv_low']}–${fmv['fmv_high']} "
+                           f"{certifier}-ldr")
             else:
                 fmv_str = f"${fmv['fmv_low']}–${fmv['fmv_high']} {certifier}"
             med_str = f"${fmv.get('median') or '?'}"

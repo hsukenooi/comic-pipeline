@@ -304,6 +304,11 @@ def create_tables(conn: sqlite3.Connection) -> None:
             -- median on a penny book cannot IntegrityError the whole row.
             median             REAL,
             bid_tier           TEXT,
+            -- BUI-1242: a SLAB row's pre-widening band top, the number its
+            -- max_bid rides. `high` is the published band, widened +/-15%,
+            -- so it must not be the bid basis. NULL on raw rows and on slab
+            -- rows priced before BUI-1242 (whose `high` is unwidened).
+            bid_high           REAL,
             updated_at         TEXT,
             UNIQUE(comic_id, grade, certifier, label)
         )
@@ -541,6 +546,9 @@ def create_tables(conn: sqlite3.Connection) -> None:
     # and same ordering constraint as `ceiling_cap` directly above: an ALTER,
     # placed before the CHECK widen so that rebuild carries them across.
     _migrate_add_fmv_median_bid_tier_columns(conn)
+    # BUI-1242: the additive `bid_high` column. Same ordering constraint as
+    # the two ALTERs above: before the CHECK widen, so its rebuild carries it.
+    _migrate_add_fmv_bid_high_column(conn)
     # BUI-952: widen the `pricing_basis` CHECK to today's vocabulary. Ordered
     # after the two above for both of their reasons — it needs the column to
     # exist to have a CHECK to inspect, and it rebuilds the table, so running
@@ -1050,6 +1058,11 @@ def _rebuild_fmv_table(conn: sqlite3.Connection, *, marker: str,
             -- median on a penny book cannot IntegrityError the whole row.
             median             REAL,
             bid_tier           TEXT,
+            -- BUI-1242: a SLAB row's pre-widening band top, the number its
+            -- max_bid rides. `high` is the published band, widened +/-15%,
+            -- so it must not be the bid basis. NULL on raw rows and on slab
+            -- rows priced before BUI-1242 (whose `high` is unwidened).
+            bid_high           REAL,
             updated_at         TEXT,
             UNIQUE(comic_id, grade, certifier, label)
         )
@@ -1150,6 +1163,18 @@ def _migrate_add_fmv_median_bid_tier_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE fmv ADD COLUMN median REAL")
     if cols and "bid_tier" not in cols:
         conn.execute("ALTER TABLE fmv ADD COLUMN bid_tier TEXT")
+
+
+def _migrate_add_fmv_bid_high_column(conn: sqlite3.Connection) -> None:
+    """Add the nullable `bid_high` column to fmv if absent (BUI-1242).
+
+    Additive and idempotent, same PRAGMA guard as every other additive
+    migration here. Existing rows get NULL, which every reader takes as "bid
+    off `high`" — correct for them, since nothing before BUI-1242 widened it.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(fmv)")}
+    if cols and "bid_high" not in cols:
+        conn.execute("ALTER TABLE fmv ADD COLUMN bid_high REAL")
 
 
 def _migrate_backfill_fmv_pricing_basis(conn: sqlite3.Connection) -> None:
@@ -2682,7 +2707,7 @@ def _merge_yearless_into_yeared(
     """
     yearless_fmvs = conn.execute(
         "SELECT id, grade, low, high, comps, confidence, notes, updated_at, "
-        "certifier, label, pricing_basis "
+        "certifier, label, pricing_basis, bid_high "
         "FROM fmv WHERE comic_id=?",
         (yearless_id,),
     ).fetchall()
@@ -2712,13 +2737,17 @@ def _merge_yearless_into_yeared(
                     -- merge can COALESCE a price UP from the yearless row;
                     -- leaving its basis behind would strip that price's
                     -- haircut and silently raise the cap it computes.
-                    pricing_basis = COALESCE(pricing_basis, ?)
+                    pricing_basis = COALESCE(pricing_basis, ?),
+                    -- BUI-1242: travels with `high` for the same reason. The
+                    -- RHS reads the OLD row, so this fires exactly when the
+                    -- COALESCE above takes the yearless high.
+                    bid_high      = CASE WHEN high IS NULL THEN ? ELSE bid_high END
                 WHERE id=?
                 """,
                 (
                     yfmv["low"], yfmv["high"], yfmv["comps"],
                     yfmv["confidence"], yfmv["notes"], yfmv["updated_at"],
-                    yfmv["pricing_basis"], yeared_fmv["id"],
+                    yfmv["pricing_basis"], yfmv["bid_high"], yeared_fmv["id"],
                 ),
             )
             # Reparent bid_fmvs; preserve the higher is_primary if both exist.
@@ -2800,8 +2829,16 @@ def upsert_fmv(
     ceiling_cap: float | None = None,
     median: float | None = None,
     bid_tier: str | None = None,
+    bid_high: float | None = None,
 ) -> int:
     """Upsert a per-identity FMV row. Returns the fmv id.
+
+    `bid_high` (BUI-1242) is a SLAB row's pre-widening band top, the basis
+    its max_bid rides while `high` carries the widened published band. It
+    belongs only on a priced, unflagged, certified row, at or below `high`.
+    Same ON CONFLICT treatment as `median`: a priced upsert takes it outright
+    (so a re-price that omits it clears a stale one), a flagged upsert clears
+    it, and a bare n=0 stub leaves it.
 
     `median`/`bid_tier` (BUI-1219) are the raw direct pool's median and
     five-tier bid tier, the inputs to the median-anchored bid cap. They are
@@ -2966,6 +3003,17 @@ def upsert_fmv(
             "(comic_id=%s grade=%s certifier=%s pricing_basis=%s)",
             comic_id, grade, certifier, pricing_basis)
         median = bid_tier = None
+    if bid_high is not None:
+        if isinstance(bid_high, bool) or not bid_high >= 0:
+            raise ValueError(f"bid_high must be >= 0, got {bid_high!r}")
+        if low is None or high is None or flag_reason is not None:
+            raise ValueError("bid_high belongs on a priced, unflagged row")
+        if certifier == FMV_CERTIFIER_NONE:
+            raise ValueError("bid_high is slab-row only (certifier != 'none')")
+        if bid_high > high:
+            raise ValueError(
+                f"bid_high {bid_high!r} above high {high!r}: the bid basis "
+                "can never exceed the published band")
     has_value = any(
         v is not None for v in (low, high, comps, confidence, notes, flag_reason)
     )
@@ -2975,8 +3023,8 @@ def upsert_fmv(
         INSERT INTO fmv (comic_id, grade, low, high, comps, confidence, notes,
                           flag_reason, ungraded_anchor, ungraded_anchor_n,
                           provenance, certifier, label, pricing_basis,
-                          ceiling_cap, median, bid_tier, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                          ceiling_cap, median, bid_tier, bid_high, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(comic_id, grade, certifier, label) DO UPDATE SET
             -- A flagged incoming row clears the stale auto-priced number; an
             -- unflagged incoming row (a fresh price OR a bare n=0 stub)
@@ -3063,13 +3111,18 @@ def upsert_fmv(
             bid_tier    = CASE WHEN excluded.flag_reason IS NOT NULL THEN NULL
                                WHEN excluded.low IS NOT NULL THEN excluded.bid_tier
                                ELSE bid_tier END,
+            -- BUI-1242: `median`'s treatment, so a re-priced row never keeps
+            -- a stale bid basis beside a new published high.
+            bid_high    = CASE WHEN excluded.flag_reason IS NOT NULL THEN NULL
+                               WHEN excluded.low IS NOT NULL THEN excluded.bid_high
+                               ELSE bid_high END,
             updated_at  = CASE WHEN excluded.low IS NOT NULL OR excluded.flag_reason IS NOT NULL
                                THEN excluded.updated_at
                                ELSE updated_at END
         """,
         (comic_id, grade, low, high, comps, confidence, notes, flag_reason,
          ungraded_anchor, ungraded_anchor_n, provenance, certifier, label,
-         pricing_basis, ceiling_cap, median, bid_tier, now),
+         pricing_basis, ceiling_cap, median, bid_tier, bid_high, now),
     )
     conn.commit()
     row = conn.execute(
@@ -3931,6 +3984,10 @@ def list_comics(
                -- comic-fmv's cache hit reads them with .get, so an older
                -- server that never serves the keys keeps today's cap.
                f.median AS fmv_median, f.bid_tier AS fmv_bid_tier,
+               -- BUI-1242: a slab row's bid basis (its `high` is the widened
+               -- published band). The KEY's presence is part of comic-fmv's
+               -- deploy-order probe, like `certifier` above.
+               f.bid_high AS fmv_bid_high,
                -- BUI-769: `comic-fmv`'s hand-priced guard reads this to decide
                -- whether a default run may overwrite the row. It must be
                -- served on EVERY row this endpoint returns, not just the ones

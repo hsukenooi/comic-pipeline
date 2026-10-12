@@ -140,6 +140,7 @@ _GRADED_FROZEN = (
     "max_bid", "confidence", "bid_factor", "pricing_basis",
     "envelope_clamped", "page_quality_fallback", "pool_n",
     "pool_undated_dropped", "pool_stale_dropped", "exact_effective_n",
+    "bid_high",  # BUI-1242: the pre-widening top max_bid rides
 )
 
 
@@ -333,15 +334,15 @@ def test_the_lone_exact_sale_is_not_the_golden_price():
     """
     baseline = _load_graded_baseline()["ae4_ladder_lone_exact_sale_is_never_the_price"]
     assert baseline["pricing_basis"] == "ladder"
-    assert baseline["fmv_high"] != 700
-    assert baseline["fmv_high"] > 900, (
+    assert baseline["bid_high"] != 700
+    assert baseline["bid_high"] > 900, (
         "the interpolated price must sit between the 4.0 and 5.5 rungs, not "
         "at or below the lone 4.5 sale"
     )
     assert baseline["confidence"] == "LOW"
     assert baseline["bid_factor"] == 0.60
     assert baseline["max_bid"] == fmv_math.clean_round(
-        baseline["fmv_high"] * 0.60)
+        baseline["bid_high"] * 0.60)
 
 
 def test_the_lone_sale_golden_pair_differs_only_in_the_bracket():
@@ -362,15 +363,17 @@ def test_the_lone_sale_golden_pair_differs_only_in_the_bracket():
     assert inside["pricing_basis"] == "lone_sale"
     assert too_wide["pricing_basis"] == "ladder"
 
-    # The priced row is the sale, flat: no band, and the 0.70 cap.
-    assert inside["fmv_low"] == inside["fmv_high"] == inside["median"] == 1000
+    # The priced row is the sale, and the 0.70 cap. BUI-1242: the published
+    # band is the sale +/-15%; the bid basis stays the sale.
+    assert inside["bid_high"] == inside["median"] == 1000
+    assert (inside["fmv_low"], inside["fmv_high"]) == (850, 1150)
     assert inside["confidence"] == "LOW"
     assert inside["bid_factor"] == 0.70
     assert inside["max_bid"] == fmv_math.clean_round(1000 * 0.70)
     # And it beats the ladder's cap on the same book, which is the trade the
     # ticket is making: 1000 * 0.70 against ~1067 * 0.60.
     assert inside["max_bid"] > fmv_math.clean_round(
-        below["fmv_high"] * 0.60)
+        below["bid_high"] * 0.60)
 
 
 def _regen() -> None:
