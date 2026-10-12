@@ -229,3 +229,60 @@ def test_probe_refuses_a_server_that_does_not_serve_bid_high():
 def test_ship_constants_are_the_audit_pick(h):
     assert getattr(fm, h) == 0.15
     assert fm.SMALL_POOL_MAX_RATIO == 3.0  # BUI-179 money guard, kept
+
+
+# ─── BUI-1261: a cached slab never takes the photo haircut ──────────────────
+
+def _stored_from_fresh(out: dict) -> dict:
+    """The row comic-fmv's upsert leaves for a priced slab: confidence stored
+    through the writer's collapse (MEDIUM-LOW and LOW both 'low')."""
+    return {"fmv_low": out["fmv_low"], "fmv_high": out["fmv_high"],
+            "fmv_comps": out["n"],
+            "fmv_confidence": fmv_runner._confidence_to_db_label(
+                out["confidence"]),
+            "fmv_notes": "", "certifier": "cgc", "label": "universal",
+            "pricing_basis": out["pricing_basis"],
+            "fmv_bid_high": out["bid_high"], "fmv_bid_tier": out["bid_tier"]}
+
+
+def test_a_cached_medium_low_direct_slab_rebids_at_the_fresh_rung():
+    """A direct slab bids BASE (0.80) whatever its label, because
+    `graded_fmv` pins grade_confidence None. Stored, MEDIUM-LOW reads 'low';
+    a cache hit carrying the book's grade_confidence used to haircut that to
+    LOW (0.60): $600 where the fresh run bid $800."""
+    row = _cached_row(fmv_low=850, fmv_high=1150, fmv_bid_high=1000,
+                      pricing_basis="direct", fmv_notes="")
+    for gc in (None, "high", "medium", "low", "bogus"):
+        cached = fmv_runner._fmv_from_db_row(row, gc)
+        assert cached["max_bid"] == 800, gc
+        assert cached["bid_factor"] == fm.BASE_BID_FACTOR, gc
+        assert cached["grade_confidence"] is None, gc
+
+
+def _exact_heavy_case(rng: random.Random):
+    """`_random_case` plus 2-7 sales AT the target grade, so the exact
+    (direct) tier is reached at every label, MEDIUM-LOW and LOW included."""
+    comps, target, pq = _random_case(rng)
+    level = rng.choice((40, 150, 600, 2500))
+    comps += [_comp(round(level * rng.uniform(0.6, 1.6), 2), target,
+                    age=rng.randint(0, 120), pid=f"x{i}")
+              for i in range(rng.randint(2, 7))]
+    return comps, target, pq
+
+
+@pytest.mark.parametrize("gc", [None, "high", "medium-low", "low"])
+def test_slab_cache_hit_matches_the_fresh_bid_across_a_sweep(gc):
+    rng = random.Random(1261)
+    seen: dict[str, int] = {}
+    for i in range(4000):
+        comps, target, pq = (_random_case if i % 2 else _exact_heavy_case)(rng)
+        fresh = _price(comps, target, pq)
+        if fresh["max_bid"] is None:
+            continue
+        key = f"{fresh['pricing_basis']}/{fresh['confidence']}"
+        seen[key] = seen.get(key, 0) + 1
+        cached = fmv_runner._fmv_from_db_row(_stored_from_fresh(fresh), gc)
+        assert cached["max_bid"] == fresh["max_bid"], (key, comps, target)
+    # The sweep reaches the collapsed direct labels this ticket is about.
+    assert seen.get("direct/MEDIUM-LOW", 0) > 20, seen
+    assert seen.get("direct/LOW", 0) > 20, seen

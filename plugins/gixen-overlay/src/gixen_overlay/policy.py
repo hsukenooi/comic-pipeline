@@ -109,6 +109,8 @@ RUNG_LOW_CONFIDENCE = 0.60     # == fmv_math.INTERPOLATED_BID_FACTOR
 # measurement, never on an unmeasured reverse-map guess. NULL/unrecognized
 # maps to 0.80 because bid_factor's own default for an absent confidence
 # signal is BASE_BID_FACTOR (no haircut without a signal).
+# BUI-1261: a certified DIRECT row skips this map entirely (see `_factor`):
+# grade_confidence is pinned None on a slab, so its label never haircuts.
 _RUNG_BY_CONFIDENCE = {
     "high": RUNG_HIGH_CONFIDENCE,
     "medium": RUNG_HIGH_CONFIDENCE,   # stored 'medium' ⊇ {MEDIUM-HIGH, MEDIUM} → brief factor 0.80
@@ -366,12 +368,26 @@ def _bid_basis_high(r: dict) -> float | None:
 
 
 def _factor(r: dict) -> float:
-    """The rung applied to `_effective_high`. A ceiling cap already carries
+    """The rung applied to `_bid_basis_high`. A ceiling cap already carries
     its 0.60 haircut (it is the FINAL cap), so no confidence rung applies on
     top: the stored-'low' rung (0.70) would advise on a bid exactly at the
-    cap, every time."""
+    cap, every time.
+
+    BUI-1261: a DIRECT slab bids BASE (0.80) whatever its label. A certified
+    grade is not a photo judgement, so `fmv_math.graded_fmv` pins
+    grade_confidence None and `bid_factor(label, None)` is always BASE; the
+    stored label carries no rung information at all. Reading the stored 'low'
+    (MEDIUM-LOW or LOW) as 0.70 false-advised every such bid. A NULL basis on
+    a certified row keeps the label rung: it could be a ladder row (0.60), and
+    reading it as direct would loosen the check. The slab ladder
+    (0.60) and lone-sale (0.70) tiers keep the label rung (0.70 on their
+    forced 'low'), which is at or above their factor, so they never
+    false-advise; tightening them is out of scope (KTD9)."""
     if r.get("high") is None and r.get("ceiling_cap") is not None:
         return 1.0
+    if ((r.get("certifier") or FMV_CERTIFIER_NONE) != FMV_CERTIFIER_NONE
+            and r.get("pricing_basis") == "direct"):
+        return RUNG_HIGH_CONFIDENCE
     return _rung_for_confidence(r.get("confidence"))
 
 
@@ -420,11 +436,20 @@ def _check_over_fmv(conn: sqlite3.Connection, intent: Any) -> dict | None:
     if err is not None:
         return err
 
-    summed_high = sum(_effective_high(r) for r in priceable)
+    # BUI-1262: measured against the BID BASIS, not the published band. A
+    # BUI-1242 slab row publishes `high` up to 15% above the `bid_high` its
+    # bid was built from; summing the widened high made this check up to 15%
+    # laxer on slabs than before BUI-1242. `_bid_basis_high` is `high` on
+    # every raw, ceiling, and pre-BUI-1242 row, so only widened slabs move,
+    # and they move back to their pre-BUI-1242 strictness. recomputed_cap
+    # reads the same basis.
+    summed_high = sum(_bid_basis_high(r) for r in priceable)
+    summed_published_high = sum(_effective_high(r) for r in priceable)
     cap = multiple * summed_high
     ratio = (intent.target_max_bid / summed_high) if summed_high else None
     data = {
         "max_bid": intent.target_max_bid, "summed_high": summed_high,
+        "summed_published_high": summed_published_high,
         "multiple": multiple, "cap": cap, "ratio": ratio,
         "link_count": len(priceable),
     }
@@ -432,14 +457,14 @@ def _check_over_fmv(conn: sqlite3.Connection, intent: Any) -> dict | None:
         return _result(
             "over_fmv", "advise",
             f"max_bid ${intent.target_max_bid:.2f} exceeds {multiple:g}x "
-            f"summed FMV high (${summed_high:.2f} across {len(priceable)} "
+            f"summed FMV bid-basis high (${summed_high:.2f} across {len(priceable)} "
             f"link(s)) = ${cap:.2f}.",
             data,
         )
     return _result(
         "over_fmv", "pass",
         f"max_bid ${intent.target_max_bid:.2f} is within {multiple:g}x "
-        f"summed FMV high (${cap:.2f}).",
+        f"summed FMV bid-basis high (${cap:.2f}).",
         data,
     )
 
