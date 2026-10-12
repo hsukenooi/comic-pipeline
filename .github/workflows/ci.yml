@@ -143,6 +143,9 @@ jobs:
       - name: Self-test — premise-check extraction + classification (BUI-632)
         run: ./scripts/premise-check --selftest
 
+      - name: Test — em-batch nightly selector (BUI-1257)
+        run: uv run --with pytest pytest scripts/tests
+
   # BUI-188: non-strict mypy type check on the two most None-juggling files.
   # The workspace must be synced first so gixen_overlay imports resolve.
   # BUI-630: ledger.py joined the target list the same commit LedgerRoute was
