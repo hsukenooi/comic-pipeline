@@ -109,8 +109,9 @@ RUNG_LOW_CONFIDENCE = 0.60     # == fmv_math.INTERPOLATED_BID_FACTOR
 # measurement, never on an unmeasured reverse-map guess. NULL/unrecognized
 # maps to 0.80 because bid_factor's own default for an absent confidence
 # signal is BASE_BID_FACTOR (no haircut without a signal).
-# BUI-1261: a certified DIRECT row skips this map entirely (see `_factor`):
-# grade_confidence is pinned None on a slab, so its label never haircuts.
+# BUI-1261/BUI-1264: a DIRECT row, raw or certified, skips this map entirely
+# (see `_factor`): a no-photo bid on it is BASE whatever its label, so the map
+# now reads only NULL-basis and derived-tier rows.
 _RUNG_BY_CONFIDENCE = {
     "high": RUNG_HIGH_CONFIDENCE,
     "medium": RUNG_HIGH_CONFIDENCE,   # stored 'medium' ⊇ {MEDIUM-HIGH, MEDIUM} → brief factor 0.80
@@ -377,16 +378,24 @@ def _factor(r: dict) -> float:
     grade is not a photo judgement, so `fmv_math.graded_fmv` pins
     grade_confidence None and `bid_factor(label, None)` is always BASE; the
     stored label carries no rung information at all. Reading the stored 'low'
-    (MEDIUM-LOW or LOW) as 0.70 false-advised every such bid. A NULL basis on
-    a certified row keeps the label rung: it could be a ladder row (0.60), and
-    reading it as direct would loosen the check. The slab ladder
-    (0.60) and lone-sale (0.70) tiers keep the label rung (0.70 on their
-    forced 'low'), which is at or above their factor, so they never
-    false-advise; tightening them is out of scope (KTD9)."""
+    (MEDIUM-LOW or LOW) as 0.70 false-advised every such bid.
+
+    BUI-1264: a DIRECT raw row also bids BASE whenever the request carried no
+    photo grade, since `bid_factor(label, None)` is BASE for every label. The
+    photo grade belongs to the bid, not the row: it is not on the intent, and
+    a stored copy would be the last fresh run's, so a later no-photo cache
+    hit on the same row would still bid 0.80 against a stricter stored rung.
+    The laxest legitimate factor on any direct row is therefore BASE (KTD9):
+    a photo-haircut raw bid (0.60 or 0.70) sits under it and is not flagged.
+
+    A NULL basis keeps the label rung: it could be a ladder, interpolated, or
+    proxy row (0.60 or 0.70), and reading it as direct would loosen the check.
+    The non-direct tiers keep the label rung (0.70 on their forced 'low'),
+    which is at or above their factor, so they never false-advise;
+    tightening them is out of scope (KTD9)."""
     if r.get("high") is None and r.get("ceiling_cap") is not None:
         return 1.0
-    if ((r.get("certifier") or FMV_CERTIFIER_NONE) != FMV_CERTIFIER_NONE
-            and r.get("pricing_basis") == "direct"):
+    if r.get("pricing_basis") == "direct":
         return RUNG_HIGH_CONFIDENCE
     return _rung_for_confidence(r.get("confidence"))
 
@@ -519,9 +528,10 @@ def _check_recomputed_cap(conn: sqlite3.Connection, intent: Any) -> dict | None:
     data = {
         "max_bid": intent.target_max_bid, "recomputed_cap": recomputed_cap,
         "link_count": len(priceable), "per_link": per_link,
-        "basis": "fmv.confidence rung x high, or the larger of that and "
-                 "min(median, high) on a BUI-1219 median-tier row — "
-                 "grade_confidence is not stored on the fmv row (see U8)",
+        "basis": "0.80 x high on a direct row, else the fmv.confidence "
+                 "rung x high; the larger of that and min(median, high) on a "
+                 "BUI-1219 median-tier row. The bid's photo "
+                 "grade_confidence is not visible here (BUI-1264)",
         "rungs": {
             "high": RUNG_HIGH_CONFIDENCE, "medium": RUNG_MEDIUM_CONFIDENCE,
             "low": RUNG_LOW_CONFIDENCE,
