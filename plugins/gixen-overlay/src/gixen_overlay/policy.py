@@ -86,6 +86,8 @@ logger = logging.getLogger("gixen_overlay.policy")
 # necessarily a narrower approximation of the brief-path haircut — exact
 # parity (folding in a stored grade_confidence) is U8 territory, not this
 # one. The recomputed-cap check's advisory data says so explicitly.
+# BUI-1261/BUI-1264: on a DIRECT row the label is not read at all (0.80, see
+# `_factor`), so the rungs below govern only NULL-basis and derived-tier rows.
 # ---------------------------------------------------------------------------
 RUNG_HIGH_CONFIDENCE = 0.80    # == fmv_math.BASE_BID_FACTOR
 RUNG_MEDIUM_CONFIDENCE = 0.70  # == the literal MEDIUM-LOW-branch return in fmv_math.bid_factor
@@ -532,10 +534,9 @@ def _check_recomputed_cap(conn: sqlite3.Connection, intent: Any) -> dict | None:
                  "rung x high; the larger of that and min(median, high) on a "
                  "BUI-1219 median-tier row. The bid's photo "
                  "grade_confidence is not visible here (BUI-1264)",
-        "rungs": {
-            "high": RUNG_HIGH_CONFIDENCE, "medium": RUNG_MEDIUM_CONFIDENCE,
-            "low": RUNG_LOW_CONFIDENCE,
-        },
+        # The factor each row reads (see `_factor`): every direct row 0.80,
+        # else the stored label's laxest rung.
+        "rungs": {"direct": RUNG_HIGH_CONFIDENCE, **_RUNG_BY_CONFIDENCE},
     }
     if intent.target_max_bid > recomputed_cap:
         return _result(
