@@ -111,7 +111,8 @@ _POOLS = [list(p) for size in (3, 4, 5, 6, 8)
           for p in itertools.combinations_with_replacement(_PRICES, size)]
 
 
-@pytest.mark.parametrize("grade_conf", [None, "high", "medium"])
+@pytest.mark.parametrize("grade_conf",
+                         [None, "high", "medium", "medium-low", "low"])
 def test_policy_recompute_never_sits_below_the_fmv_math_bid(grade_conf):
     median_rows = 0
     for pool in _POOLS:
@@ -120,18 +121,44 @@ def test_policy_recompute_never_sits_below_the_fmv_math_bid(grade_conf):
             continue
         link = policy._recomputed_link_cap(_stored_row(out))
         # BUI-1228: the rung path compares against the clean-rounded cap too,
-        # so a rounded-up bid never sits above the recomputed cap. Scoped to
-        # rows where the stored-label rung reads at least the writer's factor:
-        # a no-photo MEDIUM-LOW book bids 0.80 but stores 'low' (0.70), the
-        # separate collapse gap documented above _RUNG_BY_CONFIDENCE.
-        if out["bid_factor"] <= link["factor"]:
-            assert link["cap"] >= out["max_bid"], pool
+        # so a rounded-up bid never sits above the recomputed cap. BUI-1264
+        # removed the old scoping here: a direct raw row reads 0.80, so a
+        # no-photo MEDIUM-LOW or LOW book stored 'low' no longer reads 0.70.
+        assert link["factor"] >= out["bid_factor"], pool
+        assert link["cap"] >= out["max_bid"], pool
         if out["bid_basis"] == "median":
             median_rows += 1
             assert link["median_cap"] == out["max_bid"], pool
             assert link["cap"] >= out["max_bid"], pool
             assert link["cap"] <= out["fmv_high"], pool
-    assert median_rows > 100  # the sweep genuinely exercises the median rule
+    if grade_conf in (None, "high", "medium"):
+        # The sweep genuinely exercises the median rule. A MEDIUM-LOW or LOW
+        # photo grade haircuts every book below BASE, so none takes it.
+        assert median_rows > 100
+
+
+def test_raw_direct_no_photo_low_row_recomputes_the_fresh_bid():
+    """BUI-1264: a raw direct MEDIUM-LOW book with no photo grade bids
+    0.80 x fmv_high but stores 'low'. The recompute reads the same 0.80, so
+    its cap is exactly the bid comic-fmv computed (or the unrounded product,
+    when clean_round rounded the bid down)."""
+    seen = {"MEDIUM-LOW": 0, "LOW": 0}
+    for pool in _POOLS:
+        out = fm.compute_fmv(_comps(pool), 8.0, grade_confidence=None)
+        if (out["max_bid"] is None or out["interpolated"]
+                or out["confidence"] not in seen):
+            continue
+        seen[out["confidence"]] += 1
+        row = _stored_row(out)
+        assert row["confidence"] == "low"
+        link = policy._recomputed_link_cap(row)
+        assert out["bid_factor"] == fm.BASE_BID_FACTOR
+        assert link["factor"] == out["bid_factor"]
+        assert link["cap"] == max(out["max_bid"],
+                                  fm.BASE_BID_FACTOR * out["fmv_high"])
+    # A sweep pool all at the target grade never labels LOW; the stored
+    # 'low' rung is the same for both, so MEDIUM-LOW carries the pin.
+    assert seen["MEDIUM-LOW"] > 20, seen
 
 
 def test_null_median_row_recomputes_todays_rung():

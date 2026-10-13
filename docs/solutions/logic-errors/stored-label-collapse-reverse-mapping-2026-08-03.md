@@ -18,6 +18,8 @@ symptoms:
 root_cause: logic_error
 resolution_type: code_fix
 mechanized_by: test
+status: corrected
+superseded_by: "BUI-1261 and BUI-1264 (2026-10-13/14): the lax map was not zero-false-positive. bid_factor(label, None) is 0.80 at ANY label, so a no-photo direct row stored 'low' (a MEDIUM-LOW or LOW book) bid 0.80 against the 0.70 rung. policy._factor now reads 0.80 on every direct row; the label map covers only NULL-basis and derived-tier rows. The writer to read was bid_factor's second argument, not only the label collapse."
 enforced_by_test:
   - plugins/gixen-overlay/tests/test_policy_checks.py::test_recomputed_cap_stored_medium_passes_at_standard_080_bid
   - plugins/gixen-overlay/tests/test_policy_checks.py::test_recomputed_cap_stored_low_caps_at_070

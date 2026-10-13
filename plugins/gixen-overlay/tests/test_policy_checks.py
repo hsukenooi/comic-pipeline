@@ -1066,9 +1066,9 @@ def test_recomputed_cap_still_advises_a_direct_slab_bid_off_the_widened_high(con
     assert r["outcome"] == "advise"
 
 
-def test_recomputed_cap_keeps_the_low_rung_on_a_raw_low_row(conn):
-    """Scope: a raw 'low' row may carry a photo haircut the check cannot see,
-    so it keeps the 0.70 rung. Only certified rows read the basis."""
+def test_recomputed_cap_keeps_the_low_rung_on_a_null_basis_raw_low_row(conn):
+    """A raw 'low' row with no pricing_basis could be interpolated or a CGC
+    proxy (0.60 or 0.70), so it keeps the 0.70 rung."""
     _comic_id, fmv_id = _insert_comic_fmv(conn, high=100.0, confidence="low")
     bid = _insert_bid(conn, "900100096", 75.0)
     _link(conn, bid["id"], fmv_id)
@@ -1077,6 +1077,37 @@ def test_recomputed_cap_keeps_the_low_rung_on_a_raw_low_row(conn):
         "recomputed_cap")
     assert r["outcome"] == "advise"
     assert r["data"]["per_link"][0]["factor"] == pytest.approx(0.70)
+
+
+# ---------------------------------------------------------------------------
+# BUI-1264: a direct raw row bids 0.80 with no photo grade, whatever its label.
+# ---------------------------------------------------------------------------
+
+
+def _raw_direct_low_setup(conn, item_id, bid_amount):
+    _comic_id, fmv_id = _insert_comic_fmv(conn, high=100.0, confidence="low")
+    conn.execute("UPDATE fmv SET pricing_basis='direct' WHERE id=?", (fmv_id,))
+    conn.commit()
+    bid = _insert_bid(conn, item_id, bid_amount)
+    _link(conn, bid["id"], fmv_id)
+    return _intent(item_id=item_id, max_bid=bid_amount, trigger="edit",
+                   prior_row=bid)
+
+
+def test_recomputed_cap_passes_a_no_photo_medium_low_raw_bid_at_0_80(conn):
+    """A raw direct MEDIUM-LOW book with no photo grade stores 'low' but bids
+    0.80 x high = $80. The 'low' rung (0.70) advised it at $70."""
+    r = _by_code(policy.check_bid_write(
+        conn, _raw_direct_low_setup(conn, "900100101", 80.0)), "recomputed_cap")
+    assert r["outcome"] == "pass"
+    assert r["data"]["recomputed_cap"] == pytest.approx(80.0)
+    assert r["data"]["per_link"][0]["factor"] == pytest.approx(0.80)
+
+
+def test_recomputed_cap_still_advises_a_raw_direct_bid_above_0_80(conn):
+    r = _by_code(policy.check_bid_write(
+        conn, _raw_direct_low_setup(conn, "900100102", 85.0)), "recomputed_cap")
+    assert r["outcome"] == "advise"
 
 
 # ---------------------------------------------------------------------------
