@@ -2006,3 +2006,10 @@ def test_build_batch_rows_carries_grade_confidence():
     assert result.rows[0]["grade_confidence"] == "low"
     result = build_batch_rows(brief, [_wl_row("1", grade=8.0)])
     assert "grade_confidence" not in result.rows[0]
+
+
+def test_build_batch_rows_drops_grade_confidence_on_a_certified_row():
+    brief = [_brief("1", comic_id=42, max_bid=700)]
+    result = build_batch_rows(brief, [_wl_row("1", grade=9.6, certifier="cgc",
+                                              grade_confidence="low")])
+    assert "grade_confidence" not in result.rows[0]

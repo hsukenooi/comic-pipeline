@@ -1349,8 +1349,9 @@ def build_batch_rows(
             out_row["seller_grade"] = seller_grade
         if photo_grade is not None:
             out_row["photo_grade"] = photo_grade
-        if grade_confidence is not None:
-            out_row["grade_confidence"] = grade_confidence  # BUI-1266
+        # BUI-1266: a slab takes no photo haircut, so a certified row drops it.
+        if grade_confidence is not None and certifier in (None, "none"):
+            out_row["grade_confidence"] = grade_confidence
 
         # BUI-926 (U4): certified identity — copied onto the row when the
         # working-list entry carried it, independent of the comic_id/grade
