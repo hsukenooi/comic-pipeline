@@ -1111,6 +1111,94 @@ def test_recomputed_cap_still_advises_a_raw_direct_bid_above_0_80(conn):
 
 
 # ---------------------------------------------------------------------------
+# BUI-1266: a POST identity carrying the bid's photo grade_confidence makes
+# the direct raw factor exact: bid_factor(label, grade_confidence).
+# ---------------------------------------------------------------------------
+
+
+def _photo_post(conn, item_id, bid_amount, grade_confidence, *,
+                confidence="low", certifier="none", median=None, tier=None):
+    comic_id, fmv_id = _insert_comic_fmv(
+        conn, high=100.0, confidence=confidence, certifier=certifier)
+    conn.execute(
+        "UPDATE fmv SET pricing_basis='direct', median=?, bid_tier=? WHERE id=?",
+        (median, tier, fmv_id))
+    conn.commit()
+    identity = {"comic_id": comic_id, "grade": 9.0, "certifier": certifier}
+    if grade_confidence is not None:
+        identity["grade_confidence"] = grade_confidence
+    return _intent(item_id=item_id, max_bid=bid_amount,
+                   comic_identities=[identity])
+
+
+def test_recomputed_cap_advises_a_medium_low_photo_bid_above_0_70(conn):
+    """The ticket's Done-when: a raw direct 'low' row, photo grade
+    medium-low, bids 0.70 x high = $70. $75 is no legitimate bid."""
+    r = _by_code(policy.check_bid_write(conn, _photo_post(
+        conn, "900100110", 75.0, "medium-low")), "recomputed_cap")
+    assert r["outcome"] == "advise"
+    assert r["data"]["recomputed_cap"] == pytest.approx(70.0)
+    link = r["data"]["per_link"][0]
+    assert link["factor"] == pytest.approx(0.70)
+    assert link["grade_confidence"] == "medium-low"
+
+
+def test_recomputed_cap_passes_a_medium_low_photo_bid_at_0_70(conn):
+    r = _by_code(policy.check_bid_write(conn, _photo_post(
+        conn, "900100111", 70.0, "medium-low")), "recomputed_cap")
+    assert r["outcome"] == "pass"
+
+
+@pytest.mark.parametrize("grade_confidence, factor", [
+    ("high", 0.70), ("medium", 0.70), ("medium-low", 0.70), ("low", 0.60),
+    (" LOW ", 0.60), ("typo", 0.60), (7, 0.60), ("", 0.80), (None, 0.80)])
+def test_photo_factor_on_a_raw_direct_low_row(conn, grade_confidence, factor):
+    """Mirrors fmv_math.bid_factor: blank or absent is no haircut; once a
+    photo grade is present the stored 'low' (at best MEDIUM-LOW) also bites,
+    so even a high photo grade bids 0.70; an unrecognized value fails closed
+    to LOW."""
+    r = _by_code(policy.check_bid_write(conn, _photo_post(
+        conn, "900100112", 50.0, grade_confidence)), "recomputed_cap")
+    assert r["data"]["per_link"][0]["factor"] == pytest.approx(factor)
+
+
+def test_photo_low_on_a_high_row_haircuts_to_0_60(conn):
+    r = _by_code(policy.check_bid_write(conn, _photo_post(
+        conn, "900100113", 65.0, "low", confidence="high")), "recomputed_cap")
+    assert r["outcome"] == "advise"
+    assert r["data"]["per_link"][0]["factor"] == pytest.approx(0.60)
+
+
+def test_photo_haircut_drops_the_median_cap(conn):
+    """fmv_math.median_bid_cap returns None once a haircut engages, so a
+    VERY HIGH row photo-graded low bids 0.60 x high, not the $95 median."""
+    r = _by_code(policy.check_bid_write(conn, _photo_post(
+        conn, "900100114", 95.0, "low", confidence="high",
+        median=95.0, tier="VERY HIGH")), "recomputed_cap")
+    assert r["outcome"] == "advise"
+    link = r["data"]["per_link"][0]
+    assert link["median_cap"] is None
+    assert link["cap"] == pytest.approx(60.0)
+
+
+def test_unhaircut_photo_grade_keeps_the_median_cap(conn):
+    r = _by_code(policy.check_bid_write(conn, _photo_post(
+        conn, "900100115", 95.0, "high", confidence="high",
+        median=95.0, tier="VERY HIGH")), "recomputed_cap")
+    assert r["outcome"] == "pass"
+    assert r["data"]["per_link"][0]["median_cap"] == pytest.approx(95.0)
+
+
+def test_photo_grade_on_a_slab_identity_is_ignored(conn):
+    """A slab takes no photo haircut (graded_fmv pins grade_confidence None),
+    so a stray value on a certified identity keeps 0.80."""
+    r = _by_code(policy.check_bid_write(conn, _photo_post(
+        conn, "900100116", 80.0, "low", certifier="cgc")), "recomputed_cap")
+    assert r["outcome"] == "pass"
+    assert r["data"]["per_link"][0]["factor"] == pytest.approx(0.80)
+
+
+# ---------------------------------------------------------------------------
 # BUI-1262: over_fmv measures a slab against its bid basis, not the
 # widened published high.
 # ---------------------------------------------------------------------------

@@ -480,6 +480,7 @@ def _get_ebay_bid_count(item_id: str) -> int | None:
 @click.option("--seller", default=None, help="eBay seller username (BUI-78 seller-reliability)")
 @click.option("--seller-grade", type=float, default=None, help="Seller's stated grade (CGC float, BUI-78)")
 @click.option("--photo-grade", type=float, default=None, help="Photo-assessed consensus grade (CGC float, BUI-78)")
+@click.option("--grade-confidence", type=click.Choice(["high", "medium", "medium-low", "low"], case_sensitive=False), default=None, help="Photo grader's confidence, the one comic-fmv haircut the bid with (BUI-1266); lets the server's recomputed_cap check apply the same haircut")
 @click.option(
     "--certifier",
     default=None,
@@ -508,6 +509,7 @@ def add(
     seller: str | None,
     seller_grade: float | None,
     photo_grade: float | None,
+    grade_confidence: str | None,
     certifier: str | None,
     cert_number: str | None,
     ack_policy: bool,
@@ -541,6 +543,7 @@ def add(
             # suppress seller_grade/photo_grade from the payload — see
             # build_bid_payload's own docstring.
             certifier=certifier, cert_number=cert_number,
+            grade_confidence=grade_confidence.lower() if grade_confidence else None,
             # BUI-621 (U7): tag this row's provenance "cli" — add-batch's
             # add_one_row tags its own rows "batch".
             source="cli",
@@ -599,9 +602,10 @@ def add(
         return
 
     # Existing direct-Gixen path
-    if seller is not None or seller_grade is not None or photo_grade is not None:
+    if (seller is not None or seller_grade is not None or photo_grade is not None
+            or grade_confidence is not None):
         click.echo(
-            "⚠️  --seller/--seller-grade/--photo-grade require COMICS_SERVER_URL "
+            "⚠️  --seller/--seller-grade/--photo-grade/--grade-confidence require COMICS_SERVER_URL "
             "(server mode); ignored in direct-Gixen mode.",
             err=True,
         )

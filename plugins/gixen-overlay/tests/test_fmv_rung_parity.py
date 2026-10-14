@@ -119,7 +119,10 @@ def test_policy_recompute_never_sits_below_the_fmv_math_bid(grade_conf):
         out = fm.compute_fmv(_comps(pool), 8.0, grade_confidence=grade_conf)
         if out["max_bid"] is None:
             continue
-        link = policy._recomputed_link_cap(_stored_row(out))
+        # BUI-1266: the POST identity carries the same photo grade the bid
+        # was computed with, so the recompute reads it too.
+        row = {**_stored_row(out), policy._GRADE_CONFIDENCE_KEY: grade_conf}
+        link = policy._recomputed_link_cap(row)
         # BUI-1228: the rung path compares against the clean-rounded cap too,
         # so a rounded-up bid never sits above the recomputed cap. BUI-1264
         # removed the old scoping here: a direct raw row reads 0.80, so a
@@ -236,3 +239,27 @@ def test_slab_recompute_rides_bid_high_and_never_sits_below_the_bid():
     assert priced > 500
     assert naive_caught > 50
     assert collapsed_direct > 20  # the BUI-1261 rows are in the sweep
+
+
+@pytest.mark.parametrize("grade_conf", [
+    None, "", "high", "medium", "medium-low", "low", "typo", " Medium-Low ", 7])
+def test_photo_factor_is_bid_factor_at_the_laxest_collapsed_label(grade_conf):
+    """BUI-1266: `_photo_factor` is fmv_math.bid_factor at the most generous
+    rubric label the stored collapse could stand for, and None exactly when
+    bid_factor pays BASE for want of a photo grade."""
+    for db_label in ("high", "medium", "low", None):
+        labels = [k for k, v in _DB_LABEL.items() if v == db_label] or list(_DB_LABEL)
+        laxest = max(fm.bid_factor(label, grade_conf) for label in labels)
+        got = policy._photo_factor(db_label, grade_conf)
+        if grade_conf is None or grade_conf == "":
+            assert got is None
+        else:
+            assert got == laxest, (db_label, grade_conf)
+
+
+def test_grade_confidence_vocabulary_matches_fmv_math():
+    assert set(policy._GRADE_CONF_RANK) == set(fm._GRADE_CONF_NORMALIZE)
+    for level, rubric in fm._GRADE_CONF_NORMALIZE.items():
+        assert policy._GRADE_CONF_RANK[level] == fm._CONF_RANK[rubric]
+    assert policy._RANK_MEDIUM_LOW == fm._CONF_RANK["MEDIUM-LOW"]
+    assert policy._RANK_ABOVE_ALL == max(fm._CONF_RANK.values())

@@ -112,10 +112,13 @@ maps to):
     "seller": "some_seller",
     "seller_grade": 9.0,
     "photo_grade": 8.5,
+    "grade_confidence": "medium",
     "group": 1
   }
 ]
 ```
+
+`grade_confidence` (`high`/`medium`/`medium-low`/`low`, BUI-1266) is the photo grader's confidence that comic-fmv haircut the bid with. It rides the add's comic identity so the server's `recomputed_cap` check applies the same haircut; omit it for a seller-stated grade. A single add passes it as `--grade-confidence`.
 
 A certified row's `rows.json` entry carries `certifier`/`cert_number`/`label` instead of `seller_grade`/`photo_grade` (BUI-926) — `add_batch.py` validates `certifier` against the same vocabulary as `--certifier` above and rejects an unrecognized value.
 
@@ -165,6 +168,7 @@ These are the flags that exist in `packages/gixen-cli/cli.py` today. Anything el
 | `--seller NAME` | str | eBay seller username (from `/comic:identify`). Stored lowercased on the snipe; the key for the seller-reliability advisory (BUI-78) |
 | `--seller-grade X.Y` | float | Seller's *stated* grade as a CGC float (convert "VF/NM" → `9.0`). Stored for deviation analytics (BUI-78) |
 | `--photo-grade X.Y` | float | Photo-assessed *consensus* grade as a CGC float — the **raw** Step 2.5 assessment, not any user override (BUI-78) |
+| `--grade-confidence L` | str | Photo grader's confidence (`high`/`medium`/`medium-low`/`low`), the value comic-fmv haircut the bid with; the server's `recomputed_cap` check applies the same haircut (BUI-1266). Omit for a seller-stated grade or a slab |
 | `--certifier {none,cgc,cbcs,other}` | str | Certified grading company for a slab (BUI-926); omit for a raw comic |
 | `--cert-number VALUE` | str | Certification/cert number for a slab (BUI-926) |
 
@@ -226,10 +230,11 @@ After `/comic:fmv` (or `/comic:buy`) has produced a row with `comic_id` and a nu
 ```bash
 gixen add {item_id} {max_bid} \
   --comic-id {comic_id} --grade {grade_numeric} \
-  --seller {seller_username} --seller-grade {seller_grade} --photo-grade {photo_grade}
+  --seller {seller_username} --seller-grade {seller_grade} --photo-grade {photo_grade} \
+  --grade-confidence {grade_confidence}
 ```
 
-(Omit `--seller-grade`/`--photo-grade` when not available — e.g. `--photo-grade`
+(Omit `--seller-grade`/`--photo-grade`/`--grade-confidence` when not available — e.g. `--photo-grade`
 only when Step 2.5 photo-graded the book. `--photo-grade` is the raw consensus,
 not a value the user overrode at the gate.)
 
