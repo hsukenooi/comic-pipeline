@@ -1483,6 +1483,110 @@ def record_win_prep_cmd(output: str | None):
         click.echo(text)
 
 
+# BUI-1267: record-win/commit paces Metron at 20 req/min (BUI-465), up to 3
+# requests per win, so a 3-day batch can legitimately run for minutes. The
+# timeout only bounds a hung connection; a timeout is indeterminate, not a
+# failure (the write runs off the event loop and may still land).
+_RECORD_WINS_TIMEOUT_ENV = "RECORD_WINS_TIMEOUT"
+_DEFAULT_RECORD_WINS_TIMEOUT = 1800.0  # seconds
+_RECORD_WINS_HEARTBEAT = "/api/heartbeat/record-wins"
+
+
+def _notify(message: str) -> None:
+    """macOS notification, best effort (same mechanism as ebay-shipped)."""
+    safe = message.replace("\\", " ").replace('"', "'")
+    try:
+        subprocess.run(
+            ["/usr/bin/osascript", "-e", f'display notification "{safe}" with title "gixen record-wins"'],
+            capture_output=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def _ping_record_wins(server_url: str, ok: bool, detail: str) -> None:
+    """Best-effort heartbeat: a failed ping never changes the exit code."""
+    path = _RECORD_WINS_HEARTBEAT + ("" if ok else "/failure")
+    try:
+        requests.post(f"{server_url}{path}", params={"detail": detail[:300]}, timeout=10).raise_for_status()
+    except requests.RequestException as e:
+        click.echo(f"warning: heartbeat ping failed (non-fatal): {e}", err=True)
+
+
+@cli.command("record-wins")
+def record_wins_cmd():
+    """Record new Gixen wins in the collection, unattended (BUI-1267).
+
+    The scheduled half of /comic:collection-add: `record-win-prep`, then one
+    record-win/commit POST of the ready wins with no resolved reviews. The
+    server marks exactly the committed item_ids seen, so needs_review rows
+    stay unseen for the next attended /comic:collection-add; a notification
+    names their count. No CSV export: /comic:collection-sync exports pending
+    rows itself. Pings the `record-wins` heartbeat on success, /failure
+    otherwise.
+    """
+    server_url = _server_url()
+    if not server_url:
+        click.echo("Error: COMICS_SERVER_URL is not set; record-wins cannot run.", err=True)
+        sys.exit(1)
+
+    def fail(detail: str) -> None:
+        click.echo(f"Error: {detail}", err=True)
+        _ping_record_wins(server_url, False, detail)
+        sys.exit(1)
+
+    ok, snipes, error = _server_request_result("get", "/api/snipes")
+    if not ok:
+        fail(f"could not list snipes: {error}")
+    try:
+        payload = build_payload(snipes, server_url)
+    except RecordWinPrepError as e:
+        fail(f"record-win-prep: {e}")
+
+    wins, needs_review = payload["wins"], payload["needs_review"]
+    click.echo(
+        f"record-wins: {payload['new_win_count']} new win(s), "
+        f"{len(wins)} ready, {len(needs_review)} need review"
+    )
+
+    summary: dict = {}
+    if wins:
+        timeout = _env_float(_RECORD_WINS_TIMEOUT_ENV, _DEFAULT_RECORD_WINS_TIMEOUT, minimum=1.0)
+        ok, data, error = _server_request_result(
+            "post",
+            "/api/comics/collection/record-win/commit",
+            json={"wins": wins, "resolved_reviews": []},
+            timeout=timeout,
+        )
+        if not ok:
+            if isinstance(data, dict) and data.get("indeterminate"):
+                # The next run's record-win-prep is safe either way: a landed
+                # commit marked its wins seen, and the server dedups owned rows.
+                fail("commit timed out; it may still have landed. The next run re-checks.")
+            fail(f"record-win/commit: {error}")
+        summary = {
+            k: data.get(k)
+            for k in (
+                "rows_written",
+                "skipped_already_owned",
+                "manual_series_count",
+                "marked_seen",
+                "pending_push_count",
+                "oldest_pending_days",
+            )
+        }
+        click.echo(json.dumps(summary))
+
+    if needs_review:
+        _notify(f"{len(needs_review)} won auction(s) need review. Run /comic:collection-add.")
+    _ping_record_wins(
+        server_url,
+        True,
+        f"recorded {summary.get('rows_written', 0)}, {len(needs_review)} need review",
+    )
+
+
 @cli.command()
 @click.option(
     "--dry-run",

@@ -10,6 +10,11 @@ Mini; BUI-87) in one batch, then export a CSV for LOCG upload. The server is the
 truth across machines, so a win recorded here is visible on the other machine
 immediately — no git round-trip (R8). No Playwright, no live LOCG session needed.
 
+**Scheduled half (BUI-1267):** every 3 days `gixen record-wins` (launchd,
+alongside `ebay-shipped --auto-submit`) runs Steps 1 and 3 with no resolved
+reviews and no CSV. An attended run mostly resolves `needs_review` rows it
+left unseen; Step 1 still finds any wins the job has not reached yet.
+
 **Gixen CLI:** `gixen` (a uv-installed console script on PATH; run `./scripts/install.sh` if not found).
 
 **Every bash block below that needs a scratch dir re-sources

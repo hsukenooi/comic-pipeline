@@ -63,6 +63,7 @@ def test_the_six_named_jobs_are_declared():
         "slab-watch-collect",
         "unpriced-rerun",
         "ebay-shipped-submit",
+        "record-wins",
     }
 
 

@@ -33,6 +33,7 @@ a ping is the alarm.
 | `slab-watch-collect` | 672h | 1344h | A `comic-fmv --slab-watch-collect` run (BUI-951) where every comp fetch **and** every ledger write it attempted succeeded — exit 0. Mirrors `fmv-refresh`'s BUI-593 lesson: a fetch that ran clean while its ledger POST failed must not ping. A run where every watch-set book was already fresh (nothing fetched) still pings, and so does a run that hit its request cap as long as nothing it attempted failed. | yes |
 | `unpriced-rerun` | 672h | 1344h | A `comic-fmv --unpriced-rerun` run (BUI-1080) where every comp fetch **and** every fmv/ledger write it attempted succeeded — exit 0. Same rule as `slab-watch-collect`: a fetch that ran clean while its upsert or ledger POST failed must not ping, nor must a run where a row's hand-priced provenance could not be verified or the server rejected a write. A run with nothing unpriced still pings, and so does a run that hit its request cap as long as nothing it attempted failed. A failing run POSTs `/api/heartbeat/unpriced-rerun/failure` instead. | yes |
 | `ebay-shipped-submit` | 72h | 144h | An `ebay-shipped --auto-submit` run (BUI-1238) that finished with no failure: eBay GetOrders read cleanly, and every order it chose to submit was accepted by EZShip and confirmed in the EZShip ledger. A run with nothing new to submit still pings, and so does a run that only held orders (non-US ship-from or an unsupported carrier): a hold is the correct outcome, and it notifies instead. An expired EZShip cookie (exit 3), a rejected order (exit 4), an unconfirmable submission, or an eBay failure must not ping; they POST `/api/heartbeat/ebay-shipped-submit/failure` instead. | yes |
+| `record-wins` | 72h | 144h | A `gixen record-wins` run (BUI-1267) that listed snipes, built the record-win-prep payload, and got a 2xx from `record-win/commit` for every ready win. A run with no new wins still pings, and so does a run whose only new wins need review: those stay unseen for the next attended `/comic:collection-add` and notify instead. A failed prep, a non-2xx commit, or a timed-out commit must not ping; they POST `/api/heartbeat/record-wins/failure` instead. | yes |
 
 Cadences are sized to the **slowest normal run**, not the average, and a job is
 only flagged once it is `HEARTBEAT_STALE_FACTOR` (2×) cadences late. A watchdog
@@ -72,9 +73,9 @@ The report's top-level `healthy` means *every job in the contract is verified
 to be running*, so an uninstrumented job makes it `false` exactly as a stale one
 does. Before BUI-624 that meant `healthy` was permanently `false`: nothing
 pinged, and a version that counted only wired jobs would have handed an external
-monitor a green light for a system observing almost nothing. All eight are wired
+monitor a green light for a system observing almost nothing. All nine are wired
 now (BUI-951 added the sixth, `slab-watch-collect`; BUI-1080 the seventh,
-`unpriced-rerun`; BUI-1238 the eighth, `ebay-shipped-submit`), so `healthy: true` is
+`unpriced-rerun`; BUI-1238 the eighth, `ebay-shipped-submit`; BUI-1267 the ninth, `record-wins`), so `healthy: true` is
 finally reachable — and still means what it said. A consumer wanting the
 narrower question ("is anything I *am* watching broken?") reads `stale_jobs`
 and `never_seen_jobs` directly.
@@ -169,8 +170,14 @@ instructive rather than incidental.
   (held orders do not count as failure; they notify). Any failure POSTs
   `/api/heartbeat/ebay-shipped-submit/failure`. Scheduled every 3 days by
   `scripts/launchd/com.comics.ebay-shipped-submit.plist`.
+- **`record-wins`** — `packages/gixen-cli/cli.py`'s `record_wins_cmd`
+  (BUI-1267), via `_ping_record_wins`, only when every ready win committed
+  (wins that need review do not count as failure; they notify). Any failure
+  POSTs `/api/heartbeat/record-wins/failure`. Run every 3 days by
+  `scripts/ebay-shipped-and-wins.sh`, right after `ebay-shipped --auto-submit`,
+  from `scripts/launchd/com.comics.ebay-shipped-submit.plist`.
 
-Every ping is **advisory to its caller**: none of the eight may fail, block, or
+Every ping is **advisory to its caller**: none of the nine may fail, block, or
 alter the job it reports on. A watchdog that can break the work it watches has
 bought nothing.
 

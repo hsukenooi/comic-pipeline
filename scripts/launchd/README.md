@@ -106,6 +106,16 @@ launchctl load -w "$HOME/Library/LaunchAgents/com.comics.ebay-shipped-submit.pli
 
 Logs: `~/.comics-server/ebay-shipped-submit.log` and `.error.log`.
 
+Since BUI-1267 the job runs `scripts/ebay-shipped-and-wins.sh`, which runs
+`ebay-shipped --auto-submit` and then `gixen record-wins`. That second step
+records new Gixen wins in the collection on the comics server (the
+unattended half of `/comic:collection-add`). Wins that need review stay
+unseen and raise a notification; run `/comic:collection-add` to resolve
+them. It writes no CSV: `/comic:collection-sync` exports pending rows
+itself. Each step pings its own heartbeat (`ebay-shipped-submit`,
+`record-wins`) and runs whether or not the other failed. Rehearse the
+second step without writing anything with `gixen record-win-prep`.
+
 ## com.comics.em-batch-nightly.plist (BUI-972)
 
 Runs `scripts/em-batch-nightly.sh` at 01:00 every night: picks up to

@@ -6230,6 +6230,28 @@ JOB_CONTRACTS: dict[str, dict[str, Any]] = {
             "days; the 30-day GetOrders window covers the gap)."
         ),
     },
+    "record-wins": {
+        "cadence_hours": 72.0,
+        "success": (
+            "A `gixen record-wins` run (BUI-1267) that listed snipes, built "
+            "the record-win-prep payload, and got a 2xx from "
+            "record-win/commit for every ready win. A run with no new wins "
+            "still pings, and so does a run whose only new wins need review: "
+            "those stay unseen for the next attended /comic:collection-add "
+            "and notify instead. A failed prep, a non-2xx commit, or a "
+            "timed-out commit must not ping; they POST /api/heartbeat/"
+            "record-wins/failure instead."
+        ),
+        "wired": True,
+        "ping": (
+            "packages/gixen-cli/cli.py's record_wins_cmd, via "
+            "_ping_record_wins: POST /api/heartbeat/record-wins (failure "
+            "branch: /failure). Best-effort: a failed ping never changes the "
+            "run's exit code. Scheduling: scripts/ebay-shipped-and-wins.sh, "
+            "run by scripts/launchd/com.comics.ebay-shipped-submit.plist "
+            "(every 3 days, after ebay-shipped --auto-submit)."
+        ),
+    },
 }
 
 # THE OUTER LAYER — WIRED (BUI-672). Read this before trusting the watchdog.
