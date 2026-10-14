@@ -7,16 +7,20 @@
     <string>com.comics.ebay-shipped-submit</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/hsukenooi/.local/bin/ebay-shipped</string>
-        <string>--auto-submit</string>
+        <!-- BUI-1267: the wrapper runs ebay-shipped --auto-submit, then
+             gixen record-wins (new wins -> the collection). -->
+        <string>/bin/bash</string>
+        <string>/Users/hsukenooi/Projects/comic-pipeline/scripts/ebay-shipped-and-wins.sh</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
         <key>COMICS_SERVER_URL</key>
         <string>http://localhost:8080</string>
-        <!-- ebay-shipped shells out to `gixen` (~/.local/bin, for product
-             names) and `npx tsx` (ezship; the nvm node dir). launchd starts
-             jobs with a minimal PATH, so both are listed explicitly. -->
+        <!-- ebay-shipped and the wrapper's `gixen record-wins` live in
+             ~/.local/bin; ebay-shipped also shells out to `npx tsx` (ezship;
+             the nvm node dir) and record-wins to `comic-identify`
+             (~/.local/bin). launchd starts jobs with a minimal PATH, so each
+             dir is listed explicitly. -->
         <key>PATH</key>
         <string>/Users/hsukenooi/.local/bin:/Users/hsukenooi/.nvm/versions/node/v22.22.0/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>EZSHIP_DIR</key>

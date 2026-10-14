@@ -28,6 +28,7 @@ gixen add <item_id> <max_bid> [--offset 6] [--group 0]
 gixen add-batch <rows.json> [--verify] [--json-out results.json]  # BUI-360: batch add, server-mode only (no direct-Gixen fallback)
 gixen build-batch <brief.json> <working_list.json> [--overrides overrides.json] [--out rows.json]  # BUI-435: build add-batch's rows.json deterministically
 gixen sync                  # pull latest Gixen state into server DB
+gixen record-wins           # BUI-1267: record new wins in the collection unattended (needs_review rows stay unseen); run every 3 days by launchd
 
 # Run the server (development)
 uvicorn server.main:app --reload
