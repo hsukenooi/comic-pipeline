@@ -86,8 +86,9 @@ logger = logging.getLogger("gixen_overlay.policy")
 # necessarily a narrower approximation of the brief-path haircut — exact
 # parity (folding in a stored grade_confidence) is U8 territory, not this
 # one. The recomputed-cap check's advisory data says so explicitly.
-# BUI-1261/BUI-1264: on a DIRECT row the label is not read at all (0.80, see
-# `_factor`), so the rungs below govern only NULL-basis and derived-tier rows.
+# BUI-1261/BUI-1264: on a DIRECT row the label is not read through these
+# rungs (0.80, or BUI-1266's `_photo_factor` when a POST carries the bid's
+# photo grade), so the map below governs only NULL-basis and derived-tier rows.
 # ---------------------------------------------------------------------------
 RUNG_HIGH_CONFIDENCE = 0.80    # == fmv_math.BASE_BID_FACTOR
 RUNG_MEDIUM_CONFIDENCE = 0.70  # == the literal MEDIUM-LOW-branch return in fmv_math.bid_factor
@@ -169,6 +170,44 @@ def _median_cap(r: dict) -> float | None:
             or confidence.strip().lower() != _MEDIAN_TIER_CONFIDENCE[tier]):
         return None
     return min(MEDIAN_BID_FACTOR * median, high)
+
+
+# BUI-1266: the bid's own photo grade_confidence, carried per identity entry
+# on a POST (`comic_identities[].grade_confidence`, from /comic:buy's working
+# list via build-batch). Ranks duplicated from fmv_math (`_CONF_RANK` through
+# `_GRADE_CONF_NORMALIZE`, KTD5), pinned by tests/test_fmv_rung_parity.py.
+_GRADE_CONF_RANK = {"high": 4, "medium": 2, "medium-low": 1, "low": 0}
+_RANK_MEDIUM_LOW = 1
+# The laxest rubric rank a stored label can stand for: stored 'low' ⊇
+# {MEDIUM-LOW, LOW}, so it is at most MEDIUM-LOW. Every other label (or none)
+# is MEDIUM or above, where only the photo grade can lower the factor.
+_RANK_ABOVE_ALL = 4
+# Where `_resolve_post_identities` stashes an entry's photo grade on its
+# resolved fmv row. Not an fmv column, so it never collides with one.
+_GRADE_CONFIDENCE_KEY = "bid_grade_confidence"
+
+
+def _photo_factor(confidence: Any, grade_confidence: Any) -> float | None:
+    """`fmv_math.bid_factor(label, grade_confidence)` at the laxest rubric
+    label the stored collapse allows, or None when the bid carried no photo
+    grade (absent or blank: bid_factor pays BASE). A present but unrecognized
+    or non-string value reads LOW, as bid_factor does (fail closed)."""
+    if grade_confidence is None:
+        return None
+    if isinstance(grade_confidence, str):
+        gc = grade_confidence.strip().lower()
+        if gc == "":
+            return None
+        g = _GRADE_CONF_RANK.get(gc, 0)
+    else:
+        g = 0
+    stored = confidence.strip().lower() if isinstance(confidence, str) else None
+    combined = min(g, _RANK_MEDIUM_LOW if stored == "low" else _RANK_ABOVE_ALL)
+    if combined <= 0:
+        return RUNG_LOW_CONFIDENCE
+    if combined == _RANK_MEDIUM_LOW:
+        return RUNG_MEDIUM_CONFIDENCE
+    return RUNG_HIGH_CONFIDENCE
 
 
 def _rung_for_confidence(confidence: Any) -> float:
@@ -276,6 +315,8 @@ def _resolve_post_identities(conn: sqlite3.Connection, identities: list) -> tupl
             continue
         full = _fetch_fmv_row(conn, fmv_ref["fmv_id"])
         if full is not None:
+            # BUI-1266: the photo grade belongs to this bid, not the row.
+            full[_GRADE_CONFIDENCE_KEY] = entry.get("grade_confidence")
             resolved.append(full)
     return resolved, attempted
 
@@ -384,11 +425,15 @@ def _factor(r: dict) -> float:
 
     BUI-1264: a DIRECT raw row also bids BASE whenever the request carried no
     photo grade, since `bid_factor(label, None)` is BASE for every label. The
-    photo grade belongs to the bid, not the row: it is not on the intent, and
-    a stored copy would be the last fresh run's, so a later no-photo cache
-    hit on the same row would still bid 0.80 against a stricter stored rung.
-    The laxest legitimate factor on any direct row is therefore BASE (KTD9):
-    a photo-haircut raw bid (0.60 or 0.70) sits under it and is not flagged.
+    photo grade belongs to the bid, not the row: a stored copy would be the
+    last fresh run's, so a later no-photo cache hit on the same row would
+    still bid 0.80 against a stricter stored rung.
+
+    BUI-1266: a POST identity may carry that photo grade
+    (`grade_confidence`). On a direct raw row the factor is then
+    `bid_factor(label, grade_confidence)` at the laxest label the stored
+    collapse allows (`_photo_factor`), so a photo-haircut bid raised past its
+    rung is advised. A PATCH carries no identity, so an edit keeps BASE.
 
     A NULL basis keeps the label rung: it could be a ladder, interpolated, or
     proxy row (0.60 or 0.70), and reading it as direct would loosen the check.
@@ -398,6 +443,10 @@ def _factor(r: dict) -> float:
     if r.get("high") is None and r.get("ceiling_cap") is not None:
         return 1.0
     if r.get("pricing_basis") == "direct":
+        if (r.get("certifier") or FMV_CERTIFIER_NONE) == FMV_CERTIFIER_NONE:
+            photo = _photo_factor(r.get("confidence"), r.get(_GRADE_CONFIDENCE_KEY))
+            if photo is not None:
+                return photo
         return RUNG_HIGH_CONFIDENCE
     return _rung_for_confidence(r.get("confidence"))
 
@@ -496,7 +545,9 @@ def _recomputed_link_cap(r: dict) -> dict:
     lower) with one, and this check cannot tell which happened. Taking the
     max keeps the KTD9 rule — advise only on a bid no legitimate path could
     have produced — and both terms are at most `high`, so the median rule
-    never widens the cap past the band's top.
+    never widens the cap past the band's top. When the POST did carry a photo
+    grade that haircuts the factor (BUI-1266), the median cap is dropped, as
+    the writer drops it.
     """
     high = _bid_basis_high(r)
     factor = _factor(r)
@@ -505,7 +556,10 @@ def _recomputed_link_cap(r: dict) -> dict:
     # rounded-up bid. Take the larger of the two: the advisory still fires only
     # on a bid no writer path could have produced, and never tightens.
     rung_cap = max(factor * high, _clean_round(factor * high))
-    median_cap = _median_cap(r)
+    # BUI-1266: an engaged haircut forgoes the median cap, as in
+    # fmv_math.median_bid_cap. Only a carried photo grade moves a row that
+    # can hold a median cap below BASE.
+    median_cap = _median_cap(r) if factor >= RUNG_HIGH_CONFIDENCE else None
     cap = rung_cap if median_cap is None else max(rung_cap, median_cap)
     return {
         "fmv_id": r.get("id"),
@@ -513,6 +567,7 @@ def _recomputed_link_cap(r: dict) -> dict:
         "high": high,
         "published_high": r.get("high"),  # BUI-1242: != high on a widened slab row
         "factor": factor,
+        "grade_confidence": r.get(_GRADE_CONFIDENCE_KEY),
         "bid_tier": r.get("bid_tier"),
         "median_cap": median_cap,
         "cap": cap,
@@ -530,12 +585,13 @@ def _check_recomputed_cap(conn: sqlite3.Connection, intent: Any) -> dict | None:
     data = {
         "max_bid": intent.target_max_bid, "recomputed_cap": recomputed_cap,
         "link_count": len(priceable), "per_link": per_link,
-        "basis": "0.80 x high on a direct row, else the fmv.confidence "
-                 "rung x high; the larger of that and min(median, high) on a "
-                 "BUI-1219 median-tier row. The bid's photo "
-                 "grade_confidence is not visible here (BUI-1264)",
-        # The factor each row reads (see `_factor`): every direct row 0.80,
-        # else the stored label's laxest rung.
+        "basis": "0.80 x high on a direct row (or bid_factor(label, "
+                 "grade_confidence) on a raw one whose POST identity carried "
+                 "the bid's photo grade, BUI-1266), else the fmv.confidence "
+                 "rung x high; the larger of that and min(median, high) on an "
+                 "unhaircut BUI-1219 median-tier row",
+        # The factor each row reads (see `_factor`): a direct row 0.80 unless
+        # a photo grade haircuts it, else the stored label's laxest rung.
         "rungs": {"direct": RUNG_HIGH_CONFIDENCE, **_RUNG_BY_CONFIDENCE},
     }
     if intent.target_max_bid > recomputed_cap:

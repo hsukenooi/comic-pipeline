@@ -311,6 +311,25 @@ def _optional_float(row: dict, field_name: str) -> float | None:
     return result
 
 
+# BUI-1266: /comic:grade's four photo-confidence levels (buy.md Step 2.5),
+# the vocabulary fmv_math.bid_factor reads. Validated here so a typo fails
+# the row loudly instead of reaching the policy check, which would read an
+# unrecognized value as LOW.
+GRADE_CONFIDENCE_LEVELS = ("high", "medium", "medium-low", "low")
+
+
+def _optional_grade_confidence(row: dict) -> str | None:
+    value = row.get("grade_confidence")
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if not isinstance(value, str) or value.strip().lower() not in GRADE_CONFIDENCE_LEVELS:
+        raise _RowValidationError(
+            f"invalid grade_confidence: {value!r} (must be one of "
+            f"{'/'.join(GRADE_CONFIDENCE_LEVELS)})"
+        )
+    return value.strip().lower()
+
+
 def _optional_int(row: dict, field_name: str, default: int) -> int:
     value = row.get(field_name, default)
     try:
@@ -367,6 +386,7 @@ def build_bid_payload(
     certifier: str | None = None,
     cert_number: str | None = None,
     label: str | None = None,
+    grade_confidence: str | None = None,
     source: str | None = None,
     policy_bypass: bool = False,
 ) -> dict[str, Any]:
@@ -427,7 +447,12 @@ def build_bid_payload(
     server-side (existing group on an upsert of a live row, 0 on a fresh
     create) instead of this client silently sending a `0` that un-groups an
     already-grouped snipe. `group=0` is still sent explicitly: 0 is a
-    positive "ungrouped" claim (BUI-383), never "unspecified"."""
+    positive "ungrouped" claim (BUI-383), never "unspecified".
+
+    BUI-1266: `grade_confidence` (the photo grader's confidence, the value
+    comic-fmv haircut the bid with) rides the `comic_identities` entry so
+    the overlay's `recomputed_cap` check reproduces that haircut. Omitted on
+    a certified row, like `photo_grade`: a slab bid takes no photo haircut."""
     # BUI-926 (U4): "certified" means a supplied certifier other than the
     # literal raw sentinel "none" — that's what gates the seller_grade/
     # photo_grade suppression below.
@@ -474,6 +499,8 @@ def build_bid_payload(
             identity["certifier"] = certifier
         if label is not None:
             identity["label"] = label
+        if grade_confidence is not None and not is_certified:
+            identity["grade_confidence"] = grade_confidence
         identities.append(identity)
     payload["comic_identities"] = identities
     return payload
@@ -559,6 +586,7 @@ def add_one_row(row: dict, *, server_request: ServerRequestFn) -> RowResult:
         if cert_number is not None and not isinstance(cert_number, str):
             cert_number = str(cert_number)
         label = row.get("label")
+        grade_confidence = _optional_grade_confidence(row)
         _check_end_date_not_past(row)  # BUI-567: before the network, not after
         # BUI-623 (U9): per-row audited bypass — a ROWS_FILE row may set
         # "policy_bypass": true so this specific row commits past a blocking
@@ -578,6 +606,7 @@ def add_one_row(row: dict, *, server_request: ServerRequestFn) -> RowResult:
         comic_id=comic_id, grade=grade,
         # BUI-926 (U4): certified identity, when the row carries it.
         certifier=certifier, cert_number=cert_number, label=label,
+        grade_confidence=grade_confidence,  # BUI-1266
         # BUI-621 (U7): every add-batch row is provenance-tagged "batch",
         # distinct from cli.py's `add` command tagging "cli".
         source="batch",
@@ -1270,6 +1299,7 @@ def build_batch_rows(
             if cert_number is not None and not isinstance(cert_number, str):
                 cert_number = str(cert_number)
             label = row.get("label")
+            grade_confidence = _optional_grade_confidence(row)
         except _RowValidationError as e:
             raise AddBatchError(f"item_id {item_id!r}: {e}") from None
 
@@ -1319,6 +1349,8 @@ def build_batch_rows(
             out_row["seller_grade"] = seller_grade
         if photo_grade is not None:
             out_row["photo_grade"] = photo_grade
+        if grade_confidence is not None:
+            out_row["grade_confidence"] = grade_confidence  # BUI-1266
 
         # BUI-926 (U4): certified identity — copied onto the row when the
         # working-list entry carried it, independent of the comic_id/grade

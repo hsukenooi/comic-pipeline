@@ -321,7 +321,9 @@ gixen build-batch fmv_brief.json working_list.json --overrides overrides.json --
   comic with `item_id`, `grade` (numeric, or a CGC letter grade like `NM-` —
   the builder converts it), `listing_type` (`Auction`/`BIN` from Step 1 —
   BIN rows are skipped automatically), `seller`/`seller_grade`/`photo_grade`
-  (Steps 1/2.5), `group` (the Step 2 bid-group candidate, if any), and
+  (Steps 1/2.5), `grade_confidence` (Step 2.5's, the same value Step 3
+  priced with — BUI-1266: the server's `recomputed_cap` check reads it to
+  apply the same photo haircut; omit it when Step 3 had none), `group` (the Step 2 bid-group candidate, if any), and
   `end_date_iso` (Step 1's raw end time, refreshed by Step 4 if the run was
   stale — BUI-567; the builder threads it straight into `rows.json` so
   `add-batch`'s stale-listing guard has an end time to check). **Certified

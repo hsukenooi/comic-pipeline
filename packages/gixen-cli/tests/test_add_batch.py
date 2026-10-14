@@ -1956,3 +1956,53 @@ def test_row_result_to_dict_carries_the_reconcile_verdict():
     row.reconcile = {"checked": True, "found": False, "error": None, "live_max_bid": None}
     assert row.to_dict()["reconcile"] == row.reconcile
     assert RowResult(item_id="2", status=STATUS_ADDED).to_dict()["reconcile"] is None
+
+
+# ---------------------------------------------------------------------------
+# BUI-1266: the photo grade_confidence rides the comic_identities entry
+# ---------------------------------------------------------------------------
+
+
+def test_build_bid_payload_raw_identity_carries_grade_confidence():
+    payload = build_bid_payload("1", 70, 6, 0, comic_id=187, grade=8.0,
+                                grade_confidence="medium-low")
+    assert payload["comic_identities"] == [
+        {"comic_id": 187, "grade": 8.0, "grade_confidence": "medium-low"}
+    ]
+
+
+def test_build_bid_payload_certified_identity_omits_grade_confidence():
+    """A slab bid takes no photo haircut (graded_fmv pins it None)."""
+    payload = build_bid_payload("1", 700, 6, 0, comic_id=187, grade=9.6,
+                                certifier="cgc", grade_confidence="low")
+    assert "grade_confidence" not in payload["comic_identities"][0]
+
+
+def test_add_one_row_threads_grade_confidence_into_the_identity():
+    server = _FakeServer({
+        ("post", "/api/bids"): (True, {"item_id": "1", "created": True}, None),
+        ("post", "/api/bids/1/link-fmv"): (True, {}, None),
+    })
+    add_one_row(_row("1", comic_id=42, grade=8.0, grade_confidence=" Medium-Low "),
+                server_request=server)
+    assert server.calls[0][2]["comic_identities"] == [
+        {"comic_id": 42, "grade": 8.0, "grade_confidence": "medium-low"}
+    ]
+
+
+@pytest.mark.parametrize("bad", ["med-low", 3, True])
+def test_add_one_row_rejects_unknown_grade_confidence_without_network(bad):
+    server = _FakeServer({})
+    result = add_one_row(_row("1", comic_id=42, grade=8.0, grade_confidence=bad),
+                         server_request=server)
+    assert result.status == STATUS_FAILED
+    assert "grade_confidence" in result.error
+    assert server.calls == []
+
+
+def test_build_batch_rows_carries_grade_confidence():
+    brief = [_brief("1", comic_id=42, max_bid=70)]
+    result = build_batch_rows(brief, [_wl_row("1", grade=8.0, grade_confidence="LOW")])
+    assert result.rows[0]["grade_confidence"] == "low"
+    result = build_batch_rows(brief, [_wl_row("1", grade=8.0)])
+    assert "grade_confidence" not in result.rows[0]
