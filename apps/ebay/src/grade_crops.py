@@ -242,7 +242,70 @@ def crop_one(src: Path, out_dir: Path, font) -> list[Path]:
     return written
 
 
+CROP_MAX = 1000  # ad hoc crop output cap, px per side (BUI-1298)
+
+
+def parse_box(text):
+    """Parse ``x0,y0,x1,y1`` (integer pixels, original image, y down) or raise ValueError."""
+    parts = [p.strip() for p in str(text).split(",")]
+    if len(parts) != 4:
+        raise ValueError(f"box must be x0,y0,x1,y1 (got {text!r})")
+    try:
+        return tuple(int(p) for p in parts)
+    except ValueError:
+        raise ValueError(f"box must be four integers x0,y0,x1,y1 (got {text!r})") from None
+
+
+def crop_region(src: Path, box, out: Path) -> Path:
+    """Crop ``box`` from ``src`` into ``out``: clamped to the image, long edge capped at CROP_MAX."""
+    x0, y0, x1, y1 = box
+    with Image.open(src) as im:
+        im = ImageOps.exif_transpose(im).convert("RGB")
+        w, h = im.size
+        cx0, cy0, cx1, cy1 = max(0, x0), max(0, y0), min(w, x1), min(h, y1)
+        if cx1 <= cx0 or cy1 <= cy0:
+            raise ValueError(f"box {x0},{y0},{x1},{y1} is empty or outside the {w}x{h} image")
+        region = im.crop((cx0, cy0, cx1, cy1))
+    region.thumbnail((CROP_MAX, CROP_MAX), Image.Resampling.LANCZOS)  # shrinks only
+    out.parent.mkdir(parents=True, exist_ok=True)
+    region.save(out, "JPEG", quality=JPEG_QUALITY)
+    return out
+
+
+def crop_main(argv) -> int:
+    parser = argparse.ArgumentParser(
+        prog="grade-crops crop",
+        description="Crop one region of an original photo. BOX is x0,y0,x1,y1 in pixels of "
+        "the original image (origin top left), clamped to the image; the output is a JPEG "
+        "no larger than 1000x1000 px. Prints the written path.",
+    )
+    parser.add_argument("image", type=Path)
+    parser.add_argument("box")
+    parser.add_argument("out", type=Path)
+    args = parser.parse_args(argv)
+    try:
+        box = parse_box(args.box)
+    except ValueError as e:
+        print(f"grade-crops crop: {e}", file=sys.stderr)
+        return 2
+    if not args.image.is_file():
+        print(f"grade-crops crop: not a file: {args.image}", file=sys.stderr)
+        return 2
+    try:
+        print(crop_region(args.image, box, args.out))
+    except (OSError, ValueError) as e:
+        print(f"grade-crops crop: {args.image.name}: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main(argv=None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    # `grade-crops crop <img> <box> <out>`: exactly four args with a literal first
+    # word "crop". The folder CLI takes two positionals, so it never reaches here.
+    if len(argv) == 4 and argv[0] == "crop":
+        return crop_main(argv[1:])
     parser = argparse.ArgumentParser(
         prog="grade-crops",
         description="Write a 1024 px overview and two labelled region contact "

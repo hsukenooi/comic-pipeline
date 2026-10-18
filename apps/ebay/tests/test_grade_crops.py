@@ -166,3 +166,57 @@ def test_sheet_2_covers_both_spine_edges_top_and_bottom():
     assert centre["right edge top"] == (900, 50 + side)
     assert centre["right edge bottom"] == (900, 1450 - side)
     assert centre["left edge top"] == (100, 50 + side)
+
+
+# ---------- crop subcommand (BUI-1298) ----------
+
+def _crop(capsys, *args):
+    rc = grade_crops.main(["crop", *map(str, args)])
+    out, err = capsys.readouterr()
+    return rc, out.strip(), err
+
+
+def test_crop_writes_region_and_prints_path(tmp_path, capsys):
+    _make(tmp_path, "img-01.jpg", (400, 600))
+    out = tmp_path / "crops" / "crop-01.jpg"
+    rc, stdout, err = _crop(capsys, tmp_path / "img-01.jpg", "10,20,110,220", out)
+    assert rc == 0 and err == "" and stdout == str(out)
+    assert Image.open(out).size == (100, 200)
+
+
+def test_crop_clamps_to_image_and_caps_at_1000(tmp_path, capsys):
+    _make(tmp_path, "img-01.jpg", (2400, 3000))
+    out = tmp_path / "crop-01.jpg"
+    rc, _, _ = _crop(capsys, tmp_path / "img-01.jpg", "-50,-50,5000,5000", out)
+    assert rc == 0
+    w, h = Image.open(out).size
+    assert max(w, h) == 1000 and abs(w / h - 0.8) < 0.01   # aspect kept
+    small = tmp_path / "small.jpg"
+    _make(tmp_path, "img-02.jpg", (300, 300))
+    assert _crop(capsys, tmp_path / "img-02.jpg", "0,0,9999,9999", small)[0] == 0
+    assert Image.open(small).size == (300, 300)             # never upscaled
+
+
+@pytest.mark.parametrize("box", ["1,2,3", "a,b,c,d", "1.5,2,3,4", "", "50,50,10,10", "500,500,600,600"])
+def test_crop_bad_box_exits_nonzero(tmp_path, capsys, box):
+    _make(tmp_path, "img-01.jpg", (400, 400))
+    out = tmp_path / "crop-01.jpg"
+    rc, stdout, err = _crop(capsys, tmp_path / "img-01.jpg", box, out)
+    assert rc != 0 and stdout == "" and "grade-crops crop:" in err and not out.exists()
+
+
+def test_crop_missing_or_unreadable_file(tmp_path, capsys):
+    rc, _, err = _crop(capsys, tmp_path / "nope.jpg", "0,0,10,10", tmp_path / "o.jpg")
+    assert rc == 2 and "not a file" in err
+    bad = tmp_path / "bad.jpg"
+    bad.write_bytes(b"not an image")
+    rc, _, err = _crop(capsys, bad, "0,0,10,10", tmp_path / "o.jpg")
+    assert rc == 1 and "bad.jpg" in err
+
+
+def test_folder_cli_unchanged_alongside_crop(tmp_path, capsys):
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    src.mkdir()
+    _make(src, "img-01.jpg", (400, 600))
+    rc, lines, err = _run(capsys, src, dst)
+    assert rc == 0 and len(lines) == 3 and err == ""
