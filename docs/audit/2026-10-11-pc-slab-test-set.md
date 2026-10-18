@@ -97,3 +97,10 @@ This isn't the spec baseline. Each universal sale is priced from earlier PC sale
 - **Newly flagged: 14 of 9,516 universal rows.** All are dated before 2026-05-05, so none sits in the baseline window. Nothing flagged before is unflagged. Gross junk dominates (X-Men #96 5.5 at $36, Avengers #87 6.0 at $20, Tales to Astonish #63 4.5 at $99). Borderline: Amazing Spider-Man #87 9.6 at $1,700 (same-grade 9.6 sales run $383 to $570) and Invincible #19 9.4 at $150.
 - **Baseline.** The rule moves no baseline cell by itself. Scoring the 2026-10-11 artifact today gives 0.772 [0.674, 0.905] on 904 sales, so the move to 0.780 comes from the rebuild picking up main changes since 2026-10-11 (universal rows 9,460 to 9,516), not from the outlier rule.
 - **Section 3 (PC history) is the exposed one.** It scores every date, so the 14 newly flagged rows now drop from truth there.
+
+## Restated (BUI-1281, 2026-10-19)
+
+- **Cause.** `pc_slab_test_set.load_ledger` never selected `comps.best_offer`, so every harness score since BUI-1234 ran without `graded_pool`'s x0.89 scale. It now selects the stored flag (NULL stays unflagged; a duplicated `product_id` keeps the flag if any copy has it).
+- **Baseline, sold basis, 906 PC sales, same 2026-10-13 artifact.** Winkler **0.667 [0.593, 0.772]** before, **0.664 [0.591, 0.766]** after. Bias +0.086 to +0.084, in-band 56% both, coverage 82% both. List basis: 0.664 to 0.661.
+- **Why the move is small.** Only the stored flag is read, and it is True on 25 of 922 ledger slab rows on these books. The 2026-10-18 ranking doc's `a_db` arm (0.664) is this same number. Its post-ship baseline (0.635 on paired sales) also uses the BUI-614 capture flag, which is why that script keeps its own `best_offer` loader.
+- The 0.780 figures above stay as the historical record.
