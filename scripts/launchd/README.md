@@ -124,6 +124,8 @@ Soon, or Someday, and runs `/em-batch mode:autonomous` over them in a fresh
 detached worktree, headless, through implement, review, CI, merge, deploy,
 and close. Nothing is pushed to the user: each ticket's closing comment in
 Linear is the record, and the run's summary is saved under the state dir.
+With fewer than three tickets the prompt forces one Sonnet sub-agent per
+ticket (`EM_BATCH_NIGHTLY_SMALL_DELEGATE=0` disables, BUI-1297).
 The wrapper's header documents the knobs and the `--dry-run` / `--tickets` /
 `--resume-run` switches.
 
