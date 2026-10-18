@@ -15,7 +15,17 @@ case "$sid" in */* | .*) exit 0 ;; esac
 marker_dir="${TMPDIR:-/tmp}/comic-pipeline-stop-nag"
 [ -e "$marker_dir/$sid" ] && exit 0
 
-start="$(stat -f %B "$tp" 2>/dev/null || stat -c %W "$tp" 2>/dev/null)" || exit 0
+# BSD stat takes -f for formats; GNU stat's -f means "filesystem", so gate on the OS.
+if [ "$(uname -s 2>/dev/null)" = Darwin ]; then
+  _birth() { stat -f %B "$1" 2>/dev/null; }
+  _mtime() { stat -f %m "$1" 2>/dev/null; }
+else
+  _birth() { stat -c %W "$1" 2>/dev/null; }
+  _mtime() { stat -c %Y "$1" 2>/dev/null; }
+fi
+# STOP_NAG_SESSION_START=<epoch> overrides the birth time (tests; filesystems with none).
+start="${STOP_NAG_SESSION_START:-$(_birth "$tp")}" || exit 0
+# Birth time 0, "-", or empty means unknown: stay silent.
 case "$start" in '' | *[!0-9]*) exit 0 ;; esac
 [ "$start" -gt 0 ] || exit 0
 
@@ -23,7 +33,7 @@ cd "${CLAUDE_PROJECT_DIR:-.}" 2>/dev/null || exit 0
 files=""
 while IFS= read -r -d '' f; do
   case "$f" in *.md) ;; *) continue ;; esac
-  m="$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null)" || continue
+  m="$(_mtime "$f")" || continue
   [ "$m" -gt "$start" ] 2>/dev/null || continue
   files="${files:+$files, }$f"
 done < <(git ls-files -z --others --exclude-standard -- docs 2>/dev/null)
