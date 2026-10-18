@@ -14,6 +14,12 @@
 # the wrapper resumes the same session with a nudge, up to MAX_RESUMES times.
 # To finish a run by hand later: scripts/em-batch-nightly.sh --resume-run <run id>
 #
+# A batch with more than one chunk (BUI-1168): the planning session runs no chunk
+# and ends on `Planned <n> tickets in <k> chunks.` plus a `Queue: <path>` line.
+# The wrapper then runs the em-batch chunk driver (run-chunks.sh, BUI-1160) on that
+# queue, which starts one fresh headless session per chunk. The last chunk's
+# result is the run's summary.
+#
 # Run it now (does not wait for 01:00):
 #   launchctl kickstart -k "gui/$(id -u)/com.comics.em-batch-nightly"
 # Or by hand:
@@ -44,6 +50,7 @@ KNOBS="/Users/hsukenooi/.config/em-batch-nightly.env"
 CLAUDE="/Users/hsukenooi/.local/bin/claude"
 TITLE="Nightly comics run"
 LOG_PATH="/Users/hsukenooi/Library/Logs/em-batch-nightly.log"
+CHUNK_DRIVER="/Users/hsukenooi/.claude/skills/em-batch/scripts/run-chunks.sh"
 
 # launchd hands a job a near-empty PATH. claude lives in ~/.local/bin;
 # uv/gh/linear/gtimeout in /opt/homebrew/bin.
@@ -116,6 +123,7 @@ trap cleanup EXIT
 
 # --- Preflight ------------------------------------------------------------------
 [ -x "$CLAUDE" ] || fatal "claude not found at $CLAUDE"
+[ -x "$CHUNK_DRIVER" ] || fatal "em-batch chunk driver not found at $CHUNK_DRIVER"
 [ -r "$REPO/.claude/settings.local.json" ] || fatal "no $REPO/.claude/settings.local.json (the allow rules live there)"
 gh auth status >/dev/null 2>&1 || fatal "gh is not logged in"
 git -C "$REPO" fetch -q origin || fatal "git fetch failed"
@@ -193,7 +201,8 @@ run_model() {
   ( cd "$RUN_WT" && gtimeout "$left" "$CLAUDE" "$@" "${base_flags[@]}" ) > "$out" 2>> "$RUN_DIR/stderr.log"
 }
 
-# The contract for "finished": the result starts with the summary's first line.
+# The contract for "finished": the result starts with the summary's first line,
+# the planning line of a chunked batch, or a middle chunk's one-line result.
 summary_done() {
   python3 - "$1" <<'EOPY'
 import json, re, sys
@@ -201,7 +210,22 @@ try:
     doc = json.load(open(sys.argv[1]))
 except Exception:
     sys.exit(1)
-sys.exit(0 if re.match(r"\s*\d+ tickets? picked", doc.get("result", "")) else 1)
+ok = re.match(r"\s*(\d+ tickets? picked|Planned \d+ tickets? in \d+ chunks?|Chunk \d+ of \d+:)", doc.get("result", ""))
+sys.exit(0 if ok else 1)
+EOPY
+}
+
+# queue_of RESULT: the path on the planning result's `Queue: <path>` line, if any.
+queue_of() {
+  python3 - "$1" <<'EOPY'
+import json, os, re, sys
+try:
+    doc = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+m = re.search(r"^[\s*`_-]*Queue:[\s*`]*(\S+?)[`*.]*\s*$", doc.get("result", ""), re.M)
+if m:
+    print(os.path.expanduser(m.group(1)))
 EOPY
 }
 
@@ -234,7 +258,35 @@ done
 mins=$(( ($(date +%s) - started) / 60 ))
 echo "model run exited $mstatus after ${mins}m ($attempt resumes)"
 
-SUMMARY="$(python3 - "$RESULT_FILE" "$RUN_DIR" <<'EOPY'
+# --- Chunked batch: run every chunk through the driver (BUI-1168) -------------------
+QUEUE=""
+[ "$mstatus" -eq 0 ] && QUEUE="$(queue_of "$RESULT_FILE")"
+if [ -n "$QUEUE" ]; then
+  [ -f "$QUEUE" ] || fatal "planning session named queue $QUEUE, which does not exist. Run dir: $RUN_DIR"
+  printf '%s\n' "$QUEUE" > "$RUN_DIR/queue.txt"
+  left=$(( TIMEOUT_SECS - ($(date +%s) - started) ))
+  [ "$left" -gt 60 ] || fatal "no wall clock left to run the chunks of $QUEUE. Run dir: $RUN_DIR"
+  driver_flags=(--mode autonomous --chunk-timeout "$left")
+  [ -n "$MODEL" ] && driver_flags+=(--model "$MODEL")
+  echo "chunked batch: running $QUEUE through the chunk driver (${left}s left)"
+  # The driver adds --permission-mode/--permission-prompts/--output-format; the
+  # rest of the run's flags go after --. gtimeout bounds the whole driver by what
+  # is left of TIMEOUT, since its --chunk-timeout bounds each session only.
+  CLAUDE_BIN="$CLAUDE" gtimeout "$left" "$CHUNK_DRIVER" "$QUEUE" "${driver_flags[@]}" -- \
+    --settings "$REPO/.claude/settings.local.json" \
+    --add-dir "$REPO" --add-dir "$STATE_DIR" --add-dir "$(dirname "$QUEUE")" \
+    --autocompact auto \
+    --max-budget-usd "$BUDGET" \
+    >> "$RUN_DIR/driver.log" 2>&1
+  mstatus=$?
+  echo "chunk driver exited $mstatus (0 all done, 3 held, 4 session failed, 5 no progress, 124 wall clock)"
+  # The newest chunk result carries the run's summary (the last chunk's) or the
+  # line of the chunk the driver stopped on.
+  last_chunk="$(ls -t "$(dirname "$QUEUE")"/chunk-*.json 2>/dev/null | head -1)"
+  [ -n "$last_chunk" ] && RESULT_FILE="$last_chunk"
+fi
+
+SUMMARY="$(python3 - "$RESULT_FILE" "$RUN_DIR" "${QUEUE:+$(dirname "$QUEUE")}" <<'EOPY'
 import glob, json, sys
 try:
     doc = json.load(open(sys.argv[1]))
@@ -246,13 +298,24 @@ print(doc.get("result", "").strip())
 # is the run total; only the turn counts add up. Tokens, not dollars: the runs
 # draw on a subscription, so a dollar figure is not money spent. No apostrophes in here: bash 3.2 cannot
 # parse a quote inside a heredoc inside a command substitution.
-turns = 0
-for f in sorted(glob.glob(sys.argv[2] + "/result*.json")):
+# A chunked batch adds one fresh session per chunk (chunk-<n>.<k>.json beside the
+# queue), so its usage is the planning session total plus every chunk session.
+def load(f):
     try:
-        turns += json.load(open(f)).get("num_turns", 0)
+        return json.load(open(f))
     except Exception:
-        pass
-mu = doc.get("modelUsage", {}) or {}
+        return {}
+planning = sorted(glob.glob(sys.argv[2] + "/result*.json"))
+chunks = sorted(glob.glob(sys.argv[3] + "/chunk-*.json")) if len(sys.argv) > 3 and sys.argv[3] else []
+turns = sum(load(f).get("num_turns", 0) for f in planning + chunks)
+sessions = ([planning[-1]] if planning else []) + chunks
+mu = {}
+for f in sessions:
+    for m, v in (load(f).get("modelUsage", {}) or {}).items():
+        acc = mu.setdefault(m, {})
+        for k, n in v.items():
+            if isinstance(n, (int, float)):
+                acc[k] = acc.get(k, 0) + n
 out = sum(v.get("outputTokens", 0) for v in mu.values())
 rd = sum(v.get("cacheReadInputTokens", 0) for v in mu.values())
 wr = sum(v.get("cacheCreationInputTokens", 0) + v.get("inputTokens", 0) for v in mu.values())
