@@ -38,7 +38,7 @@ Date: 2026-10-18. Analysis only, no production code. Script: `2026-10-18-slab-fm
 | Append, eBay-source PC sales only | 875 | 0.538 [0.494, 0.592] | 65% | +0.000 |
 | **Append with the refusal guard (the build)** | 860 | **0.516 [0.478, 0.565]** | 66% | -0.012 |
 
-- **Per book**, the append is better on 38 books, worse on 7, and tied on 1. Per sale it's better on 330 and worse on 241. Every era gains, Silver -0.116 and Modern -0.062.
+- **Per book**, the append is better on 38 books, worse on 7, and tied on 1. Per sale it's better on 330 and worse on 241. Silver (-0.116) and Modern (-0.062) gain clearly. Copper gains on its 2-book mean but loses per sale, 6 better and 11 worse.
 - **Newly priced rows.** The append prices 132 sales the baseline refuses, at Winkler 0.676 and bias +0.019. The guard keeps 115 of them at 0.564 and refuses 17 that PC rungs alone would open, which score about 1.4. BUI-1218's 7 newly priced misses don't recur at scale.
 - **The 90-day window loses.** It gains only -0.056 [-0.114, -0.004] and fails the drop-top-book rerun: -0.039 [-0.082, +0.005] without Avengers #87. `graded_pool` already ages comps out past 365 days, so the full-history append is the 365-day append.
 - **Method.** PC sales are added only if dated strictly before the test sale. The test sale and its `same_sale` twins are hidden from both pools. A PC row that `same_sale` matches a ledger comp is dropped and the ledger copy stays. Bootstrap: 2,000 reps over books, seed 1229.
