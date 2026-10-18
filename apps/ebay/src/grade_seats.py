@@ -95,8 +95,26 @@ def conf_label(text):
     return "-".join(re.findall(r"HIGH|MEDIUM|LOW", m.group(1)))
 
 
+_LABEL_MD = (
+    re.compile(r"^([ \t]*)[*_]{1,3}([A-Z][A-Z /-]*:)[*_]{0,3}", re.M),   # **GRADE:** / __GRADE:__
+    re.compile(r"^([ \t]*)[*_]{1,3}([A-Z][A-Z /-]*)[*_]{1,3}:", re.M),   # **GRADE**:
+)
+
+
+def _unbold_labels(text):
+    """Strip markdown bold/italic around a line-leading ALL-CAPS label (BUI-1286).
+
+    Only the label is touched, so values and RATIONALE prose keep their own
+    asterisks and underscores. A bolded numeric GRADE value is unwrapped too.
+    """
+    text = _LABEL_MD[0].sub(r"\1\2", text)
+    text = _LABEL_MD[1].sub(r"\1\2:", text)
+    return re.sub(r"^(GRADE:[ \t]*)[*_]{1,3}(?=\d)", r"\1", text, flags=re.M)
+
+
 def parse_block(text):
     """Parse one OUTPUT FORMAT block; None when a required field is missing."""
+    original, text = text, _unbold_labels(text)
     if not all(re.search(rf"^{re.escape(f)}", text, re.M) for f in REQUIRED):
         return None
     m = re.search(r"^GRADE:[ \t]*([0-9]+(?:\.[0-9]+)?)", text, re.M)
@@ -114,7 +132,7 @@ def parse_block(text):
         "cap": cap,
         "defect": _scrub("; ".join(parts))[:240],
         "limits": _field(text, "PHOTO LIMITATIONS")[:240],
-        "raw": text.strip(),
+        "raw": original.strip(),
     }
 
 
@@ -127,7 +145,7 @@ def parse_adjudication(text):
     """
     marks = list(re.finditer(r"^[ \t*#]*RECONCILED BLOCK\b.*$", text, re.M))
     body = text[marks[-1].end():] if marks else text
-    if not marks and len(re.findall(r"^GRADE:", text, re.M)) != 1:
+    if not marks and len(re.findall(r"^GRADE:", _unbold_labels(text), re.M)) != 1:
         return None
     parts = re.split(r"^[ \t*#]*SEAT FINDINGS\b.*$", body, maxsplit=1, flags=re.M)
     block = parse_block(parts[0])
