@@ -56,6 +56,8 @@ def env(tmp_path, monkeypatch):
     fdir.mkdir()
     monkeypatch.setenv("GRADE_SEATS_CLAUDE", str(fake))
     monkeypatch.setenv("FAKE_DIR", str(fdir))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))  # BUI-1285: never the real ~/.claude/projects
+    monkeypatch.delenv("GRADE_SEATS_KEEP_TRANSCRIPTS", raising=False)
     monkeypatch.setattr(grade_seats, "SEAT_TIMEOUT", 3.0)
     (tmp_path / "agent.md").write_text("---\nname: x\n---\nBODY\n")
     monkeypatch.setattr(grade_seats, "shared_crops", lambda books: {})
@@ -531,3 +533,15 @@ def test_describe_flag_prints_lines(monkeypatch, capsys):
                         lambda i: "Staple rust." if i == "1" else None)
     assert grade_seats.main(["--describe", "1", "2"]) == 0
     assert capsys.readouterr().out.splitlines() == ['1: "Staple rust."', "2: none available"]
+
+
+def test_parse_block_bolded_labels():
+    text = ("**PHOTO MAP:** img-01: front\n**GRADE:** 8.5 (VF+)\n__GRADE RANGE:__ 8.0-9.0\n"
+            "**CONFIDENCE**: MEDIUM: front only\n**GRADE CAP:** none\n"
+            "**RATIONALE:** Clean with a_b_c marks. More.\n")
+    b = grade_seats.parse_block(text)
+    assert b["grade"] == 8.5 and b["range"] == "8.0-9.0" and b["confidence"] == "MEDIUM"
+    assert "a_b_c" in b["defect"]          # prose underscores survive
+    assert b["raw"].startswith("**PHOTO MAP:**")  # raw stays the seat's own text
+    bold_value = grade_seats.parse_block("GRADE: **7.0**\nGRADE RANGE: 7.0\nCONFIDENCE: HIGH\n")
+    assert bold_value["grade"] == 7.0

@@ -95,8 +95,26 @@ def conf_label(text):
     return "-".join(re.findall(r"HIGH|MEDIUM|LOW", m.group(1)))
 
 
+_LABEL_MD = (
+    re.compile(r"^([ \t]*)[*_]{1,3}([A-Z][A-Z /-]*:)[*_]{0,3}", re.M),   # **GRADE:** / __GRADE:__
+    re.compile(r"^([ \t]*)[*_]{1,3}([A-Z][A-Z /-]*)[*_]{1,3}:", re.M),   # **GRADE**:
+)
+
+
+def _unbold_labels(text):
+    """Strip markdown bold/italic around a line-leading ALL-CAPS label (BUI-1286).
+
+    Only the label is touched, so values and RATIONALE prose keep their own
+    asterisks and underscores. A bolded numeric GRADE value is unwrapped too.
+    """
+    text = _LABEL_MD[0].sub(r"\1\2", text)
+    text = _LABEL_MD[1].sub(r"\1\2:", text)
+    return re.sub(r"^(GRADE:[ \t]*)[*_]{1,3}(?=\d)", r"\1", text, flags=re.M)
+
+
 def parse_block(text):
     """Parse one OUTPUT FORMAT block; None when a required field is missing."""
+    original, text = text, _unbold_labels(text)
     if not all(re.search(rf"^{re.escape(f)}", text, re.M) for f in REQUIRED):
         return None
     m = re.search(r"^GRADE:[ \t]*([0-9]+(?:\.[0-9]+)?)", text, re.M)
@@ -114,7 +132,7 @@ def parse_block(text):
         "cap": cap,
         "defect": _scrub("; ".join(parts))[:240],
         "limits": _field(text, "PHOTO LIMITATIONS")[:240],
-        "raw": text.strip(),
+        "raw": original.strip(),
     }
 
 
@@ -127,7 +145,7 @@ def parse_adjudication(text):
     """
     marks = list(re.finditer(r"^[ \t*#]*RECONCILED BLOCK\b.*$", text, re.M))
     body = text[marks[-1].end():] if marks else text
-    if not marks and len(re.findall(r"^GRADE:", text, re.M)) != 1:
+    if not marks and len(re.findall(r"^GRADE:", _unbold_labels(text), re.M)) != 1:
         return None
     parts = re.split(r"^[ \t*#]*SEAT FINDINGS\b.*$", body, maxsplit=1, flags=re.M)
     block = parse_block(parts[0])
@@ -496,6 +514,101 @@ def run_units(workdir, units, suffix, log, parse=parse_block):
     return results
 
 
+# ---------- transcript cleanup (BUI-1285) ----------
+
+KEEP_TRANSCRIPTS_ENV = "GRADE_SEATS_KEEP_TRANSCRIPTS"
+_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+# Claude Code names a project dir after the session cwd with every character outside
+# [A-Za-z0-9] replaced by "-" (verified: "/Users/x/.claude" -> "-Users-x--claude",
+# "Mobile Documents" -> "Mobile-Documents"). We only vouch for the characters seen
+# on disk ("/", ".", "-", alphanumerics); anything else (an underscore, a space) is
+# not pinned down, so cleanup is skipped for it. Long paths get a hash suffix upstream.
+_SLUG_SAFE = re.compile(r"[A-Za-z0-9/.\-]+")
+_SLUG_MAX = 200
+
+
+def transcript_slug(workdir):
+    """Claude Code's project-dir name for a session cwd, or None when not provable."""
+    p = str(Path(workdir).resolve())
+    if not p.startswith("/") or not _SLUG_SAFE.fullmatch(p):
+        return None
+    slug = re.sub(r"[^A-Za-z0-9]", "-", p)
+    if len(slug) > _SLUG_MAX or not slug.strip("-"):
+        return None
+    return slug
+
+
+def _is_scratch_workdir(workdir):
+    """A grade-seats scratch dir: holds the two files this run wrote, outside any repo."""
+    w = Path(workdir).resolve()
+    home = Path.home().resolve()
+    if w == home or w in home.parents or len(w.parts) < 3:
+        return False
+    if any((a / ".git").exists() for a in (w, *w.parents)):
+        return False
+    return all((w / n).is_file() and not (w / n).is_symlink()
+               for n in ("grader-body.md", "empty-mcp.json"))
+
+
+def _session_ids(folders, since):
+    ids = set()
+    for folder in folders:
+        for env in Path(folder).glob("seat-*.json"):
+            try:
+                if env.stat().st_mtime < since:
+                    continue
+                sid = json.loads(env.read_text()).get("session_id")
+            except (OSError, ValueError, AttributeError):
+                continue
+            if isinstance(sid, str) and _UUID.fullmatch(sid):
+                ids.add(sid)
+    return ids
+
+
+def cleanup_transcripts(workdir, folders, since, log=lambda m: None):
+    """Remove this run's seat transcripts from ``~/.claude/projects/<slug>`` (BUI-1285).
+
+    Deletes only ``<session_id>.jsonl`` and ``<session_id>/`` for session ids read from
+    this run's own envelopes, inside the one project dir whose name is the slug of this
+    workdir and which is a real (non-symlink) direct child of ``~/.claude/projects``.
+    The project dir itself goes only if it is then empty (``rmdir``). Never raises.
+    Returns the number of session transcripts removed.
+    """
+    if os.environ.get(KEEP_TRANSCRIPTS_ENV):
+        return 0
+    try:
+        if not _is_scratch_workdir(workdir):
+            log("transcripts kept: workdir is not a grade-seats scratch dir")
+            return 0
+        slug = transcript_slug(workdir)
+        if slug is None:
+            log("transcripts kept: workdir path has no provable project slug")
+            return 0
+        root = (Path.home() / ".claude" / "projects")
+        proj = root / slug
+        if root.is_symlink() or proj.is_symlink() or not proj.is_dir():
+            return 0
+        if proj.resolve().parent != root.resolve() or proj.resolve().name != slug:
+            log("transcripts kept: project dir is not a direct child of ~/.claude/projects")
+            return 0
+        removed = 0
+        for sid in sorted(_session_ids(folders, since)):
+            f, d = proj / f"{sid}.jsonl", proj / sid
+            if f.is_file() and not f.is_symlink():
+                f.unlink()
+                removed += 1
+            if d.is_dir() and not d.is_symlink():
+                shutil.rmtree(d)
+        try:
+            proj.rmdir()  # succeeds only when empty
+        except OSError:
+            pass
+        return removed
+    except (OSError, ValueError, RuntimeError) as e:  # cleanup must never fail a grading run
+        log(f"transcript cleanup skipped ({e})")
+        return 0
+
+
 # ---------- orchestration ----------
 
 def load_spec(path):
@@ -602,6 +715,7 @@ def main(argv=None) -> int:
         lines = lines[end + 1:]
     (workdir / "grader-body.md").write_text("\n".join(lines) + "\n")
 
+    run_start = time.time() - 2
     shared = shared_crops(books)
     log = []  # (unit, suffix, usage, error), one entry per process attempt
     first = run_units(workdir, make_units(books, shared), "", log)
@@ -654,6 +768,8 @@ def main(argv=None) -> int:
                                 "retry": sfx.endswith("-retry"),
                                 "error": err, **usage})
 
+    cleanup_transcripts(workdir, {b["folder"] for b in books}, run_start,
+                        lambda m: print(f"grade-seats: {m}", file=sys.stderr))
     print(json.dumps(report, indent=2) if args.json else render(report))
     return 0 if all(any(not s.get("failed") for s in bk["seats"]) for bk in report["books"]) else 1
 
