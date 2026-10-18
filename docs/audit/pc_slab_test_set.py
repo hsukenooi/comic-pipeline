@@ -296,17 +296,22 @@ def load_ledger(conn: sqlite3.Connection, comic_id: int) -> list[dict]:
     """Ledger CGC universal slab comps for one book (same filter as the spike)."""
     rows = conn.execute(
         """SELECT provider, product_id, title, price, sold_date, grade, page_quality,
-                  first_seen_at
+                  first_seen_at, best_offer
            FROM comps WHERE comic_id=? AND pool='slab' AND certifier='cgc'
              AND label='universal' AND excluded_code IS NULL AND price > 0
              AND grade IS NOT NULL""", (comic_id,)).fetchall()
+    # BUI-1281: carry the stored `comps.best_offer` flag so `fmv_math.graded_pool`
+    # applies its x0.89 scale as production does. A product_id seen twice keeps the
+    # flag if any copy has it (upsert fills it on a later sighting); NULL is unflagged.
+    flagged = {r[1] for r in rows if r[8]}
     out, seen = [], set()
     for r in rows:
         d = dict(zip(("provider", "product_id", "title", "price", "sold_date", "grade",
-                      "page_quality", "first_seen_at"), r))
+                      "page_quality", "first_seen_at", "best_offer"), r))
         if d["product_id"] in seen:
             continue
         seen.add(d["product_id"])
+        d["best_offer"] = d["product_id"] in flagged
         d["_date"] = (fmv_math._parse_sold_date(d["sold_date"])
                       or fmv_math._parse_sold_date(d["first_seen_at"]))
         d["sold_date"] = d["_date"].isoformat() if d["_date"] else None
