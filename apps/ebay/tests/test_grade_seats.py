@@ -56,6 +56,8 @@ def env(tmp_path, monkeypatch):
     fdir.mkdir()
     monkeypatch.setenv("GRADE_SEATS_CLAUDE", str(fake))
     monkeypatch.setenv("FAKE_DIR", str(fdir))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))  # BUI-1285: never the real ~/.claude/projects
+    monkeypatch.delenv("GRADE_SEATS_KEEP_TRANSCRIPTS", raising=False)
     monkeypatch.setattr(grade_seats, "SEAT_TIMEOUT", 3.0)
     (tmp_path / "agent.md").write_text("---\nname: x\n---\nBODY\n")
     monkeypatch.setattr(grade_seats, "shared_crops", lambda books: {})
