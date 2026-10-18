@@ -32,6 +32,8 @@
 #   EM_BATCH_NIGHTLY_BUDGET_USD=80    --max-budget-usd for the model run
 #   EM_BATCH_NIGHTLY_TIMEOUT=6h       wall clock for the model run (gtimeout syntax)
 #   EM_BATCH_NIGHTLY_MODEL=           optional --model override (default: the CLI default)
+#   EM_BATCH_NIGHTLY_SMALL_DELEGATE=1 under 3 tickets, force one Sonnet sub-agent per ticket
+#                                     instead of the EM implementing itself (BUI-1297); 0 disables
 #
 # Permissions: the run loads the user-authored allow rules from the shared
 # checkout's .claude/settings.local.json (gitignored, so a fresh worktree has
@@ -86,6 +88,7 @@ CAP="${EM_BATCH_NIGHTLY_CAP:-8}"
 BUDGET="${EM_BATCH_NIGHTLY_BUDGET_USD:-80}"
 TIMEOUT="${EM_BATCH_NIGHTLY_TIMEOUT:-6h}"
 MODEL="${EM_BATCH_NIGHTLY_MODEL:-}"
+SMALL_DELEGATE="${EM_BATCH_NIGHTLY_SMALL_DELEGATE:-1}"
 
 notify() { /usr/bin/osascript -e "display notification \"$1\" with title \"$TITLE\"" >/dev/null 2>&1; }
 
@@ -158,6 +161,18 @@ fi
 git -C "$REPO" worktree add -q --detach "$RUN_WT" origin/main || fatal "could not create $RUN_WT"
 echo "worktree: $RUN_WT at $(git -C "$RUN_WT" rev-parse --short HEAD)"
 
+# --- Small-batch delegation (BUI-1297) ---------------------------------------------
+# The skill's "fewer than three tickets" route has the Opus EM implement in its own
+# context (7-8M tokens/night). Override it: one Sonnet sub-agent per ticket.
+# TICKETS is non-empty here (empty exited above); word-splitting is intended.
+# shellcheck disable=SC2086
+TICKET_COUNT=$(printf '%s\n' $TICKETS | grep -c .)
+DELEGATE_LINE=""
+if [ "$SMALL_DELEGATE" != "0" ] && [ "$TICKET_COUNT" -lt 3 ]; then
+  DELEGATE_LINE="
+- Small batch override (BUI-1297): this batch has $TICKET_COUNT ticket(s). Ignore the skill's \"fewer than three tickets, do it yourself\" route. Spawn exactly one implementation sub-agent per ticket with the Agent tool, isolation: \"worktree\", model: \"sonnet\". Keep only open, verify, and land for yourself; do not implement in your own context. pr-open.sh works on the sub-agent's branch as usual."
+fi
+
 # --- Prompt ------------------------------------------------------------------------
 PROMPT="/em-batch mode:autonomous $TICKETS
 
@@ -165,7 +180,7 @@ Run context from scripts/em-batch-nightly.sh (BUI-972):
 - Your cwd is a fresh detached worktree at origin/main. Do every git write from it or from agent worktrees, never in the shared checkout.
 - Shared checkout, for deploy only: $REPO (see the profile's Deploy model for the on-main-and-clean rule).
 - Run dir for wave-plan.md and handoff.md: $RUN_DIR
-- Budget: about \$$BUDGET and $TIMEOUT of wall clock. Prefer finishing fewer tickets cleanly over starting all of them.
+- Budget: about \$$BUDGET and $TIMEOUT of wall clock. Prefer finishing fewer tickets cleanly over starting all of them.$DELEGATE_LINE
 - A hold (a ticket that needs the user) = a Linear comment naming the one decision + \`linear issue update ID -a hsukenooi\`, state unchanged. Never set Blocked; that state is the user's own.
 - In handoff.md record every agent's usage from its completion notification per ticket: model, output tokens, cache-read tokens, tool uses, duration, review depth run. Tokens, never dollars.
 - Headless: only a subagent's completion resumes you. A background Bash command, a Monitor, or a CI watch never wakes you, so never end your turn while waiting on one. Wait in the foreground: a normal Bash call such as \`gh pr checks N --watch\` with a long tool timeout, repeated as needed.
