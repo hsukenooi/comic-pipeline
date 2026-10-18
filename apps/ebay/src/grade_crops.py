@@ -282,7 +282,9 @@ def crop_main(argv) -> int:
     parser.add_argument("image", type=Path)
     parser.add_argument("box")
     parser.add_argument("out", type=Path)
-    args = parser.parse_args(argv)
+    # `--` makes all three positionals literal: a box may start with `-` (a negative
+    # coordinate, clamped), which argparse would otherwise read as an option.
+    args = parser.parse_args(["--", *argv])
     try:
         box = parse_box(args.box)
     except ValueError as e:
