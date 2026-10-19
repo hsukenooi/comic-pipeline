@@ -192,6 +192,35 @@ if [ "$DRY_RUN" -eq 1 ]; then
   exit 0
 fi
 
+# --- Mark an attended queue (BUI-1312) -------------------------------------------------
+# mark_attended_queue TICKET NOTE [OWN_QUEUE]: a hand-run em-batch session keeps a queue
+# under $EM_BATCH_QUEUE_ROOT/<run>/queue.md. Pick the newest one with a chunk still
+# pending or running (not the nightly's own queue) and, if it lists TICKET, write NOTE as
+# that ticket's Outcome through queue.sh. Never aborts the nightly: any failure logs one
+# line and returns 0. Env overrides exist for tests: EM_BATCH_QUEUE_ROOT, EM_BATCH_QUEUE_SH.
+mark_attended_queue() {
+  (
+    set +e
+    ticket="$1"; note="$2"; own="${3:-}"
+    root="${EM_BATCH_QUEUE_ROOT:-$HOME/.local/state/em-batch}"
+    queue_sh="${EM_BATCH_QUEUE_SH:-/Users/hsukenooi/.claude/skills/em-batch/scripts/queue.sh}"
+    [ -x "$queue_sh" ] || { echo "attended-queue: $queue_sh not executable; skipping $ticket"; exit 0; }
+    target=""
+    for q in $(ls -t "$root"/*/queue.md 2>/dev/null); do
+      [ -n "$own" ] && [ "$q" = "$own" ] && continue
+      if grep -Eq '^- \*\*Status\*\* – (pending|running)[[:space:]]*$' "$q"; then target="$q"; break; fi
+    done
+    [ -n "$target" ] || { echo "attended-queue: no live queue under $root; $ticket not marked"; exit 0; }
+    grep -q "^### $ticket:" "$target" || { echo "attended-queue: $target does not list $ticket; not marked"; exit 0; }
+    if err="$("$queue_sh" "$target" outcome "$ticket" "$note" 2>&1)"; then
+      echo "attended-queue: marked $ticket in $target"
+    else
+      echo "attended-queue: queue.sh failed for $ticket in $target: $(printf '%s' "$err" | head -1)"
+    fi
+  ) || echo "attended-queue: unexpected failure for ${1:-?}"
+  return 0
+}
+
 # --- Model run -----------------------------------------------------------------------
 base_flags=(--permission-mode auto
   --permission-prompts none
@@ -347,6 +376,15 @@ fi
 [ "$mstatus" -eq 0 ] || SUMMARY="$SUMMARY
 (The run exited with status $mstatus; the summary above may be partial. Run dir: $RUN_DIR)"
 printf '%s\n' "$SUMMARY" > "$RUN_DIR/summary.md"
+
+# --- Mark landed tickets in an attended queue (BUI-1312) -----------------------------
+# The model run lands tickets itself, so "landed" here means Done in Linear now.
+# shellcheck disable=SC2086
+for t in $TICKETS; do
+  if linear issue view "$t" 2>/dev/null | grep -q '^\*\*State:\*\* Done'; then
+    mark_attended_queue "$t" "Landed by the nightly comics run $(basename "$RUN_DIR"), Done." "$QUEUE"
+  fi
+done
 
 # --- Report ------------------------------------------------------------------------
 printf '%s\n' "$SUMMARY"
