@@ -438,6 +438,11 @@ def two_seat_consensus(a, b):
 
 # ---------- process running ----------
 
+# BUI-1299: user settings (hooks, enabled plugins, user CLAUDE.md) stay out of every seat.
+# Mirrored in scripts/headless-seat.sh (SEAT_SUPPRESS_FLAGS); test_grade_seats pins parity.
+SEAT_SUPPRESS_FLAGS = ["--setting-sources", "local", "--settings", '{"disableAllHooks":true}']
+
+
 def claude_cmd(workdir):
     workdir = Path(workdir).resolve()
     exe = os.environ.get("GRADE_SEATS_CLAUDE", "claude")
@@ -448,6 +453,7 @@ def claude_cmd(workdir):
         "--system-prompt-file", str(workdir / "grader-body.md"),
         "--tools", "Read,Bash", "--strict-mcp-config",
         "--mcp-config", str(workdir / "empty-mcp.json"),
+        *SEAT_SUPPRESS_FLAGS,
         "--max-turns", "8", "--output-format", "json",
     ]
 

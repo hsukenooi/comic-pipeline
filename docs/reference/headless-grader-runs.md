@@ -20,6 +20,10 @@ claude -p --model <model> \
 
 Run `claude -p` with its working directory set to a directory outside the repo (the run's workdir). From the repo root the seat also auto-loads the project CLAUDE.md and the auto-memory MEMORY.md (48.5k characters), which adds about 17.7k tokens to every API call (28.6k from the repo root against 10.9k from a non-repo directory, same flags, 2026-10-06). `grade-seats` sets `cwd=<workdir>` on every seat, retry, and adjudicator process. A harness script must `cd` to its output directory before `claude -p`. Job text paths must be absolute.
 
+## Keep user settings out of seats (BUI-1299)
+
+Fixture harnesses `source scripts/headless-seat.sh` and call `headless_seat <prompt-file> <max-turns> [mcp-config] < job > out.json`. It runs `claude -p` in a subshell at `$SEAT_CWD` (default `/tmp/comic-grading-seat`, outside any repo; sourcing never changes the caller's cwd) with `--setting-sources local --settings '{"disableAllHooks":true}'`. That drops the user's hooks, enabled plugins, and user CLAUDE.md without writing under `~/.claude`. `grade_seats.claude_cmd` carries the same flags (`SEAT_SUPPRESS_FLAGS`, parity test). `--bare` is not used: it reads only `ANTHROPIC_API_KEY`, never the keychain login. Probe (haiku, 1 turn): first-call cache write 5184 tokens, no hook attachments, and the user-CLAUDE.md `instructions` attachment gone.
+
 ## Do not use `--allowedTools` for this
 
 `--allowedTools` only gates permission prompts. Every built-in tool schema still ships on every API call.
