@@ -7,6 +7,17 @@ install once by hand (below), same as `docs/reference/sentinel-probe-scheduling.
 already documents for `com.comics.sentinel-probe.plist` (that one predates
 this directory and isn't duplicated here).
 
+Install or reinstall any plist here with one command (BUI-1304):
+
+```bash
+scripts/launchd/install.sh com.comics.<name>   # add --dry-run to preview
+```
+
+It lints the plist, copies it to `~/Library/LaunchAgents`, unloads, loads
+with `-w`, and confirms `launchctl list` shows the label. Run it bare, with
+no `cd` or pipe, so its allow rule matches and auto mode never prompts. The
+per-job `cp` / `launchctl` blocks below are the same steps spelled out.
+
 ## com.comics.slab-watch-collect.plist (BUI-951)
 
 Runs `comic-fmv --slab-watch-collect` monthly — the closest launchd
