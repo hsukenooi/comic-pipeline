@@ -13,7 +13,7 @@ import backfill_best_offer as bb
 
 
 def _write_capture(d: Path) -> None:
-    rec = {"response": {"items": [
+    rec = {"provider": "sold-comps.com", "validation": "ok", "response": {"items": [
         {"itemId": "1", "bestOfferAccepted": True},
         {"itemId": "2", "bestOfferAccepted": False},
         {"itemId": "9", "bestOfferAccepted": True},
@@ -22,22 +22,32 @@ def _write_capture(d: Path) -> None:
     with gzip.open(d / "raw_responses.a.jsonl.gz", "wt") as fh:
         fh.write(json.dumps(rec) + "\nnot json\n")
     with open(d / "raw_responses.b.jsonl", "w") as fh:
-        fh.write(json.dumps({"response": {"items": [
-            {"itemId": "4", "bestOfferAccepted": False}]}}) + "\n")
+        fh.write(json.dumps({"provider": "sold-comps.com", "response": {"items": [
+            {"itemId": "4", "bestOfferAccepted": False},
+            {"itemId": "1", "bestOfferAccepted": False}]}}) + "\n")
+        # other provider / failed validation: ignored
+        fh.write(json.dumps({"provider": "serpapi", "response": {"items": [
+            {"itemId": "5", "bestOfferAccepted": True}]}}) + "\n")
+        fh.write(json.dumps({"provider": "sold-comps.com", "validation": "bad",
+                             "response": {"items": [
+            {"itemId": "6", "bestOfferAccepted": True}]}}) + "\n")
 
 
 def test_load_capture_flags_reads_gz_and_plain(tmp_path):
     _write_capture(tmp_path)
-    assert bb.load_capture_flags(tmp_path) == {
-        "1": True, "2": False, "9": True, "4": False}
+    stats: dict = {}
+    # "1" is True in one file and False in another: conflicting, dropped.
+    assert bb.load_capture_flags(tmp_path, stats) == {
+        "2": False, "9": True, "4": False}
+    assert stats["conflicting"] == 1
 
 
 ROWS = [
-    {"id": 10, "pool": "slab", "product_id": "1", "best_offer": None},
-    {"id": 11, "pool": "slab", "product_id": "2", "best_offer": None},
-    {"id": 12, "pool": "slab", "product_id": "1", "best_offer": 0},  # stored
-    {"id": 13, "pool": "raw", "product_id": "4", "best_offer": None},
-    {"id": 14, "pool": "raw", "product_id": "77", "best_offer": None},
+    {"id": 10, "pool": "slab", "product_id": "1", "best_offer": None, "provider": "sold-comps.com"},
+    {"id": 11, "pool": "slab", "product_id": "2", "best_offer": None, "provider": "sold-comps.com"},
+    {"id": 12, "pool": "slab", "product_id": "1", "best_offer": 0, "provider": "sold-comps.com"},  # stored
+    {"id": 13, "pool": "raw", "product_id": "4", "best_offer": None, "provider": "sold-comps.com"},
+    {"id": 14, "pool": "raw", "product_id": "77", "best_offer": None, "provider": "sold-comps.com"},
 ]
 FLAGS = {"1": True, "2": False, "9": True, "4": False}
 
@@ -51,6 +61,24 @@ def test_plan_counts_per_pool_and_never_touches_stored():
     assert counts["slab"]["already_set"] == 1
     assert counts["raw"]["no_capture_match"] == 1
     assert not_in_ledger == 1  # "9"
+
+
+def test_one_flag_fills_every_row_sharing_a_product_id():
+    rows = [
+        {"id": 1, "pool": "slab", "product_id": "1", "best_offer": None,
+         "provider": "sold-comps.com", "comic_id": 1},
+        {"id": 2, "pool": "raw", "product_id": "1", "best_offer": None,
+         "provider": "sold-comps.com", "comic_id": 2},
+    ]
+    items, _, _ = bb.plan(rows, {"1": True})
+    assert [i["id"] for i in items] == [1, 2]
+
+
+def test_plan_ignores_other_providers():
+    rows = [{"id": 1, "pool": "slab", "product_id": "1", "best_offer": None,
+             "provider": "serpapi"}]
+    items, counts, _ = bb.plan(rows, {"1": True})
+    assert items == [] and not counts
 
 
 def test_plan_pool_filter():

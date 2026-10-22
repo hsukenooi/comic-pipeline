@@ -46,9 +46,19 @@ DEFAULT_CAPTURE = Path.home() / ".local" / "share" / "ebay-sold-comps-capture"
 DEFAULT_SHOW = 20
 
 
-def load_capture_flags(capture_dir: Path | str = DEFAULT_CAPTURE) -> dict[str, bool]:
-    """item id -> bestOfferAccepted, from every raw_responses* file."""
-    flags: dict[str, bool] = {}
+PROVIDER = "sold-comps.com"
+
+
+def load_capture_flags(
+    capture_dir: Path | str = DEFAULT_CAPTURE, stats: dict | None = None,
+) -> dict[str, bool]:
+    """item id -> bestOfferAccepted, from every raw_responses* file.
+
+    Only sold-comps.com records whose `validation` is absent or "ok" count.
+    An id seen with BOTH True and False across records is ambiguous and is
+    dropped (counted in `stats["conflicting"]` when `stats` is given).
+    """
+    seen: dict[str, set[bool]] = {}
     for f in sorted(glob.glob(str(Path(capture_dir) / "raw_responses*"))):
         op = gzip.open if f.endswith(".gz") else open
         with op(f, "rt") as fh:
@@ -57,10 +67,17 @@ def load_capture_flags(capture_dir: Path | str = DEFAULT_CAPTURE) -> dict[str, b
                     rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                resp = rec.get("response") if isinstance(rec, dict) else None
-                for it in (resp or {}).get("items") or []:
+                if not isinstance(rec, dict) or rec.get("provider") != PROVIDER:
+                    continue
+                if rec.get("validation") not in (None, "ok"):
+                    continue
+                for it in (rec.get("response") or {}).get("items") or []:
                     if it.get("itemId") and isinstance(it.get("bestOfferAccepted"), bool):
-                        flags[str(it["itemId"])] = it["bestOfferAccepted"]
+                        seen.setdefault(str(it["itemId"]), set()).add(
+                            it["bestOfferAccepted"])
+    flags = {k: next(iter(v)) for k, v in seen.items() if len(v) == 1}
+    if stats is not None:
+        stats["conflicting"] = len(seen) - len(flags)
     return flags
 
 
@@ -73,11 +90,17 @@ def plan(
     `_product_id` for reporting - stripped before posting). Counts per pool:
     would_set_true / would_set_false / already_set / no_capture_match.
     `not_in_ledger` is capture ids matching no scanned ledger row.
+
+    Only sold-comps.com ledger rows are considered. By design, ONE capture
+    flag fills EVERY ledger row sharing that product_id (across comic_id and
+    pool): a flag describes the eBay sale, not the book it was filed under.
     """
     items: list[dict] = []
     counts: dict[str, Counter] = {}
     seen: set[str] = set()
     for row in rows:
+        if row.get("provider") != PROVIDER:
+            continue
         p = row.get("pool")
         if pool and p != pool:
             continue
@@ -137,7 +160,8 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(1)
     _health_gate(base)
 
-    flags = load_capture_flags(args.capture_dir)
+    stats: dict = {}
+    flags = load_capture_flags(args.capture_dir, stats)
     if not flags:
         print(f"Error: no bestOfferAccepted flags found under {args.capture_dir}.",
               file=sys.stderr)
@@ -145,7 +169,8 @@ def main(argv: list[str] | None = None) -> None:
     items, counts, not_in_ledger = plan(
         _iter_all_comps(base, page_size=args.page_size), flags, pool=args.pool,
     )
-    print(f"capture flags: {len(flags)} item ids")
+    print(f"capture flags: {len(flags)} item ids "
+          f"({stats['conflicting']} dropped: conflicting True/False)")
     _print_counts(counts, not_in_ledger)
     for it in items[:args.show]:
         print(f"  id={it['id']} pool={it['_pool']} product_id={it['_product_id']}"

@@ -5733,10 +5733,20 @@ def restamp_comps(
             continue
         new_value = item["new"]
         if not dry_run:
-            conn.execute(
-                f"UPDATE comps SET {field} = ? WHERE id = ?",
-                (new_value, row_id),
+            # Atomic compare-and-set: the guard lives in the UPDATE itself,
+            # so a writer landing between the SELECT above and here is
+            # caught (rowcount 0) instead of overwritten.
+            cur = conn.execute(
+                f"UPDATE comps SET {field} = ? WHERE id = ? AND {field} IS ?",
+                (new_value, row_id, expected),
             )
+            if cur.rowcount == 0:
+                skipped_stale += 1
+                results.append({
+                    "id": row_id, "field": field, "status": "skipped_stale",
+                    "current": current, "expected": expected,
+                })
+                continue
         changed += 1
         results.append({
             "id": row_id, "field": field, "status": "changed",
