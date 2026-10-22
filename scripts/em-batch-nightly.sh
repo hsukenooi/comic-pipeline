@@ -170,7 +170,7 @@ TICKET_COUNT=$(printf '%s\n' $TICKETS | grep -c .)
 DELEGATE_LINE=""
 if [ "$SMALL_DELEGATE" != "0" ] && [ "$TICKET_COUNT" -lt 3 ]; then
   DELEGATE_LINE="
-- Small batch override (BUI-1297): this batch has $TICKET_COUNT ticket(s). Ignore the skill's \"fewer than three tickets, do it yourself\" route. Spawn exactly one implementation sub-agent per ticket with the Agent tool, isolation: \"worktree\", model: \"sonnet\". Keep only open, verify, and land for yourself; do not implement in your own context. pr-open.sh works on the sub-agent's branch as usual."
+- Small batch override (BUI-1297): this batch has $TICKET_COUNT ticket(s). Ignore the skill's \"fewer than three tickets, do it yourself\" route. Spawn exactly one implementation sub-agent per ticket with the Agent tool, subagent_type: \"em-worker\", isolation: \"worktree\", model: \"sonnet\". Keep only open, verify, and land for yourself; do not implement in your own context. pr-open.sh works on the sub-agent's branch as usual."
 fi
 
 # --- Prompt ------------------------------------------------------------------------
