@@ -49,7 +49,7 @@ Statuses: `PENDING → WON/LOST/ENDED/FAILED`, plus the soft-delete tombstone. *
 ### The `/comic:*` skill workflow
 `/comic:buy` is the orchestrator; it reads and runs the leaf skills in sequence with a user gate at each step: **identify → collection-check → (conditional) grade → fmv → snipe-add**. Leaf skills are also usable standalone. The skills shell out to:
 - the `gixen` console script for snipe add/edit/list/fmv (run adds **sequentially** — Gixen sessions are stateful, parallel adds fail).
-- `locg collection check-batch` (BUI-504) or the `comics-api` wrapper (BUI-510) for ownership, and the `/api/comics/wish-list*` endpoints for wish-list — both hit the comics server's authoritative store on the Mac Mini, never a local offline cache (bare `locg collection check` is forbidden; see "The collection + wish-list are served from the comics server" above).
+- `locg collection check-batch` (BUI-504) or the `comics-api` wrapper (BUI-510) for ownership, and the `/api/comics/wish-list*` endpoints for wish-list — both hit the comics server's authoritative store on the Mac Mini, never a local offline cache (bare `locg collection check` is forbidden; see "Collection and wish-list live on the comics server" above).
 - the overlay's `/api/comics/*` endpoints for FMV linking (`bids → bid_fmvs → fmv → comics`).
 
 The scan tools (`seller-scan`, `wishlist-sellers`) reject a certified (CGC/CBCS) listing by default — pass `--include-graded` (BUI-932, off by default) to surface slabs instead.
