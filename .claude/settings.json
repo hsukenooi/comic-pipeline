@@ -1,4 +1,9 @@
 {
+  "enabledPlugins": {
+    "cloudflare@cloudflare": false,
+    "typesafe@typesafe-ai": false,
+    "slack@claude-plugins-official": false
+  },
   "hooks": {
     "Stop": [
       {
