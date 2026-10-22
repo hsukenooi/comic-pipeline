@@ -2,7 +2,7 @@
 name: em-worker
 description: Implements one Linear ticket in an isolated worktree for em-batch. Spawned by the EM only; commits on its own branch, never pushes.
 model: sonnet
-tools: Read, Edit, Write, Bash, Grep, Glob
+tools: Read, Edit, Write, Bash, Grep, Glob, Skill
 ---
 
 # em-worker
