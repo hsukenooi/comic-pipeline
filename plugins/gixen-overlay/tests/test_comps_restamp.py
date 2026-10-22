@@ -295,7 +295,7 @@ def test_db_layer_refuses_an_unknown_field(db):
 
 def test_certifier_is_not_a_restampable_field():
     assert "certifier" not in COMPS_RESTAMP_FIELDS
-    assert set(COMPS_RESTAMP_FIELDS) == {"grade", "label", "page_quality"}
+    assert set(COMPS_RESTAMP_FIELDS) == {"grade", "label", "page_quality", "best_offer"}
 
 
 def test_one_transaction_a_mid_batch_db_layer_error_leaves_earlier_writes(db):
@@ -506,3 +506,101 @@ def test_restamp_endpoint_422s_a_mixed_batch_refuses_the_whole_call(api):
 def test_restamp_endpoint_422s_an_empty_items_list(api):
     r = api.post("/api/comics/comps/restamp", json={"items": []})
     assert r.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# 4. best_offer backfill (BUI-1280) - fill-only NULL -> 0/1, both modes
+# ---------------------------------------------------------------------------
+
+
+def _best_offer(conn, row_id):
+    return conn.execute(
+        "SELECT best_offer FROM comps WHERE id=?", (row_id,)
+    ).fetchone()[0]
+
+
+def test_best_offer_dry_run_reports_and_writes_nothing(db):
+    comic_id = upsert_comic(db, "Invincible", "1", 2003)
+    upsert_comps(db, comic_id, [_slab_comp(product_id="s1")])
+    row_id = _row_id(db, "s1")
+
+    result = restamp_comps(db, [
+        {"id": row_id, "field": "best_offer", "expected": None, "new": 1},
+    ], dry_run=True)
+
+    assert result["changed"] == 1
+    assert result["results"][0]["to"] == 1
+    assert _best_offer(db, row_id) is None
+
+
+def test_best_offer_apply_fills_null_with_true_and_false(db):
+    comic_id = upsert_comic(db, "Invincible", "1", 2003)
+    upsert_comps(db, comic_id, [_slab_comp(product_id="s1"),
+                                _slab_comp(product_id="s2")])
+    a, b = _row_id(db, "s1"), _row_id(db, "s2")
+
+    result = restamp_comps(db, [
+        {"id": a, "field": "best_offer", "expected": None, "new": 1},
+        {"id": b, "field": "best_offer", "expected": None, "new": 0},
+    ], dry_run=False)
+
+    assert result["changed"] == 2
+    assert _best_offer(db, a) == 1
+    assert _best_offer(db, b) == 0
+
+
+def test_best_offer_never_overwrites_a_stored_value(db):
+    comic_id = upsert_comic(db, "Invincible", "1", 2003)
+    upsert_comps(db, comic_id, [_slab_comp(product_id="s1", best_offer=False)])
+    row_id = _row_id(db, "s1")
+
+    # Same caller read as the stored NULL, but the row is already filled.
+    result = restamp_comps(db, [
+        {"id": row_id, "field": "best_offer", "expected": None, "new": 1},
+    ], dry_run=False)
+
+    assert result["skipped_stale"] == 1
+    assert _best_offer(db, row_id) == 0
+
+
+def test_best_offer_refuses_a_non_fill_request(db):
+    comic_id = upsert_comic(db, "Invincible", "1", 2003)
+    upsert_comps(db, comic_id, [_slab_comp(product_id="s1", best_offer=False)])
+    row_id = _row_id(db, "s1")
+    with pytest.raises(ValueError):
+        restamp_comps(db, [
+            {"id": row_id, "field": "best_offer", "expected": 0, "new": 1},
+        ], dry_run=False)
+    assert _best_offer(db, row_id) == 0
+
+
+def test_best_offer_endpoint_dry_run_then_apply(api):
+    comic_id = _create_comic(api)
+    _ingest(api, comic_id, _slab_comp(product_id="s1"))
+    row_id = _comps_all_row_id(api, "s1")
+    item = {"id": row_id, "field": "best_offer", "expected": None, "new": 1}
+
+    dry = api.post("/api/comics/comps/restamp", json={"items": [item]})
+    assert dry.status_code == 200, dry.text
+    assert dry.json()["dry_run"] is True and dry.json()["changed"] == 1
+    rows = api.get("/api/comics/comps/all").json()
+    assert rows[0]["best_offer"] is None
+
+    applied = api.post("/api/comics/comps/restamp",
+                       json={"dry_run": False, "items": [item]})
+    assert applied.json()["changed"] == 1
+    rows = api.get("/api/comics/comps/all").json()
+    assert rows[0]["best_offer"] == 1
+
+
+def test_best_offer_endpoint_422s_an_overwrite_or_bad_value(api):
+    comic_id = _create_comic(api)
+    _ingest(api, comic_id, _slab_comp(product_id="s1"))
+    row_id = _comps_all_row_id(api, "s1")
+    for bad in ({"expected": 0, "new": 1}, {"expected": None, "new": 2},
+                {"expected": None, "new": None}, {"expected": None, "new": "yes"}):
+        r = api.post("/api/comics/comps/restamp", json={
+            "dry_run": False,
+            "items": [{"id": row_id, "field": "best_offer", **bad}],
+        })
+        assert r.status_code == 422, (bad, r.text)
