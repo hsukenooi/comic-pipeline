@@ -242,6 +242,11 @@ def crop_one(src: Path, out_dir: Path, font) -> list[Path]:
     return written
 
 
+def size_line(src: Path, w: int, h: int) -> str:
+    """The per-photo size line the folder CLI prints after that photo's paths."""
+    return f"{src.name} original {w}x{h} px"
+
+
 CROP_MAX = 1000  # ad hoc crop output cap, px per side (BUI-1298)
 
 
@@ -313,7 +318,9 @@ def main(argv=None) -> int:
         description="Write a 1024 px overview and two labelled region contact "
         "sheets (corners; left edge top/bottom, staple area, right edge top/bottom/middle, center) "
         "for every "
-        "img-NN.jpg in IMAGE_FOLDER. Prints only the written paths.",
+        "img-NN.jpg in IMAGE_FOLDER. Prints the written paths, then one "
+        "'img-NN.jpg original WxH px' line per photo (the pixel space of "
+        "`grade-crops crop` boxes).",
     )
     parser.add_argument("image_folder", type=Path)
     parser.add_argument("crop_dir", type=Path)
@@ -341,6 +348,11 @@ def main(argv=None) -> int:
             continue
         for p in paths:
             print(p)
+        # BUI-1298: seats never see the original's size, and guessed crop boxes
+        # landed outside the photo (4 of 13 gate seats). Print it beside the paths.
+        with Image.open(src) as raw:
+            w, h = ImageOps.exif_transpose(raw).size
+        print(size_line(src, w, h))
     return 1 if failed else 0
 
 

@@ -21,9 +21,22 @@ def _make(folder, name, size):
 
 
 def _run(capsys, src, dst):
+    """Paths only; size lines (BUI-1298) are checked by _run_sizes."""
     rc = grade_crops.main([str(src), str(dst)])
     out, err = capsys.readouterr()
-    return rc, out.splitlines(), err
+    return rc, [ln for ln in out.splitlines() if ln.startswith("/")], err
+
+
+def test_folder_cli_prints_each_original_size_after_its_paths(tmp_path, capsys):
+    src, dst = tmp_path / "in", tmp_path / "out"
+    src.mkdir()
+    _make(src, "img-01.jpg", (1200, 1600))
+    _make(src, "img-02.jpg", (1600, 900))
+    assert grade_crops.main([str(src), str(dst)]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[3] == "img-01.jpg original 1200x1600 px"
+    assert lines[7] == "img-02.jpg original 1600x900 px"
+    assert len(lines) == 8 and all(ln.startswith("/") for i, ln in enumerate(lines) if i not in (3, 7))
 
 
 def test_two_photos_write_overview_and_two_sheets(tmp_path, capsys):
