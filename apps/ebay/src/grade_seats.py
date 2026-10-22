@@ -438,6 +438,12 @@ def two_seat_consensus(a, b):
 
 # ---------- process running ----------
 
+# BUI-1299: hooks and project settings stay out of every seat. User settings stay in: they
+# carry the allow rules seat Bash (grade-crops) needs; `local` alone denied it.
+# Mirrored in scripts/headless-seat.sh (SEAT_SUPPRESS_FLAGS); test_grade_seats pins parity.
+SEAT_SUPPRESS_FLAGS = ["--setting-sources", "user", "--settings", '{"disableAllHooks":true}']
+
+
 def claude_cmd(workdir):
     workdir = Path(workdir).resolve()
     exe = os.environ.get("GRADE_SEATS_CLAUDE", "claude")
@@ -448,6 +454,7 @@ def claude_cmd(workdir):
         "--system-prompt-file", str(workdir / "grader-body.md"),
         "--tools", "Read,Bash", "--strict-mcp-config",
         "--mcp-config", str(workdir / "empty-mcp.json"),
+        *SEAT_SUPPRESS_FLAGS,
         "--max-turns", "8", "--output-format", "json",
     ]
 

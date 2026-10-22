@@ -545,3 +545,17 @@ def test_parse_block_bolded_labels():
     assert b["raw"].startswith("**PHOTO MAP:**")  # raw stays the seat's own text
     bold_value = grade_seats.parse_block("GRADE: **7.0**\nGRADE RANGE: 7.0\nCONFIDENCE: HIGH\n")
     assert bold_value["grade"] == 7.0
+
+
+def test_seat_suppress_flags_parity_with_headless_seat_script(tmp_path):
+    """BUI-1299: the hook/plugin suppression flags are one constant in two languages."""
+    import re
+    script = Path(__file__).resolve().parents[3] / "scripts" / "headless-seat.sh"
+    text = script.read_text()
+    m = re.search(r"SEAT_SUPPRESS_FLAGS=\((.*)\)", text)
+    assert m
+    import shlex
+    assert shlex.split(m.group(1)) == grade_seats.SEAT_SUPPRESS_FLAGS
+    cmd = grade_seats.claude_cmd(tmp_path)
+    i = cmd.index("--setting-sources")
+    assert cmd[i:i + 4] == grade_seats.SEAT_SUPPRESS_FLAGS
