@@ -4,11 +4,12 @@
 #   headless_seat <system-prompt-file> <max-turns> [mcp-config] [extra claude args...] < job.txt > out.json
 # Sourcing defines functions only; it never cd's the caller's shell. headless_seat runs claude
 # in a subshell whose cwd is $SEAT_CWD (default /tmp/comic-grading-seat, outside any repo), so
-# no project CLAUDE.md / MEMORY.md loads, and with user settings (hooks, enabled plugins) off.
+# no project CLAUDE.md / MEMORY.md loads, and with hooks off. User settings stay on so the
+# user's allow rules let seat Bash (grade-crops) run; local-only settings denied it.
 # Flags mirrored in apps/ebay/src/grade_seats.py (SEAT_SUPPRESS_FLAGS); a test pins parity.
 # Model: $SEAT_MODEL (default claude-fable-5-1). Needs no write under ~/.claude.
 
-SEAT_SUPPRESS_FLAGS=(--setting-sources local --settings '{"disableAllHooks":true}')
+SEAT_SUPPRESS_FLAGS=(--setting-sources user --settings '{"disableAllHooks":true}')
 
 headless_seat() {
   local prompt="$1" turns="$2" mcp="${3:-}"
