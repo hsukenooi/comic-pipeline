@@ -60,7 +60,7 @@ COMPS_EXCLUSION_CODE_MANUAL = "manual"
 # tuples the table's own CHECK constraints enforce — both here (defense in
 # depth behind `models.CompsRestampItem`, the same belt-and-suspenders
 # posture `stamp_comps_excluded` takes on `COMPS_EXCLUSION_CODES`) and there.
-COMPS_RESTAMP_FIELDS = ("grade", "label", "page_quality")
+COMPS_RESTAMP_FIELDS = ("grade", "label", "page_quality", "best_offer")
 
 # BUI-659: the fmv_history closed vocabulary. 'upsert' marks a row appended
 # by the live POST /api/comics path (api_upsert_comic); 'backfill' marks a
@@ -5699,6 +5699,16 @@ def restamp_comps(
             raise ValueError(
                 f"unknown restamp field {field!r} "
                 f"(expected one of {COMPS_RESTAMP_FIELDS})"
+            )
+        if field == "best_offer" and (
+            item["expected"] is not None or item["new"] not in (0, 1)
+        ):
+            # BUI-1280 / KTD4: best_offer is FILL-ONLY (NULL -> 0/1), the
+            # same rule upsert_comps's COALESCE keeps. A stored fact is
+            # never rewritten, whatever the caller claims to expect.
+            raise ValueError(
+                "best_offer restamp is fill-only: expected must be null "
+                "and new must be 0 or 1"
             )
         row_id = item["id"]
         row = conn.execute(

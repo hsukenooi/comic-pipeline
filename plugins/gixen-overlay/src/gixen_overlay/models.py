@@ -1056,6 +1056,12 @@ class CompsRestampItem(BaseModel):
             for name, v in (("expected", self.expected), ("new", self.new)):
                 if v is not None and not isinstance(v, (int, float)):
                     raise ValueError(f"grade {name} must be numeric or null")
+        elif self.field == "best_offer":
+            # BUI-1280: fill-only (KTD4) - NULL -> 0/1, never a rewrite.
+            if self.expected is not None:
+                raise ValueError("best_offer expected must be null (fill-only)")
+            if isinstance(self.new, bool) or self.new not in (0, 1):
+                raise ValueError("best_offer new must be 0 or 1")
         else:
             vocab = FMV_LABELS if self.field == "label" else COMP_PAGE_QUALITIES
             for name, v in (("expected", self.expected), ("new", self.new)):
