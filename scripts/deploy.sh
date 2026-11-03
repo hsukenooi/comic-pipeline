@@ -169,6 +169,7 @@ check_cli_sha "comic-fmv"  comic-fmv
 check_cli_sha "ebay-fetch" ebay-fetch
 check_cli_sha "ebay-auth"  ebay-auth
 check_cli_sha "ebay-watchlist" ebay-watchlist
+check_cli_sha "ebay-bid-status" ebay-bid-status
 
 # COMICS_SERVER_URL was already resolved above (before the install/sync/
 # kickstart steps); re-health-gate it now that the server has been restarted.

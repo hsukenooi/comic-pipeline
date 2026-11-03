@@ -96,6 +96,16 @@ def _ebay_fetch_bin() -> str | None:
     return shutil.which(name)
 
 
+def _ebay_bid_status_bin() -> str | None:
+    """Resolve the apps/ebay `ebay-bid-status` console script (BUI-1346), or
+    None. Same call-time resolution as _ebay_fetch_bin; EBAY_BID_STATUS_BIN
+    overrides the PATH lookup."""
+    name = os.getenv("EBAY_BID_STATUS_BIN", "ebay-bid-status")
+    if os.sep in name or (os.altsep and os.altsep in name):
+        return name if os.access(name, os.X_OK) else None
+    return shutil.which(name)
+
+
 logger = logging.getLogger(__name__)
 
 # The host configures the plugin subsystem's logger explicitly so the audit
@@ -220,6 +230,7 @@ _LISTED_WIN_FETCH_MAX_PER_SYNC = 5
 # Tracked so the lifespan teardown can cancel + await any in-flight fallback
 # task before _db.close() runs. Without this the task can hit a closed DB.
 _ebay_fallback_task: asyncio.Task | None = None
+_win_confirm_task: asyncio.Task | None = None  # BUI-1346
 # Local-eBay bidder (per-snipe direct-HTTP bid placement). Initialized in
 # lifespan; used by the Gixen-side state machine to fire the timed bid.
 _bidder: "ebay_bidder.EbayBidder | None" = None
@@ -1304,6 +1315,9 @@ async def _sync_loop() -> None:
                 # found the old "falsy result == failure" check was mistaking
                 # a quiet week of zero snipes for 177+ hours of outage.
                 await _sync_gixen(db, _sync_client, reraise=True)
+                # BUI-1346: after a good sync, confirm recent Gixen WONs
+                # against eBay (throttled inside; never blocks this loop).
+                _spawn_win_confirm_task()
             consecutive_failures = 0
             last_error = None
         except (GixenConnectionError, GixenError) as e:
@@ -1934,6 +1948,17 @@ def _spawn_fallback_task() -> None:
     _ebay_fallback_task = asyncio.create_task(_run_ebay_fallback())
 
 
+def _spawn_win_confirm_task() -> None:
+    """Schedule server.win_confirm.run_win_confirmation as a tracked task
+    (BUI-1346). It throttles itself and never raises, so firing it after
+    every sync is safe; one in flight at a time."""
+    global _win_confirm_task
+    if _win_confirm_task is not None and not _win_confirm_task.done():
+        return
+    from server import win_confirm  # deferred: win_confirm imports server.main
+    _win_confirm_task = asyncio.create_task(win_confirm.run_win_confirmation())
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _db, _db_path, _api_client, _sync_client, _api_lock, _sync_lock, _write_lock, _ebay_fallback_lock, _bidder
@@ -2022,6 +2047,13 @@ async def lifespan(app: FastAPI):
             pass
         except Exception as e:  # noqa: BLE001  # lifespan shutdown — log any stray error from background task
             logger.warning("lifespan: fallback task raised on cancel: %s", e)
+
+    if _win_confirm_task is not None and not _win_confirm_task.done():
+        _win_confirm_task.cancel()
+        try:
+            await asyncio.wait_for(_win_confirm_task, timeout=2.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
 
     if sniper_task:
         sniper_task.cancel()
