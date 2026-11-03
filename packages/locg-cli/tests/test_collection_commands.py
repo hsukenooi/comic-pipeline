@@ -7291,3 +7291,101 @@ def test_record_win_publisher_scoping_leaves_an_unambiguous_series_alone(tmp_pat
     assert result["rows_written"] == 1
     row = cache.load()["comics"][-1]
     assert row["series_name"] == "Amazing Spider-Man (1963 - 1998)"
+
+
+# ---------------------------------------------------------------------------
+# cmd_collection_record_win — a throttled or dropped Metron miss is flagged (BUI-1341)
+#
+# The 2026-10-08 batch wrote 9 wins with placeholder dates, null publishers,
+# and metron_unavailable: false. These pin the ROW field through a real
+# MetronClient, not just the client flag.
+# ---------------------------------------------------------------------------
+
+def _asm_series():
+    from unittest.mock import MagicMock
+
+    series = MagicMock()
+    series.id = 7
+    series.display_name = "The Amazing Spider-Man (1963)"
+    series.year_began = 1963
+    series.year_end = 1998
+    return series
+
+
+def _single_row(cache) -> dict[str, Any]:
+    rows = cache.load()["comics"]
+    assert len(rows) == 1
+    return rows[0]
+
+
+def test_record_win_nested_trip_reset_by_later_call_flags_row_1341(tmp_path):
+    """The done-when case: the series half trips ``degraded``, the decorated
+    issue half resets it and misses, and the row still says Metron was
+    unavailable rather than shipping a silent placeholder."""
+    from locg.commands import cmd_collection_record_win
+
+    metron, session = _real_metron_with_mock_session(issues_list=[])
+    series = _asm_series()
+
+    def _tripping_resolve_series(series_query, year=None):
+        metron.degraded = True
+        return series
+
+    metron.resolve_series = _tripping_resolve_series
+    cache = make_cache(tmp_path)
+
+    result = cmd_collection_record_win(
+        [_make_win(item_id="1", series="Amazing Spider-Man", issue="115", year=1972)],
+        cache=cache,
+        metron=metron,
+    )
+
+    assert session.issues_list.call_count >= 1  # the resetting call really ran
+    row = _single_row(cache)
+    assert row["metron_unavailable"] is True
+    assert row["publisher_name"] is None
+    assert row["release_date"] == "1972-01-01"
+    assert result["metron_unavailable_rows"] == 1
+
+
+def test_record_win_dropped_connection_flags_row_1341(tmp_path):
+    """A mid-body connection drop (raw ``requests`` error mokkari does not
+    wrap) used to come back as a clean miss. The row must be flagged."""
+    import requests
+    from locg.commands import cmd_collection_record_win
+
+    metron, session = _real_metron_with_mock_session(series_list=[_asm_series()])
+    session.issues_list.side_effect = requests.exceptions.ChunkedEncodingError("cut")
+    cache = make_cache(tmp_path)
+
+    result = cmd_collection_record_win(
+        [_make_win(item_id="1", series="Amazing Spider-Man", issue="115", year=1972)],
+        cache=cache,
+        metron=metron,
+    )
+
+    row = _single_row(cache)
+    assert row["metron_unavailable"] is True
+    assert row["metron_id"] is None
+    assert result["metron_unavailable_rows"] == 1
+
+
+def test_record_win_genuine_miss_stays_unflagged_1341(tmp_path):
+    """An exception-free no-match is an answer: the row keeps
+    ``metron_unavailable: false`` so backfill does not retry it as an outage."""
+    from locg.commands import cmd_collection_record_win
+
+    metron, session = _real_metron_with_mock_session(series_list=[_asm_series()], issues_list=[])
+    cache = make_cache(tmp_path)
+
+    result = cmd_collection_record_win(
+        [_make_win(item_id="1", series="Amazing Spider-Man", issue="115", year=1972)],
+        cache=cache,
+        metron=metron,
+    )
+
+    assert session.issues_list.call_count >= 1
+    row = _single_row(cache)
+    assert row["metron_unavailable"] is False
+    assert row["publisher_name"] is None
+    assert result["metron_unavailable_rows"] == 0

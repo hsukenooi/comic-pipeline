@@ -2150,3 +2150,135 @@ def test_resolve_series_non_tie_does_not_fetch_publishers():
     result = client.resolve_series("The Transformers", year=1992)  # only Panini in window
     assert result.id == 17480
     session.series.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# MetronClient.degraded — transport failures that used to look like a miss (BUI-1341)
+# ---------------------------------------------------------------------------
+
+def _mokkari_raised(status: int, body: bytes, content_type: str = "text/html") -> BaseException:
+    """Run mokkari's OWN response handler and return what it raises."""
+    import mokkari
+    import requests
+
+    session = mokkari.api("u", "p", user_agent="locg-cli-test")  # offline at construction
+    resp = requests.Response()
+    resp.status_code = status
+    resp._content = body
+    resp.headers["Content-Type"] = content_type
+    resp.url = "https://metron.cloud/api/series/"
+    try:
+        session._handle_http_response(resp)
+    except Exception as exc:  # noqa: BLE001 — pin whatever mokkari raises
+        return exc
+    raise AssertionError(f"mokkari did not raise on {status}")  # pragma: no cover
+
+
+def test_is_transient_error_matrix_1341():
+    """Transport and edge failures are transient; answers are not."""
+    import requests
+    from locg.metron import _is_transient_error
+    from mokkari.exceptions import ApiError
+
+    # Transient: what mokkari raises for an edge page, auth refusal, timeout.
+    assert _is_transient_error(_mokkari_raised(200, b"<html>challenge</html>")) is True
+    assert _is_transient_error(_mokkari_raised(403, b"<html>forbidden</html>")) is True
+    assert _is_transient_error(_mokkari_raised(401, b'{"detail": "bad creds"}')) is True
+    assert _is_transient_error(_mokkari_raised(408, b"timeout")) is True
+    assert _is_transient_error(ApiError("Connection error: timed out")) is True
+    # Transient: raw requests errors mokkari does not wrap.
+    assert _is_transient_error(requests.exceptions.ChunkedEncodingError("cut")) is True
+    assert _is_transient_error(requests.exceptions.ConnectTimeout("slow")) is True
+
+    # Answers: a 404, a 400, a detail-only error, a data-shape error, a bug.
+    assert _is_transient_error(_mokkari_raised(404, b'{"detail": "Not found."}')) is False
+    assert _is_transient_error(_mokkari_raised(400, b'{"detail": "bad query"}')) is False
+    assert _is_transient_error(
+        _mokkari_raised(200, b'{"detail": "Not found."}', "application/json")
+    ) is False
+    assert _is_transient_error(ApiError("404 not found")) is False
+    assert _is_transient_error(_server_error_api_error(404)) is False
+    assert _is_transient_error(ValueError("data shape")) is False
+
+
+def test_degraded_true_on_raw_requests_error_1341():
+    """A connection dropped mid-body escapes mokkari unwrapped. It used to land
+    in the blanket handler as a silent no-match; it must trip the breaker."""
+    import requests
+    client, session = _make_client_with_session(series_list=[_mock_series()])
+    session.issues_list.side_effect = requests.exceptions.ChunkedEncodingError("cut")
+
+    assert client.lookup_issue("Fantastic Four", "1", 1963) is None
+    assert client.degraded is True
+
+
+def test_degraded_true_on_edge_html_page_1341():
+    """An HTML page where JSON was expected (an edge proxy answering for
+    Metron) is an outage, not "no such series"."""
+    client, session = _make_client_with_session()
+    session.series_list.side_effect = _mokkari_raised(200, b"<html>challenge</html>")
+
+    assert client.lookup_issue("Fantastic Four", "1", 1963) is None
+    assert client.degraded is True
+
+
+def test_degraded_false_on_genuine_miss_1341():
+    """Exception-free no-match at either half leaves the flag down."""
+    client, session = _make_client_with_session(series_list=[])
+    assert client.lookup_issue("Fantastic Four", "1", 1963) is None
+    assert client.degraded is False
+
+    client, session = _make_client_with_session(series_list=[_mock_series()], issues_list=[])
+    assert client.lookup_issue("Fantastic Four", "1", 1963) is None
+    assert client.degraded is False
+
+
+def test_lookup_issue_keeps_series_trip_when_issue_half_resets_it_1341():
+    """The decorator resets ``degraded`` on entry to ``issue_in_series``, so a
+    trip left by ``resolve_series`` must survive the pair when the lookup
+    misses. Simulated: the series half trips and still returns a handle; the
+    real, decorated issue half then resets the flag and finds nothing."""
+    client, session = _make_client_with_session(issues_list=[])
+    series = _mock_series()
+
+    def _tripping_resolve_series(series_query, year=None):
+        client.degraded = True
+        return series
+
+    client.resolve_series = _tripping_resolve_series
+
+    assert client.lookup_issue("Fantastic Four", "1", 1963) is None
+    assert session.issues_list.call_count == 1  # the resetting call really ran
+    assert client.degraded is True
+
+
+def test_lookup_issue_hit_after_series_trip_does_not_trip_1341():
+    """A good answer never trips the batch breaker: only a miss carries the
+    series half's flag forward."""
+    client, session = _make_client_with_session(issues_list=[_mock_issue(id=100)])
+    series = _mock_series()
+
+    def _tripping_resolve_series(series_query, year=None):
+        client.degraded = True
+        return series
+
+    client.resolve_series = _tripping_resolve_series
+
+    result = client.lookup_issue("Fantastic Four", "1", 1963)
+    assert result is not None and result["metron_id"] == 100
+    assert client.degraded is False
+
+
+def test_degraded_does_not_leak_into_next_lookup_1341():
+    """The carried flag is per lookup: the next healthy lookup clears it."""
+    import requests
+    client, session = _make_client_with_session(
+        series_list=[_mock_series()], issues_list=[_mock_issue(id=100)]
+    )
+    session.issues_list.side_effect = requests.exceptions.ChunkedEncodingError("cut")
+    assert client.lookup_issue("Fantastic Four", "1", 1963) is None
+    assert client.degraded is True
+
+    session.issues_list.side_effect = None
+    assert client.lookup_issue("Fantastic Four", "2", 1963) is not None
+    assert client.degraded is False
