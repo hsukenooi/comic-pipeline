@@ -291,13 +291,19 @@ One upload is:
 
 ```bash
 agent-browser --cdp 9222 upload "#list" "<CSV>"        # auto-advances to a "Pending" list
-agent-browser --cdp 9222 snapshot -i | grep 'button "YES'   # ref of "YES. I'M READY. »"
-agent-browser --cdp 9222 click @<ref>
+agent-browser --cdp 9222 network requests --clear      # reset the log so the check below sees only this submit
+agent-browser --cdp 9222 eval 'const b=[...document.querySelectorAll("button")].find(x=>/ready/i.test(x.textContent)); b.form.requestSubmit(b); "submitted"'
+agent-browser --cdp 9222 network requests --filter queue_import_comic   # must list a request, else the submit did not fire
 agent-browser --cdp 9222 get text "#importer"          # poll until no "Pending" remains
 ```
 
-Get the button's ref from `snapshot -i`; `find text` fails on the curly
-apostrophe in "I'M". The per-row result renders in `#importer`.
+**Never `click` the import button (BUI-1343).** "YES. I'M READY. »" is a plain
+`<button type="submit">` inside a POST form, and `agent-browser click` on it is a
+silent no-op. Submit with `requestSubmit(button)` through `eval`, as above. The
+`/ready/i` text match also avoids the curly apostrophe in "I'M" that breaks
+`find text`. Do not treat the upload as started until `network requests --filter
+queue_import_comic` shows a request; if it is empty, re-run the `eval` once, then
+stop and report. The per-row result renders in `#importer`.
 
 **LOCG rejects a 1-row file** ("Something is wrong with that file"). To upload a
 single row, pad the CSV with one already-owned row (a no-op re-apply).
@@ -380,7 +386,8 @@ python3 -c "import json,os; d=json.load(open('$EXPORT_JSON')); \
   open(p,'w').write(d['csv']); print('wishes csv:', p, '| wish rows:', d['wish_list_count'])"
 ```
 
-Probe it the same way (≤5 rows, same browser commands as Step 3), reading the
+Probe it the same way (≤5 rows, same browser commands as Step 3, including the
+`requestSubmit` eval and the `queue_import_comic` network check), reading the
 `#importer` result:
 
 - Expect every row to be **"Added to Wish List."**
@@ -402,13 +409,22 @@ line of defense — never skip it.
 
 ## Step 4: Re-export from LOCG
 
-On the same import page, click **EXPORT MY COMICS** (get its ref from
-`snapshot -i`). After about 20 seconds the file lands at
-`~/Downloads/ComicGeeks-<timestamp>.xlsx`; take the newest one:
+On the same import page, submit the **EXPORT MY COMICS** form with
+`requestSubmit`. `click` on it is a silent no-op (BUI-1343). Record a marker
+first so you can prove the file is new:
 
 ```bash
-python3 -c "import glob,os,time; f=max(glob.glob(os.path.expanduser('~/Downloads/ComicGeeks-*.xlsx')), key=os.path.getmtime); \
-  print(f, '| saved', time.ctime(os.path.getmtime(f)))"
+touch /tmp/locg-export-marker
+agent-browser --cdp 9222 eval 'const b=[...document.querySelectorAll("button")].find(x=>/export my comics/i.test(x.textContent)); b.form.requestSubmit(b); "submitted"'
+```
+
+After about 20 seconds the file lands at `~/Downloads/ComicGeeks-<timestamp>.xlsx`.
+Take the newest one and confirm it is newer than the marker. If none is, the
+submit did not fire: re-run the `eval` once, then stop and report.
+
+```bash
+python3 -c "import glob,os,time; m=os.path.getmtime(os.path.expanduser('/tmp/locg-export-marker')); f=max(glob.glob(os.path.expanduser('~/Downloads/ComicGeeks-*.xlsx')), key=os.path.getmtime); \
+  assert os.path.getmtime(f)>m, 'no new export since submit'; print(f, '| saved', time.ctime(os.path.getmtime(f)))"
 ```
 
 It carries LOCG's canonical Series Name / Release Date for the rows you just
@@ -646,6 +662,7 @@ win-records cleanup in
 | Claiming success without checking `row_count` against `added - auto_healed_duplicates` | Step 6's check is two-sided (BUI-468): `ROWS_AFTER` must equal `ROWS_BEFORE + added - auto_healed_duplicates` exactly. A large `added` means duplicates were inserted instead of reconciled; a shrink beyond `auto_healed_duplicates` means rows vanished for an unaccounted reason. Either way — STOP, investigate, restore the backup if needed (`POST /api/comics/collection/restore`) |
 | Treating `auto_healed_duplicates`/`second_copies_credited` as buried-in-warnings trivia | Both are top-level Step 5 summary counters — report them by name in Step 7, not just via the `warnings` string (BUI-468). `auto_healed_duplicates` deletes rows; `second_copies_credited` silently increments `in_collection` on a survivor. Both are reversible via `import-history.jsonl` (`type=auto_healed_duplicate_win` / `type=second_copy_credited`) |
 | Handing the upload or export back to the user as a manual step | The agent drives both in the automation Chrome (BUI-1087); the user only clears Cloudflare and logs in (Step 2c) |
+| `agent-browser click` on LOCG's "Yes. I'm Ready." or "Export My Comics" button | Both are plain `<button type="submit">` in a POST form; `click` is a silent no-op (BUI-1343). Use `eval` with `btn.form.requestSubmit(btn)` and verify the request or file |
 | Running `agent-browser close` after the sync | Over CDP it closes the user's Chrome window. Leave the browser open |
 | Uploading a 1-row CSV | LOCG rejects it ("Something is wrong with that file"); pad with an already-owned row |
 | Uploading the `.notes.md` rows | Only the `.csv` files go to LOCG; `.notes.md` lists rows withheld for manual resolution |
