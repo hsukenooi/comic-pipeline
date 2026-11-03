@@ -194,6 +194,15 @@ GROUP_WIN_SOURCES = frozenset({
 # diagnosable — the actual gap the BUI-381 P3 review was reaching for. If a
 # real WON→non-WON path is ever introduced, revisit with a superseded flag
 # (append-only, forensics-preserving) rather than a DELETE.
+#
+# BUI-1346 introduced that path (server/win_confirm.py reverses a Gixen WON to
+# LOST when eBay reports OUTBID, the exact-tie phantom win) and deliberately
+# leaves the ledger row in place, with no superseded flag. The ledger records
+# group-cancel evidence, and that evidence stays true after the reversal:
+# Gixen believed the snipe won and cancelled its group siblings on that
+# belief, so those siblings genuinely never bid and REMOVED is still their
+# correct classification. Retracting the row would reopen the phantom-WON
+# window for exactly those siblings.
 
 
 _COLUMN_MIGRATIONS = [
@@ -290,7 +299,25 @@ _COLUMN_MIGRATIONS = [
     "ALTER TABLE bids ADD COLUMN grade REAL",
     "ALTER TABLE bids ADD COLUMN certifier TEXT NOT NULL DEFAULT 'none'",
     "ALTER TABLE bids ADD COLUMN cert_number TEXT",
+    # BUI-1346: eBay's own word on a Gixen WON. Gixen calls a snipe WON when
+    # its max equals the final price, but eBay gives an exact tie to the
+    # earlier bidder, so a tie is a phantom win. server/win_confirm.py asks
+    # eBay (`ebay-bid-status`) about each recently ended WON row and stamps
+    # ebay_bid_checked_at once eBay gives a definitive answer, so a row is
+    # never re-queried. ebay_bid_status holds that answer ('WINNING',
+    # 'OUTBID', or NULL when eBay saw no bid of ours). 'OUTBID' is the
+    # reversal marker: the row is flipped WON -> LOST, and update_bid_status
+    # refuses any later WON write onto it (Gixen keeps listing it WON, so
+    # without that guard the next sync would undo the reversal). Plain TEXT,
+    # no CHECK: the vocabulary is enforced at win_confirm's single writer.
+    "ALTER TABLE bids ADD COLUMN ebay_bid_checked_at TEXT",
+    "ALTER TABLE bids ADD COLUMN ebay_bid_status TEXT",
 ]
+
+# BUI-1346: the stored eBay status that reverses a Gixen WON, and the notes
+# marker win_confirm appends to the reversed row.
+EBAY_BID_STATUS_OUTBID = "OUTBID"
+WIN_REVERSED_NOTE = "eBay reported OUTBID, Gixen WON reversed to LOST BUI-1346"
 
 
 # The full current bids schema. Both table rebuilds in _apply_migrations (FK
@@ -329,7 +356,9 @@ _BIDS_TABLE_SQL = """
         removal_requested_at TEXT,
         grade               REAL,
         certifier           TEXT NOT NULL DEFAULT 'none',
-        cert_number         TEXT
+        cert_number         TEXT,
+        ebay_bid_checked_at TEXT,
+        ebay_bid_status     TEXT
     )
 """
 
@@ -1186,6 +1215,16 @@ def update_bid_status(
     # branch is retained for that boundary and the legacy contract, never for a
     # deliberate multi-row write. Prefer only_id whenever the site holds a row id.
     id_clause = " AND id=?" if only_id is not None else ""
+    # BUI-1346: never write WON onto a row eBay itself reported OUTBID. Gixen
+    # keeps listing a tie-lost snipe as WON, and _sync_gixen's terminal
+    # transitions re-classify from Gixen's status every cycle, so without this
+    # guard the next sync would undo win_confirm's WON -> LOST reversal. Only a
+    # WON write is narrowed: every other status passes through unchanged.
+    if status == "WON":
+        id_clause += (
+            " AND COALESCE(ebay_bid_status, '') != "
+            f"'{EBAY_BID_STATUS_OUTBID}'"
+        )
     win_rows: list[sqlite3.Row] = []
     if status == "WON":
         # BUI-381: capture group-win evidence at classification time, for

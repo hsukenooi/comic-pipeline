@@ -26,6 +26,7 @@ ebay-shipped = "shipped_orders:main"
 ebay-auth = "ebay_auth:main"
 ebay-watchlist = "ebay_watchlist:main"
 comic-autosnipe = "autosnipe:main"
+ebay-bid-status = "ebay_bid_status:main"
 
 [tool.hatch.build.targets.wheel]
 # BUI-332: glob-based include so every src/*.py is shipped automatically —
