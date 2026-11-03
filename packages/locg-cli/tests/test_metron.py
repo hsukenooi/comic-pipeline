@@ -2087,3 +2087,66 @@ def test_integration_real_lookup():
     assert result["metron_id"] is not None
     assert result["cover_date"] is not None
     assert result["series_year_began"] == 1961
+
+
+# ---------------------------------------------------------------------------
+# BUI-1342: exact-name tie broken by US vs foreign-reprint publisher
+# ---------------------------------------------------------------------------
+
+def _wire_publishers(session: MagicMock, by_id: dict[int, str | None]) -> None:
+    def _detail(sid: int) -> MagicMock:
+        d = MagicMock()
+        d.publisher = None if by_id[sid] is None else MagicMock()
+        if by_id[sid] is not None:
+            d.publisher.name = by_id[sid]
+        return d
+    session.series.side_effect = _detail
+
+
+def _transformers_pair():
+    return [
+        _mock_series(id=7253, display_name="The Transformers", year_began=1984, year_end=1991),
+        _mock_series(id=17480, display_name="The Transformers", year_began=1984, year_end=1992),
+    ]
+
+
+def test_resolve_series_tie_picks_us_over_foreign_reprint():
+    client, session = _make_client_with_session(series_list=_transformers_pair())
+    _wire_publishers(session, {7253: "Marvel", 17480: "Panini UK"})
+    result = client.resolve_series("The Transformers", year=1985)
+    assert result is not None and result.id == 7253
+    assert session.series.call_count == 2  # fetched on the tie path only
+
+
+def test_resolve_series_tie_two_us_publishers_stays_none():
+    client, session = _make_client_with_session(series_list=_transformers_pair())
+    _wire_publishers(session, {7253: "Marvel", 17480: "IDW Publishing"})
+    assert client.resolve_series("The Transformers", year=1985) is None
+
+
+def test_resolve_series_tie_unknown_publisher_stays_none():
+    client, session = _make_client_with_session(series_list=_transformers_pair())
+    _wire_publishers(session, {7253: "Marvel", 17480: None})
+    assert client.resolve_series("The Transformers", year=1985) is None
+
+
+def test_resolve_series_tie_all_foreign_stays_none():
+    client, session = _make_client_with_session(series_list=_transformers_pair())
+    _wire_publishers(session, {7253: "Kamite", 17480: "Panini UK"})
+    assert client.resolve_series("The Transformers", year=1985) is None
+
+
+def test_resolve_series_tie_one_us_two_foreign_picks_us():
+    three = _transformers_pair() + [
+        _mock_series(id=9, display_name="The Transformers", year_began=1984, year_end=1990),
+    ]
+    client, session = _make_client_with_session(series_list=three)
+    _wire_publishers(session, {7253: "Marvel", 17480: "Panini UK", 9: "Panini Comics"})
+    assert client.resolve_series("The Transformers", year=1985).id == 7253
+
+
+def test_resolve_series_non_tie_does_not_fetch_publishers():
+    client, session = _make_client_with_session(series_list=_transformers_pair())
+    result = client.resolve_series("The Transformers", year=1992)  # only Panini in window
+    assert result.id == 17480
+    session.series.assert_not_called()
