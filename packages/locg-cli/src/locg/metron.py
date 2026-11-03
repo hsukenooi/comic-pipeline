@@ -6,7 +6,7 @@ import logging
 import os
 import re
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from mokkari.exceptions import ApiError, RateLimitError
 
@@ -337,6 +337,26 @@ class MetronCredentialError(RuntimeError):
     """Raised on first use when METRON_USERNAME or METRON_PASSWORD is absent."""
 
 
+# BUI-1342: publishers of foreign-edition reprint series that Metron lists
+# under the same display name as the US original (e.g. Panini UK's "The
+# Transformers (1984)" next to Marvel's). Deliberately small and conservative:
+# lowercase prefixes of the publisher name. "Marvel UK" is NOT listed — it is
+# ambiguous, so such a tie stays unresolved.
+FOREIGN_REPRINT_PUBLISHER_PREFIXES: tuple[str, ...] = (
+    "panini",
+    "kamite",
+    "editorial televisa",
+    "planeta",
+    "semic",
+    "egmont",
+    "editora abril",
+)
+
+
+def _is_foreign_publisher(name: str) -> bool:
+    return name.strip().lower().startswith(FOREIGN_REPRINT_PUBLISHER_PREFIXES)
+
+
 class MetronClient:
     """Lazy mokkari wrapper. The mokkari session is created on first use."""
 
@@ -381,7 +401,10 @@ class MetronClient:
 
     @staticmethod
     def _disambiguate_series(
-        series_list: list[Any], year: Any, query: str
+        series_list: list[Any],
+        year: Any,
+        query: str,
+        publisher_of: Optional[Callable[[Any], Optional[str]]] = None,
     ) -> Optional[Any]:
         """Pick the series whose publication range includes ``year`` (BUI-32).
 
@@ -415,6 +438,13 @@ class MetronClient:
           -> that one
         - otherwise (no year, no exact-name survivor, or still ambiguous)
           -> ``None`` so the caller falls back to ``needs_manual_series_canonical``
+        - BUI-1342 tie-break: when 2+ exact-name, in-window survivors remain
+          and ``publisher_of`` is given, look up each survivor's publisher
+          (tie path only). If exactly one survivor has a known non-foreign
+          publisher and every other survivor's publisher is a
+          ``FOREIGN_REPRINT_PUBLISHER_PREFIXES`` match (e.g. Marvel vs Panini
+          UK "The Transformers (1984)"), pick that one. Any other tie (two
+          US series, an unknown/None publisher) stays ``None``.
         """
         query_norm = _normalize_metron_display_name(query)
 
@@ -454,7 +484,15 @@ class MetronClient:
             return None
 
         matches = [s for s in exact_matches if _in_window(s)]
-        return matches[0] if len(matches) == 1 else None
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1 and publisher_of is not None:
+            pubs = [(s, publisher_of(s)) for s in matches]
+            if all(p for _, p in pubs):
+                domestic = [s for s, p in pubs if not _is_foreign_publisher(p)]
+                if len(domestic) == 1:
+                    return domestic[0]
+        return None
 
     @staticmethod
     def _cache_year_key(year: Any) -> Optional[int]:
@@ -522,7 +560,16 @@ class MetronClient:
                 self._series_cache[cache_key] = None
                 return None
 
-            best_series = self._disambiguate_series(series_list, year, metron_query)
+            def _publisher_of(series: Any) -> Optional[str]:
+                # Tie path only (BUI-1342): the list rows carry no publisher,
+                # so one detail fetch per tied candidate.
+                detail = session.series(series.id)
+                name = getattr(getattr(detail, "publisher", None), "name", None)
+                return name if isinstance(name, str) else None
+
+            best_series = self._disambiguate_series(
+                series_list, year, metron_query, publisher_of=_publisher_of
+            )
             if best_series is None:
                 logger.debug(
                     "Metron series ambiguous for %r (mapped from %r, year=%r): %d candidates",
