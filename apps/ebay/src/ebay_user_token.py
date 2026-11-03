@@ -9,6 +9,7 @@ are minted on demand.
 Public API for callers (BUI-1210 `ebay-watchlist`):
 
     get_user_access_token() -> str      # raises UserTokenError
+    has_scope(scope) -> bool            # did the stored token's grant include it?
     UserTokenError                      # .exit_code: 3 re-login needed, 5 network
 
 Nothing here ever prints a token or the client secret.
@@ -27,7 +28,9 @@ from ebay_fetch import CONFIG_DIR, CONFIG_FILE, atomic_write_json, load_config
 
 TOKEN_FILE = CONFIG_DIR / "user_token_production.json"
 ACCESS_CACHE_FILE = CONFIG_DIR / "user_access_cache_production.json"
-SCOPE = "https://api.ebay.com/oauth/api_scope"
+BASE_SCOPE = "https://api.ebay.com/oauth/api_scope"
+AUCTION_SCOPE = "https://api.ebay.com/oauth/api_scope/sell.auction.read"  # BUI-1345
+SCOPE = f"{BASE_SCOPE} {AUCTION_SCOPE}"  # what `ebay-auth login` asks for
 TOKEN_URL = "https://api.ebay.com/identity/v1/oauth2/token"
 AUTH_URL = "https://auth.ebay.com/oauth2/authorize"
 RELOGIN_HINT = "run `ebay-auth login`"
@@ -60,6 +63,25 @@ def load_token_file():
     if not isinstance(data, dict) or not data.get("refresh_token"):
         raise _relogin("eBay user token file has no refresh_token")
     return data
+
+
+def granted_scopes(data):
+    """Scopes the stored refresh token was granted, as a list.
+
+    `exchange_code` records them as `granted_scope`. A file written before
+    BUI-1345 has none and was granted the base scope only. eBay rejects a
+    refresh whose scope is wider than the original grant, so refresh must send
+    exactly this, never the login SCOPE.
+    """
+    recorded = data.get("granted_scope")
+    if isinstance(recorded, str) and recorded.split():
+        return recorded.split()
+    return [BASE_SCOPE]
+
+
+def has_scope(scope):
+    """True if the stored token was granted `scope`. Raises UserTokenError if no token."""
+    return scope in granted_scopes(load_token_file())
 
 
 def refresh_expiry(data):
@@ -174,7 +196,11 @@ def get_user_access_token():
         return cached
 
     body = token_request(
-        {"grant_type": "refresh_token", "refresh_token": data["refresh_token"], "scope": SCOPE}
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": data["refresh_token"],
+            "scope": " ".join(granted_scopes(data)),
+        }
     )
     access_token = body["access_token"]
     try:
@@ -220,6 +246,7 @@ def exchange_code(code, runame):
     if not body.get("refresh_token"):
         raise UserTokenError("token response had no refresh_token", EXIT_NETWORK)
     body["obtained_at"] = time.time()
+    body["granted_scope"] = SCOPE  # the scope the consent URL asked for (BUI-1345)
     atomic_write_json(TOKEN_FILE, body, mode=0o600)
     try:
         ACCESS_CACHE_FILE.unlink()  # drop the cache minted from the old refresh token
@@ -236,7 +263,11 @@ def describe_state(now=None):
     except UserTokenError as exc:
         return "missing", {"detail": str(exc)}
     expires_at, source = refresh_expiry(data)
-    details = {"file": str(TOKEN_FILE), "obtained from": source}
+    details = {
+        "file": str(TOKEN_FILE),
+        "obtained from": source,
+        "scopes": " ".join(sc.rsplit("/", 1)[-1] for sc in granted_scopes(data)),
+    }
     if expires_at is None:
         return "unknown", details
     days = (expires_at - now) / 86400
