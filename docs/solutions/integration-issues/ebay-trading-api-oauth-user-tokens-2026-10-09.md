@@ -19,6 +19,8 @@ tags: [ebay, trading-api, oauth, user-token, refresh-token, iaf-token, secrets, 
 
 # Trading API calls take an OAuth user token in `X-EBAY-API-IAF-TOKEN`
 
+Since BUI-1345 login also requests `sell.auction.read`; see `ebay-user-token-scopes-and-no-login-scope-test-2026-11-04.md`.
+
 ## Context
 
 Every app-level eBay call here uses a `client_credentials` token, which reaches public Browse data only. Member data, such as the watchlist, comes from the XML Trading API and needs a user token. The 2026-10-09 spike proved the base scope `https://api.ebay.com/oauth/api_scope` and the keyset's existing RuName are enough.

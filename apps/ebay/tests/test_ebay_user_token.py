@@ -47,8 +47,10 @@ def env(monkeypatch, tmp_path):
     return type("Env", (), {"calls": calls, "responses": responses, "tmp": tmp_path})
 
 
-def write_token(obtained_at=None, lifetime=547 * DAY, mtime=None):
+def write_token(obtained_at=None, lifetime=547 * DAY, mtime=None, granted_scope=None):
     data = {"refresh_token": REFRESH, "refresh_token_expires_in": lifetime}
+    if granted_scope is not None:
+        data["granted_scope"] = granted_scope
     if obtained_at is not None:
         data["obtained_at"] = obtained_at
     eut.TOKEN_FILE.write_text(json.dumps(data))
@@ -62,7 +64,41 @@ def test_refresh_then_cache_hit(env):
     assert eut.get_user_access_token() == ACCESS
     assert len(env.calls) == 1
     assert env.calls[0]["data"]["grant_type"] == "refresh_token"
-    assert env.calls[0]["data"]["scope"] == eut.SCOPE
+    # A file with no recorded scope predates BUI-1345: base scope only.
+    assert env.calls[0]["data"]["scope"] == eut.BASE_SCOPE
+
+
+def test_refresh_sends_both_scopes_for_new_file(env):
+    write_token(obtained_at=time.time(), granted_scope=eut.SCOPE)
+    eut.get_user_access_token()
+    assert env.calls[0]["data"]["scope"] == f"{eut.BASE_SCOPE} {eut.AUCTION_SCOPE}"
+
+
+def test_has_scope_old_and_new_file(env):
+    write_token(obtained_at=time.time())
+    assert eut.has_scope(eut.BASE_SCOPE)
+    assert not eut.has_scope(eut.AUCTION_SCOPE)
+    write_token(obtained_at=time.time(), granted_scope=eut.SCOPE)
+    assert eut.has_scope(eut.AUCTION_SCOPE)
+
+
+def test_has_scope_without_token_raises(env):
+    with pytest.raises(eut.UserTokenError):
+        eut.has_scope(eut.AUCTION_SCOPE)
+
+
+def test_consent_url_asks_for_both_scopes():
+    url = eut.consent_url("cid", "RU")
+    assert "scope=https%3A%2F%2Fapi.ebay.com%2Foauth%2Fapi_scope+https%3A%2F%2Fapi.ebay.com%2Foauth%2Fapi_scope%2Fsell.auction.read" in url
+
+
+def test_status_shows_scopes(env, capsys):
+    write_token(obtained_at=time.time())
+    ebay_auth.main(["status"])
+    assert "api_scope" in capsys.readouterr().out
+    write_token(obtained_at=time.time(), granted_scope=eut.SCOPE)
+    ebay_auth.main(["status"])
+    assert "sell.auction.read" in capsys.readouterr().out
 
 
 def test_cache_expiry_uses_five_minute_margin(env):
@@ -150,6 +186,7 @@ def test_login_exchanges_code_and_writes_0600(env, monkeypatch, capsys):
     assert sent == {"grant_type": "authorization_code", "code": "v^1.1#CODE", "redirect_uri": "My-RuName"}
     saved = json.loads(eut.TOKEN_FILE.read_text())
     assert saved["refresh_token"] == REFRESH
+    assert saved["granted_scope"] == eut.SCOPE
     assert saved["obtained_at"] == pytest.approx(time.time(), abs=5)
     assert stat.S_IMODE(eut.TOKEN_FILE.stat().st_mode) == 0o600
     out = capsys.readouterr().out
