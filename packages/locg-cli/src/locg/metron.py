@@ -8,6 +8,7 @@ import re
 import time
 from typing import Any, Callable, Optional
 
+import requests
 from mokkari.exceptions import ApiError, RateLimitError
 
 logger = logging.getLogger("locg")
@@ -216,6 +217,44 @@ def _is_connection_error(exc: BaseException) -> bool:
     return isinstance(exc, ApiError) and str(exc).startswith(_CONNECTION_ERROR_PREFIX)
 
 
+# BUI-1341: HTTP statuses that mean "Metron (or its edge) refused or timed
+# out this request", not "no such comic". 5xx has its own retry path
+# (BUI-342) and 429 surfaces as ``RateLimitError``; a 404 or 400 stays a
+# silent no-match.
+_TRANSIENT_HTTP_STATUSES = frozenset({401, 403, 408})
+
+
+def _is_transient_error(exc: BaseException) -> bool:
+    """True iff ``exc`` is a transport or edge failure, never a genuine miss (BUI-1341).
+
+    ``_is_connection_error`` alone covers only what mokkari re-wraps with its
+    ``"Connection error:"`` prefix (``ConnectionError`` and ``ReadTimeout``).
+    Every other transport failure used to reach the method bodies' blanket
+    handler and come back as a silent ``None`` with ``degraded`` still
+    ``False``, so record-win wrote a placeholder date and a null publisher
+    under ``metron_unavailable: false``. Those failures are:
+
+    - a raw ``requests`` exception mokkari does not wrap (for example
+      ``ChunkedEncodingError`` when a connection drops mid-body);
+    - an ``ApiError`` raised from a non-HTTP ``requests`` error, such as the
+      ``JSONDecodeError`` behind mokkari's "Invalid JSON response" when an
+      edge proxy answers with an HTML page;
+    - an ``ApiError`` raised from an HTTP 401, 403, or 408.
+
+    A data-shape ``ApiError`` (pydantic cause), a ``detail``-only ``ApiError``
+    (no cause), and a 404 or other 4xx stay ``False``: those are answers.
+    """
+    if _is_connection_error(exc):
+        return True
+    candidate = exc.__cause__ if isinstance(exc, ApiError) else exc
+    if not isinstance(candidate, requests.exceptions.RequestException):
+        return False
+    if isinstance(candidate, requests.exceptions.HTTPError):
+        status = getattr(candidate.response, "status_code", None)
+        return status in _TRANSIENT_HTTP_STATUSES
+    return True
+
+
 def _http_status_from_cause(exc: BaseException) -> Optional[int]:
     """Recover the HTTP status of a mokkari ``ApiError`` from its chained cause.
 
@@ -268,7 +307,7 @@ def _retry_once_on_rate_limit(func):
     start of every decorated call, then flipped ``True`` only by a failure
     path — here on an exhausted rate-limit retry or an exhausted 5xx retry
     (BUI-342), or inside the method body itself on a connection-error
-    ``ApiError`` (see ``_is_connection_error``). A batch caller
+    ``ApiError`` or other transport failure (see ``_is_transient_error``). A batch caller
     (``cmd_collection_record_win``) polls this after a ``None`` result to tell
     "Metron is throttled/unreachable/erroring, stop calling it for the rest of
     the batch" apart from a genuine, exception-free "no match" — which never
@@ -589,7 +628,7 @@ class MetronClient:
             # every later issue of this series.
             if _is_server_error(exc):
                 raise
-            if _is_connection_error(exc):
+            if _is_transient_error(exc):
                 self.degraded = True
             logger.debug(
                 "Metron series resolution failed for %r (mapped from %r): %s",
@@ -646,7 +685,7 @@ class MetronClient:
             # ApiError does NOT (it stays a silent None, same as before).
             if _is_server_error(exc):
                 raise
-            if _is_connection_error(exc):
+            if _is_transient_error(exc):
                 self.degraded = True
             logger.debug(
                 "Metron issue lookup failed for series id %s #%s: %s",
@@ -714,7 +753,7 @@ class MetronClient:
             # ApiError does NOT (it stays a silent None, same as before).
             if _is_server_error(exc):
                 raise
-            if _is_connection_error(exc):
+            if _is_transient_error(exc):
                 self.degraded = True
             logger.debug(
                 "Metron series search failed for %r (mapped from %r): %s",
@@ -823,7 +862,17 @@ class MetronClient:
         best_series = self.resolve_series(series_query, year)
         if best_series is None:
             return None
-        return self.issue_in_series(best_series, issue_number)
+        # BUI-1341: both halves are decorated, and the decorator resets
+        # ``degraded`` on entry, so ``issue_in_series`` would erase a trip
+        # ``resolve_series`` left behind. Carry it across the pair on a miss so
+        # the caller's single ``degraded`` read covers the whole lookup (the
+        # BUI-913 fix, applied here). A hit keeps the last call's value, so a
+        # good answer never trips the batch breaker.
+        series_degraded = self.degraded
+        result = self.issue_in_series(best_series, issue_number)
+        if result is None:
+            self.degraded = self.degraded or series_degraded
+        return result
 
     def lookup_issue_request_cost(self, series_query: str, year: Any = None) -> int:
         """How many HTTP requests the NEXT ``lookup_issue(series_query, ...,
@@ -906,7 +955,7 @@ class MetronClient:
             # ApiError does NOT (it stays a silent None, same as before).
             if _is_server_error(exc):
                 raise
-            if _is_connection_error(exc):
+            if _is_transient_error(exc):
                 self.degraded = True
             logger.debug("Metron issue-detail lookup failed for id %s: %s", metron_id, exc)
             return None
@@ -957,7 +1006,7 @@ class MetronClient:
             # ApiError does NOT (it stays a silent None, same as before).
             if _is_server_error(exc):
                 raise
-            if _is_connection_error(exc):
+            if _is_transient_error(exc):
                 self.degraded = True
             logger.debug("Metron issue-by-id lookup failed for id %s: %s", metron_id, exc)
             return None
@@ -1051,7 +1100,7 @@ class MetronClient:
             # ApiError does NOT (it stays a silent None, same as before).
             if _is_server_error(exc):
                 raise
-            if _is_connection_error(exc):
+            if _is_transient_error(exc):
                 self.degraded = True
             logger.debug("Metron creator lookup failed for %r: %s", name, exc)
             return None
@@ -1109,7 +1158,7 @@ class MetronClient:
             # ApiError does NOT (it stays a silent None, same as before).
             if _is_server_error(exc):
                 raise
-            if _is_connection_error(exc):
+            if _is_transient_error(exc):
                 self.degraded = True
             logger.debug(
                 "Metron creator-run candidate lookup failed (series=%s creator=%s): %s",
