@@ -66,6 +66,10 @@ Pass `buy.md` each chosen row's `item_id` too: `buy.md` Step 7 records the outco
 
 Identify flags non-comics. The watchlist holds novels and other items. Drop any row identify flags as a non-comic before pricing, and tell the user which rows you dropped. Those drops are recorded as `non_comic` in `buy.md` Step 7.
 
+## Nightly autosnipe (BUI-1340)
+
+`comic-autosnipe` (`apps/ebay/src/autosnipe.py`) runs this flow unattended from the ~/.claude nightly routine, with every `/comic:buy` gate replaced by a fixed skip rule, and sends each snipe's FMV and max bid to Telegram. It records only `sniped`, owned and defect `skipped`, `over_cap`, and trading-card `non_comic` outcomes, so a book it skipped for an uncertain reason still shows here. `AUTOSNIPE_DRY_RUN=1` in `~/.config/comic-autosnipe/env` keeps it from adding snipes.
+
 ## Rules
 
 - **Never bid, snipe, or buy.** `/comic:buy` owns every gate and the user approves each snipe there.
