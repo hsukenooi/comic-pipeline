@@ -54,7 +54,8 @@ SETTLE = timedelta(minutes=30)
 # At most one eBay lookup per interval, and a bounded batch per lookup.
 INTERVAL_S = 1800.0
 BATCH = 40
-LOOKUP_TIMEOUT_S = 180
+# Generous: up to BATCH GraphQL calls (15 s timeout each) plus Trading pages.
+LOOKUP_TIMEOUT_S = 600
 _EBAY_STATUSES = ("WINNING", EBAY_BID_STATUS_OUTBID)
 
 _last_lookup_at = 0.0
@@ -64,13 +65,17 @@ _lookup_failing = False
 def candidate_rows(db: sqlite3.Connection, now_dt: datetime) -> list[sqlite3.Row]:
     """WON rows not yet checked whose auction ended within the window and at
     least SETTLE ago, newest first, capped at BATCH. A row with no parseable
-    end (auction_end_at, else resolved_at) cannot be bounded and is skipped."""
+    end or a non-numeric item_id (auction_end_at, else resolved_at) cannot be bounded and is skipped."""
     rows = db.execute(
         "SELECT id, item_id, auction_end_at, resolved_at FROM bids "
         "WHERE status='WON' AND ebay_bid_checked_at IS NULL ORDER BY id DESC"
     ).fetchall()
     out = []
     for row in rows:
+        # ebay-bid-status rejects a non-numeric ID with a usage error for the
+        # whole batch, so one malformed row would block every later check.
+        if not str(row["item_id"]).isdigit():
+            continue
         end_dt = _parse_iso_utc(row["auction_end_at"]) or _parse_iso_utc(row["resolved_at"])
         if end_dt is None:
             continue

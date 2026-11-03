@@ -148,7 +148,7 @@ def test_failed_lookup_changes_nothing_and_logs_once(monkeypatch, conn, caplog):
     _completed(returncode=3, stderr="token expired"),
     _completed(payload=None),  # empty stdout -> bad JSON
     _completed(payload={"not": "a list"}),
-    subprocess.TimeoutExpired(cmd="ebay-bid-status", timeout=180),
+    subprocess.TimeoutExpired(cmd="ebay-bid-status", timeout=600),
     OSError("exec failed"),
 ])
 def test_any_lookup_failure_is_a_no_op(monkeypatch, conn, proc):
@@ -202,6 +202,7 @@ def test_candidate_window(conn):
     recent = _seed_won(conn, "1", ended=timedelta(hours=-2))
     _seed_won(conn, "2", ended=timedelta(minutes=-5))   # not settled yet
     _seed_won(conn, "3", ended=timedelta(days=-100))    # past eBay's ~90 days
+    _seed_won(conn, "test-item")                        # non-numeric: would fail the batch
     checked = _seed_won(conn, "4")
     conn.execute("UPDATE bids SET ebay_bid_checked_at='x' WHERE id=?", (checked,))
     conn.execute("INSERT INTO bids (item_id, max_bid, status, auction_end_at) "

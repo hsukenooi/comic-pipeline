@@ -140,7 +140,7 @@ def fetch_graphql_item(token, item_id):
                 "X-EBAY-C-MARKETPLACE-ID": "EBAY_US",
                 "Content-Type": "application/json",
             },
-            timeout=30,
+            timeout=15,
         )
     except requests.RequestException as exc:
         raise SourceUnavailable(f"network error calling {GRAPHQL_ENDPOINT}: {type(exc).__name__}") from None
