@@ -26,6 +26,9 @@ AUTOSNIPE_CONFIG). An environment variable wins over the file.
   AUTOSNIPE_SPEND_CAP=300   total max bid for one run, in dollars
   AUTOSNIPE_MIN_HOURS=6     skip auctions ending sooner than this
   AUTOSNIPE_GRADE_OVER=100  photo-grade a stated-grade raw book above this price
+  AUTOSNIPE_GRADE_MAX=5     photo-grade at most this many new books a run (BUI-1350)
+  AUTOSNIPE_GRADE_CACHE     grade verdicts kept by item ID until the auction ends
+                            (default ~/.local/state/comic-autosnipe/grades.json)
   AUTOSNIPE_REPO            repo root for grade-seats (default ~/Projects/comic-pipeline)
   AUTOSNIPE_DASHBOARD_URL   link printed in the message
 
@@ -55,6 +58,8 @@ DEFAULTS = {
     "AUTOSNIPE_SPEND_CAP": "300",
     "AUTOSNIPE_MIN_HOURS": "6",
     "AUTOSNIPE_GRADE_OVER": "100",
+    "AUTOSNIPE_GRADE_MAX": "5",
+    "AUTOSNIPE_GRADE_CACHE": str(Path.home() / ".local" / "state" / "comic-autosnipe" / "grades.json"),
     "AUTOSNIPE_REPO": str(Path.home() / "Projects" / "comic-pipeline"),
     "AUTOSNIPE_DASHBOARD_URL": "http://mac-mini.tail9b7fa5.ts.net:8080/comics",
     "COMICS_SERVER_URL": "http://localhost:8080",
@@ -65,6 +70,7 @@ CONF_RANK = {"HIGH": 4, "MEDIUM-HIGH": 3.5, "MEDIUM": 3, "MEDIUM-LOW": 2, "LOW":
 CONF_MAP = {"HIGH": "high", "MEDIUM-HIGH": "medium", "MEDIUM": "medium",
             "MEDIUM-LOW": "medium-low", "LOW": "low"}
 LANDED = {"added", "updated"}
+SPLIT = "graders split by a full grade or more"
 
 
 class RunError(Exception):
@@ -85,6 +91,7 @@ class Book:
     seller_grade: object = None
     photo_grade: float | None = None
     grade_confidence: str | None = None
+    grade_cached: bool = False    # the photo grade came from an earlier run
     fmv: dict = field(default_factory=dict)
     skip: str | None = None       # reason, once a gate drops the book
     record: str | None = None     # watchlist outcome to record (live runs only)
@@ -302,8 +309,61 @@ class Autosnipe:
         price = b.price or 0
         return not b.grade or price > float(self.cfg["AUTOSNIPE_GRADE_OVER"])
 
+    def load_grade_cache(self):
+        """Unexpired verdicts by item ID. An unreadable cache means grade again."""
+        path = Path(self.cfg["AUTOSNIPE_GRADE_CACHE"])
+        try:
+            data = json.loads(path.read_text())
+        except FileNotFoundError:
+            return {}
+        except (OSError, json.JSONDecodeError) as e:
+            self.notes.append(f"grade cache unreadable, grading again ({e})")
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {k: v for k, v in data.items()
+                if isinstance(v, dict) and (parse_time(v.get("end")) or self.now) > self.now}
+
+    def save_grade_cache(self, cache):
+        path = Path(self.cfg["AUTOSNIPE_GRADE_CACHE"])
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(cache, indent=2, sort_keys=True))
+            tmp.replace(path)
+        except OSError as e:
+            self.notes.append(f"could not save the grade cache: {e}")
+
+    def apply_grade(self, b, entry):
+        if "skip" in entry:
+            b.skip = f"Grade – {entry['skip']}"
+        elif entry["confidence"] == "LOW":
+            b.skip = f"Grade – photo grade {entry['grade']} has low confidence"
+        else:
+            b.photo_grade = b.grade = entry["grade"]
+            b.grade_confidence = CONF_MAP.get(entry["confidence"], "medium-low")
+
     def grade(self):
         todo = [b for b in self.live() if self.needs_grade(b)]
+        if not todo:
+            return
+        cache = self.load_grade_cache()
+        fresh = []
+        for b in todo:
+            if b.item_id in cache:
+                b.grade_cached = True
+                self.apply_grade(b, cache[b.item_id])
+            else:
+                fresh.append(b)
+        fresh.sort(key=lambda b: b.end or self.now)
+        cap = int(self.cfg["AUTOSNIPE_GRADE_MAX"])
+        for b in fresh[cap:]:
+            b.skip = f"Grade – over the {cap}-book grading cap for one run"
+        self.grade_fresh(fresh[:cap], cache)
+        self.save_grade_cache(cache)
+
+    def grade_fresh(self, todo, cache):
+        """Photo-grade books with no cached verdict, and cache each real verdict."""
         if not todo:
             return
         gdir = self.workdir / "grading"
@@ -334,14 +394,15 @@ class Autosnipe:
         for b in books:
             verdict = consensus(report.get(b.item_id))
             if isinstance(verdict, str):
-                b.skip = f"Grade – {verdict}"
-                continue
-            grade, conf = verdict
-            if conf == "LOW":
-                b.skip = f"Grade – photo grade {grade} has low confidence"
-                continue
-            b.photo_grade, b.grade = grade, grade
-            b.grade_confidence = CONF_MAP.get(conf, "medium-low")
+                entry = {"skip": verdict}
+                cacheable = verdict == SPLIT   # a failed grader run is retried next night
+            else:
+                entry = {"grade": verdict[0], "confidence": verdict[1]}
+                cacheable = True
+            if cacheable and b.end:
+                cache[b.item_id] = {**entry, "end": b.end.isoformat(),
+                                    "graded_at": self.now.isoformat()}
+            self.apply_grade(b, entry)
 
     def price(self):
         todo = self.live()
@@ -463,7 +524,8 @@ class Autosnipe:
         return {"dry_run": self.dry_run, "workdir": str(self.workdir), "notes": self.notes,
                 "books": [{"item_id": b.item_id, "name": b.name, "url": b.url,
                            "end": b.end.isoformat() if b.end else None, "grade": b.grade,
-                           "grade_confidence": b.grade_confidence, "fmv": b.fmv,
+                           "grade_confidence": b.grade_confidence,
+                           "grade_cached": b.grade_cached, "fmv": b.fmv,
                            "skip": b.skip, "status": b.status} for b in self.books]}
 
 
@@ -475,7 +537,7 @@ def consensus(book):
     if adj:
         return float(adj["grade"]), str(adj.get("confidence", "")).upper()
     if book.get("adjudicator_failed") or book.get("split"):
-        return "graders split by a full grade or more"
+        return SPLIT
     pol = book.get("policy") or {}
     if pol.get("consensus"):
         c = pol["consensus"]
@@ -522,6 +584,7 @@ def format_message(snipe, error=None):
         for b in sniped:
             f = b.fmv
             grade = f"{b.grade}" + (f" photo, {b.grade_confidence}" if b.photo_grade is not None else "")
+            grade += ", cached" if b.grade_cached else ""
             ends = b.end.strftime("%a %d %b %H:%M UTC") if b.end else "?"
             lines.append(f"• <a href=\"{e(b.url)}\">{e(b.name)}</a> – grade {e(str(grade))}, "
                          f"FMV {money(f.get('fmv_low'))}–{money(f.get('fmv_high'))}, "

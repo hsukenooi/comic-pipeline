@@ -68,7 +68,7 @@ Identify flags non-comics. The watchlist holds novels and other items. Drop any 
 
 ## Nightly autosnipe (BUI-1340)
 
-`comic-autosnipe` (`apps/ebay/src/autosnipe.py`) runs this flow unattended from the ~/.claude nightly routine, with every `/comic:buy` gate replaced by a fixed skip rule, and sends each snipe's FMV and max bid to Telegram. It records only `sniped`, owned and defect `skipped`, `over_cap`, and trading-card `non_comic` outcomes, so a book it skipped for an uncertain reason still shows here. `AUTOSNIPE_DRY_RUN=1` in `~/.config/comic-autosnipe/env` keeps it from adding snipes.
+`comic-autosnipe` (`apps/ebay/src/autosnipe.py`) runs this flow unattended from the ~/.claude nightly routine, with every `/comic:buy` gate replaced by a fixed skip rule, and sends each snipe's FMV and max bid to Telegram. It records only `sniped`, owned and defect `skipped`, `over_cap`, and trading-card `non_comic` outcomes, so a book it skipped for an uncertain reason still shows here. `AUTOSNIPE_DRY_RUN=1` in `~/.config/comic-autosnipe/env` keeps it from adding snipes. It keeps each photo-grade verdict by item ID until the auction ends, so a book is graded once, and it grades at most `AUTOSNIPE_GRADE_MAX` (default 5) new books a run (BUI-1350).
 
 ## Rules
 
