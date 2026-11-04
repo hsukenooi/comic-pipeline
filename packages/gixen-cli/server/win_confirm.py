@@ -19,12 +19,20 @@ never touches the eBay WON inference in fallback._run_ebay_fallback
   or an unresolved item -> nothing written at all; the row is retried on a
   later run until it ages out of the ~90-day window eBay keeps the data.
 
+A WON the completed-bids purge already tombstoned (POST /api/purge, often
+within the hour of the end, before SETTLE has passed) is still checked
+(BUI-1348): it stays REMOVED, so the purge still hides it, but a reversal
+rewrites its prior_status WON -> LOST. prior_status is what the first-party
+comps read for a purge-swept row (BUI-660), so without this a phantom win
+purged early would count as a won comp forever and never reach the
+reversed-wins review list.
+
 The group_wins ledger row a reversed win recorded is deliberately kept: Gixen
 believed it won and cancelled the group siblings on that belief, so those
 siblings never bid and their REMOVED classification stays correct (see the
 BUI-385/BUI-1346 note in server/db.py).
 
-Writes are id-targeted and status-guarded (`WHERE id=? AND status='WON'`)
+Writes are id-targeted and status-guarded (`WHERE id=? AND` a still-WON guard)
 under the app-wide write lock, after a fresh re-read, the same TOCTOU shape
 as _run_ebay_fallback (BUI-417). bids.auction_end_at is only read, never
 written: it arms the sniper.
@@ -41,7 +49,8 @@ import subprocess
 from datetime import datetime, timedelta, timezone
 
 from server.db import (
-    EBAY_BID_STATUS_OUTBID, WIN_REVERSED_NOTE, get_bid_by_id, write_transaction,
+    EBAY_BID_STATUS_OUTBID, TOMBSTONE_STATUSES_SQL, WIN_REVERSED_NOTE,
+    get_bid_by_id, write_transaction,
 )
 from server.fallback import _parse_iso_utc
 
@@ -57,18 +66,30 @@ BATCH = 40
 # Generous: up to BATCH GraphQL calls (15 s timeout each) plus Trading pages.
 LOOKUP_TIMEOUT_S = 600
 _EBAY_STATUSES = ("WINNING", EBAY_BID_STATUS_OUTBID)
+_TOMBSTONES = tuple(t.strip().strip("'") for t in TOMBSTONE_STATUSES_SQL.split(","))
+# A Gixen WON still awaiting eBay's word: live, or purge-swept (BUI-1348). The
+# purge records the status it overwrote in prior_status (BUI-660).
+_GIXEN_WON_SQL = (
+    f"(status='WON' OR (status IN ({TOMBSTONE_STATUSES_SQL}) AND prior_status='WON'))"
+)
+
+
+def _is_gixen_won(row: sqlite3.Row) -> bool:
+    return row["status"] == "WON" or (
+        row["status"] in _TOMBSTONES and row["prior_status"] == "WON"
+    )
 
 _last_lookup_at = 0.0
 _lookup_failing = False
 
 
 def candidate_rows(db: sqlite3.Connection, now_dt: datetime) -> list[sqlite3.Row]:
-    """WON rows not yet checked whose auction ended within the window and at
+    """Gixen WON rows (live or purge-swept, see _GIXEN_WON_SQL) not yet checked whose auction ended within the window and at
     least SETTLE ago, newest first, capped at BATCH. A row with no parseable
     end or a non-numeric item_id (auction_end_at, else resolved_at) cannot be bounded and is skipped."""
     rows = db.execute(
         "SELECT id, item_id, auction_end_at, resolved_at FROM bids "
-        "WHERE status='WON' AND ebay_bid_checked_at IS NULL ORDER BY id DESC"
+        f"WHERE {_GIXEN_WON_SQL} AND ebay_bid_checked_at IS NULL ORDER BY id DESC"
     ).fetchall()
     out = []
     for row in rows:
@@ -148,7 +169,7 @@ def apply_results(
         if status is not None and status not in _EBAY_STATUSES:
             continue  # unknown vocabulary is not evidence
         fresh = get_bid_by_id(wconn, row["id"])
-        if fresh is None or fresh["status"] != "WON" or fresh["ebay_bid_checked_at"]:
+        if fresh is None or not _is_gixen_won(fresh) or fresh["ebay_bid_checked_at"]:
             continue  # changed since gather (BUI-417 TOCTOU shape)
         if status == EBAY_BID_STATUS_OUTBID:
             price = res.get("final_price")
@@ -156,13 +177,18 @@ def apply_results(
                 float(price) if isinstance(price, (int, float)) and price > 0
                 and res.get("currency") in (None, "USD") else None
             )
+            # A live WON flips to LOST. A purge-swept one stays tombstoned
+            # (the purge still hides it) and its prior_status flips instead.
+            # SQLite evaluates every SET against the pre-update row.
             wconn.execute(
-                "UPDATE bids SET status='LOST', "
+                "UPDATE bids SET "
+                "status=CASE WHEN status='WON' THEN 'LOST' ELSE status END, "
+                "prior_status=CASE WHEN status='WON' THEN prior_status ELSE 'LOST' END, "
                 "winning_bid=COALESCE(?, winning_bid), "
                 "ebay_bid_status=?, ebay_bid_checked_at=?, "
                 "notes=CASE WHEN notes IS NULL OR notes='' THEN ? "
                 "ELSE notes || '; ' || ? END "
-                "WHERE id=? AND status='WON'",
+                f"WHERE id=? AND {_GIXEN_WON_SQL}",
                 (usd_price, EBAY_BID_STATUS_OUTBID, now_iso,
                  WIN_REVERSED_NOTE, WIN_REVERSED_NOTE, row["id"]),
             )
@@ -174,7 +200,7 @@ def apply_results(
         else:
             wconn.execute(
                 "UPDATE bids SET ebay_bid_status=?, ebay_bid_checked_at=? "
-                "WHERE id=? AND status='WON'",
+                f"WHERE id=? AND {_GIXEN_WON_SQL}",
                 (status, now_iso, row["id"]),
             )
     return reversed_count

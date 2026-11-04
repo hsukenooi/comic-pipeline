@@ -1908,3 +1908,93 @@ def test_era_evidence_endpoint_threads_identity_and_returns_verbatim(client):
     assert captured["items"] == [
         {"item_id": "x", "series": "S", "issue": "1", "edition": "annual"}
     ]
+
+
+# --- reversed-wins review list (BUI-1348) ------------------------------------
+
+def _seed_reversed_bid(client, item_id, *, status="LOST", prior=None,
+                       ebay_status="OUTBID", note=True, title="ASM 300"):
+    import os
+    import sqlite3
+    from server.db import WIN_REVERSED_NOTE
+    db = sqlite3.connect(os.environ["DB_PATH"])
+    db.execute(
+        "INSERT INTO bids (item_id, ebay_title, max_bid, status, prior_status, "
+        "winning_bid, ebay_bid_status, ebay_bid_checked_at, notes) "
+        "VALUES (?, ?, 25.0, ?, ?, 25.0, ?, '2026-11-05T00:00:00+00:00', ?)",
+        (item_id, title, status, prior, ebay_status,
+         WIN_REVERSED_NOTE if note else None),
+    )
+    db.commit()
+    db.close()
+
+
+def _win_row(full_title, item_id, source, copies=1):
+    return {
+        "full_title": full_title,
+        "series_name": "The Amazing Spider-Man",
+        "publisher_name": "Marvel Comics",
+        "release_date": "1988-05-01",
+        "in_collection": copies,
+        "source": source,
+        "gixen_item_id": item_id,
+    }
+
+
+def test_reversed_wins_lists_every_matching_row_and_never_mutates(client):
+    from gixen_overlay.db import mark_collection_wins_seen
+    rows = [
+        _win_row("The Amazing Spider-Man #300", "188733995492", "agent_win"),
+        _win_row("The Amazing Spider-Man #300", "188733995492", "locg_export"),
+        _win_row("The Amazing Spider-Man #301", "999", "agent_win"),
+    ]
+    _seed_collection(client.store, rows)
+    before = (client.store / "collection.json").read_text()
+    _seed_reversed_bid(client, "188733995492")
+    # Purge-swept reversal: recorded, but its row was absorbed (no id on it).
+    _seed_reversed_bid(client, "800412993298", status="REMOVED", prior="LOST")
+    import os
+    import sqlite3
+    db = sqlite3.connect(os.environ["DB_PATH"])
+    mark_collection_wins_seen(db, ["188733995492", "800412993298"])
+    db.close()
+    # Not a reversal: OUTBID without the marker, and a marker without OUTBID.
+    _seed_reversed_bid(client, "999", note=False)
+    _seed_reversed_bid(client, "999", ebay_status="WINNING", status="WON")
+    # A reversal the collection never recorded is not flagged.
+    _seed_reversed_bid(client, "555")
+
+    r = client.get("/api/comics/collection/reversed-wins")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    by_item = {w["item_id"]: w for w in body["reversed_wins"]}
+    assert body["count"] == 2 and set(by_item) == {"188733995492", "800412993298"}
+    tie = by_item["188733995492"]
+    assert tie["recorded_by_collection_add"] is True
+    assert sorted(r["source"] for r in tie["collection_rows"]) == ["agent_win", "locg_export"]
+    assert {"full_title", "release_date", "source"} <= set(tie["collection_rows"][0])
+    absorbed = by_item["800412993298"]
+    assert absorbed["collection_rows"] == []
+    assert (absorbed["bid_status"], absorbed["prior_status"]) == ("REMOVED", "LOST")
+    assert (client.store / "collection.json").read_text() == before
+
+
+def test_reversed_wins_flags_a_row_carrying_the_id_without_seen_entry(client):
+    _seed_collection(client.store, [_win_row("The Amazing Spider-Man #300", "188733995492", "agent_win")])
+    _seed_reversed_bid(client, "188733995492")
+    body = client.get("/api/comics/collection/reversed-wins").json()
+    assert body["count"] == 1
+    assert body["reversed_wins"][0]["recorded_by_collection_add"] is False
+    assert len(body["reversed_wins"][0]["collection_rows"]) == 1
+
+
+def test_reversed_wins_empty_without_reversals(client):
+    body = client.get("/api/comics/collection/reversed-wins").json()
+    assert body == {"count": 0, "reversed_wins": []}
+
+
+def test_reversed_wins_unreadable_store_is_500_not_empty(client):
+    _seed_reversed_bid(client, "188733995492")
+    (client.store / "collection.json").write_text("{not json")
+    r = client.get("/api/comics/collection/reversed-wins")
+    assert r.status_code == 500

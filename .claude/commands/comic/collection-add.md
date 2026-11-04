@@ -335,6 +335,14 @@ Pending push total: N rows; oldest pending = X days.
 
 Escalate the pending-push message when `oldest_pending_days > 21` or `pending_push_count > 25`.
 
+Then check for reversed wins (BUI-1348). eBay can reverse a Gixen WON after this skill recorded it (a tie goes to the earlier bidder, BUI-1346), so the book reads owned when it isn't:
+
+```bash
+comics-api GET /api/comics/collection/reversed-wins
+```
+
+When `count > 0`, list each entry's `item_id`, `ebay_title`, and every `collection_rows` entry under **Reversed wins to review**. Never remove a row here: Hsu Ken decides, then removes it with `POST /api/comics/collection/remediate/delete` by `full_title` + `release_date` + `source` (dry run first). An entry with no `collection_rows` may have been absorbed into a `locg_export` row, so check that one by title.
+
 ## Common Mistakes
 
 | Mistake | Fix |

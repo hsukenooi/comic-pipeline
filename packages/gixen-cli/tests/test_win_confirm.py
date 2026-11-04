@@ -19,7 +19,8 @@ import pytest
 import server.main as m
 from server import win_confirm as wc
 from server.db import (
-    WIN_REVERSED_NOTE, get_bid_by_id, init_db, record_group_win, update_bid_status,
+    WIN_REVERSED_NOTE, get_bid_by_id, init_db, mark_bids_purged, record_group_win,
+    update_bid_status,
 )
 
 TIE_ITEM = "188733995492"  # one of the two known phantom wins
@@ -261,3 +262,63 @@ def test_migration_adds_columns_to_existing_schema_db(tmp_path):
         assert conn.execute("SELECT winning_bid FROM bids WHERE item_id='old1'").fetchone()[0] == 9.0
     finally:
         conn.close()
+
+
+# --- BUI-1348: a WON purged before it was checked ------------------------------
+
+
+def test_purge_swept_won_is_still_checked_and_reversed(monkeypatch, conn):
+    """POST /api/purge tombstones every WON (mark_bids_purged), often inside
+    SETTLE. The swept row must still be checked: it stays REMOVED (the purge
+    still hides it) but its prior_status, which the first-party comps read,
+    flips WON -> LOST and it carries the reversal marker."""
+    row_id = _seed_won(conn, ended=timedelta(minutes=-10))  # not settled yet
+    mark_bids_purged(conn, [TIE_ITEM])
+    conn.commit()
+    assert get_bid_by_id(conn, row_id)["status"] == "REMOVED"
+    # Later, once settled:
+    conn.execute("UPDATE bids SET auction_end_at=? WHERE id=?",
+                 (_iso(timedelta(hours=-2)), row_id))
+    conn.commit()
+    n, _ = _run(monkeypatch, conn, _completed([_result(TIE_ITEM, "OUTBID")]))
+    assert n == 1
+    row = get_bid_by_id(conn, row_id)
+    assert row["status"] == "REMOVED"
+    assert row["prior_status"] == "LOST"
+    assert row["ebay_bid_status"] == "OUTBID"
+    assert row["ebay_bid_checked_at"] is not None
+    assert row["notes"] == WIN_REVERSED_NOTE
+
+
+def test_purge_swept_winning_keeps_prior_won(monkeypatch, conn):
+    row_id = _seed_won(conn)
+    mark_bids_purged(conn, [TIE_ITEM])
+    conn.commit()
+    n, _ = _run(monkeypatch, conn, _completed([_result(TIE_ITEM, "WINNING")]))
+    assert n == 0
+    row = get_bid_by_id(conn, row_id)
+    assert (row["status"], row["prior_status"]) == ("REMOVED", "WON")
+    assert row["ebay_bid_status"] == "WINNING" and row["ebay_bid_checked_at"]
+
+
+def test_purge_between_gather_and_apply_still_reverses(conn):
+    """TOCTOU: the purge running between gather and apply does not lose the
+    check; the reversal lands on prior_status instead."""
+    row_id = _seed_won(conn)
+    rows = wc.candidate_rows(conn, datetime.now(timezone.utc))
+    mark_bids_purged(conn, [TIE_ITEM])
+    assert wc.apply_results(conn, rows, {TIE_ITEM: _result(TIE_ITEM, "OUTBID")}, "now") == 1
+    row = get_bid_by_id(conn, row_id)
+    assert (row["status"], row["prior_status"]) == ("REMOVED", "LOST")
+
+
+def test_tombstone_without_prior_won_is_not_a_candidate(conn):
+    """A REMOVED row that was never a Gixen WON (a removed live snipe, a
+    swept LOST, or a pre-BUI-660 tombstone with no prior_status) is skipped."""
+    for item, prior in (("11", "PENDING"), ("12", "LOST"), ("13", None)):
+        conn.execute(
+            "INSERT INTO bids (item_id, max_bid, status, prior_status, auction_end_at) "
+            "VALUES (?, 9.0, 'REMOVED', ?, ?)", (item, prior, _iso(timedelta(hours=-2))),
+        )
+    conn.commit()
+    assert wc.candidate_rows(conn, datetime.now(timezone.utc)) == []
