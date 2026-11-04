@@ -28,19 +28,21 @@ FORBIDDEN = {"errors": [{"extensions": {"errorCode": "FORBIDDEN"},
              "data": None}
 
 
-def trading_xml(won=(), lost=(), ack="Success", pages=1):
-    def items(ids):
+def trading_xml(won=(), lost=(), ack="Success", pages=1, lost_pages=None, won_price="25.00"):
+    def items(ids, price="25.00"):
         return "".join(
             f"<Item><ItemID>{i}</ItemID><SellingStatus>"
-            f'<CurrentPrice currencyID="USD">25.00</CurrentPrice></SellingStatus></Item>'
+            f'<CurrentPrice currencyID="USD">{price}</CurrentPrice></SellingStatus></Item>'
             for i in ids
         )
     won_xml = (
         f"<WonList><PaginationResult><TotalNumberOfPages>{pages}</TotalNumberOfPages>"
         "</PaginationResult><OrderTransactionArray><OrderTransaction><Transaction>"
-        f"{items(won)}</Transaction></OrderTransaction></OrderTransactionArray></WonList>"
+        f"{items(won, won_price)}</Transaction></OrderTransaction></OrderTransactionArray></WonList>"
     )
-    lost_xml = f"<LostList><ItemArray>{items(lost)}</ItemArray></LostList>"
+    lost_pg = (f"<PaginationResult><TotalNumberOfPages>{lost_pages}</TotalNumberOfPages>"
+               "</PaginationResult>") if lost_pages else ""
+    lost_xml = f"<LostList>{lost_pg}<ItemArray>{items(lost)}</ItemArray></LostList>"
     body = won_xml + lost_xml if ack != "Failure" else "<Errors><ErrorCode>931</ErrorCode></Errors>"
     return (f'<?xml version="1.0"?><GetMyeBayBuyingResponse {NSDECL}><Ack>{ack}</Ack>'
             f"{body}</GetMyeBayBuyingResponse>").encode()
@@ -172,6 +174,50 @@ def test_trading_paginates(http, capsys):
     queues[bs.TRADING_ENDPOINT].append(FakeResp(content=trading_xml(lost=[TIE_ITEM], pages=2)))
     _, res, _ = run(capsys, TIE_ITEM)
     assert calls.count(bs.TRADING_ENDPOINT) == 2 and res[0]["status"] == "OUTBID"
+
+
+def _requested_pages(body):
+    """{list tag: page} for the lists present in a request body."""
+    import re
+    return {m.group(1): int(m.group(2)) for m in
+            re.finditer(r"<(WonList|LostList)>.*?<PageNumber>(\d+)</PageNumber>", body)}
+
+
+def test_each_list_pages_to_its_own_end(http, capsys, monkeypatch):
+    queues, _ = http
+    bodies = []
+    real_post = bs.requests.post
+
+    def spy(url, **kw):
+        if url == bs.TRADING_ENDPOINT:
+            bodies.append(kw["data"].decode())
+        return real_post(url, **kw)
+
+    monkeypatch.setattr(bs.requests, "post", spy)
+    queues[bs.GRAPHQL_ENDPOINT].append(FakeResp(json_body=FORBIDDEN))
+    for _ in range(3):
+        queues[bs.TRADING_ENDPOINT].append(FakeResp(content=trading_xml(pages=1, lost_pages=3)))
+    run(capsys, TIE_ITEM)
+    reqs = [_requested_pages(b) for b in bodies]
+    assert reqs == [{"WonList": 1, "LostList": 1}, {"LostList": 2}, {"LostList": 3}]
+
+
+def test_wonlist_zero_price_is_null_not_zero(http, capsys):
+    queues, _ = http
+    queues[bs.GRAPHQL_ENDPOINT].append(FakeResp(json_body=FORBIDDEN))
+    queues[bs.TRADING_ENDPOINT].append(FakeResp(content=trading_xml(won=[TIE_ITEM], won_price="0.0")))
+    _, res, _ = run(capsys, TIE_ITEM)
+    assert res[0]["status"] == "WINNING" and res[0]["final_price"] is None
+
+
+def test_wonlist_price_falls_back_to_transaction_price():
+    from xml.etree import ElementTree as ET
+    xml = (f'<R {NSDECL}><WonList><OrderTransactionArray><OrderTransaction><Transaction>'
+           '<Item><ItemID>9</ItemID><SellingStatus><CurrentPrice currencyID="USD">0.0</CurrentPrice>'
+           '</SellingStatus></Item><TotalPrice currencyID="USD">31.5</TotalPrice>'
+           '</Transaction></OrderTransaction></OrderTransactionArray></WonList></R>')
+    won = bs._list_entries(ET.fromstring(xml).find("e:WonList", bs.NS))
+    assert won["9"] == (31.5, "USD")
 
 
 def test_token_error_exits_with_its_code(monkeypatch, capsys):

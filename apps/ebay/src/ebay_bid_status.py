@@ -155,32 +155,56 @@ def fetch_graphql_item(token, item_id):
     return parse_graphql_item(item_id, body)
 
 
-def _trading_body(page):
-    lst = (
-        f"<Include>true</Include><DurationInDays>{DURATION_DAYS}</DurationInDays>"
-        f"<Pagination><EntriesPerPage>{PER_PAGE}</EntriesPerPage>"
-        f"<PageNumber>{page}</PageNumber></Pagination>"
-    )
+def _trading_body(won_page, lost_page):
+    """Request each list at its own page; a None page omits that list."""
+    def lst(tag, page):
+        if page is None:
+            return ""
+        return (
+            f"<{tag}><Include>true</Include><DurationInDays>{DURATION_DAYS}</DurationInDays>"
+            f"<Pagination><EntriesPerPage>{PER_PAGE}</EntriesPerPage>"
+            f"<PageNumber>{page}</PageNumber></Pagination></{tag}>"
+        )
     return (
         '<?xml version="1.0" encoding="utf-8"?>\n'
         '<GetMyeBayBuyingRequest xmlns="urn:ebay:apis:eBLBaseComponents">'
-        f"<WonList>{lst}</WonList><LostList>{lst}</LostList>"
+        f"{lst('WonList', won_page)}{lst('LostList', lost_page)}"
         "<DetailLevel>ReturnAll</DetailLevel></GetMyeBayBuyingRequest>"
     )
 
 
+def _money(el):
+    """(value, currency) for a money element. A missing or non-positive value
+    is (None, None), never 0.0: a sold item has a price or none is known."""
+    if el is None:
+        return None, None
+    value = _to_float(el.text)
+    if value is None or value <= 0:
+        return None, None
+    return value, el.get("currencyID")
+
+
 def _list_entries(container):
-    """{item_id: (price, currency)} for every Item under a Won/LostList."""
+    """{item_id: (price, currency)} for every Item under a Won/LostList.
+
+    Price is the Item's SellingStatus/CurrentPrice when positive, else the
+    enclosing Transaction's TransactionPrice/TotalPrice/AmountPaid, else None.
+    """
     out = {}
     if container is None:
         return out
+    parents = {c: p for p in container.iter() for c in p}
     for item in container.iter(f"{{{NS['e']}}}Item"):
         iid = item.findtext("e:ItemID", namespaces=NS)
         if not iid:
             continue
-        price_el = item.find("e:SellingStatus/e:CurrentPrice", NS)
-        price = _to_float(price_el.text) if price_el is not None else None
-        currency = price_el.get("currencyID") if price_el is not None else None
+        price, currency = _money(item.find("e:SellingStatus/e:CurrentPrice", NS))
+        parent = parents.get(item)
+        if price is None and parent is not None:
+            for path in ("e:TransactionPrice", "e:TotalPrice", "e:AmountPaid"):
+                price, currency = _money(parent.find(path, NS))
+                if price is not None:
+                    break
         out[iid] = (price, currency)
     return out
 
@@ -195,7 +219,7 @@ def _pages(container):
 
 
 def parse_trading_page(content):
-    """Return (won, lost, total_pages) for one GetMyeBayBuying response."""
+    """Return (won, lost, won_pages, lost_pages) for one GetMyeBayBuying response."""
     try:
         root = ET.fromstring(content)
     except ET.ParseError:
@@ -205,17 +229,21 @@ def parse_trading_page(content):
         codes = [e.findtext("e:ErrorCode", namespaces=NS) for e in root.findall("e:Errors", NS)]
         raise SourceUnavailable(f"GetMyeBayBuying Ack={ack} (errors {codes})")
     won_el, lost_el = root.find("e:WonList", NS), root.find("e:LostList", NS)
-    return _list_entries(won_el), _list_entries(lost_el), max(_pages(won_el), _pages(lost_el))
+    return _list_entries(won_el), _list_entries(lost_el), _pages(won_el), _pages(lost_el)
 
 
 def fetch_trading_lists(token):
-    """Return (won, lost) across every page. Raises SourceUnavailable."""
+    """Return (won, lost), each list paged to its own end. Raises SourceUnavailable."""
     won, lost, page = {}, {}, 1
+    won_pages = lost_pages = 1  # real totals are learned from page 1
     while True:
         try:
             resp = requests.post(
                 TRADING_ENDPOINT,
-                data=_trading_body(page).encode(),
+                data=_trading_body(
+                    page if page <= won_pages else None,
+                    page if page <= lost_pages else None,
+                ).encode(),
                 headers={
                     "X-EBAY-API-CALL-NAME": "GetMyeBayBuying",
                     "X-EBAY-API-SITEID": "0",
@@ -229,10 +257,12 @@ def fetch_trading_lists(token):
             raise SourceUnavailable(f"network error calling {TRADING_ENDPOINT}: {type(exc).__name__}") from None
         if resp.status_code != 200:
             raise SourceUnavailable(f"HTTP {resp.status_code} from {TRADING_ENDPOINT}")
-        w, lo, total = parse_trading_page(resp.content)
+        w, lo, wp, lp = parse_trading_page(resp.content)
         won.update(w)
         lost.update(lo)
-        if page >= min(total, MAX_PAGES):
+        if page == 1:
+            won_pages, lost_pages = wp, lp
+        if page >= min(max(won_pages, lost_pages), MAX_PAGES):
             return won, lost
         page += 1
 
