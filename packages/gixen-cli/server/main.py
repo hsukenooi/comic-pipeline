@@ -2805,6 +2805,9 @@ async def api_get_all_bids(item_id: str | None = None, snipe_group: int | None =
             # BUI-384: same auditability rationale — the group-membership
             # start that bounds _group_won_before's cancel evidence.
             "group_changed_at": item.get("group_changed_at"),
+            # BUI-1349: expose the BUI-1346 eBay win-confirmation audit fields.
+            "ebay_bid_checked_at": item.get("ebay_bid_checked_at"),
+            "ebay_bid_status": item.get("ebay_bid_status"),
         })
     return result
 

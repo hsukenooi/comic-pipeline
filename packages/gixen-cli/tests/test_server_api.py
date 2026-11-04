@@ -3869,6 +3869,7 @@ def test_get_all_bids_response_shape_still_includes_pre_existing_fields(api):
         "end_date_iso", "added_at", "status", "status_mirror", "winning_bid",
         "seller", "local_snipe_at", "local_snipe_result", "gixen_vanished_at",
         "notes", "ebay_no_price_at", "group_changed_at",
+        "ebay_bid_checked_at", "ebay_bid_status",  # BUI-1349
     }
 
 
@@ -5744,3 +5745,20 @@ def test_retry_pending_removals_ignores_unstamped_rows(tmp_path, monkeypatch):
     db.close()
     assert row["status"] == "PENDING"
     mock.remove_snipe.assert_not_called()
+
+
+def test_api_bids_exposes_ebay_bid_audit_fields(api):
+    """BUI-1349: /api/bids returns the BUI-1346 eBay confirmation fields."""
+    _seed_bid_row("200000991", status="WON")
+    _seed_bid_row("200000992", status="WON")
+    conn = _dbconn()
+    conn.execute(
+        "UPDATE bids SET ebay_bid_checked_at='2026-11-04T00:00:00', "
+        "ebay_bid_status='WINNING' WHERE item_id='200000991'")
+    conn.commit()
+    conn.close()
+    rows = {r["item_id"]: r for r in api.get("/api/bids").json()}
+    assert rows["200000991"]["ebay_bid_checked_at"] == "2026-11-04T00:00:00"
+    assert rows["200000991"]["ebay_bid_status"] == "WINNING"
+    assert rows["200000992"]["ebay_bid_checked_at"] is None
+    assert rows["200000992"]["ebay_bid_status"] is None
