@@ -88,6 +88,7 @@ class Fake:
 
 
 def make(fake, tmp_path, **cfg):
+    cfg.setdefault("AUTOSNIPE_GRADE_CACHE", tmp_path / "grades.json")
     conf = dict(autosnipe.DEFAULTS, **{k: str(v) for k, v in cfg.items()})
     return Autosnipe(conf, run=fake, fetch=fake.fetch, now=NOW, workdir=tmp_path)
 
@@ -270,3 +271,77 @@ def test_main_reports_a_failed_run(tmp_path, monkeypatch):
                          "--json-out", str(tmp_path / "s.json")])
     assert rc == 1 and "Run failed: gixen list failed" in out.read_text()
     assert json.loads((tmp_path / "s.json").read_text())["error"].startswith("gixen list")
+
+
+GOOD = {"seats": [], "policy": {"consensus": {"grade": 6.0, "confidence": "MEDIUM"}}}
+
+
+def ungraded(*ids, hours=48):
+    return {i: listing(i, f"X-Men #{140 + n} (1981)", grade=None, hours=hours)
+            for n, i in enumerate(ids, 1)}
+
+
+def grade_calls(fake):
+    return [c for c in fake.calls if c[0] in ("grade-photos", "grade-seats")]
+
+
+def test_grade_is_cached_and_reused_next_night(tmp_path):
+    cache = tmp_path / "grades.json"
+    (tmp_path / "n1").mkdir()
+    (tmp_path / "n2").mkdir()
+    first = Fake(watch("1"), ungraded("1"), seats={"1": GOOD})
+    s1 = make(first, tmp_path / "n1", AUTOSNIPE_GRADE_CACHE=cache)
+    s1.execute()
+    assert grade_calls(first) and not by_id(s1)["1"].grade_cached
+    second = Fake(watch("1"), ungraded("1"))
+    s2 = make(second, tmp_path / "n2", AUTOSNIPE_DRY_RUN=1, AUTOSNIPE_GRADE_CACHE=cache)
+    s2.execute()
+    b = by_id(s2)["1"]
+    assert grade_calls(second) == [] and b.grade_cached and not b.skip
+    assert b.grade == 6.0 and b.grade_confidence == "medium"
+    assert "photo, medium, cached" in format_message(s2)
+    assert s2.summary()["books"][0]["grade_cached"] is True
+
+
+@pytest.mark.parametrize("seat,cached", [
+    ({"split": True}, True),
+    ({"seats": [{"grade": 5.0, "confidence": "HIGH"}]}, False),
+])
+def test_only_real_verdicts_are_cached(tmp_path, seat, cached):
+    s = make(Fake(watch("1"), ungraded("1"), seats={"1": seat}), tmp_path)
+    s.execute()
+    assert by_id(s)["1"].skip.startswith("Grade")
+    assert ("1" in json.loads((tmp_path / "grades.json").read_text())) is cached
+
+
+def test_expired_cache_entries_are_pruned(tmp_path):
+    (tmp_path / "grades.json").write_text(json.dumps(
+        {"old": {"grade": 5.0, "confidence": "HIGH", "end": iso(-1)}}))
+    s = make(Fake(watch("1"), ungraded("1"), seats={"1": GOOD}), tmp_path)
+    s.execute()
+    assert set(json.loads((tmp_path / "grades.json").read_text())) == {"1"}
+
+
+def test_unreadable_cache_grades_again(tmp_path):
+    (tmp_path / "grades.json").write_text("{not json")
+    fake = Fake(watch("1"), ungraded("1"), seats={"1": GOOD})
+    s = make(fake, tmp_path)
+    s.execute()
+    assert grade_calls(fake) and not by_id(s)["1"].skip
+    assert any("grade cache unreadable" in n for n in s.notes)
+
+
+def test_grading_cap_grades_soonest_ending_first(tmp_path):
+    w = watch("1", hours=72) + watch("2", hours=24)
+    books = {**ungraded("1", hours=72), **{"2": listing("2", "X-Men #150 (1981)", grade=None, hours=24)}}
+    (tmp_path / "grades.json").write_text(json.dumps(
+        {"3": {"grade": 7.0, "confidence": "HIGH", "end": iso(96)}}))
+    w += watch("3", hours=96)
+    books["3"] = listing("3", "X-Men #160 (1981)", grade=None, hours=96)
+    fake = Fake(w, books, seats={"2": GOOD})
+    s = make(fake, tmp_path, AUTOSNIPE_GRADE_MAX=1)
+    s.execute()
+    b = by_id(s)
+    assert b["1"].skip == "Grade – over the 1-book grading cap for one run"
+    assert not b["2"].skip and not b["3"].skip and b["3"].grade_cached
+    assert "1" not in json.loads((tmp_path / "grades.json").read_text())
