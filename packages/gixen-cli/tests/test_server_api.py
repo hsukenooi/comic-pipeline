@@ -938,6 +938,35 @@ def test_sync_captures_won_status(api):
     assert r.json()["purged_completed"] >= 1
 
 
+def test_purge_keeps_an_unchecked_won_findable_by_win_confirm(api):
+    """BUI-1348: POST /api/purge tombstones a WON that eBay has not confirmed
+    yet. The row must stay a win_confirm candidate (prior_status='WON',
+    unchecked) so a phantom tie win is still reversed after the purge."""
+    from datetime import datetime, timedelta, timezone
+    from server import win_confirm as wc
+
+    end = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    conn = sqlite3.connect(os.environ["DB_PATH"])
+    conn.execute(
+        "INSERT INTO bids (item_id, max_bid, status, winning_bid, auction_end_at, "
+        "resolved_at) VALUES ('400000077', 25.0, 'WON', 25.0, ?, ?)", (end, end),
+    )
+    conn.commit()
+    conn.close()
+
+    r = api.post("/api/purge", json={"sibling_ids": []})
+    assert r.status_code == 200
+
+    conn = sqlite3.connect(os.environ["DB_PATH"])
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM bids WHERE item_id='400000077'").fetchone()
+    assert row["status"] == "REMOVED"  # the purge still hides it
+    assert row["prior_status"] == "WON" and row["ebay_bid_checked_at"] is None
+    candidates = wc.candidate_rows(conn, datetime.now(timezone.utc))
+    conn.close()
+    assert [c["item_id"] for c in candidates] == ["400000077"]
+
+
 def test_edit_bid_non_numeric_item_id(api):
     r = api.patch("/api/bids/abc", json={"max_bid": 75.0, "bid_offset": 6, "snipe_group": 0})
     assert r.status_code == 422
