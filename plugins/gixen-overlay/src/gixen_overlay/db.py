@@ -5885,6 +5885,27 @@ def get_collection_wins_seen(conn: sqlite3.Connection) -> set[str]:
     return {r["item_id"] for r in rows}
 
 
+def get_reversed_win_bids(
+    conn: sqlite3.Connection, outbid_status: str, reversed_note: str
+) -> list[sqlite3.Row]:
+    """Bids rows whose Gixen WON eBay reversed to LOST (BUI-1346/BUI-1348).
+
+    Matches on BOTH the stored eBay status and the notes marker that
+    server.win_confirm writes, so a row only one of them touched is not
+    reported. Includes purge-swept rows (status REMOVED, prior_status LOST):
+    a win recorded into the collection before the purge is just as stale.
+    The caller passes server.db's EBAY_BID_STATUS_OUTBID and
+    WIN_REVERSED_NOTE so the vocabulary has one owner. Read-only.
+    """
+    return conn.execute(
+        "SELECT id, item_id, ebay_title, status, prior_status, max_bid, "
+        "winning_bid, auction_end_at, ebay_bid_checked_at FROM bids "
+        "WHERE ebay_bid_status = ? AND instr(COALESCE(notes, ''), ?) > 0 "
+        "ORDER BY id DESC",
+        (outbid_status, reversed_note),
+    ).fetchall()
+
+
 def mark_collection_wins_seen(
     conn: sqlite3.Connection, item_ids: list[str]
 ) -> int:

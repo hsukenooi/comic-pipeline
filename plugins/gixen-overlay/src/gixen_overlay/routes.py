@@ -40,6 +40,7 @@ from gixen_overlay.db import (
     mark_items_seen,
     remove_seen_for_seller,
     get_collection_wins_seen,
+    get_reversed_win_bids,
     mark_collection_wins_seen,
     get_first_party_outcomes,
     calibration_report,
@@ -96,6 +97,8 @@ from gixen_overlay.models import (
 )
 from gixen_overlay.title_parser import parse_title
 from server.db import (
+    EBAY_BID_STATUS_OUTBID,
+    WIN_REVERSED_NOTE,
     get_bid_by_item_id,
     resolve_server_dir,
     TOMBSTONE_STATUSES_SQL,
@@ -4305,6 +4308,72 @@ async def api_collection_wins_seen(request: Request):
     """
     db = request.app.state.db
     return {"item_ids": sorted(get_collection_wins_seen(db))}
+
+
+# The fields a human needs to pick the row out for remediate/delete. Not
+# gixen_item_id alone: it is not unique (a lot shares one id across issues).
+_REVERSED_WIN_ROW_FIELDS = (
+    "full_title", "series_name", "publisher_name", "release_date", "source",
+    "in_collection", "gixen_item_id", "metron_id",
+)
+
+
+@router.get("/api/comics/collection/reversed-wins")
+async def api_collection_reversed_wins(request: Request):
+    """Review list: wins eBay reversed that the collection already recorded (BUI-1348).
+
+    server.win_confirm flips a phantom Gixen WON to LOST when eBay reports
+    OUTBID (BUI-1346). If /comic:collection-add recorded that win first, the
+    book still reads owned. This lists every reversed win whose item_id is in
+    the record-win seen-set or on a collection row's ``gixen_item_id``, with
+    ALL matching rows (never one picked: ``gixen_item_id`` is not unique, and
+    an agent_win row can have a locg_export twin). A recorded win with no
+    matching row may have been absorbed into a locg_export row that does not
+    carry the id; check it by title.
+
+    Read-only: it never mutates the collection. A human removes a stale row
+    with ``POST /api/comics/collection/remediate/delete`` (``full_title`` +
+    ``release_date`` + ``source`` identity, ``dry_run`` first). An unreadable
+    store is a 500, never an empty list (R11).
+    """
+    db = request.app.state.db
+    bids = get_reversed_win_bids(db, EBAY_BID_STATUS_OUTBID, WIN_REVERSED_NOTE)
+    if not bids:
+        return {"count": 0, "reversed_wins": []}
+    seen = get_collection_wins_seen(db)
+    _ensure_collection_store()
+    try:
+        comics = CollectionCache().load().get("comics", [])
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=f"collection store unavailable: {exc}") from exc
+    by_item: dict[str, list[dict]] = {}
+    for row in comics:
+        gid = row.get("gixen_item_id")
+        if gid not in (None, ""):
+            by_item.setdefault(str(gid), []).append(
+                {k: row.get(k) for k in _REVERSED_WIN_ROW_FIELDS}
+            )
+    out = []
+    for b in bids:
+        item_id = str(b["item_id"])
+        rows = by_item.get(item_id, [])
+        recorded = item_id in seen
+        if not rows and not recorded:
+            continue
+        out.append({
+            "item_id": item_id,
+            "bid_id": b["id"],
+            "ebay_title": b["ebay_title"],
+            "bid_status": b["status"],
+            "prior_status": b["prior_status"],
+            "max_bid": b["max_bid"],
+            "winning_bid": b["winning_bid"],
+            "auction_end_at": b["auction_end_at"],
+            "reversed_at": b["ebay_bid_checked_at"],
+            "recorded_by_collection_add": recorded,
+            "collection_rows": rows,
+        })
+    return {"count": len(out), "reversed_wins": out}
 
 
 # ---------------------------------------------------------------------------
