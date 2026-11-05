@@ -350,6 +350,15 @@ def create_tables(conn: sqlite3.Connection) -> None:
             first_seen_at  TEXT DEFAULT (datetime('now'))
         )
     """)
+    # BUI-1355: reversed wins a human has reviewed and handled, so the BUI-1348
+    # review list can empty. Standalone (no FK), additive like collection_wins_seen.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS reversed_wins_dismissed (
+            item_id       TEXT PRIMARY KEY,
+            dismissed_at  TEXT DEFAULT (datetime('now')),
+            note          TEXT
+        )
+    """)
     # BUI-601: the rejected-writes ledger. Every 4xx/5xx on an overlay
     # request lands here (see ledger.LedgerRoute) — mutations from BUI-601,
     # and GETs too since BUI-707 — so a write (or now, a read) that the
@@ -5919,6 +5928,31 @@ def mark_collection_wins_seen(
         cur = conn.execute(
             "INSERT OR IGNORE INTO collection_wins_seen (item_id) VALUES (?)",
             (item_id,),
+        )
+        inserted += cur.rowcount
+    conn.commit()
+    return inserted
+
+
+def get_reversed_wins_dismissed(conn: sqlite3.Connection) -> set[str]:
+    """Return the item_ids of reversed wins a human has dismissed (BUI-1355)."""
+    rows = conn.execute("SELECT item_id FROM reversed_wins_dismissed").fetchall()
+    return {r["item_id"] for r in rows}
+
+
+def dismiss_reversed_wins(
+    conn: sqlite3.Connection, item_ids: list[str], note: str | None = None
+) -> int:
+    """Dismiss reversed-win item_ids. Returns the number newly inserted.
+
+    INSERT OR IGNORE keeps the original dismissed_at and note on a re-dismiss.
+    """
+    inserted = 0
+    for item_id in item_ids:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO reversed_wins_dismissed (item_id, note) "
+            "VALUES (?, ?)",
+            (item_id, note),
         )
         inserted += cur.rowcount
     conn.commit()
