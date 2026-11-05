@@ -40,7 +40,9 @@ from gixen_overlay.db import (
     mark_items_seen,
     remove_seen_for_seller,
     get_collection_wins_seen,
+    dismiss_reversed_wins,
     get_reversed_win_bids,
+    get_reversed_wins_dismissed,
     mark_collection_wins_seen,
     get_first_party_outcomes,
     calibration_report,
@@ -4319,7 +4321,9 @@ _REVERSED_WIN_ROW_FIELDS = (
 
 
 @router.get("/api/comics/collection/reversed-wins")
-async def api_collection_reversed_wins(request: Request):
+async def api_collection_reversed_wins(
+    request: Request, include_dismissed: bool = False
+):
     """Review list: wins eBay reversed that the collection already recorded (BUI-1348).
 
     server.win_confirm flips a phantom Gixen WON to LOST when eBay reports
@@ -4335,11 +4339,18 @@ async def api_collection_reversed_wins(request: Request):
     with ``POST /api/comics/collection/remediate/delete`` (``full_title`` +
     ``release_date`` + ``source`` identity, ``dry_run`` first). An unreadable
     store is a 500, never an empty list (R11).
+
+    An entry a human has handled is dismissed with
+    ``POST /api/comics/collection/reversed-wins/dismiss`` (BUI-1355) and is
+    hidden here. ``include_dismissed=true`` lists it too, flagged
+    ``dismissed: true``. Every entry carries ``dismissed``; ``dismissed_count``
+    is the number of dismissed entries among the matches (hidden or shown).
     """
     db = request.app.state.db
     bids = get_reversed_win_bids(db, EBAY_BID_STATUS_OUTBID, WIN_REVERSED_NOTE)
     if not bids:
-        return {"count": 0, "reversed_wins": []}
+        return {"count": 0, "dismissed_count": 0, "reversed_wins": []}
+    dismissed = get_reversed_wins_dismissed(db)
     seen = get_collection_wins_seen(db)
     _ensure_collection_store()
     try:
@@ -4354,12 +4365,18 @@ async def api_collection_reversed_wins(request: Request):
                 {k: row.get(k) for k in _REVERSED_WIN_ROW_FIELDS}
             )
     out = []
+    dismissed_count = 0
     for b in bids:
         item_id = str(b["item_id"])
         rows = by_item.get(item_id, [])
         recorded = item_id in seen
         if not rows and not recorded:
             continue
+        is_dismissed = item_id in dismissed
+        if is_dismissed:
+            dismissed_count += 1
+            if not include_dismissed:
+                continue
         out.append({
             "item_id": item_id,
             "bid_id": b["id"],
@@ -4371,9 +4388,46 @@ async def api_collection_reversed_wins(request: Request):
             "auction_end_at": b["auction_end_at"],
             "reversed_at": b["ebay_bid_checked_at"],
             "recorded_by_collection_add": recorded,
+            "dismissed": is_dismissed,
             "collection_rows": rows,
         })
-    return {"count": len(out), "reversed_wins": out}
+    return {"count": len(out), "dismissed_count": dismissed_count, "reversed_wins": out}
+
+
+@router.post("/api/comics/collection/reversed-wins/dismiss")
+async def api_collection_reversed_wins_dismiss(
+    request: Request, payload: dict = Body(default={})
+):
+    """Dismiss reviewed reversed-win entries so the review list empties (BUI-1355).
+
+    Body: ``{"item_ids": [str, ...], "note": optional str}``. Only item_ids
+    that are currently reversed wins are written; others come back in
+    ``unknown``. Re-dismissing is idempotent (``already_dismissed``). Never
+    touches the collection store: removing a stale row stays a separate,
+    human-decided ``remediate/delete``. Empty or malformed ``item_ids`` is 422.
+    """
+    item_ids = payload.get("item_ids")
+    note = payload.get("note")
+    if (
+        not isinstance(item_ids, list)
+        or not item_ids
+        or not all(isinstance(i, str) and i for i in item_ids)
+    ):
+        raise HTTPException(status_code=422, detail="item_ids must be a non-empty list of strings")
+    if note is not None and not isinstance(note, str):
+        raise HTTPException(status_code=422, detail="note must be a string")
+    db = request.app.state.db
+    reversed_ids = {
+        str(b["item_id"])
+        for b in get_reversed_win_bids(db, EBAY_BID_STATUS_OUTBID, WIN_REVERSED_NOTE)
+    }
+    already = get_reversed_wins_dismissed(db)
+    ordered = list(dict.fromkeys(item_ids))
+    unknown = [i for i in ordered if i not in reversed_ids]
+    already_dismissed = [i for i in ordered if i in reversed_ids and i in already]
+    fresh = [i for i in ordered if i in reversed_ids and i not in already]
+    n_new = dismiss_reversed_wins(db, fresh, note)
+    return {"dismissed": n_new, "already_dismissed": already_dismissed, "unknown": unknown}
 
 
 # ---------------------------------------------------------------------------

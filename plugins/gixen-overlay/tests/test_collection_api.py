@@ -1990,7 +1990,7 @@ def test_reversed_wins_flags_a_row_carrying_the_id_without_seen_entry(client):
 
 def test_reversed_wins_empty_without_reversals(client):
     body = client.get("/api/comics/collection/reversed-wins").json()
-    assert body == {"count": 0, "reversed_wins": []}
+    assert body == {"count": 0, "dismissed_count": 0, "reversed_wins": []}
 
 
 def test_reversed_wins_unreadable_store_is_500_not_empty(client):
@@ -1998,3 +1998,63 @@ def test_reversed_wins_unreadable_store_is_500_not_empty(client):
     (client.store / "collection.json").write_text("{not json")
     r = client.get("/api/comics/collection/reversed-wins")
     assert r.status_code == 500
+
+
+# --- dismissing reviewed reversed wins (BUI-1355) -----------------------------
+
+_DISMISS = "/api/comics/collection/reversed-wins/dismiss"
+
+
+def _seed_two_reversed(client):
+    _seed_collection(client.store, [_win_row("The Amazing Spider-Man #300", "111", "agent_win")])
+    _seed_reversed_bid(client, "111")
+    _seed_reversed_bid(client, "222", status="REMOVED", prior="LOST")
+    import os
+    import sqlite3
+    from gixen_overlay.db import mark_collection_wins_seen
+    db = sqlite3.connect(os.environ["DB_PATH"])
+    mark_collection_wins_seen(db, ["222"])
+    db.close()
+
+
+def test_dismissed_reversed_win_disappears_and_include_dismissed_shows_it(client):
+    _seed_two_reversed(client)
+    before = (client.store / "collection.json").read_text()
+    r = client.post(_DISMISS, json={"item_ids": ["222"], "note": "absorbed, fixed"})
+    assert r.status_code == 200, r.text
+    assert r.json() == {"dismissed": 1, "already_dismissed": [], "unknown": []}
+    body = client.get("/api/comics/collection/reversed-wins").json()
+    assert body["count"] == 1 and body["dismissed_count"] == 1
+    assert [w["item_id"] for w in body["reversed_wins"]] == ["111"]
+    assert body["reversed_wins"][0]["dismissed"] is False
+    full = client.get("/api/comics/collection/reversed-wins?include_dismissed=true").json()
+    assert full["count"] == 2 and full["dismissed_count"] == 1
+    flags = {w["item_id"]: w["dismissed"] for w in full["reversed_wins"]}
+    assert flags == {"111": False, "222": True}
+    assert (client.store / "collection.json").read_text() == before
+
+
+def test_dismiss_unknown_id_reported_and_not_written(client):
+    _seed_two_reversed(client)
+    r = client.post(_DISMISS, json={"item_ids": ["nope", "111"]})
+    assert r.json() == {"dismissed": 1, "already_dismissed": [], "unknown": ["nope"]}
+    import os
+    import sqlite3
+    db = sqlite3.connect(os.environ["DB_PATH"])
+    db.row_factory = sqlite3.Row
+    from gixen_overlay.db import get_reversed_wins_dismissed
+    assert get_reversed_wins_dismissed(db) == {"111"}
+    db.close()
+
+
+def test_redismiss_is_idempotent(client):
+    _seed_two_reversed(client)
+    assert client.post(_DISMISS, json={"item_ids": ["111"]}).json()["dismissed"] == 1
+    r = client.post(_DISMISS, json={"item_ids": ["111"]})
+    assert r.status_code == 200
+    assert r.json() == {"dismissed": 0, "already_dismissed": ["111"], "unknown": []}
+
+
+def test_dismiss_rejects_empty_list(client):
+    assert client.post(_DISMISS, json={"item_ids": []}).status_code == 422
+    assert client.post(_DISMISS, json={}).status_code == 422

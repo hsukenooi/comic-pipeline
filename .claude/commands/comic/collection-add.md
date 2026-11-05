@@ -341,7 +341,7 @@ Then check for reversed wins (BUI-1348). eBay can reverse a Gixen WON after this
 comics-api GET /api/comics/collection/reversed-wins
 ```
 
-When `count > 0`, list each entry's `item_id`, `ebay_title`, and every `collection_rows` entry under **Reversed wins to review**. Never remove a row here: Hsu Ken decides, then removes it with `POST /api/comics/collection/remediate/delete` by `full_title` + `release_date` + `source` (dry run first). An entry with no `collection_rows` may have been absorbed into a `locg_export` row, so check that one by title.
+When `count > 0`, list each entry's `item_id`, `ebay_title`, and every `collection_rows` entry under **Reversed wins to review**. Never remove a row here: Hsu Ken decides, then removes it with `POST /api/comics/collection/remediate/delete` by `full_title` + `release_date` + `source` (dry run first). An entry with no `collection_rows` may have been absorbed into a `locg_export` row, so check that one by title. Once Hsu Ken has handled an entry (removed the row, or confirmed it was absorbed and already fixed), dismiss it with `comics-api POST /api/comics/collection/reversed-wins/dismiss` and body `{"item_ids": [...]}`. Never dismiss without his decision.
 
 ## Common Mistakes
 
