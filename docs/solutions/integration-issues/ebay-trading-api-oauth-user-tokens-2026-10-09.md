@@ -27,6 +27,7 @@ Every app-level eBay call here uses a `client_credentials` token, which reaches 
 
 ## Guidance
 
+- **Add the RuName to the config before the first login (BUI-1369).** `ebay-auth login` reads it from the `runame` key in `~/.config/ebay-fetch/config.json`, beside the client id and secret. Without the key, login exits 3 with `no RuName: add a "runame" key to ...`. The value is the RuName string itself, not a URL, shaped like `Your_Name-YourApp-PRD-1a2b3c4d5-6e7f8a9b`. Find it in the eBay developer portal under **Application Keys**, then **User Tokens** for the Production keyset, then **Get a Token from eBay via Your Application**. Each eBay Redirect URL row there lists its RuName.
 - **Send the token in the IAF header.** Trading calls take `X-EBAY-API-IAF-TOKEN: <access token>`, not an `<eBayAuthToken>` XML element. Keep `X-EBAY-API-CALL-NAME`, `X-EBAY-API-SITEID`, and `X-EBAY-API-COMPATIBILITY-LEVEL` as usual.
 - **Get the refresh token once, in a browser.** `ebay-auth login` prints the consent URL, reads the pasted redirect URL, and exchanges the `code` (5-minute life) with `grant_type=authorization_code` and the RuName as `redirect_uri`.
 - **Mint access tokens with the refresh grant.** `grant_type=refresh_token` plus `scope`, Basic-authed with the client id and secret. Access tokens last 2 hours. eBay does not rotate the refresh token, so concurrent runs are safe.
