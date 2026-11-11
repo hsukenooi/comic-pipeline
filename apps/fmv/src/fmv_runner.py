@@ -33,6 +33,7 @@ import click
 import requests
 
 import fmv_math
+import pricecharting
 
 
 EBAY_SOLD_COMPS_BIN = "ebay-sold-comps"
@@ -831,6 +832,28 @@ def run(*, batch_path: str | None, out_path: str | None,
     # nothing (no happy-path noise, same as the block above), but "dropped 4,
     # stamped 0" is exactly the silent-nothing-stored shape this module keeps
     # getting burned by, so it is said out loud.
+    # BUI-1282: the PriceCharting append's outcome, counted every run. A
+    # failure already warned per book; this line makes the total visible
+    # under --quiet too, so a run that silently fell back to ledger-only
+    # pricing on every slab cannot read like one that appended (BUI-921).
+    pc_rows = [r for r in fresh_fmvs.values() if r.get("pc_status")]
+    if pc_rows:
+        pc_failed = sum(r["pc_status"] in pricecharting.FAILED_STATUSES
+                        for r in pc_rows)
+        pc_used = sum(bool((r.get("fmv") or {}).get("pc_slab_count"))
+                      for r in pc_rows)
+        pc_unresolved = sum(r["pc_status"] == pricecharting.UNRESOLVED
+                            for r in pc_rows)
+        pc_guarded = sum(bool(r.get("pc_guard_kept_base")) for r in pc_rows)
+        if pc_failed or pc_used or pc_unresolved or pc_guarded:
+            click.echo(
+                f"{'⚠️  ' if pc_failed else ''}PriceCharting: {pc_used} slab "
+                f"row(s) priced with PC sales appended, {pc_guarded} kept "
+                f"ledger-only by the refusal guard, {pc_unresolved} with no "
+                f"verified PC page, {pc_failed} FAILED (scrape/classify/parse;"
+                " priced ledger-only).",
+                err=True,
+            )
     ledger_dropped_total = sum(
         int(r.get("ledger_dropped") or 0) for r in fresh_fmvs.values())
     excluded_stamped_total = sum(
@@ -2981,6 +3004,82 @@ def _graded_as_of() -> date:
     return date.today()
 
 
+def _apply_pricecharting(base: dict, pool: list[dict], inp: dict,
+                         target_grade: float, *, certifier: str, label: str,
+                         page_quality: str | None,
+                         as_of: date,
+                         dropped_ids: set[str] | None = None,
+                         dropped_rows: list[dict] | None = None,
+                         ) -> tuple[dict, dict]:
+    """BUI-1282: re-price with PriceCharting CGC universal sales appended to
+    the slab pool, behind the BUI-1226 refusal guard.
+
+    Returns `(fmv, info)`. `fmv` is the appended result when
+    `pricecharting.keep_appended` accepts it, else `base` unchanged; either
+    way it carries `pc_slab_count` (PC comps in the pool that priced it, 0
+    when the ledger-only result stands). `info` is `{"status", "warning",
+    "appended", "guard_kept_base"}` for the run summary. A scrape, classify,
+    or parse failure prices ledger-only and is echoed here AND counted by
+    `run()`, never silent (BUI-921).
+
+    PC rows exist only inside this function's pool: they are not returned in
+    `slab_comps`, not posted to the comps ledger, and not sent to the server
+    (PC's terms are personal use; BUI-1218).
+    """
+    info = {"status": pricecharting.DISABLED, "warning": None, "appended": 0,
+            "guard_kept_base": False}
+    base["pc_slab_count"] = 0
+    if certifier != "cgc" or label != "universal":
+        info["status"] = "not_cgc_universal"
+        return base, info
+    try:
+        got = pricecharting.fetch_book_sales(inp.get("title"), inp.get("issue"),
+                                             inp.get("year"))
+    except (OSError, ValueError, TypeError, RuntimeError,
+            subprocess.SubprocessError) as e:
+        # Belt and braces: the module already turns every expected failure
+        # into a status. Anything else must still not cost the book its
+        # ledger-only price, and must still be reported.
+        got = {"status": "error", "sales": [], "warning":
+               f"PriceCharting {inp.get('title')} #{inp.get('issue')}: "
+               f"error ({type(e).__name__}: {e})"}
+    info["status"], info["warning"] = got["status"], got["warning"]
+    if got["warning"]:
+        tail = ("PriceCharting sales still used."
+                if got["status"] == pricecharting.OK
+                else "priced from live + ledger slab comps only.")
+        click.echo(f"⚠️  {got['warning']} — {tail}", err=True)
+    extra = pricecharting.append_rows(got["sales"], pool, certifier=certifier,
+                                      label=label, dropped_ids=dropped_ids,
+                                      dropped_rows=dropped_rows)
+    info["appended"] = len(extra)
+    if not extra:
+        return base, info
+    appended = fmv_math.graded_fmv(pool + extra, target_grade,
+                                   certifier=certifier, label=label,
+                                   page_quality=page_quality, as_of=as_of)
+    if not pricecharting.keep_appended(base, appended):
+        info["guard_kept_base"] = True
+        return base, info
+    appended["pc_slab_count"] = len(extra)
+    # PC sale prices never reach the server, and `fmv_notes` is posted: take
+    # them out of the per-sale price lists the notes print (multiset removal,
+    # so a ledger sale at the same price stays listed).
+    pc_prices = [float(r["price"]) for r in extra]
+    for key, price_of in (("exact_sales", float),
+                          ("exact_sales_detail", lambda d: float(d["price"]))):
+        left = list(pc_prices)
+        kept = []
+        for item in appended.get(key) or []:
+            price = price_of(item)
+            if price in left:
+                left.remove(price)
+            else:
+                kept.append(item)
+        appended[key] = kept
+    return appended, info
+
+
 def _compute_graded_one(result: dict | None, original_book: dict, *,
                         server_url: str,
                         punt_reason: str | None = None) -> dict:
@@ -3112,9 +3211,15 @@ def _compute_graded_one(result: dict | None, original_book: dict, *,
         result.get("graded_identity_dropped_ids") or [])
     pool = _merge_slab_pool(live_slab, ledger_slab, dropped_ids=dropped_ids)
 
+    as_of = _graded_as_of()
     fmv = fmv_math.graded_fmv(pool, target_grade, certifier=certifier,
                               label=label, page_quality=page_quality,
-                              as_of=_graded_as_of())
+                              as_of=as_of)
+    fmv, pc_info = _apply_pricecharting(fmv, pool, inp, target_grade,
+                                        certifier=certifier, label=label,
+                                        page_quality=page_quality, as_of=as_of,
+                                        dropped_ids=dropped_ids,
+                                        dropped_rows=dropped_rows)
     fmv["live_slab_count"] = len(live_slab)
     fmv["ledger_slab_count"] = len(ledger_slab)
     # BUI-929's printing guard already DROPPED the confirmed later printings
@@ -3139,6 +3244,12 @@ def _compute_graded_one(result: dict | None, original_book: dict, *,
     # visible rather than a silence.
     row["comps_excluded_posted"] = comps_excluded_posted
     row["ledger_dropped"] = ledger_dropped
+    # BUI-1282: the PriceCharting outcome for `run()`'s summary. Client-side
+    # only: `_upsert_fmv` builds its body field by field, and `_post_comps`
+    # above archived `live_slab`, which never holds a PC row.
+    row["pc_status"] = pc_info["status"]
+    row["pc_warning"] = pc_info["warning"]
+    row["pc_guard_kept_base"] = pc_info["guard_kept_base"]
     return row
 
 
@@ -4453,7 +4564,11 @@ def _graded_note_parts(fmv: dict) -> list[str]:
     if pool_n is not None:
         parts.append(
             f"slab_pool={pool_n} (live={fmv.get('live_slab_count', 0)} "
-            f"ledger={fmv.get('ledger_slab_count', 0)})")
+            f"ledger={fmv.get('ledger_slab_count', 0)}"
+            # BUI-1282: a count only, so the sources still add up to the
+            # pool; no PC sale row or price is ever written to the server.
+            + (f" pc={fmv['pc_slab_count']}" if fmv.get("pc_slab_count") else "")
+            + ")")
     for key, token in (("pool_undated_dropped", "undated_dropped"),
                        ("pool_stale_dropped", "stale_dropped"),
                        ("printing_dropped", "printing_dropped"),
@@ -5313,6 +5428,8 @@ def _certified_provenance(fmv: dict) -> str:
         tokens.append("pq widened")
     if fmv.get("ledger_dropped"):
         tokens.append(f"ledger-drop {fmv['ledger_dropped']}")
+    if fmv.get("pc_slab_count"):
+        tokens.append(f"pc {fmv['pc_slab_count']}")
     return " ".join(tokens)
 
 

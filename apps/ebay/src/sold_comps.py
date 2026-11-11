@@ -2945,6 +2945,34 @@ def run_batch(books: list[dict], api_key: str, *, force: bool = False,
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 
+def classify_slab_titles(items: list[dict]) -> list[dict]:
+    """Classify third-party slab sale titles the way this module's graded pool
+    would (BUI-1282). `comic-fmv` appends PriceCharting CGC sales to the slab
+    pool, and it shells out here rather than copying `parse_grade`,
+    `parse_slab_fields`, `hard_exclude`, and `graded_identity_exclude`, so a
+    title guard has one home. Each item is `{"title", "issue"}`; each result is
+    `{"grade", "certifier", "label", "page_quality", "exclude_code"}`, where
+    `exclude_code` is None for a title the live slab pool would admit. A title
+    with no certifier or no grade comes back with those fields None. No
+    network, no API key."""
+    out: list[dict] = []
+    for it in items:
+        title = str((it or {}).get("title") or "")
+        grade = parse_grade(title) if title else None
+        if not title or not _SLAB_TITLE_RE.search(title):
+            out.append({"grade": grade, "certifier": None, "label": None,
+                        "page_quality": None, "exclude_code": "not_graded"})
+            continue
+        f = parse_slab_fields(title)
+        if hard_exclude(title, graded_target=f["certifier"]):
+            code = "hard_exclude"
+        else:
+            code = graded_identity_exclude(title, issue=(it or {}).get("issue"))
+        out.append({"grade": grade, "certifier": f["certifier"], "label": f["label"],
+                    "page_quality": f["page_quality"], "exclude_code": code})
+    return out
+
+
 def _print_human(results: list[dict]) -> None:
     for r in results:
         inp = r["input"]
@@ -3048,9 +3076,24 @@ def main(argv=None) -> int:
                    help="Cache TTL in days (default: 7).")
     p.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS,
                    help="Thread pool size for batch mode (default: 10).")
+    p.add_argument("--classify-titles", metavar="PATH",
+                   help="Classify slab sale titles from a JSON array of "
+                        "{title, issue} ('-' for stdin) and print JSON; no "
+                        "fetch, no API key (BUI-1282).")
     p.add_argument("--quiet", action="store_true",
                    help="Suppress human summary on stdout.")
     args = p.parse_args(argv)
+
+    # BUI-1282: a local, keyless classification mode for comic-fmv's
+    # PriceCharting append. Handled before the API key load on purpose.
+    if args.classify_titles:
+        items = _read_batch(args.classify_titles)
+        if not isinstance(items, list):
+            print("Error: --classify-titles input must be a JSON array.",
+                  file=sys.stderr)
+            return 2
+        _write_out(args.out or "-", classify_slab_titles(items))
+        return 0
 
     api_key = load_sold_comps_key()
     ttl_sec = int(args.cache_ttl_days * 24 * 3600)
