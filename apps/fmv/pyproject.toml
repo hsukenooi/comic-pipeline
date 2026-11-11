@@ -24,6 +24,7 @@ include = [
     "src/fmv_cli.py",
     "src/fmv_math.py",
     "src/fmv_runner.py",
+    "src/pricecharting.py",
     "src/sentinel_probe.py",
 ]
 sources = ["src"]
