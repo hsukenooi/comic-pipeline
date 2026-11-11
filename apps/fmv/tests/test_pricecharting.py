@@ -500,3 +500,68 @@ def test_malformed_cache_entry_is_a_cache_miss(pc_on, monkeypatch):
     monkeypatch.setattr(pc, "scrape", lambda url: synthetic_page())
     got = pc.fetch_book_sales("X-Men", "96", 1975, now=1_000_000.0)
     assert got["cache"] == "miss" and got["status"] == pc.OK
+
+
+def test_a_pc_twin_of_an_excluded_ledger_row_stays_out_of_the_pool(tmp_path):
+    """BUI-1375: the excluded row is hidden by the default ledger read, so the
+    slab caller asks for it and uses it only to skip the PC copy."""
+    book = {"item_id": "1", "title": "X-Men", "issue": "96", "year": 1975,
+            "grade": 4.5, "certifier": "cgc"}
+    result = {"input": {"_req_id": 0, **book}, "comps": [],
+              "slab_comps": [_slab(900, 4.0, "e1"), _slab(1400, 5.5, "e2"),
+                             _slab(1500, 6.0, "e3")],
+              "queries_used": [{"tier": "base", "cached": False}]}
+    (tmp_path / "b.json").write_text(json.dumps([book]))
+    excluded = {**_slab(700, 4.5, "x9"), "excluded_code": "multibook_lot"}
+    seen = {}
+
+    def fake_ledger(*a, excluded_out=None, **k):
+        seen["asked"] = excluded_out is not None
+        if excluded_out is not None:
+            excluded_out.append(excluded)
+        return []
+
+    sales = _pc_sales(("x9", 4.5, 700.0, "2026-09-01"))
+    upsert = MagicMock(return_value={"comic_id": 42, "fmv_id": 7, "certifier": "cgc"})
+    with patch("fmv_runner._fetch_comps", return_value=[result]), \
+         patch("fmv_runner._upsert_fmv", upsert), \
+         patch("fmv_runner._post_comps", MagicMock(return_value=True)), \
+         patch("fmv_runner._post_comps_exclusions", return_value=0), \
+         patch("fmv_runner._fetch_ledger_comps", side_effect=fake_ledger), \
+         patch("fmv_runner._fetch_first_party_outcomes", return_value=[]), \
+         patch("fmv_runner._db_lookup_by_identity", return_value=[]), \
+         patch("fmv_runner._fetch_active_asks", return_value=None), \
+         patch("fmv_runner._probe_certifier_support", return_value=True), \
+         patch("fmv_runner._graded_as_of", return_value=_AS_OF), \
+         patch.object(pc, "fetch_book_sales",
+                      return_value={"status": "ok", "sales": sales, "warning": None}):
+        fmv_runner.run(batch_path=str(tmp_path / "b.json"),
+                       out_path=str(tmp_path / "o.json"), max_age_days=7,
+                       force=False, quiet=True, server_url="http://test-server:8080")
+    row = json.loads((tmp_path / "o.json").read_text())[0]
+    assert seen["asked"]
+    assert row["fmv"]["pc_slab_count"] == 0
+    assert all(c["product_id"] != "x9" for c in row["slab_comps"])
+
+
+class TestFetchLedgerCompsExcluded:
+    ROWS = [{"product_id": "a", "pool": "slab", "certifier": "cgc", "label": "universal"},
+            {"product_id": "x", "pool": "slab", "certifier": "cgc", "label": "universal",
+             "excluded_code": "printing"}]
+
+    def test_excluded_rows_are_split_out_and_param_sent(self):
+        sink = []
+        with patch("fmv_runner._get_json_or_warn", return_value=list(self.ROWS)) as g:
+            out = fmv_runner._fetch_ledger_comps(
+                "http://s", title="X", issue="1", year=1975, pool="slab",
+                excluded_out=sink)
+        assert g.call_args.kwargs["params"]["include_excluded"] == "true"
+        assert [r["product_id"] for r in out] == ["a"]
+        assert [r["product_id"] for r in sink] == ["x"]
+
+    def test_default_call_sends_no_param_and_never_returns_excluded(self):
+        with patch("fmv_runner._get_json_or_warn", return_value=list(self.ROWS)) as g:
+            out = fmv_runner._fetch_ledger_comps(
+                "http://s", title="X", issue="1", year=1975, pool="slab")
+        assert "include_excluded" not in g.call_args.kwargs["params"]
+        assert [r["product_id"] for r in out] == ["a"]
