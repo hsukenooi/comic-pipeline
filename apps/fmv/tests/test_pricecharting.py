@@ -396,3 +396,107 @@ def test_an_unexpected_error_prices_ledger_only_and_is_reported(capsys):
     assert fmv is base and info["status"] == "error"
     assert "error" in pc.FAILED_STATUSES
     assert "disk full" in capsys.readouterr().err
+
+
+# ─── BUI-1282 review fixes ──────────────────────────────────────────────────
+
+_IDENT = {"title": "X-Men", "issue": "96", "year": 1975}
+_AS_OF = date(2026, 9, 15)
+
+
+def _apply(base, pool, sales, **kw):
+    with patch.object(pc, "fetch_book_sales",
+                      return_value={"status": "ok", "sales": sales, "warning": None}):
+        return fmv_runner._apply_pricecharting(
+            base, pool, _IDENT, 4.5, certifier="cgc", label="universal",
+            page_quality=None, as_of=_AS_OF, **kw)
+
+
+def test_append_rows_skips_a_pc_twin_of_a_dropped_sale():
+    twin = _pc_sales(("e9", 4.5, 800.0, "2026-09-02"))[0]
+    other = _pc_sales(("p5", 4.5, 810.0, "2026-08-01"))[0]
+    kw = dict(certifier="cgc", label="universal")
+    assert pc.append_rows([twin], [], dropped_ids={"e9"}, **kw) == []
+    # a dropped row under a different id still matches on grade/date/price
+    dropped_row = {"product_id": "other", "grade": 4.5, "price": 800.0,
+                   "sold_date": "2026-09-02"}
+    assert pc.append_rows([twin], [], dropped_rows=[dropped_row], **kw) == []
+    assert [r["product_id"] for r in
+            pc.append_rows([twin, other], [], dropped_ids={"e9"}, **kw)] == ["p5"]
+
+
+def test_a_printing_dropped_sale_does_not_return_through_pc(tmp_path):
+    book = {"item_id": "1", "title": "X-Men", "issue": "96", "year": 1975,
+            "grade": 4.5, "certifier": "cgc"}
+    # e0 is the live sale the printing guard dropped: absent from slab_comps.
+    result = {"input": {"_req_id": 0, **book}, "comps": [],
+              "slab_comps": [_slab(900, 4.0, "e1"), _slab(1400, 5.5, "e2"),
+                             _slab(1500, 6.0, "e3")],
+              "graded_identity_dropped_ids": [{"product_id": "e0", "code": "printing"}],
+              "queries_used": [{"tier": "base", "cached": False}]}
+    (tmp_path / "b.json").write_text(json.dumps([book]))
+    sales = _pc_sales(("e0", 4.5, 700.0, "2026-09-01"))
+    upsert = MagicMock(return_value={"comic_id": 42, "fmv_id": 7, "certifier": "cgc"})
+    with patch("fmv_runner._fetch_comps", return_value=[result]), \
+         patch("fmv_runner._upsert_fmv", upsert), \
+         patch("fmv_runner._post_comps", MagicMock(return_value=True)), \
+         patch("fmv_runner._post_comps_exclusions", return_value=0), \
+         patch("fmv_runner._fetch_ledger_comps", return_value=[]), \
+         patch("fmv_runner._fetch_first_party_outcomes", return_value=[]), \
+         patch("fmv_runner._db_lookup_by_identity", return_value=[]), \
+         patch("fmv_runner._fetch_active_asks", return_value=None), \
+         patch("fmv_runner._probe_certifier_support", return_value=True), \
+         patch("fmv_runner._graded_as_of", return_value=_AS_OF), \
+         patch.object(pc, "fetch_book_sales",
+                      return_value={"status": "ok", "sales": sales, "warning": None}):
+        fmv_runner.run(batch_path=str(tmp_path / "b.json"),
+                       out_path=str(tmp_path / "o.json"), max_age_days=7,
+                       force=False, quiet=True, server_url="http://test-server:8080")
+    row = json.loads((tmp_path / "o.json").read_text())[0]
+    assert row["fmv"]["pc_slab_count"] == 0
+    assert not row["fmv"].get("exact_sales")
+
+
+def test_notes_never_list_a_pc_sale_price():
+    ledger = [_slab(900, 4.0, "e1"), _slab(1400, 5.5, "e2"), _slab(1500, 6.0, "e3")]
+    base = fmv_math.graded_fmv(ledger, 4.5, certifier="cgc", label="universal",
+                               as_of=_AS_OF)
+    assert base["pricing_basis"] == "ladder"
+    fmv, _ = _apply(base, ledger, _pc_sales(("p1", 4.5, 777.77, "2026-09-02")))
+    assert fmv["pc_slab_count"] == 1
+    notes = " | ".join(fmv_runner._graded_note_parts(fmv))
+    assert "777.77" not in notes and "pc=1" in notes
+
+
+def test_ledger_exact_price_is_not_removed_with_the_pc_one():
+    ledger = [_slab(700, 4.5, "e0"), _slab(900, 4.0, "e1"),
+              _slab(1400, 5.5, "e2"), _slab(1500, 6.0, "e3")]
+    base = fmv_math.graded_fmv(ledger, 4.5, certifier="cgc", label="universal",
+                               as_of=_AS_OF)
+    fmv, _ = _apply(base, ledger, _pc_sales(("p1", 4.5, 777.77, "2026-09-02")))
+    assert fmv["pc_slab_count"] == 1
+    assert fmv["exact_sales"] == [700.0]
+
+
+def test_cache_write_failure_message_says_pc_sales_still_used(capsys):
+    base = fmv_math.graded_fmv([], 4.5, certifier="cgc", label="universal",
+                               as_of=_AS_OF)
+    with patch.object(pc, "fetch_book_sales", return_value={
+            "status": "ok", "sales": DIRECT_PC,
+            "warning": "PriceCharting X-Men #96 (1975): cache write failed: boom"}):
+        fmv, _ = fmv_runner._apply_pricecharting(
+            base, [], _IDENT, 4.5, certifier="cgc", label="universal",
+            page_quality=None, as_of=_AS_OF)
+    err = capsys.readouterr().err
+    assert fmv["pc_slab_count"] == 3
+    assert "cache write failed" in err and "still used" in err
+    assert "ledger slab comps only" not in err
+
+
+def test_malformed_cache_entry_is_a_cache_miss(pc_on, monkeypatch):
+    path = pc._cache_path("X-Men", "96", 1975)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"version": pc.CACHE_VERSION, "fetched_at": 1_000_000.0}))
+    monkeypatch.setattr(pc, "scrape", lambda url: synthetic_page())
+    got = pc.fetch_book_sales("X-Men", "96", 1975, now=1_000_000.0)
+    assert got["cache"] == "miss" and got["status"] == pc.OK

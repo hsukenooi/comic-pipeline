@@ -3007,7 +3007,10 @@ def _graded_as_of() -> date:
 def _apply_pricecharting(base: dict, pool: list[dict], inp: dict,
                          target_grade: float, *, certifier: str, label: str,
                          page_quality: str | None,
-                         as_of: date) -> tuple[dict, dict]:
+                         as_of: date,
+                         dropped_ids: set[str] | None = None,
+                         dropped_rows: list[dict] | None = None,
+                         ) -> tuple[dict, dict]:
     """BUI-1282: re-price with PriceCharting CGC universal sales appended to
     the slab pool, behind the BUI-1226 refusal guard.
 
@@ -3042,10 +3045,13 @@ def _apply_pricecharting(base: dict, pool: list[dict], inp: dict,
                f"error ({type(e).__name__}: {e})"}
     info["status"], info["warning"] = got["status"], got["warning"]
     if got["warning"]:
-        click.echo(f"⚠️  {got['warning']} — priced from live + ledger slab "
-                   "comps only.", err=True)
+        tail = ("PriceCharting sales still used."
+                if got["status"] == pricecharting.OK
+                else "priced from live + ledger slab comps only.")
+        click.echo(f"⚠️  {got['warning']} — {tail}", err=True)
     extra = pricecharting.append_rows(got["sales"], pool, certifier=certifier,
-                                      label=label)
+                                      label=label, dropped_ids=dropped_ids,
+                                      dropped_rows=dropped_rows)
     info["appended"] = len(extra)
     if not extra:
         return base, info
@@ -3056,6 +3062,21 @@ def _apply_pricecharting(base: dict, pool: list[dict], inp: dict,
         info["guard_kept_base"] = True
         return base, info
     appended["pc_slab_count"] = len(extra)
+    # PC sale prices never reach the server, and `fmv_notes` is posted: take
+    # them out of the per-sale price lists the notes print (multiset removal,
+    # so a ledger sale at the same price stays listed).
+    pc_prices = [float(r["price"]) for r in extra]
+    for key, price_of in (("exact_sales", float),
+                          ("exact_sales_detail", lambda d: float(d["price"]))):
+        left = list(pc_prices)
+        kept = []
+        for item in appended.get(key) or []:
+            price = price_of(item)
+            if price in left:
+                left.remove(price)
+            else:
+                kept.append(item)
+        appended[key] = kept
     return appended, info
 
 
@@ -3196,7 +3217,9 @@ def _compute_graded_one(result: dict | None, original_book: dict, *,
                               as_of=as_of)
     fmv, pc_info = _apply_pricecharting(fmv, pool, inp, target_grade,
                                         certifier=certifier, label=label,
-                                        page_quality=page_quality, as_of=as_of)
+                                        page_quality=page_quality, as_of=as_of,
+                                        dropped_ids=dropped_ids,
+                                        dropped_rows=dropped_rows)
     fmv["live_slab_count"] = len(live_slab)
     fmv["ledger_slab_count"] = len(ledger_slab)
     # BUI-929's printing guard already DROPPED the confirmed later printings

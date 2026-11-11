@@ -274,7 +274,13 @@ def _cache_read(path: Path, now: float) -> dict | None:
         return None
     if not isinstance(entry, dict) or entry.get("version") != CACHE_VERSION:
         return None
-    ttl = PAGE_TTL_SEC if entry.get("status") == OK else NEGATIVE_TTL_SEC
+    # A malformed entry (hand-edited, truncated, or a pre-status writer) is a
+    # cache miss, never a KeyError in the caller.
+    if entry.get("status") not in (OK, UNRESOLVED):
+        return None
+    if entry["status"] == OK and not isinstance(entry.get("page"), str):
+        return None
+    ttl = PAGE_TTL_SEC if entry["status"] == OK else NEGATIVE_TTL_SEC
     fetched = entry.get("fetched_at")
     if not isinstance(fetched, (int, float)) or now - fetched > ttl:
         return None
@@ -426,16 +432,28 @@ def same_sale(pc: dict, c: dict) -> bool:
 
 
 def append_rows(sales: list[dict], pool: list[dict], *, certifier: str,
-                label: str) -> list[dict]:
+                label: str, dropped_ids: set[str] | None = None,
+                dropped_rows: list[dict] | None = None) -> list[dict]:
     """PC CGC universal sales shaped as slab pool comps, minus any sale a
-    pool comp already holds. Empty unless the target is CGC universal."""
+    pool comp already holds. Empty unless the target is CGC universal.
+
+    `dropped_ids` / `dropped_rows` (BUI-1282 review): the sales this run's
+    graded guards rejected (printing, store_variant, cross_title,
+    multibook_lot). PC re-lists the same eBay sale under the same item id, so
+    a PC row whose `product_id` is in `dropped_ids`, or that `same_sale`-matches
+    a dropped row, is skipped rather than smuggled back in."""
     if certifier != "cgc" or label != "universal":
         return []
+    dropped = {str(d) for d in (dropped_ids or ())}
     out = []
     for s in sales:
         if not s.get("universal") or s.get("exclude_code") is not None:
             continue
+        if str(s["product_id"]) in dropped:
+            continue
         if any(same_sale(s, c) for c in pool):
+            continue
+        if dropped_rows and any(same_sale(s, c) for c in dropped_rows):
             continue
         out.append({"provider": "pricecharting", "product_id": s["product_id"],
                     "title": s["title"], "price": s["price"],
