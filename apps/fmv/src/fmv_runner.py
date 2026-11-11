@@ -2283,7 +2283,9 @@ def _fetch_ledger_comps(server_url: str, *, title: str | None,
                         issue: object, year: int | None,
                         pool: str = "raw",
                         certifier: str | None = None,
-                        label: str | None = None) -> list[dict] | None:
+                        label: str | None = None,
+                        excluded_out: list[dict] | None = None
+                        ) -> list[dict] | None:
     """The ONE sanctioned read of `GET /api/comics/comps` from the pricing path.
 
     `plugins/gixen-overlay/tests/test_fmv_history.py` enforces that by parsing
@@ -2343,6 +2345,15 @@ def _fetch_ledger_comps(server_url: str, *, title: str | None,
     CBCS sale priced into a CGC ladder. (The raw caller passes neither and
     filters nothing, so its behaviour is unchanged.)
 
+    BUI-1375 — `excluded_out`: when a list is passed, the read adds
+    `include_excluded=true` and every row stamped with an `excluded_code`
+    (BUI-947) is moved into that list instead of the returned pool rows. The
+    pool therefore NEVER holds an excluded row; the list exists only so the
+    PriceCharting append can skip a PC twin of a hand-excluded sale. An older
+    server ignores the param and returns no excluded rows (the pre-fix
+    behaviour); the client also strips any excluded row it is handed, so it
+    cannot leak either way. Omitted (every other caller) sends nothing new.
+
     No `grade` filter either way: both pricing paths need the neighbouring
     grades — `build_pool` to widen its window, the slab ladder to interpolate.
     No `days` filter — see the staleness note above.
@@ -2357,6 +2368,7 @@ def _fetch_ledger_comps(server_url: str, *, title: str | None,
             "year": year,
             "pool": pool,
             "limit": LEDGER_ADVISORY_READ_LIMIT,
+            **({"include_excluded": "true"} if excluded_out is not None else {}),
         },
         warn=(f"comps-ledger advisory read failed for {title!r} #{issue} "
               "— falling back to a plain fetch-err for this book"),
@@ -2371,6 +2383,11 @@ def _fetch_ledger_comps(server_url: str, *, title: str | None,
     if not isinstance(rows, list):
         return None
     out = [r for r in rows if isinstance(r, dict)]
+    stamped = [r for r in out if r.get("excluded_code") is not None]
+    if stamped:
+        out = [r for r in out if r.get("excluded_code") is None]
+        if excluded_out is not None:
+            excluded_out.extend(stamped)
     if certifier is not None:
         out = [r for r in out
                if _identity_token(r.get("certifier"), "") == certifier]
@@ -3179,9 +3196,13 @@ def _compute_graded_one(result: dict | None, original_book: dict, *,
     live_slab = [c for c in slab_comps
                  if _identity_token(c.get("certifier"), "") == certifier
                  and _identity_token(c.get("label"), "") == label]
+    # BUI-1375: excluded ledger rows (BUI-947) never enter `ledger_slab`; their
+    # product_ids feed only the PC append's skip set below.
+    excluded_ledger: list[dict] = []
     ledger_slab = _fetch_ledger_comps(
         server_url, title=inp.get("title"), issue=inp.get("issue"),
         year=inp.get("year"), pool="slab", certifier=certifier, label=label,
+        excluded_out=excluded_ledger,
     ) or []
     # BUI-946: product_ids this run's live fetch guards (multibook_lot,
     # cross_title, store_variant, printing) excluded — see _merge_slab_pool's
@@ -3210,6 +3231,13 @@ def _compute_graded_one(result: dict | None, original_book: dict, *,
         server_url, dropped_rows,
         result.get("graded_identity_dropped_ids") or [])
     pool = _merge_slab_pool(live_slab, ledger_slab, dropped_ids=dropped_ids)
+    # BUI-1375: PC re-lists a hand-excluded sale under the same item id. Kept
+    # apart from `dropped_ids` so the pool merge and the exclusion stamping
+    # above stay exactly as they were.
+    pc_skip_ids = dropped_ids | {
+        str(r["product_id"]) for r in excluded_ledger
+        if r.get("product_id") not in (None, "")}
+    pc_skip_rows = dropped_rows + excluded_ledger
 
     as_of = _graded_as_of()
     fmv = fmv_math.graded_fmv(pool, target_grade, certifier=certifier,
@@ -3218,8 +3246,8 @@ def _compute_graded_one(result: dict | None, original_book: dict, *,
     fmv, pc_info = _apply_pricecharting(fmv, pool, inp, target_grade,
                                         certifier=certifier, label=label,
                                         page_quality=page_quality, as_of=as_of,
-                                        dropped_ids=dropped_ids,
-                                        dropped_rows=dropped_rows)
+                                        dropped_ids=pc_skip_ids,
+                                        dropped_rows=pc_skip_rows)
     fmv["live_slab_count"] = len(live_slab)
     fmv["ledger_slab_count"] = len(ledger_slab)
     # BUI-929's printing guard already DROPPED the confirmed later printings
