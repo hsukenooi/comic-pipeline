@@ -1,0 +1,30 @@
+{
+  "id": "1a03e2fx",
+  "internalDate": "1787748820000",
+  "payload": {
+    "mimeType": "multipart/alternative",
+    "headers": [
+      {
+        "name": "From",
+        "value": "Hart Audio Cables <orders@hartaudiocables.com>"
+      },
+      {
+        "name": "Subject",
+        "value": "A shipment from order #75151 is getting ready to ship!"
+      },
+      {
+        "name": "Date",
+        "value": "Wed, 26 Aug 2026 12:53:40 +0000 (UTC)"
+      }
+    ],
+    "body": {},
+    "parts": [
+      {
+        "mimeType": "text/plain",
+        "body": {
+          "data": "WW91ciBvcmRlciBpcyBnZXR0aW5nIHJlYWR5IHRvIHNoaXAhCgpIYXJ0IEF1ZGlvIENhYmxlcwoKT3JkZXIgIzc1MTUxCgotLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KWW91ciBvcmRlciBpcyBnZXR0aW5nIHJlYWR5IHRvIHNoaXAhCi0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQoKV2UndmUgcHJvY2Vzc2VkIHlvdXIgc2hpcHBpbmcgbGFiZWwgYW5kIGFyZSBnZXR0aW5nCnlvdXIgb3JkZXIgcmVhZHkgdG8gaGVhZCB5b3VyIHdheSEgWW91IHNob3VsZCBzZWUgdXBkYXRlcyBvbiB5b3VyCnRyYWNraW5nIHdpdGhpbiA0OCBob3Vycy4KCihQbGVhc2Ugbm90ZSwgaWYgb3V0c2lkZSB0aGUgVVMgaXQgY291bGQgdGFrZSBsb25nZXIgdG8gdXBkYXRlKQoKVmlldyB5b3VyIG9yZGVyIAooIGh0dHBzOi8vZXhhbXBsZS50ZXN0L3JlZGFjdGVkICkKCgpvciBWaXNpdCBvdXIgc3RvcmUgCiggaHR0cHM6Ly9leGFtcGxlLnRlc3QvcmVkYWN0ZWQgKQoKClVTUFMgdHJhY2tpbmcgbnVtYmVyOiA5MjAwMTkwMjY3MzM4ODAwMDEyNzc1NzY2MyAKKCBodHRwczovL2V4YW1wbGUudGVzdC9yZWRhY3RlZCApCgoKSXRlbXMgaW4gdGhpcyBzaGlwbWVudAotLS0tLS0tLS0tLS0tLS0tLS0tLS0tCgpSUEwtSEMtMTU6IER1YWwgTGVtbyAyLXBpbiBDYWJsZSBmb3IgRm9jYWwgVXRvcGlhIMOXIDEKClRocmVhZGVkIDMuNW1tIChTdGFuZGFyZCkKCklmIHlvdSBoYXZlIGFueSBxdWVzdGlvbnMsIHJlcGx5IHRvIHRoaXMgZW1haWwgb3IKY29udGFjdCB1cyBhdCBvcmRlcnNAaGFydGF1ZGlvY2FibGVzLmNvbQ=="
+        }
+      }
+    ]
+  }
+}
