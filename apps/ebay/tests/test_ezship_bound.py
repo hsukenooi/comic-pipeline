@@ -230,10 +230,20 @@ def test_ledger_hit_is_already_submitted():
     assert row["category"]["id"] == "1063"
 
 
-def test_order_shipped_before_the_window_is_not_listed():
-    payload = run([fixture("bigtime_confirmation"), fixture("bigtime_shipment")], days=45)
+def test_order_shipped_before_the_window_is_named_not_counted():
+    payload = run([fixture("bigtime_confirmation"), fixture("bigtime_shipment")], days=45,
+                  ledger={BIGTIME_TRACKING})
     assert payload["rows"] == []
-    assert payload["shipped_before_window"] == 1
+    assert payload["shipped_before_window"] == [{
+        "merchant": "BIG TIME COLLECTIBLES",
+        "order_number": "147708",
+        "last_email_at": "2026-07-01",
+        "tracking": [{"tracking_number": BIGTIME_TRACKING, "carrier": "USPS",
+                      "in_ledger": True}],
+    }]
+    text = eb.render_text(payload)
+    assert "Shipped before the 45-day window" in text
+    assert f"BIG TIME COLLECTIBLES #147708 | last email 2026-07-01 | USPS {BIGTIME_TRACKING} (in CLI ledger)" in text
 
 
 def test_own_replies_and_ezship_mail_are_excluded_from_the_query():

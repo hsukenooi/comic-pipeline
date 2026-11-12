@@ -288,7 +288,7 @@ def collect(order_days: int, days: int, max_results: int, ledger: set, categorie
         if key not in orders or orders[key]["status"] == "unparsed":
             orders[key] = row
 
-    rows, linked_tracking, stale = [], set(), 0
+    rows, linked_tracking, stale = [], set(), []
     for (sender, number), row in orders.items():
         if row["status"] == "unparsed":
             rows.append(row)
@@ -311,7 +311,15 @@ def collect(order_days: int, days: int, max_results: int, ledger: set, categorie
                 latest = msg["sent_at"]
         linked_tracking.update(tracking)
         if tracking and latest is not None and latest < cutoff:
-            stale += 1  # shipped before the window: treated as handled
+            # Shipped before the window. Named, never counted, because the
+            # ledger can't tell a website submission from a forgotten order.
+            stale.append({
+                "merchant": row["merchant"],
+                "order_number": number,
+                "last_email_at": latest.date().isoformat(),
+                "tracking": [{"tracking_number": t, "carrier": c,
+                              "in_ledger": t in ledger} for t, c in tracking.items()],
+            })
             continue
         _propose(row, tracking, ledger, categories)
         rows.append(row)
@@ -446,8 +454,15 @@ def render_text(payload: dict) -> str:
         out += [f"  - {s['from']} | {s['subject']}" for s in payload["skipped"]]
     out += ["", f"Note: {payload['ledger_note']}."]
     if payload["shipped_before_window"]:
-        out.append(f"{payload['shipped_before_window']} order(s) shipped before the "
-                   f"{payload['days']}-day window and are not listed.")
+        out += ["", f"Shipped before the {payload['days']}-day window "
+                    "(confirm each one is on the EZShip website):"]
+        for old in payload["shipped_before_window"]:
+            tracking = ", ".join(
+                f"{t['carrier']} {t['tracking_number']}"
+                + (" (in CLI ledger)" if t["in_ledger"] else "")
+                for t in old["tracking"])
+            out.append(f"  - {old['merchant'] or '?'} #{old['order_number']} | "
+                       f"last email {old['last_email_at']} | {tracking}")
     return "\n".join(out)
 
 
