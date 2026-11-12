@@ -48,7 +48,8 @@ CATEGORIES_PATH = Path(__file__).with_name("ezship_categories.json")
 
 # `Order #X`: the word Order first, so `#US-3108` matches and a `#2` in an
 # item name does not.
-_ORDER_NO = re.compile(r"Order\s*#\s*([A-Z0-9-]+)")
+_ORDER_NO = re.compile(
+    r"\bOrder\s*(?:#|No\.?|Number)\s*:?\s*#?\s*([A-Z0-9-]*\d[A-Z0-9-]*)", re.I)
 
 # The warehouse. "Portland, OR" alone is not enough: newsletters print a
 # Portland office address.
@@ -67,9 +68,15 @@ CATEGORY_RULES = [
     ("1013", "Cables", re.compile(r"\bcables?\b", re.I)),
 ]
 
+# Supplies and apparel that carry a Books keyword ("Comic bags & boards",
+# a Batman T-shirt). A name that hits one gets no Books match.
+_NOT_BOOKS = re.compile(
+    r"\b(?:bags?|boards?|boxes|box|sleeves?|shirts?|t-shirts?|tees?|hoodies?)\b", re.I)
+
 # Row statuses.
 READY = "ready_to_submit"
 WAITING = "waiting_for_tracking"
+SHIPPED_NO_TRACKING = "shipped_no_tracking"
 HOLD = "hold"
 UNSUPPORTED = "unsupported_carrier"
 NO_CATEGORY = "no_category"
@@ -102,7 +109,8 @@ def pick_category(item_names):
     """
     found = set()
     for name in item_names:
-        hits = {(cid, cname) for cid, cname, pat in CATEGORY_RULES if pat.search(name)}
+        hits = {(cid, cname) for cid, cname, pat in CATEGORY_RULES
+                if pat.search(name) and not (cid == "1063" and _NOT_BOOKS.search(name))}
         if not hits:
             return None, None, f"no category rule matches {name!r}"
         found |= hits
@@ -284,7 +292,7 @@ def _order_token(order_number: str):
         r"Order\s*#\s*" + re.escape(order_number) + r"(?![A-Za-z0-9-])", re.I)
 
 
-def classify_messages(messages):
+def classify_messages(messages, cutoff=None):
     """Split warehouse mail into orders, shipping mail, unparsed, skipped."""
     orders, shipping, unparsed, skipped = {}, [], [], 0
     for message in messages:
@@ -305,13 +313,28 @@ def classify_messages(messages):
         if is_shipping_mail(subject, text):
             shipping.append(message)
             continue
-        if not (_ORDER_NO.search(subject) or _ORDER_NO.search(text)):
+        merchant = parse_merchant(from_header) or from_header
+        if re.search(r"ezbuy|ezship", from_header, re.I):
             skipped += 1
             continue
-        merchant = parse_merchant(from_header) or from_header
+        if not (_ORDER_NO.search(subject) or _ORDER_NO.search(text)):
+            # Mail with no order number is judged on the shipment window only.
+            if cutoff is not None and not _in_window(sent_at, cutoff):
+                skipped += 1
+                continue
+            unparsed.append({
+                "status": UNPARSED, "message_id": message.get("id"),
+                "merchant": merchant, "subject": subject, "order_number": None,
+                "reason": "mail to the warehouse address with no order number"})
+            continue
         address = sender_address(from_header)
         parsed = parse_order(message)
         if not parsed["ok"]:
+            # Mail that cannot be read is only worth attention inside the
+            # shipment window; older mail is stale either way.
+            if cutoff is not None and not _in_window(sent_at, cutoff):
+                skipped += 1
+                continue
             unparsed.append({
                 "status": UNPARSED, "message_id": message.get("id"),
                 "merchant": merchant, "subject": subject,
@@ -341,9 +364,12 @@ def find_trackings(order: dict, order_days: int, max_results: int):
              f'"{order["order_number"]}"')
     fetched = fetch_messages(query, max_results)
     token = _order_token(order["order_number"])
-    trackings, ids = {}, set()
+    trackings, ids, untracked = {}, set(), []
     for message in fetched.messages:
         if message.get("id") == order["message_id"]:
+            continue
+        if (_REPLY_SUBJECT.match(headers_of(message).get("Subject", ""))
+                or "SENT" in (message.get("labelIds") or [])):
             continue
         body = decode_body(message.get("payload") or {})
         text = _plain_text(body)
@@ -352,11 +378,13 @@ def find_trackings(order: dict, order_days: int, max_results: int):
         ids.add(message.get("id"))
         found, _ur, _lr = extract_shipments(body, text)
         sent_at = _message_date(message, headers_of(message))
+        if not found and is_shipping_mail(headers_of(message).get("Subject", ""), text):
+            untracked.append(headers_of(message).get("Subject", ""))
         for carrier, number, _verified, _source in found:
             trackings.setdefault(number, {
                 "tracking_number": number, "carrier": carrier,
                 "sent_at": sent_at})
-    return list(trackings.values()), ids, fetched.truncated
+    return list(trackings.values()), ids, fetched.truncated, untracked
 
 
 def build_report(messages, ledger, days, order_days, search_max=_DEFAULT_SEARCH_MAX,
@@ -364,12 +392,12 @@ def build_report(messages, ledger, days, order_days, search_max=_DEFAULT_SEARCH_
     categories = categories if categories is not None else load_categories()
     now = now or datetime.now(timezone.utc)
     cutoff = now - timedelta(days=days)
-    orders, shipping, unparsed, skipped = classify_messages(messages)
+    orders, shipping, unparsed, skipped = classify_messages(messages, cutoff)
     truncated = False
     rows, linked_ids, outside_window = [], set(), 0
 
     for order in sorted(orders, key=lambda o: o["sent_at"] or "", reverse=True):
-        trackings, ids, trunc = find_trackings(order, order_days, search_max)
+        trackings, ids, trunc, untracked = find_trackings(order, order_days, search_max)
         truncated = truncated or trunc
         linked_ids |= ids
         row = {"merchant": order["merchant"], "order_number": order["order_number"],
@@ -377,6 +405,11 @@ def build_report(messages, ledger, days, order_days, search_max=_DEFAULT_SEARCH_
                "items": [i["name"] for i in order["items"]],
                "trackings": [t["tracking_number"] for t in trackings],
                "message_id": order["message_id"]}
+        if not trackings and untracked:
+            rows.append({**row, "status": SHIPPED_NO_TRACKING,
+                         "reason": "shipping mail found but no readable tracking "
+                                   f"number ({untracked[0]!r})"})
+            continue
         if not trackings:
             rows.append({**row, "status": WAITING})
             continue
@@ -533,7 +566,9 @@ def main(argv=None):
         print(render_table(report))
     if report["truncated"]:
         return _EXIT_TRUNCATED
-    return _EXIT_UNPARSED if report["unparsed"] else _EXIT_OK
+    attention = report["unparsed"] or any(
+        r["status"] == SHIPPED_NO_TRACKING for r in report["orders"])
+    return _EXIT_UNPARSED if attention else _EXIT_OK
 
 
 if __name__ == "__main__":

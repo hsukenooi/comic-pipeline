@@ -279,7 +279,7 @@ def test_category_file_is_in_the_wheel_include():
 
 def test_truncated_order_search_exits_2(monkeypatch, hart_order, tmp_path, capsys):
     def fake_fetch(query, max_results, max_workers=8):
-        if "from:" in query:
+        if "12826" not in query:
             return so.Fetched([], True, 25)
         return so.Fetched([hart_order], False, 1)
 
@@ -297,7 +297,7 @@ def test_gmail_failure_exits_1(monkeypatch, tmp_path, capsys):
 
 def test_order_search_failure_exits_1(monkeypatch, hart_order, tmp_path):
     def fake_fetch(query, max_results, max_workers=8):
-        if "from:" in query:
+        if "12826" not in query:
             raise so.ShippedOrdersError("denied")
         return so.Fetched([hart_order], False, 1)
 
@@ -342,3 +342,66 @@ def test_sent_label_mail_is_skipped(search):
                "Order #5\n12826 NE Airport Way\n")
     msg["labelIds"] = ["SENT"]
     assert report([msg])["unparsed"] == []
+
+
+def test_shipping_mail_without_tracking_is_not_waiting(hart_order, search):
+    vague = make("v1", "Hart Audio Cables <orders@hartaudiocables.com>",
+                 "A shipment from order #75151 is on the way",
+                 "Order #75151\nYour parcel is on its way. Track it with the carrier.\n")
+    search.map["75151"] = [vague]
+    row = row_for(report([hart_order]), "75151")
+    assert row["status"] == eb.SHIPPED_NO_TRACKING
+    assert "proposal" not in row
+
+
+def test_shipped_no_tracking_exits_3(monkeypatch, hart_order, tmp_path):
+    vague = make("v1", "Hart Audio Cables <orders@hartaudiocables.com>",
+                 "A shipment from order #75151 is on the way", "Order #75151\nOn its way.\n")
+
+    def fake_fetch(query, max_results, max_workers=8):
+        if "12826" not in query:
+            return so.Fetched([vague], False, 1)
+        return so.Fetched([hart_order], False, 1)
+
+    monkeypatch.setattr(eb, "fetch_messages", fake_fetch)
+    assert eb.main(["--ledger", str(tmp_path / "none.json")]) == 3
+
+
+@pytest.mark.parametrize("line", ["order #123", "ORDER #123", "Order No. 123",
+                                  "Order Number: 123"])
+def test_order_number_spellings_are_parsed_as_orders(line, search):
+    msg = make("p1", "Shop <a@shop.test>", "Receipt",
+               line + "\n12826 NE Airport Way\n")
+    rep = report([msg])
+    assert rep["skipped_not_warehouse"] == 0
+    assert rep["unparsed"][0]["order_number"] == "123"
+
+
+def test_warehouse_mail_without_order_number_is_unparsed(search):
+    msg = make("p2", "Shop <a@shop.test>", "Hello", "Ship to 12826 NE Airport Way\n")
+    rep = report([msg])
+    assert rep["skipped_not_warehouse"] == 0
+    assert rep["unparsed"][0]["reason"].endswith("no order number")
+
+
+def test_ezship_mail_is_still_skipped(search):
+    msg = make("p3", "EZShip <noreply@ezbuy.sg>", "Hello", "12826 NE Airport Way\n")
+    assert report([msg])["unparsed"] == []
+
+
+def test_item_number_is_not_an_order_number():
+    assert eb._ORDER_NO.search("Batman #2 comic") is None
+
+
+@pytest.mark.parametrize("name", ["Comic bags & boards", "Batman T-shirt",
+                                  "Comic book box", "Batman hoodie"])
+def test_supplies_and_apparel_are_not_books(name):
+    assert eb.pick_category([name])[0] is None
+
+
+def test_old_mail_without_order_number_is_skipped(search):
+    old = make("p9", "Shop <a@shop.test>", "Hello", "Ship to 12826 NE Airport Way\n",
+               date="Mon, 01 Jun 2026 00:00:00 +0000")
+    old["internalDate"] = str(int(datetime(2026, 6, 1, tzinfo=timezone.utc).timestamp() * 1000))
+    rep = report([old])
+    assert rep["unparsed"] == [] and rep["skipped_not_warehouse"] == 1
