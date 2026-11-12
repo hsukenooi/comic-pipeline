@@ -56,6 +56,7 @@ _WAREHOUSE = re.compile(
     r"12826\s*(?:NE|N\.E\.|North\s*east)\s+Airport\s+Way", re.I)
 
 _DEFAULT_SEARCH_MAX = 25
+_REPLY_SUBJECT = re.compile(r"\s*(?:re|fwd?)\s*:", re.I)
 
 # Keyword rules: whole words only, so "notebook" stays out of Books.
 # (category id, category name, pattern).
@@ -290,6 +291,10 @@ def classify_messages(messages):
         hdrs = headers_of(message)
         subject = hdrs.get("Subject", "")
         from_header = hdrs.get("From", "")
+        # Replies, forwards, and mail we sent are not merchant mail.
+        if _REPLY_SUBJECT.match(subject) or "SENT" in (message.get("labelIds") or []):
+            skipped += 1
+            continue
         text = plain_text_part(message.get("payload") or {})
         if text is None:
             text = _plain_text(decode_body(message.get("payload") or {}))

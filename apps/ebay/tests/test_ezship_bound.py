@@ -326,3 +326,19 @@ def test_main_uses_both_windows(monkeypatch, tmp_path):
     assert eb.main(["--days", "90", "--ledger", str(tmp_path / "n.json")]) == 0
     assert seen[0].startswith("newer_than:180d ")
     assert '"12826"' in seen[0] and "-from:ezbuy.sg" in seen[0]
+
+
+@pytest.mark.parametrize("subject", ["Re: Order #5 confirmed", "FWD: Order #5 confirmed",
+                                     "fw: Order #5 confirmed"])
+def test_reply_and_forward_mail_is_skipped(subject, search):
+    msg = make("r1", "Shop <a@shop.test>", subject,
+               "Order #5\n12826 NE Airport Way\n")
+    rep = report([msg])
+    assert rep["unparsed"] == [] and rep["orders"] == []
+
+
+def test_sent_label_mail_is_skipped(search):
+    msg = make("r2", "Me <me@example.test>", "Order #5 confirmed",
+               "Order #5\n12826 NE Airport Way\n")
+    msg["labelIds"] = ["SENT"]
+    assert report([msg])["unparsed"] == []
