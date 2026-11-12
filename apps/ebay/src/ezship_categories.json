@@ -1,0 +1,2226 @@
+{
+ "categories": [
+  {
+   "id": "1100",
+   "name": "Office Supplies",
+   "isDefault": false,
+   "declaredMin": "0",
+   "subCategories": [
+    {
+     "id": "1222",
+     "name": "Postcard",
+     "isDefault": false,
+     "declaredMin": "100"
+    }
+   ]
+  },
+  {
+   "id": "1104",
+   "name": "Toys",
+   "isDefault": false,
+   "declaredMin": "0",
+   "subCategories": [
+    {
+     "id": "1093",
+     "name": "Remote Control Car",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "1094",
+     "name": "soft toys",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "1095",
+     "name": "Learning toys",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "1096",
+     "name": "Building Blocks & lego",
+     "isDefault": false,
+     "declaredMin": "500"
+    }
+   ]
+  },
+  {
+   "id": "1107",
+   "name": "Home Decoration",
+   "isDefault": false,
+   "declaredMin": "0",
+   "subCategories": [
+    {
+     "id": "1219",
+     "name": "Photo frame",
+     "isDefault": false,
+     "declaredMin": "300"
+    },
+    {
+     "id": "1220",
+     "name": "photo album",
+     "isDefault": false,
+     "declaredMin": "300"
+    }
+   ]
+  },
+  {
+   "id": "1111",
+   "name": "Sport Equipment",
+   "isDefault": false,
+   "declaredMin": "0",
+   "subCategories": [
+    {
+     "id": "1173",
+     "name": "Dumbbell",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "1174",
+     "name": "Barbell",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "1175",
+     "name": "Horizontal Bar",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "1176",
+     "name": "Treadmill",
+     "isDefault": false,
+     "declaredMin": "5000"
+    },
+    {
+     "id": "1203",
+     "name": "Badminton racket",
+     "isDefault": false,
+     "declaredMin": "200"
+    }
+   ]
+  },
+  {
+   "id": "1121",
+   "name": "CD/DVD",
+   "isDefault": false,
+   "declaredMin": "0",
+   "subCategories": [
+    {
+     "id": "1221",
+     "name": "compact disc",
+     "isDefault": false,
+     "declaredMin": "1000"
+    }
+   ]
+  },
+  {
+   "id": "1123",
+   "name": "Personal Care",
+   "isDefault": false,
+   "declaredMin": "0",
+   "subCategories": [
+    {
+     "id": "1181",
+     "name": "Mosquito Repellent/Balm",
+     "isDefault": false,
+     "declaredMin": "1"
+    },
+    {
+     "id": "1182",
+     "name": "Hair Dryer",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "1183",
+     "name": "Cotton Swabs",
+     "isDefault": false,
+     "declaredMin": "1"
+    },
+    {
+     "id": "1184",
+     "name": "Cotton Pads",
+     "isDefault": false,
+     "declaredMin": "10"
+    },
+    {
+     "id": "1185",
+     "name": "Facial Tissue",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "1199",
+     "name": "contact lens",
+     "isDefault": false,
+     "declaredMin": "150"
+    },
+    {
+     "id": "1200",
+     "name": "Contact Lens Accessories",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "1201",
+     "name": "Dental floss",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "1202",
+     "name": "toothpick",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "1216",
+     "name": "Sanitary napkin",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "1217",
+     "name": "Mouthwash",
+     "isDefault": false,
+     "declaredMin": "100"
+    }
+   ]
+  },
+  {
+   "id": "1138",
+   "name": "Pet Supplies",
+   "isDefault": false,
+   "declaredMin": "0",
+   "subCategories": [
+    {
+     "id": "1069",
+     "name": "Pet Toys",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "1070",
+     "name": "Pet Diapers",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "1071",
+     "name": "Pet Clothes / Apparel",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "1072",
+     "name": "Pet Bed / House",
+     "isDefault": false,
+     "declaredMin": "300"
+    }
+   ]
+  },
+  {
+   "id": "1145",
+   "name": "Musical Instrument",
+   "isDefault": false,
+   "declaredMin": "0",
+   "subCategories": [
+    {
+     "id": "1215",
+     "name": "Electronic organ",
+     "isDefault": false,
+     "declaredMin": "2000"
+    },
+    {
+     "id": "1224",
+     "name": "er hu",
+     "isDefault": false,
+     "declaredMin": "2000"
+    }
+   ]
+  },
+  {
+   "id": "1146",
+   "name": "Bathroom Toiletries",
+   "isDefault": false,
+   "declaredMin": "0",
+   "subCategories": [
+    {
+     "id": "817",
+     "name": "Laundry Ball",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "818",
+     "name": "Faucet",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "819",
+     "name": "Basin",
+     "isDefault": false,
+     "declaredMin": "5000"
+    },
+    {
+     "id": "820",
+     "name": "Shower Nozzle",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "821",
+     "name": "Hair Conditioner",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "822",
+     "name": "Hair Shampoo",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "823",
+     "name": "Hair Coloring Kit",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "824",
+     "name": "Washing Powder / Liquid Detergent",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "825",
+     "name": "Shower Gel",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "826",
+     "name": "Toothpaste",
+     "isDefault": false,
+     "declaredMin": "300"
+    },
+    {
+     "id": "827",
+     "name": "Teeth Whitening Kit",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "828",
+     "name": "Hand Soap",
+     "isDefault": false,
+     "declaredMin": "300"
+    },
+    {
+     "id": "829",
+     "name": "Toothbrush",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "830",
+     "name": "Towel",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "831",
+     "name": "Shower Cap",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "832",
+     "name": "Bath Towel",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "1169",
+     "name": "Pipe",
+     "isDefault": false,
+     "declaredMin": "300"
+    }
+   ]
+  },
+  {
+   "id": "1147",
+   "name": "Construction & Renovation",
+   "isDefault": false,
+   "declaredMin": "0",
+   "subCategories": [
+    {
+     "id": "833",
+     "name": "Paper Box",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "834",
+     "name": "Bubble Wrap",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "835",
+     "name": "Anti Collision Strip",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "836",
+     "name": "Wall Paper",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "837",
+     "name": "Floor Panel",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "838",
+     "name": "Cotton Foam",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "839",
+     "name": "Paper Bag",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "840",
+     "name": "Screw",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "841",
+     "name": "Nut",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "842",
+     "name": "Automatives Accessories",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "843",
+     "name": "Home Appliances Accessories",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "844",
+     "name": "Multi- Tools",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "845",
+     "name": "Air Filter",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "846",
+     "name": "Screw Driver",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "1170",
+     "name": "Socket",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "1171",
+     "name": "Extension Socket",
+     "isDefault": false,
+     "declaredMin": "200"
+    }
+   ]
+  },
+  {
+   "id": "1148",
+   "name": "Cosmectis",
+   "isDefault": false,
+   "declaredMin": "0",
+   "subCategories": [
+    {
+     "id": "847",
+     "name": "Skin Care Products",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "848",
+     "name": "Facial Masks",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "849",
+     "name": "Facial Cream",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "850",
+     "name": "Lipstick",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "851",
+     "name": "Lip Balm",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "852",
+     "name": "Toner",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "853",
+     "name": "Nose Sticker",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "854",
+     "name": "Foundation",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "855",
+     "name": "Make up Brush",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "856",
+     "name": "Eyebrow Pencils",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "857",
+     "name": "Perfume",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "858",
+     "name": "Nail Polish",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "859",
+     "name": "Nail Sticker",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "860",
+     "name": "Beauty equipment",
+     "isDefault": false,
+     "declaredMin": "5000"
+    },
+    {
+     "id": "861",
+     "name": "Eyeshadow",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "862",
+     "name": "Mascara",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "863",
+     "name": "Blush",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "864",
+     "name": "Hair Regrowth Kit",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "865",
+     "name": "Essential Oil",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "866",
+     "name": "Fragrance Mist",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "867",
+     "name": "Deodorant",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "868",
+     "name": "Body Lotion",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "1186",
+     "name": "Hand Soap",
+     "isDefault": false,
+     "declaredMin": "10"
+    },
+    {
+     "id": "1187",
+     "name": "Facial Cleanser",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "1188",
+     "name": "Nail Clippers",
+     "isDefault": false,
+     "declaredMin": "1"
+    },
+    {
+     "id": "1189",
+     "name": "Razors",
+     "isDefault": false,
+     "declaredMin": "300"
+    },
+    {
+     "id": "1190",
+     "name": "Shaving Cream",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "1191",
+     "name": "Moisturizer",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "1192",
+     "name": "Cleansing Pads",
+     "isDefault": false,
+     "declaredMin": "10"
+    }
+   ]
+  },
+  {
+   "id": "1149",
+   "name": "Fashion",
+   "isDefault": false,
+   "declaredMin": "0",
+   "subCategories": [
+    {
+     "id": "869",
+     "name": "Tops & Tee",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "870",
+     "name": "Pajamas",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "871",
+     "name": "Pant",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "872",
+     "name": "Lingerie",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "873",
+     "name": "Skirt",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "874",
+     "name": "Coat",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "875",
+     "name": "Socks",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "876",
+     "name": "Uniform",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "877",
+     "name": "Shirt",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "878",
+     "name": "Swimming Suite",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "879",
+     "name": "Fabric",
+     "isDefault": false,
+     "declaredMin": "100"
+    }
+   ]
+  },
+  {
+   "id": "1150",
+   "name": "Fashion Accessories",
+   "isDefault": false,
+   "declaredMin": "0",
+   "subCategories": [
+    {
+     "id": "880",
+     "name": "Earrings & Studs",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "881",
+     "name": "Bracelet",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "882",
+     "name": "Ring",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "883",
+     "name": "Necklace",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "884",
+     "name": "Pendant",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "885",
+     "name": "Waist Badge",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "886",
+     "name": "Rubber Band",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "887",
+     "name": "Belt",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "1193",
+     "name": "Hair Clip",
+     "isDefault": false,
+     "declaredMin": "1"
+    }
+   ]
+  },
+  {
+   "id": "1151",
+   "name": "Games",
+   "isDefault": false,
+   "declaredMin": "0",
+   "subCategories": [
+    {
+     "id": "888",
+     "name": "Mahjong",
+     "isDefault": false,
+     "declaredMin": "5000"
+    },
+    {
+     "id": "889",
+     "name": "Poker Cards",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "890",
+     "name": "Poker Chips",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "891",
+     "name": "Board Games",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "892",
+     "name": "Game/Movie Disc",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "1097",
+     "name": "Game Console",
+     "isDefault": false,
+     "declaredMin": "1000"
+    }
+   ]
+  },
+  {
+   "id": "1152",
+   "name": "Groceries",
+   "isDefault": false,
+   "declaredMin": "0",
+   "subCategories": [
+    {
+     "id": "893",
+     "name": "Seasoning",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "895",
+     "name": "Snacks",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "896",
+     "name": "Tea",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "897",
+     "name": "Dry Foods",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "898",
+     "name": "Instant Noodle",
+     "isDefault": false,
+     "declaredMin": "300"
+    },
+    {
+     "id": "899",
+     "name": "Health Suppliments",
+     "isDefault": false,
+     "declaredMin": "2000"
+    },
+    {
+     "id": "900",
+     "name": "coffee beans",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "901",
+     "name": "coffee powder",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "902",
+     "name": "cooking spices",
+     "isDefault": false,
+     "declaredMin": "100"
+    }
+   ]
+  },
+  {
+   "id": "1153",
+   "name": "Health & Protective Supplies",
+   "isDefault": false,
+   "declaredMin": "0",
+   "subCategories": [
+    {
+     "id": "903",
+     "name": "Face Mask",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "904",
+     "name": "PPE Protective Suit",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "905",
+     "name": "Medical Cart",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "906",
+     "name": "Face Shield Mask",
+     "isDefault": false,
+     "declaredMin": "300"
+    },
+    {
+     "id": "907",
+     "name": "Disposal Gloves",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "908",
+     "name": "Shoe Cover",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "909",
+     "name": "Thermometer",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "910",
+     "name": "Blood Pressure Device / Machine",
+     "isDefault": false,
+     "declaredMin": "2000"
+    },
+    {
+     "id": "911",
+     "name": "Blood Glucose Meter",
+     "isDefault": false,
+     "declaredMin": "3000"
+    },
+    {
+     "id": "912",
+     "name": "Stethoscope",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "913",
+     "name": "Alcohol Wipes",
+     "isDefault": false,
+     "declaredMin": "300"
+    },
+    {
+     "id": "914",
+     "name": "bandage",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "915",
+     "name": "home first-aid kit",
+     "isDefault": false,
+     "declaredMin": "100"
+    }
+   ]
+  },
+  {
+   "id": "1154",
+   "name": "Home & Garden",
+   "isDefault": false,
+   "declaredMin": "0",
+   "subCategories": [
+    {
+     "id": "916",
+     "name": "Blanket",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "917",
+     "name": "Pillow",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "918",
+     "name": "Bedsheet 4in1",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "919",
+     "name": "Bedspread",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "920",
+     "name": "Mosquito Net",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "921",
+     "name": "Bolster",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "922",
+     "name": "Cushion",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "923",
+     "name": "Quilt Cover",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "924",
+     "name": "Bed Sheet",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "925",
+     "name": "Quilt",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "926",
+     "name": "Foot Mat",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "927",
+     "name": "Umbrella",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "928",
+     "name": "carpet",
+     "isDefault": false,
+     "declaredMin": "400"
+    },
+    {
+     "id": "929",
+     "name": "bleach",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "930",
+     "name": "surface cleaner",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "931",
+     "name": "leather care kit",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "932",
+     "name": "Lamp",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "933",
+     "name": "Yoga mat",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "934",
+     "name": "handicraft",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "935",
+     "name": "Hanger",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "936",
+     "name": "Mosquito Repellent Device",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "937",
+     "name": "Curtains",
+     "isDefault": false,
+     "declaredMin": "2000"
+    },
+    {
+     "id": "938",
+     "name": "Candles",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "939",
+     "name": "Wall Clock",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "940",
+     "name": "Basket",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "941",
+     "name": "Scissors",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "942",
+     "name": "Fencing",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "943",
+     "name": "Storage Rack",
+     "isDefault": false,
+     "declaredMin": "300"
+    },
+    {
+     "id": "944",
+     "name": "Pull Flower Decoration",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "945",
+     "name": "Christmas Tree",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "946",
+     "name": "Sewing Thread",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "947",
+     "name": "Wall Paper",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "948",
+     "name": "Rope",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "949",
+     "name": "Tools Box",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "950",
+     "name": "Rack",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "951",
+     "name": "Soap Dispenser",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "952",
+     "name": "Decoration Statue",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "953",
+     "name": "Home Fragrance",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "974",
+     "name": "Shovel",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "1167",
+     "name": "Storage Box",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "1168",
+     "name": "Mop",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "1197",
+     "name": "Air extractor",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "1205",
+     "name": "Piggy bank",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "1206",
+     "name": "Air pump",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "1207",
+     "name": "Key chain",
+     "isDefault": false,
+     "declaredMin": "20"
+    },
+    {
+     "id": "1208",
+     "name": "Glass bottle",
+     "isDefault": false,
+     "declaredMin": "50"
+    },
+    {
+     "id": "1209",
+     "name": "Plastic bottle",
+     "isDefault": false,
+     "declaredMin": "10"
+    },
+    {
+     "id": "1212",
+     "name": "Deodorant",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "1213",
+     "name": "Hanging ironing machine",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "1214",
+     "name": "Flower watering machine",
+     "isDefault": false,
+     "declaredMin": "1"
+    }
+   ]
+  },
+  {
+   "id": "1155",
+   "name": "Home Furniture",
+   "isDefault": false,
+   "declaredMin": "0",
+   "subCategories": [
+    {
+     "id": "954",
+     "name": "Bed Frame",
+     "isDefault": false,
+     "declaredMin": "5000"
+    },
+    {
+     "id": "955",
+     "name": "Light",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "956",
+     "name": "Mahjong Table",
+     "isDefault": false,
+     "declaredMin": "5000"
+    },
+    {
+     "id": "957",
+     "name": "Dining Table",
+     "isDefault": false,
+     "declaredMin": "5000"
+    },
+    {
+     "id": "958",
+     "name": "Mirror",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "959",
+     "name": "Chair",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "960",
+     "name": "Hammock",
+     "isDefault": false,
+     "declaredMin": "3000"
+    },
+    {
+     "id": "961",
+     "name": "Artificial Plants and Greenery",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "962",
+     "name": "Sofa",
+     "isDefault": false,
+     "declaredMin": "5000"
+    },
+    {
+     "id": "963",
+     "name": "Bed",
+     "isDefault": false,
+     "declaredMin": "5000"
+    },
+    {
+     "id": "964",
+     "name": "Mattress",
+     "isDefault": false,
+     "declaredMin": "5000"
+    },
+    {
+     "id": "965",
+     "name": "Sofa cover",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "966",
+     "name": "Vase",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "967",
+     "name": "Tv Console",
+     "isDefault": false,
+     "declaredMin": "5000"
+    },
+    {
+     "id": "968",
+     "name": "Coffee Table",
+     "isDefault": false,
+     "declaredMin": "5000"
+    },
+    {
+     "id": "969",
+     "name": "Partition",
+     "isDefault": false,
+     "declaredMin": "3000"
+    },
+    {
+     "id": "970",
+     "name": "Storage Cabinet",
+     "isDefault": false,
+     "declaredMin": "4000"
+    },
+    {
+     "id": "971",
+     "name": "Dressing Table",
+     "isDefault": false,
+     "declaredMin": "5000"
+    },
+    {
+     "id": "972",
+     "name": "Computer Desk",
+     "isDefault": false,
+     "declaredMin": "5000"
+    }
+   ]
+  },
+  {
+   "id": "1156",
+   "name": "Kitchenware",
+   "isDefault": false,
+   "declaredMin": "0",
+   "subCategories": [
+    {
+     "id": "973",
+     "name": "Glass",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "975",
+     "name": "Plastic Wrap",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "976",
+     "name": "Storage Container / Box",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "977",
+     "name": "Dustbin",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "978",
+     "name": "Storage Rack",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "979",
+     "name": "Plate",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "980",
+     "name": "Knife and Fork",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "981",
+     "name": "Chopsticks",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "982",
+     "name": "Cutting Board",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "983",
+     "name": "Induction Cooker",
+     "isDefault": false,
+     "declaredMin": "2000"
+    },
+    {
+     "id": "984",
+     "name": "Bowl",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "985",
+     "name": "Kitchen Knife",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "986",
+     "name": "Dishcloth",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "987",
+     "name": "Cutting Tools",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "988",
+     "name": "Vegetable Basket",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "989",
+     "name": "Drain basket",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "990",
+     "name": "Cooking Pan",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "991",
+     "name": "Cleaning Tools",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "992",
+     "name": "Barbecue Grill",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "993",
+     "name": "Kettle",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "994",
+     "name": "Food Container",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "995",
+     "name": "Baking Tools",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "996",
+     "name": "Oven",
+     "isDefault": false,
+     "declaredMin": "5000"
+    },
+    {
+     "id": "997",
+     "name": "Tissue",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "998",
+     "name": "Dish Soap",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "999",
+     "name": "Cooler",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "1000",
+     "name": "Water Filter",
+     "isDefault": false,
+     "declaredMin": "2000"
+    },
+    {
+     "id": "1165",
+     "name": "Insulation Bag",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "1166",
+     "name": "Insulation Box",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "1204",
+     "name": "Spoon",
+     "isDefault": false,
+     "declaredMin": "10"
+    },
+    {
+     "id": "1218",
+     "name": "Sterilizing cabinet",
+     "isDefault": false,
+     "declaredMin": "1000"
+    }
+   ]
+  },
+  {
+   "id": "1157",
+   "name": "Mobile, PC & Home Appliances",
+   "isDefault": false,
+   "declaredMin": "0",
+   "subCategories": [
+    {
+     "id": "1001",
+     "name": "Television",
+     "isDefault": false,
+     "declaredMin": "20000"
+    },
+    {
+     "id": "1002",
+     "name": "Refrigerator",
+     "isDefault": false,
+     "declaredMin": "20000"
+    },
+    {
+     "id": "1003",
+     "name": "Electric Sweeper",
+     "isDefault": false,
+     "declaredMin": "10000"
+    },
+    {
+     "id": "1004",
+     "name": "Washing Machine",
+     "isDefault": false,
+     "declaredMin": "20000"
+    },
+    {
+     "id": "1005",
+     "name": "Vacuum Cleaner",
+     "isDefault": false,
+     "declaredMin": "5000"
+    },
+    {
+     "id": "1006",
+     "name": "Electric Drill",
+     "isDefault": false,
+     "declaredMin": "2000"
+    },
+    {
+     "id": "1007",
+     "name": "Electronic Fan",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "1008",
+     "name": "Blower",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "1009",
+     "name": "Electronic Scale",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "1010",
+     "name": "Isulation Resistance Tester",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "1011",
+     "name": "Thermometer",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "1012",
+     "name": "LED Monitor",
+     "isDefault": false,
+     "declaredMin": "10000"
+    },
+    {
+     "id": "1013",
+     "name": "Cables",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "1014",
+     "name": "Fragrance Burner",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "1015",
+     "name": "Massager",
+     "isDefault": false,
+     "declaredMin": "2000"
+    },
+    {
+     "id": "1016",
+     "name": "Headset",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "1017",
+     "name": "Phone Casing",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "1018",
+     "name": "Screen Protector",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "1019",
+     "name": "Charger Cable",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "1020",
+     "name": "Charger",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "1021",
+     "name": "Phone Stand",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "1022",
+     "name": "Tablet Stand",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "1023",
+     "name": "Cooling Pad / Cooling Fan",
+     "isDefault": false,
+     "declaredMin": "300"
+    },
+    {
+     "id": "1024",
+     "name": "Selfie Stick",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "1025",
+     "name": "Hard Disc",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "1027",
+     "name": "Keyboard",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "1028",
+     "name": "Speaker",
+     "isDefault": false,
+     "declaredMin": "2000"
+    },
+    {
+     "id": "1029",
+     "name": "Monitor",
+     "isDefault": false,
+     "declaredMin": "10000"
+    },
+    {
+     "id": "1030",
+     "name": "Motherboard",
+     "isDefault": false,
+     "declaredMin": "5000"
+    },
+    {
+     "id": "1031",
+     "name": "Computer Case",
+     "isDefault": false,
+     "declaredMin": "3000"
+    },
+    {
+     "id": "1032",
+     "name": "Camera",
+     "isDefault": false,
+     "declaredMin": "6000"
+    },
+    {
+     "id": "1033",
+     "name": "Camera Lens",
+     "isDefault": false,
+     "declaredMin": "5000"
+    },
+    {
+     "id": "1034",
+     "name": "Battery",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "1035",
+     "name": "Powerbank",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "1036",
+     "name": "Watch",
+     "isDefault": false,
+     "declaredMin": "2000"
+    },
+    {
+     "id": "1037",
+     "name": "Watchband",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "1038",
+     "name": "Hand/Cell Phone",
+     "isDefault": false,
+     "declaredMin": "10000"
+    },
+    {
+     "id": "1039",
+     "name": "Kindle",
+     "isDefault": false,
+     "declaredMin": "5000"
+    },
+    {
+     "id": "1040",
+     "name": "Tablet",
+     "isDefault": false,
+     "declaredMin": "50000"
+    },
+    {
+     "id": "1041",
+     "name": "Chromecast/TV stick",
+     "isDefault": false,
+     "declaredMin": "3000"
+    },
+    {
+     "id": "1042",
+     "name": "Projector",
+     "isDefault": false,
+     "declaredMin": "5000"
+    },
+    {
+     "id": "1043",
+     "name": "Doorbell",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "1044",
+     "name": "Security Camera",
+     "isDefault": false,
+     "declaredMin": "3000"
+    },
+    {
+     "id": "1045",
+     "name": "Soundbar",
+     "isDefault": false,
+     "declaredMin": "5000"
+    },
+    {
+     "id": "1162",
+     "name": "Vacuum Sealer Machines",
+     "isDefault": false,
+     "declaredMin": "3000"
+    },
+    {
+     "id": "1172",
+     "name": "Lock",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "1198",
+     "name": "Adapters & Cables",
+     "isDefault": false,
+     "declaredMin": "500"
+    }
+   ]
+  },
+  {
+   "id": "1158",
+   "name": "Mothers&Kids",
+   "isDefault": false,
+   "declaredMin": "0",
+   "subCategories": [
+    {
+     "id": "1046",
+     "name": "Childrens Clothing",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "1047",
+     "name": "Milk Bottle",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "1048",
+     "name": "Diapers",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "1049",
+     "name": "Baby Chair",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "1050",
+     "name": "Baby Stroller",
+     "isDefault": false,
+     "declaredMin": "2000"
+    },
+    {
+     "id": "1051",
+     "name": "Baby Pacifier",
+     "isDefault": false,
+     "declaredMin": "200"
+    }
+   ]
+  },
+  {
+   "id": "1159",
+   "name": "Office & Stationery",
+   "isDefault": false,
+   "declaredMin": "0",
+   "subCategories": [
+    {
+     "id": "1052",
+     "name": "Printer",
+     "isDefault": false,
+     "declaredMin": "2000"
+    },
+    {
+     "id": "1053",
+     "name": "Printing Paper",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "1054",
+     "name": "Pen Holder",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "1055",
+     "name": "Badge",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "1056",
+     "name": "Folder",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "1057",
+     "name": "Cartridge",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "1058",
+     "name": "Pen",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "1059",
+     "name": "Seal/Chop/Stamp",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "1060",
+     "name": "Note Book",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "1061",
+     "name": "Corrector",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "1062",
+     "name": "Pencil Case",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "1063",
+     "name": "Books",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "1065",
+     "name": "Sharpener",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "1066",
+     "name": "Excercise Book",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "1067",
+     "name": "Tape",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "1163",
+     "name": "Thermal Paper",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "1164",
+     "name": "Sticky Notes",
+     "isDefault": false,
+     "declaredMin": "10"
+    },
+    {
+     "id": "1178",
+     "name": "Mouse",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "1179",
+     "name": "Mouse Pad",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "1180",
+     "name": "Glue",
+     "isDefault": false,
+     "declaredMin": "10"
+    },
+    {
+     "id": "1194",
+     "name": "powdered ink",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "1210",
+     "name": "Stapler",
+     "isDefault": false,
+     "declaredMin": "30"
+    },
+    {
+     "id": "1211",
+     "name": "Staple",
+     "isDefault": false,
+     "declaredMin": "1"
+    }
+   ]
+  },
+  {
+   "id": "1160",
+   "name": "Shoes, Bags & Accessories",
+   "isDefault": false,
+   "declaredMin": "0",
+   "subCategories": [
+    {
+     "id": "1073",
+     "name": "Suitcase",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "1074",
+     "name": "Shoe",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "1075",
+     "name": "Handbag / Totebag",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "1076",
+     "name": "Bagpack",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "1077",
+     "name": "Wallet / Purse",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "1078",
+     "name": "Zip",
+     "isDefault": false,
+     "declaredMin": "100"
+    },
+    {
+     "id": "1079",
+     "name": "Bag Strap",
+     "isDefault": false,
+     "declaredMin": "100"
+    }
+   ]
+  },
+  {
+   "id": "1161",
+   "name": "Sports & Outdoors",
+   "isDefault": false,
+   "declaredMin": "0",
+   "subCategories": [
+    {
+     "id": "1080",
+     "name": "Bicycle",
+     "isDefault": false,
+     "declaredMin": "4000"
+    },
+    {
+     "id": "1081",
+     "name": "Scating Board",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "1082",
+     "name": "Torch Light",
+     "isDefault": false,
+     "declaredMin": "300"
+    },
+    {
+     "id": "1083",
+     "name": "Tent",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "1084",
+     "name": "Ball",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "1085",
+     "name": "Hand Gloves",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "1086",
+     "name": "Hat / Cap",
+     "isDefault": false,
+     "declaredMin": "200"
+    },
+    {
+     "id": "1087",
+     "name": "Spectacles",
+     "isDefault": false,
+     "declaredMin": "500"
+    },
+    {
+     "id": "1088",
+     "name": "Crutch / Walking Stick",
+     "isDefault": false,
+     "declaredMin": "300"
+    },
+    {
+     "id": "1089",
+     "name": "Fishing Tools",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "1090",
+     "name": "Climbing Gear",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "1091",
+     "name": "Helmet",
+     "isDefault": false,
+     "declaredMin": "1000"
+    },
+    {
+     "id": "1223",
+     "name": "sport equipment",
+     "isDefault": false,
+     "declaredMin": "500"
+    }
+   ]
+  },
+  {
+   "id": "1195",
+   "name": "art designer",
+   "isDefault": false,
+   "declaredMin": "0",
+   "subCategories": [
+    {
+     "id": "1196",
+     "name": "Pigment",
+     "isDefault": false,
+     "declaredMin": "100"
+    }
+   ]
+  }
+ ]
+}

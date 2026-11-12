@@ -1,0 +1,33 @@
+{
+  "id": "fixture-nearearth_shipment",
+  "threadId": "fixture-nearearth_shipment",
+  "internalDate": "1794413071000",
+  "payload": {
+    "mimeType": "multipart/alternative",
+    "headers": [
+      {
+        "name": "From",
+        "value": "Near Earth US <store+81627906368@t.shopifyemail.com>"
+      },
+      {
+        "name": "Subject",
+        "value": "A shipment from order #US-3108 is on the way"
+      }
+    ],
+    "body": {},
+    "parts": [
+      {
+        "mimeType": "text/plain",
+        "body": {
+          "data": "WW91ciBvcmRlciBpcyBvbiB0aGUgd2F5CgpOZWFyIEVhcnRoIFVTCgpPcmRlciAjVVMtMzEwOAoKLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCllvdXIgb3JkZXIgaXMgb24gdGhlIHdheQotLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KCllvdXIgb3JkZXIgaXMgb24gdGhlIHdheS4gVHJhY2sgeW91ciBzaGlwbWVudCB0byBzZWUKdGhlIGRlbGl2ZXJ5IHN0YXR1cy4KClZpZXcgeW91ciBvcmRlciAKKCBodHRwczovL2V4YW1wbGUudGVzdC8gKQoKCm9yIFZpc2l0IG91ciBzdG9yZSAKKCBodHRwczovL2V4YW1wbGUudGVzdC8gKQoKCmVoYlVTUFMgdHJhY2tpbmcgbnVtYmVyOiA5MjAwMTkwMzI3NDEwNDE5OTQ0OTMzIAooIGh0dHBzOi8vZXhhbXBsZS50ZXN0LyApCgoKSXRlbXMgaW4gdGhpcyBzaGlwbWVudAotLS0tLS0tLS0tLS0tLS0tLS0tLS0tCgpUaGUgRGlzdGFuY2UgUnVubmluZyBTb2NrcywgMiBQYWNrIMOXIDEKCkVVIDQyLTQ0IC8gYmxhY2smd2hpdGUKCklmIHlvdSBoYXZlIGFueSBxdWVzdGlvbnMsIHJlcGx5IHRvIHRoaXMgZW1haWwgb3IKY29udGFjdCB1cyBhdCBzaG9wQG5lYXJlYXJ0aC5ydW4u"
+        }
+      },
+      {
+        "mimeType": "text/html",
+        "body": {
+          "data": "PGh0bWw-PGJvZHk-PHByZT5Zb3VyIG9yZGVyIGlzIG9uIHRoZSB3YXkKCk5lYXIgRWFydGggVVMKCk9yZGVyICNVUy0zMTA4CgotLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KWW91ciBvcmRlciBpcyBvbiB0aGUgd2F5Ci0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQoKWW91ciBvcmRlciBpcyBvbiB0aGUgd2F5LiBUcmFjayB5b3VyIHNoaXBtZW50IHRvIHNlZQp0aGUgZGVsaXZlcnkgc3RhdHVzLgoKVmlldyB5b3VyIG9yZGVyIAooIGh0dHBzOi8vZXhhbXBsZS50ZXN0LyApCgoKb3IgVmlzaXQgb3VyIHN0b3JlIAooIGh0dHBzOi8vZXhhbXBsZS50ZXN0LyApCgoKZWhiVVNQUyB0cmFja2luZyBudW1iZXI6IDkyMDAxOTAzMjc0MTA0MTk5NDQ5MzMgCiggaHR0cHM6Ly9leGFtcGxlLnRlc3QvICkKCgpJdGVtcyBpbiB0aGlzIHNoaXBtZW50Ci0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KClRoZSBEaXN0YW5jZSBSdW5uaW5nIFNvY2tzLCAyIFBhY2sgw5cgMQoKRVUgNDItNDQgLyBibGFjayZhbXA7d2hpdGUKCklmIHlvdSBoYXZlIGFueSBxdWVzdGlvbnMsIHJlcGx5IHRvIHRoaXMgZW1haWwgb3IKY29udGFjdCB1cyBhdCBzaG9wQG5lYXJlYXJ0aC5ydW4uPC9wcmU-PC9ib2R5PjwvaHRtbD4="
+        }
+      }
+    ]
+  }
+}

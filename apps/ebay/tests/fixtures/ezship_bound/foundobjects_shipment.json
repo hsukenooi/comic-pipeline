@@ -1,0 +1,33 @@
+{
+  "id": "fixture-foundobjects_shipment",
+  "threadId": "fixture-foundobjects_shipment",
+  "internalDate": "1794431682000",
+  "payload": {
+    "mimeType": "multipart/alternative",
+    "headers": [
+      {
+        "name": "From",
+        "value": "\"found / objects\" <info@foundobjects.store>"
+      },
+      {
+        "name": "Subject",
+        "value": "A shipment from order #1702 is on the way"
+      }
+    ],
+    "body": {},
+    "parts": [
+      {
+        "mimeType": "text/plain",
+        "body": {
+          "data": "WW91ciBvcmRlciBpcyBvbiB0aGUgd2F5CgoqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKgpmb3VuZCAvIG9iamVjdHMgCiggaHR0cHM6Ly9leGFtcGxlLnRlc3QvICkKCioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqCgpPcmRlciAjMTcwMgoKLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCllvdXIgb3JkZXIgaXMgb24gdGhlIHdheQotLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KCllvdXIgb3JkZXIgaXMgb24gdGhlIHdheS4gVHJhY2sgeW91ciBzaGlwbWVudCB0byBzZWUKdGhlIGRlbGl2ZXJ5IHN0YXR1cy4KClZpZXcgeW91ciBvcmRlciAKKCBodHRwczovL2V4YW1wbGUudGVzdC8gKQoKClRyYWNrIG9yZGVyIHdpdGggU2hvcCAKKCBodHRwczovL2V4YW1wbGUudGVzdC8gKQoKCm9yIFZpc2l0IG91ciBzdG9yZSAKKCBodHRwczovL2V4YW1wbGUudGVzdC8gKQoKClVTUFMgdHJhY2tpbmcgbnVtYmVyOiA5MjAwMTkwMjY3MzM4ODAwMTEyOTc4NTUyNCAKKCBodHRwczovL2V4YW1wbGUudGVzdC8gKQoKCkl0ZW1zIGluIHRoaXMgc2hpcG1lbnQKLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQoKQUJTT0xVVEUgQkFUTUFOICMyNCBGSUxJUEUgQU5EUkFERSAxOjI1IFJBVElPIMOXIDEKClNJR05FRCBDTEFZIE1BTk4gQUJTT0xVVEUgQkFUTUFOICMyNSBDVlIgTCBGT0lMIC0KUFJFU0FMRSAxMS8wNCDDlyAxCgpJZiB5b3UgaGF2ZSBhbnkgcXVlc3Rpb25zLCByZXBseSB0byB0aGlzIGVtYWlsIG9yCmNvbnRhY3QgdXMgYXQgaW5mb0Bmb3VuZG9iamVjdHMuc3RvcmUu"
+        }
+      },
+      {
+        "mimeType": "text/html",
+        "body": {
+          "data": "PGh0bWw-PGJvZHk-PHByZT5Zb3VyIG9yZGVyIGlzIG9uIHRoZSB3YXkKCioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqCmZvdW5kIC8gb2JqZWN0cyAKKCBodHRwczovL2V4YW1wbGUudGVzdC8gKQoKKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioKCk9yZGVyICMxNzAyCgotLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KWW91ciBvcmRlciBpcyBvbiB0aGUgd2F5Ci0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQoKWW91ciBvcmRlciBpcyBvbiB0aGUgd2F5LiBUcmFjayB5b3VyIHNoaXBtZW50IHRvIHNlZQp0aGUgZGVsaXZlcnkgc3RhdHVzLgoKVmlldyB5b3VyIG9yZGVyIAooIGh0dHBzOi8vZXhhbXBsZS50ZXN0LyApCgoKVHJhY2sgb3JkZXIgd2l0aCBTaG9wIAooIGh0dHBzOi8vZXhhbXBsZS50ZXN0LyApCgoKb3IgVmlzaXQgb3VyIHN0b3JlIAooIGh0dHBzOi8vZXhhbXBsZS50ZXN0LyApCgoKVVNQUyB0cmFja2luZyBudW1iZXI6IDkyMDAxOTAyNjczMzg4MDAxMTI5Nzg1NTI0IAooIGh0dHBzOi8vZXhhbXBsZS50ZXN0LyApCgoKSXRlbXMgaW4gdGhpcyBzaGlwbWVudAotLS0tLS0tLS0tLS0tLS0tLS0tLS0tCgpBQlNPTFVURSBCQVRNQU4gIzI0IEZJTElQRSBBTkRSQURFIDE6MjUgUkFUSU8gw5cgMQoKU0lHTkVEIENMQVkgTUFOTiBBQlNPTFVURSBCQVRNQU4gIzI1IENWUiBMIEZPSUwgLQpQUkVTQUxFIDExLzA0IMOXIDEKCklmIHlvdSBoYXZlIGFueSBxdWVzdGlvbnMsIHJlcGx5IHRvIHRoaXMgZW1haWwgb3IKY29udGFjdCB1cyBhdCBpbmZvQGZvdW5kb2JqZWN0cy5zdG9yZS48L3ByZT48L2JvZHk-PC9odG1sPg=="
+        }
+      }
+    ]
+  }
+}

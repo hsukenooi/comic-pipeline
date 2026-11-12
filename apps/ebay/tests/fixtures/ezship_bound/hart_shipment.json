@@ -1,0 +1,33 @@
+{
+  "id": "fixture-hart_shipment",
+  "threadId": "fixture-hart_shipment",
+  "internalDate": "1787748820000",
+  "payload": {
+    "mimeType": "multipart/alternative",
+    "headers": [
+      {
+        "name": "From",
+        "value": "Hart Audio Cables <orders@hartaudiocables.com>"
+      },
+      {
+        "name": "Subject",
+        "value": "A shipment from order #75151 is getting ready to ship!"
+      }
+    ],
+    "body": {},
+    "parts": [
+      {
+        "mimeType": "text/plain",
+        "body": {
+          "data": "WW91ciBvcmRlciBpcyBnZXR0aW5nIHJlYWR5IHRvIHNoaXAhCgpIYXJ0IEF1ZGlvIENhYmxlcwoKT3JkZXIgIzc1MTUxCgotLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KWW91ciBvcmRlciBpcyBnZXR0aW5nIHJlYWR5IHRvIHNoaXAhCi0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQoKV2UndmUgcHJvY2Vzc2VkIHlvdXIgc2hpcHBpbmcgbGFiZWwgYW5kIGFyZSBnZXR0aW5nCnlvdXIgb3JkZXIgcmVhZHkgdG8gaGVhZCB5b3VyIHdheSEgWW91IHNob3VsZCBzZWUgdXBkYXRlcyBvbiB5b3VyCnRyYWNraW5nIHdpdGhpbiA0OCBob3Vycy4KCihQbGVhc2Ugbm90ZSwgaWYgb3V0c2lkZSB0aGUgVVMgaXQgY291bGQgdGFrZSBsb25nZXIgdG8gdXBkYXRlKQoKVmlldyB5b3VyIG9yZGVyIAooIGh0dHBzOi8vZXhhbXBsZS50ZXN0LyApCgoKb3IgVmlzaXQgb3VyIHN0b3JlIAooIGh0dHBzOi8vZXhhbXBsZS50ZXN0LyApCgoKVVNQUyB0cmFja2luZyBudW1iZXI6IDkyMDAxOTAyNjczMzg4MDAwMTI3NzU3NjYzIAooIGh0dHBzOi8vZXhhbXBsZS50ZXN0LyApCgoKSXRlbXMgaW4gdGhpcyBzaGlwbWVudAotLS0tLS0tLS0tLS0tLS0tLS0tLS0tCgpSUEwtSEMtMTU6IER1YWwgTGVtbyAyLXBpbiBDYWJsZSBmb3IgRm9jYWwgVXRvcGlhIMOXIDEKClRocmVhZGVkIDMuNW1tIChTdGFuZGFyZCkKCklmIHlvdSBoYXZlIGFueSBxdWVzdGlvbnMsIHJlcGx5IHRvIHRoaXMgZW1haWwgb3IKY29udGFjdCB1cyBhdCBvcmRlcnNAaGFydGF1ZGlvY2FibGVzLmNvbQ=="
+        }
+      },
+      {
+        "mimeType": "text/html",
+        "body": {
+          "data": "PGh0bWw-PGJvZHk-PHByZT5Zb3VyIG9yZGVyIGlzIGdldHRpbmcgcmVhZHkgdG8gc2hpcCEKCkhhcnQgQXVkaW8gQ2FibGVzCgpPcmRlciAjNzUxNTEKCi0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQpZb3VyIG9yZGVyIGlzIGdldHRpbmcgcmVhZHkgdG8gc2hpcCEKLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCgpXZSYjeDI3O3ZlIHByb2Nlc3NlZCB5b3VyIHNoaXBwaW5nIGxhYmVsIGFuZCBhcmUgZ2V0dGluZwp5b3VyIG9yZGVyIHJlYWR5IHRvIGhlYWQgeW91ciB3YXkhIFlvdSBzaG91bGQgc2VlIHVwZGF0ZXMgb24geW91cgp0cmFja2luZyB3aXRoaW4gNDggaG91cnMuCgooUGxlYXNlIG5vdGUsIGlmIG91dHNpZGUgdGhlIFVTIGl0IGNvdWxkIHRha2UgbG9uZ2VyIHRvIHVwZGF0ZSkKClZpZXcgeW91ciBvcmRlciAKKCBodHRwczovL2V4YW1wbGUudGVzdC8gKQoKCm9yIFZpc2l0IG91ciBzdG9yZSAKKCBodHRwczovL2V4YW1wbGUudGVzdC8gKQoKClVTUFMgdHJhY2tpbmcgbnVtYmVyOiA5MjAwMTkwMjY3MzM4ODAwMDEyNzc1NzY2MyAKKCBodHRwczovL2V4YW1wbGUudGVzdC8gKQoKCkl0ZW1zIGluIHRoaXMgc2hpcG1lbnQKLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQoKUlBMLUhDLTE1OiBEdWFsIExlbW8gMi1waW4gQ2FibGUgZm9yIEZvY2FsIFV0b3BpYSDDlyAxCgpUaHJlYWRlZCAzLjVtbSAoU3RhbmRhcmQpCgpJZiB5b3UgaGF2ZSBhbnkgcXVlc3Rpb25zLCByZXBseSB0byB0aGlzIGVtYWlsIG9yCmNvbnRhY3QgdXMgYXQgb3JkZXJzQGhhcnRhdWRpb2NhYmxlcy5jb208L3ByZT48L2JvZHk-PC9odG1sPg=="
+        }
+      }
+    ]
+  }
+}
