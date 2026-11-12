@@ -1,0 +1,30 @@
+{
+  "id": "1a0f17fx",
+  "internalDate": "1790757983000",
+  "payload": {
+    "mimeType": "multipart/alternative",
+    "headers": [
+      {
+        "name": "From",
+        "value": "\"found / objects\" <info@foundobjects.store>"
+      },
+      {
+        "name": "Subject",
+        "value": "Order #1702 confirmed"
+      },
+      {
+        "name": "Date",
+        "value": "Wed, 30 Sep 2026 08:46:23 +0000 (UTC)"
+      }
+    ],
+    "body": {},
+    "parts": [
+      {
+        "mimeType": "text/plain",
+        "body": {
+          "data": "VGhhbmsgeW91IGZvciB5b3VyIG9yZGVyIQoKKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioKZm91bmQgLyBvYmplY3RzIAooIGh0dHBzOi8vZXhhbXBsZS50ZXN0L3JlZGFjdGVkICkKCioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqCgpPcmRlciAjMTcwMgoKLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQpUaGFuayB5b3UgZm9yIHlvdXIgb3JkZXIhCi0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KCldlJ3JlIGdldHRpbmcgeW91ciBvcmRlciByZWFkeSB0byBiZSBzaGlwcGVkLiBXZSB3aWxsCm5vdGlmeSB5b3Ugd2hlbiBpdCBoYXMgYmVlbiBzZW50LgoKVmlldyB5b3VyIG9yZGVyIAooIGh0dHBzOi8vZXhhbXBsZS50ZXN0L3JlZGFjdGVkICkKCgpEb3dubG9hZCB0byB0cmFjayB3aXRoIFNob3AgCiggaHR0cHM6Ly9leGFtcGxlLnRlc3QvcmVkYWN0ZWQgKQoKCm9yIFZpc2l0IG91ciBzdG9yZSAKKCBodHRwczovL2V4YW1wbGUudGVzdC9yZWRhY3RlZCApCgoKT3JkZXIgc3VtbWFyeQotLS0tLS0tLS0tLS0tCgpBQlNPTFVURSBCQVRNQU4gIzI0IEZJTElQRSBBTkRSQURFIDE6MjUgUkFUSU8gw5cgMQoKJDE2Ljk5CgpTSUdORUQgQ0xBWSBNQU5OIEFCU09MVVRFIEJBVE1BTiAjMjUgQ1ZSIEwgRk9JTCAtClBSRVNBTEUgMTEvMDQgw5cgMQoKJDQ0Ljk5CgpTdWJ0b3RhbAoKJDYxLjk4CgpTaGlwcGluZwoKJDYuOTAKClRheGVzCgokMC4wMAoKVG90YWwKCiQ2OC44OCBVU0QKCkN1c3RvbWVyIGluZm9ybWF0aW9uCi0tLS0tLS0tLS0tLS0tLS0tLS0tCgpTaGlwcGluZyBhZGRyZXNzCi0tLS0tLS0tLS0tLS0tLS0KClRlc3QgQnV5ZXIKMTI4MjYgTm9ydGhlYXN0IEFpcnBvcnQgV2F5ClBvcnRsYW5kIE9SIDk3MjMwClVuaXRlZCBTdGF0ZXMKCkJpbGxpbmcgYWRkcmVzcwotLS0tLS0tLS0tLS0tLS0KCltyZW1vdmVkXQoKUGF5bWVudAotLS0tLS0tCgpWaXNhCmVuZGluZyB3aXRoIDAwMDAKClNoaXBwaW5nIG1ldGhvZAotLS0tLS0tLS0tLS0tLS0KCkVjb25vbXkKCklmIHlvdSBoYXZlIGFueSBxdWVzdGlvbnMsIHJlcGx5IHRvIHRoaXMgZW1haWwgb3IKY29udGFjdCB1cyBhdCBpbmZvQGZvdW5kb2JqZWN0cy5zdG9yZS4="
+        }
+      }
+    ]
+  }
+}

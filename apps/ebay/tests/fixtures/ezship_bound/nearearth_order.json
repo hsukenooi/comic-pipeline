@@ -1,0 +1,30 @@
+{
+  "id": "1a1c92fx",
+  "internalDate": "1794376094000",
+  "payload": {
+    "mimeType": "multipart/alternative",
+    "headers": [
+      {
+        "name": "From",
+        "value": "Near Earth US <store+81627906368@t.shopifyemail.com>"
+      },
+      {
+        "name": "Subject",
+        "value": "Order #US-3108 confirmed"
+      },
+      {
+        "name": "Date",
+        "value": "Wed, 11 Nov 2026 05:48:14 +0000 (UTC)"
+      }
+    ],
+    "body": {},
+    "parts": [
+      {
+        "mimeType": "text/plain",
+        "body": {
+          "data": "VGhhbmsgeW91IGZvciB5b3VyIG9yZGVyIQoKTmVhciBFYXJ0aCBVUwoKT3JkZXIgI1VTLTMxMDgKCi0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KVGhhbmsgeW91IGZvciB5b3VyIG9yZGVyIQotLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCgpXZSdyZSBnZXR0aW5nIHlvdXIgb3JkZXIgcmVhZHkgdG8gYmUgc2hpcHBlZC4gV2Ugd2lsbApub3RpZnkgeW91IHdoZW4gaXQgaGFzIGJlZW4gc2VudC4KClZpZXcgeW91ciBvcmRlciAKKCBodHRwczovL2V4YW1wbGUudGVzdC9yZWRhY3RlZCApCgoKb3IgVmlzaXQgb3VyIHN0b3JlIAooIGh0dHBzOi8vZXhhbXBsZS50ZXN0L3JlZGFjdGVkICkKCgpPcmRlciBzdW1tYXJ5Ci0tLS0tLS0tLS0tLS0KClRoZSBEaXN0YW5jZSBSdW5uaW5nIFNvY2tzLCAyIFBhY2sgw5cgMQoKRVUgNDItNDQgLyBibGFjayZ3aGl0ZQoKJDQ1LjAwIFVTRAoKU3VidG90YWwKCiQ0NS4wMCBVU0QKClNoaXBwaW5nCgokNi4wMCBVU0QKClRheGVzCgokMC4wMCBVU0QKClRvdGFsCgokNTEuMDAgVVNECgpDdXN0b21lciBpbmZvcm1hdGlvbgotLS0tLS0tLS0tLS0tLS0tLS0tLQoKU2hpcHBpbmcgYWRkcmVzcwotLS0tLS0tLS0tLS0tLS0tCgpUZXN0IEJ1eWVyCjEyODI2IE5vcnRoZWFzdCBBaXJwb3J0IFdheQpQb3J0bGFuZCBPUiA5NzIzMApVbml0ZWQgU3RhdGVzCgpCaWxsaW5nIGFkZHJlc3MKLS0tLS0tLS0tLS0tLS0tCgpbcmVtb3ZlZF0KClBheW1lbnQKLS0tLS0tLQoKVmlzYQplbmRpbmcgd2l0aCAwMDAwCgpCb3VnaHQgd2l0aCBTaG9wICggaHR0cHM6Ly9leGFtcGxlLnRlc3QvcmVkYWN0ZWQgKSAKClNoaXBwaW5nIG1ldGhvZAotLS0tLS0tLS0tLS0tLS0KClN0YW5kYXJkCgpJZiB5b3UgaGF2ZSBhbnkgcXVlc3Rpb25zLCByZXBseSB0byB0aGlzIGVtYWlsIG9yCmNvbnRhY3QgdXMgYXQgc2hvcEBuZWFyZWFydGgucnVuLiBPcmRlcnMgc29sZCBieSBOZWFyIEVhcnRoIFVTLg=="
+        }
+      }
+    ]
+  }
+}
