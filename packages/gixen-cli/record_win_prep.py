@@ -104,9 +104,29 @@ REASON_UNPARSEABLE_LOT = "lot with unparseable contents"
 # reason UNLESS the server's Metron-cover-year check (BUI-498) positively places
 # the issue inside the resolved volume's window; the first collection-evidence
 # attempt (Option A) failed open, so the confirming signal is Metron's cover
-# year, never local evidence. Lots always hold under this reason (per-issue era
-# confirmation is out of scope).
+# year, never local evidence. A null-year lot is checked per constituent issue
+# (BUI-1384) and records only when every issue confirms.
 REASON_MISSING_YEAR = "year is null (vintage-key volume-mis-resolution risk)"
+
+
+def lot_era_key(item_id: object, issue: str) -> str:
+    """The era-evidence ``item_id`` for one lot constituent (BUI-1384).
+
+    The server echoes ``item_id`` opaquely, so a per-issue key lets one lot's
+    constituents get separate verdicts without a server change.
+    """
+    return f"{item_id}#{issue}"
+
+
+def _lot_constituents(identity: dict) -> list[str] | None:
+    """A lot's de-duplicated issues, or ``None`` when the lot is unparseable."""
+    raw = identity.get("constituent_issues") or []
+    valid = [c for c in raw if c]
+    if not identity.get("series") or not raw or len(valid) != len(raw):
+        return None
+    # A seller typo like "100, 100, 101" must not produce two entries sharing
+    # the same item_id + issue: that would double-record one physical book.
+    return list(dict.fromkeys(valid))
 
 
 class RecordWinPrepError(Exception):
@@ -453,7 +473,11 @@ def _build_win_entry(win: dict, identity: dict, *, issue: str) -> dict:
 
 
 def entries_for_win(
-    win: dict, identity: dict, *, era_confirmed: bool = False
+    win: dict,
+    identity: dict,
+    *,
+    era_confirmed: bool = False,
+    confirmed_lot_issues: frozenset[str] | set[str] = frozenset(),
 ) -> tuple[list[dict], dict | None]:
     """Turn one (win, comic-identify result) pair into either ready wins
     entries or a single needs_review entry. BUI-354: a null series/issue (or,
@@ -468,37 +492,33 @@ def entries_for_win(
     False and is consulted ONLY on the regular null-year path, so the flow
     fails closed — an unknown/failed/ambiguous signal, a lot, or any caller
     that passes nothing all hold exactly as BUI-475's unconditional hold-all
-    did (which is what replaced BUI-422's fail-open price gate). A lot with a
-    null year always holds regardless of ``era_confirmed`` (per-issue era
-    confirmation is out of BUI-498's scope)."""
+    did (which is what replaced BUI-422's fail-open price gate).
+
+    BUI-1384: a null-year lot is era-checked per constituent.
+    ``confirmed_lot_issues`` holds the issues the server confirmed. The lot
+    records only when every constituent is in it; otherwise the WHOLE lot
+    holds, naming the unconfirmed issues. Recording the confirmed part would
+    mark the item seen on commit, and the held issues would never come back."""
     if identity.get("error"):
         return [], _build_review_entry(win, identity, f"comic-identify error: {identity['error']}")
 
     if identity.get("is_lot"):
-        series = identity.get("series")
-        raw_constituents = identity.get("constituent_issues") or []
         # Every element must be a genuine issue value — a partially-parsed lot
         # (e.g. ["1", None, "3"]) is exactly as untrustworthy as an entirely
         # empty one and must not silently produce a win entry with a null
         # issue (the blank-issue outcome BUI-354's gate exists to prevent).
-        valid_constituents = [c for c in raw_constituents if c]
-        if not series or not raw_constituents or len(valid_constituents) != len(raw_constituents):
+        constituents = _lot_constituents(identity)
+        if constituents is None:
             return [], _build_review_entry(win, identity, REASON_UNPARSEABLE_LOT)
         # BUI-475: a null year on a lot is the same volume-mis-resolution risk
-        # as the non-lot case — its era can't be confirmed without a year, so
-        # gate it unconditionally before expanding into per-issue win entries.
-        # BUI-498's Metron-cover-year confirmation is per SINGLE issue and does
-        # not extend to lots (each constituent would need its own cover-year
-        # check), so a null-year lot always holds — `era_confirmed` is not
-        # consulted here (and `_needs_era_check` never requests it for a lot).
+        # as the non-lot case. Each constituent needs its own BUI-498 verdict.
         if identity.get("year") is None:
-            return [], _build_review_entry(win, identity, REASON_MISSING_YEAR)
-        # De-duplicate while preserving order: a title with a literal repeated
-        # issue number (e.g. a seller typo like "100, 100, 101") must not
-        # produce two win entries sharing the same item_id + issue — that
-        # would silently double-record the same physical book downstream.
-        deduped_constituents = list(dict.fromkeys(valid_constituents))
-        return [_build_win_entry(win, identity, issue=issue) for issue in deduped_constituents], None
+            unconfirmed = [i for i in constituents if i not in confirmed_lot_issues]
+            if unconfirmed:
+                review = _build_review_entry(win, identity, REASON_MISSING_YEAR)
+                review["era_unconfirmed_issues"] = unconfirmed
+                return [], review
+        return [_build_win_entry(win, identity, issue=issue) for issue in constituents], None
 
     if not identity.get("series") or not identity.get("issue"):
         return [], _build_review_entry(win, identity, REASON_NULL_SERIES_OR_ISSUE)
@@ -532,6 +552,29 @@ def _needs_era_check(identity: dict) -> bool:
     if not identity.get("series") or not identity.get("issue"):
         return False
     return identity.get("year") is None
+
+
+def _lot_era_requests(win: dict, identity: dict) -> list[dict]:
+    """One BUI-498 era-evidence request per constituent of a null-year lot
+    (BUI-1384), keyed by :func:`lot_era_key`. Empty for anything else,
+    including an unparseable lot, which holds for a reason the era signal
+    cannot lift."""
+    if identity.get("error") or not identity.get("is_lot"):
+        return []
+    if identity.get("year") is not None:
+        return []
+    constituents = _lot_constituents(identity)
+    if constituents is None:
+        return []
+    return [
+        {
+            "item_id": lot_era_key(win.get("item_id"), issue),
+            "series": identity.get("series"),
+            "issue": issue,
+            "edition": identity.get("edition"),
+        }
+        for issue in constituents
+    ]
 
 
 def build_payload(
@@ -596,11 +639,24 @@ def build_payload(
         for win, identity in zip(new_wins, identities)
         if _needs_era_check(identity)
     ]
+    # BUI-1384: null-year lots ride the same call, one request per issue.
+    for win, identity in zip(new_wins, identities):
+        era_requests.extend(_lot_era_requests(win, identity))
     era_map = fetch_era(server_url, era_requests) if era_requests else {}
 
     for win, identity in zip(new_wins, identities):
         era_confirmed = era_map.get(win.get("item_id"), False)
-        entries, review = entries_for_win(win, identity, era_confirmed=era_confirmed)
+        confirmed_lot_issues = frozenset(
+            req["issue"]
+            for req in _lot_era_requests(win, identity)
+            if era_map.get(req["item_id"], False)
+        )
+        entries, review = entries_for_win(
+            win,
+            identity,
+            era_confirmed=era_confirmed,
+            confirmed_lot_issues=confirmed_lot_issues,
+        )
         result["wins"].extend(entries)
         if review is not None:
             result["needs_review"].append(review)

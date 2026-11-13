@@ -95,10 +95,36 @@ class WriteWinsResult(NamedTuple):
     the number of rows passed to ``write_wins`` — a caller counting only
     ``len(rows)`` submitted (the pre-BUI-367 behavior) over-reports how many
     *new* rows actually landed whenever a duplicate is present.
+
+    ``self_overwritten`` (BUI-1384) names the ``full_title`` of each row that
+    replaced a row written earlier in the SAME commit (this call, or an earlier
+    chunk sharing ``written_keys``). A re-record against the store is normal;
+    a commit overwriting its own rows means two books collapsed onto one key,
+    so the caller fails loudly on it.
     """
 
     inserted: int
     overwritten: int
+    self_overwritten: tuple[str, ...] = ()
+
+
+#: The issue token in a win row's ``full_title`` ("Power Fantasy #3 Newsstand
+#: Edition" -> "3"). Lot rows share one ``gixen_item_id``, so the token is
+#: what tells their constituents apart (BUI-1384).
+_WIN_ISSUE_RE = re.compile(r"#\s*([^\s#]+)")
+
+
+def win_row_key(row: dict[str, Any]) -> tuple[str, str | None] | None:
+    """The ``write_wins`` identity of an agent_win row: item ID plus issue.
+
+    ``None`` for a row without a ``gixen_item_id`` (always appended). A title
+    with no ``#`` token keys on the item ID alone, the pre-BUI-1384 rule.
+    """
+    gixen_id = row.get("gixen_item_id")
+    if not gixen_id:
+        return None
+    match = _WIN_ISSUE_RE.search(str(row.get("full_title") or ""))
+    return (str(gixen_id), match.group(1).lower() if match else None)
 
 
 # Per-process monotonic counter for tiebreaking rows with identical timestamps
@@ -1566,18 +1592,56 @@ class CollectionCache:
             "wish_list_count": wish_count,
         }
 
+    @staticmethod
+    def _single_win_fallback(
+        comics: list[dict[str, Any]],
+        key: tuple[str, str | None],
+        idx_by_item: dict[str, list[int]],
+        incoming_per_item: dict[str, int],
+        this_commit: set[tuple[str, str | None]],
+    ) -> int | None:
+        """The row a corrected single-issue re-record replaces, or ``None``.
+
+        A single win re-recorded with a corrected issue (#300 to #399) still
+        overwrites its old row, as before BUI-1384. It applies only when this
+        batch carries one row for the item, the store holds exactly one, and
+        this commit did not write that one. A lot split across two chunks
+        therefore never overwrites its own first half.
+        """
+        if incoming_per_item.get(key[0]) != 1:
+            return None
+        existing = idx_by_item.get(key[0]) or []
+        if len(existing) != 1:
+            return None
+        if win_row_key(comics[existing[0]]) in this_commit:
+            return None
+        return existing[0]
+
     def write_wins(
-        self, rows: list[dict[str, Any]], command: str = "record-win"
+        self,
+        rows: list[dict[str, Any]],
+        command: str = "record-win",
+        *,
+        written_keys: set[tuple[str, str | None]] | None = None,
     ) -> WriteWinsResult:
         """Insert or update a batch of agent_win rows under exclusive lock.
 
-        Duplicate detection is by gixen_item_id: an existing row with the
-        same ID is overwritten; rows without a gixen_item_id are always
-        appended.  The index is kept up to date as rows are appended (BUI-356)
-        so two incoming rows sharing a gixen_item_id within the same call are
-        handled identically to a duplicate against the on-disk store — the
-        later row overwrites the earlier one in place rather than both being
-        appended.  Callers are responsible for chunking large batches.
+        Duplicate detection is by :func:`win_row_key`, the gixen_item_id plus
+        the issue in ``full_title`` (BUI-1384): a lot's rows share one item ID,
+        and keying on the ID alone made each issue overwrite the one before it.
+        An existing row with the same key is overwritten (or, for a corrected
+        single-issue re-record, the item's one stored row: see
+        :meth:`_single_win_fallback`); rows without a gixen_item_id are always
+        appended.  The index is kept up to date as rows
+        are appended (BUI-356) so two incoming rows sharing a key within the
+        same call are handled identically to a duplicate against the on-disk
+        store — the later row overwrites the earlier one in place rather than
+        both being appended.  Callers are responsible for chunking large
+        batches.
+
+        ``written_keys`` carries the keys a multi-chunk commit has already
+        written. Pass one set across chunks: a row whose key is in it (or was
+        written earlier in this call) is reported in ``self_overwritten``.
 
         Returns a :class:`WriteWinsResult` (inserted, overwritten) so callers
         can report the accurate split instead of treating every submitted row
@@ -1585,27 +1649,69 @@ class CollectionCache:
         """
         inserted = 0
         overwritten = 0
+        self_overwritten: list[str] = []
+        prior = written_keys if written_keys is not None else set()
+        this_call: set[tuple[str, str | None]] = set()
 
         def mutate(payload: dict[str, Any]) -> None:
             nonlocal inserted, overwritten
-            idx_by_gixen: dict[str, int] = {
-                row["gixen_item_id"]: i
-                for i, row in enumerate(payload["comics"])
-                if row.get("gixen_item_id")
-            }
+            self_overwritten.clear()
+            this_call.clear()
+            inserted = overwritten = 0
+            idx_by_key: dict[tuple[str, str | None], int] = {}
+            idx_by_item: dict[str, list[int]] = {}
+            for i, existing in enumerate(payload["comics"]):
+                key = win_row_key(existing)
+                if key is not None:
+                    idx_by_key[key] = i
+                    idx_by_item.setdefault(key[0], []).append(i)
+            incoming_per_item: dict[str, int] = {}
             for row in rows:
-                gixen_id = row.get("gixen_item_id")
-                if gixen_id and gixen_id in idx_by_gixen:
-                    payload["comics"][idx_by_gixen[gixen_id]] = row
+                key = win_row_key(row)
+                if key is not None:
+                    incoming_per_item[key[0]] = incoming_per_item.get(key[0], 0) + 1
+            for row in rows:
+                key = win_row_key(row)
+                target = idx_by_key.get(key) if key is not None else None
+                if (
+                    target is not None
+                    and (key in prior or key in this_call)
+                    and payload["comics"][target].get("full_title") != row.get("full_title")
+                ):
+                    # Same item + issue, different book: one of them is lost.
+                    # An exact repeat of one win is harmless and not reported.
+                    self_overwritten.append(str(row.get("full_title") or ""))
+                if target is None and key is not None:
+                    target = self._single_win_fallback(
+                        payload["comics"], key, idx_by_item, incoming_per_item,
+                        prior | this_call,
+                    )
+                if target is not None:
+                    old_key = win_row_key(payload["comics"][target])
+                    if old_key is not None and old_key != key:
+                        idx_by_key.pop(old_key, None)
+                    payload["comics"][target] = row
+                    if key is not None:
+                        idx_by_key[key] = target
                     overwritten += 1
                 else:
                     payload["comics"].append(row)
-                    if gixen_id:
-                        idx_by_gixen[gixen_id] = len(payload["comics"]) - 1
+                    if key is not None:
+                        idx_by_key[key] = len(payload["comics"]) - 1
+                        idx_by_item.setdefault(key[0], []).append(len(payload["comics"]) - 1)
                     inserted += 1
+                if key is not None:
+                    this_call.add(key)
 
         self.apply(mutate, command=command)
-        return WriteWinsResult(inserted=inserted, overwritten=overwritten)
+        # Only a committed write counts toward later chunks' self-overwrite check.
+        if written_keys is not None:
+            written_keys.update(this_call)
+        return WriteWinsResult(
+            inserted=inserted,
+            overwritten=overwritten,
+            self_overwritten=tuple(self_overwritten),
+        )
 
     def append_audit(self, record: dict[str, Any]) -> None:
         """Append a JSON audit record to import-history.jsonl.

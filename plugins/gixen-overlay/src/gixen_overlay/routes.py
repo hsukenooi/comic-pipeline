@@ -3462,6 +3462,23 @@ async def api_record_win_commit(request: Request, req: RecordWinCommitRequest):
             }),
         )
 
+    if result.get("self_overwritten_titles"):
+        # BUI-1384: this commit overwrote a row it had itself just written, so
+        # two books collapsed onto one item ID + issue and one is lost (the
+        # 2026-11-13 Power Fantasy lot kept only #16). Never mark seen on it:
+        # the item stays unprocessed for a human to resolve.
+        raise HTTPException(
+            status_code=500,
+            detail=jsonable_encoder({
+                **result,
+                "error": "self_overwrite",
+                "message": (
+                    "record-win overwrote rows it wrote in this same commit; "
+                    "a book was lost — nothing was marked seen"
+                ),
+            }),
+        )
+
     if result.get("partial_failure"):
         # BUI-137: some chunk failed to commit partway through. Raised BEFORE
         # any mark-seen call below — never mark seen on a partial commit, so a

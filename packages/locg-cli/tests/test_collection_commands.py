@@ -4584,6 +4584,27 @@ def test_record_win_rows_intra_batch_duplicate_counts_as_overwrite(tmp_path):
     payload = cache.load()
     dupes = [r for r in payload["comics"] if r.get("gixen_item_id") == "DUPE"]
     assert len(dupes) == 1
+    # BUI-1384: an exact repeat of one win loses no book, so it is not flagged.
+    assert result["self_overwritten_titles"] == []
+
+
+def test_record_win_lot_records_every_issue(tmp_path):
+    """BUI-1384 Done-when: a 3-issue lot commit leaves 3 rows in the store."""
+    from locg.commands import cmd_collection_record_win
+
+    cache = make_cache(tmp_path)
+    wins = [
+        _make_win(item_id="800765031857", series="The Power Fantasy", issue=str(n))
+        for n in (1, 2, 3)
+    ]
+
+    result = cmd_collection_record_win(wins, cache=cache, metron=_null_metron())
+
+    lot = [r for r in cache.load()["comics"] if r.get("gixen_item_id") == "800765031857"]
+    assert len(lot) == 3
+    assert result["rows_inserted"] == 3
+    assert result["rows_overwritten"] == 0
+    assert result["self_overwritten_titles"] == []
 
 
 # --- Monotonic seq ---
@@ -4632,12 +4653,12 @@ def test_record_win_partial_failure_marks_flag(tmp_path):
     call_count = 0
     original_write_wins = cache.write_wins
 
-    def patched_write_wins(rows, command="record-win"):
+    def patched_write_wins(rows, command="record-win", **kwargs):
         nonlocal call_count
         call_count += 1
         if call_count == 2:
             raise OSError("simulated crash")
-        return original_write_wins(rows, command=command)
+        return original_write_wins(rows, command=command, **kwargs)
 
     cache.write_wins = patched_write_wins
 

@@ -770,6 +770,36 @@ def test_record_win_commit_partial_failure_returns_500_and_marks_nothing_seen(cl
     assert "115500019999" not in seen
 
 
+def test_record_win_commit_self_overwrite_returns_500_and_marks_nothing_seen(client):
+    """BUI-1384: a commit that overwrote its own rows lost a book. It must 500
+    with a distinct error and mark nothing seen, so the lot comes back."""
+    result = {
+        "rows_written": 2,
+        "rows_inserted": 1,
+        "rows_overwritten": 1,
+        "self_overwritten_titles": ["X-Men Annual #6"],
+        "partial_failure": False,
+    }
+    win = {
+        "item_id": "115500018888",
+        "current_bid": "10.00",
+        "end_date_iso": "2026-06-04T18:00:00Z",
+        "identify_data": {"series": "X-Men", "issue": "6", "year": "1966"},
+    }
+    with patch("gixen_overlay.routes.cmd_collection_record_win", return_value=result):
+        r = client.post(
+            "/api/comics/collection/record-win/commit",
+            json={"wins": [win], "resolved_reviews": []},
+        )
+    assert r.status_code == 500, r.text
+    detail = r.json()["detail"]
+    assert detail["error"] == "self_overwrite"
+    assert detail["self_overwritten_titles"] == ["X-Men Annual #6"]
+
+    seen = client.get("/api/comics/collection/record-win/seen").json()["item_ids"]
+    assert "115500018888" not in seen
+
+
 def test_record_win_commit_partial_failure_with_non_json_value_still_renders_500(client):
     """BUI-491: a non-JSON-native value (e.g. a Path) landing in the
     partial_failure result dict must not abort the response with a
