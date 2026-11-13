@@ -1487,6 +1487,42 @@ def record_win_prep_cmd(output: str | None):
         click.echo(text)
 
 
+@cli.command("audit-collapsed-lots")
+@click.option("--apply", "do_apply", is_flag=True,
+              help="Restore missing issues via record-win/commit (needs a BUI-1384 server).")
+@click.option("--output", type=click.Path(dir_okay=False, writable=True), default=None,
+              help="Also write the report to this file.")
+def audit_collapsed_lots_cmd(do_apply: bool, output: str | None):
+    """BUI-1386: list won lots whose issues are missing from the collection.
+
+    Dry run by default: only GETs and the read-only check/batch POST."""
+    import audit_collapsed_lots as acl
+
+    server_url = _server_url()
+    if not server_url:
+        click.echo("Error: COMICS_SERVER_URL is not set.", err=True)
+        sys.exit(1)
+    snipes = _server_request("get", "/api/snipes")
+    try:
+        result = acl.audit(snipes, server_url)
+    except (RecordWinPrepError, requests.RequestException, RuntimeError) as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    text = acl.format_report(result)
+    click.echo(text)
+    if output:
+        Path(output).write_text(text + "\n")
+    if do_apply:
+        try:
+            out = acl.apply_restore(result, server_url)
+        except (RecordWinPrepError, requests.RequestException, RuntimeError) as e:
+            click.echo(f"Error: {e}", err=True)
+            sys.exit(1)
+        for n in out["notes"]:
+            click.echo(n)
+        click.echo(f"apply: posted {out['posted']} missing issue(s)")
+
+
 # BUI-1267: record-win/commit paces Metron at 20 req/min (BUI-465), up to 3
 # requests per win, so a 3-day batch can legitimately run for minutes. The
 # timeout only bounds a hung connection; a timeout is indeterminate, not a
