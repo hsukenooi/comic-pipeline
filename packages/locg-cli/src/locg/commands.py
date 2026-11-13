@@ -5423,6 +5423,10 @@ def cmd_collection_record_win(
     rows_written = 0
     rows_inserted = 0
     rows_overwritten = 0
+    # BUI-1384: keys this commit has written, shared across chunks, and the
+    # titles of rows refused because a different book already took the key.
+    written_keys: set[tuple[str, str | None]] = set()
+    self_collision_titles: list[str] = []
     chunks_committed = 0
     skipped_already_owned = 0
     skipped_already_owned_titles: list[str] = []
@@ -5546,10 +5550,13 @@ def cmd_collection_record_win(
             built_rows.append(result["row"])
 
         try:
-            write_result = cache.write_wins(built_rows, command="record-win")
+            write_result = cache.write_wins(
+                built_rows, command="record-win", written_keys=written_keys
+            )
             rows_written += len(built_rows)
             rows_inserted += write_result.inserted
             rows_overwritten += write_result.overwritten
+            self_collision_titles.extend(write_result.self_collisions)
             chunks_committed += 1
             manual_variant_count += chunk_manual_variant
             manual_series_count += chunk_manual_series
@@ -5573,6 +5580,10 @@ def cmd_collection_record_win(
         # keep working without modification.
         "rows_inserted": rows_inserted,
         "rows_overwritten": rows_overwritten,
+        # BUI-1384: rows refused because a different book in this commit took
+        # the same item ID + issue key. Non-empty means a book went unrecorded;
+        # the record-win endpoint refuses to mark seen on it.
+        "self_collision_titles": self_collision_titles,
         "chunks_committed": chunks_committed,
         "skipped_already_owned": skipped_already_owned,
         "skipped_already_owned_titles": skipped_already_owned_titles,

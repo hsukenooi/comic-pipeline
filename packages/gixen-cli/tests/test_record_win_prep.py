@@ -722,14 +722,42 @@ def test_entries_for_win_null_year_holds_by_default_fail_closed():
 
 
 def test_entries_for_win_null_year_lot_holds_even_when_confirmed():
-    """era_confirmed never releases a lot — per-issue era confirmation is out of
-    BUI-498's scope, so a null-year lot always holds."""
+    """The single-win era_confirmed flag never releases a lot: each constituent
+    needs its own verdict in confirmed_lot_issues (BUI-1384)."""
     win = _snipe("1")
     identity = _identity(series="X-Men", issue=None, year=None,
                          is_lot=True, constituent_issues=["1", "2", "3"])
     entries, review = entries_for_win(win, identity, era_confirmed=True)
     assert entries == []
     assert review["reason"] == REASON_MISSING_YEAR
+    assert review["era_unconfirmed_issues"] == ["1", "2", "3"]
+
+
+def test_entries_for_win_null_year_lot_records_when_every_issue_confirms():
+    """BUI-1384: a null-year lot whose every constituent the era check confirms
+    records one entry per issue."""
+    win = _snipe("1")
+    identity = _identity(series="X-Men", issue=None, year=None,
+                         is_lot=True, constituent_issues=["1", "2", "3"])
+    entries, review = entries_for_win(
+        win, identity, confirmed_lot_issues=frozenset({"1", "2", "3"})
+    )
+    assert review is None
+    assert [e["identify_data"]["issue"] for e in entries] == ["1", "2", "3"]
+
+
+def test_entries_for_win_null_year_lot_partly_confirmed_holds_whole_lot():
+    """BUI-1384: one unconfirmed issue holds the WHOLE lot. Recording the rest
+    would mark the item seen on commit, and the held issue would be lost."""
+    win = _snipe("1")
+    identity = _identity(series="X-Men", issue=None, year=None,
+                         is_lot=True, constituent_issues=["1", "2", "3"])
+    entries, review = entries_for_win(
+        win, identity, confirmed_lot_issues=frozenset({"1", "3"})
+    )
+    assert entries == []
+    assert review["reason"] == REASON_MISSING_YEAR
+    assert review["era_unconfirmed_issues"] == ["2"]
 
 
 def test_entries_for_win_year_present_records_regardless_of_era_confirmed():
@@ -840,6 +868,62 @@ def test_build_payload_null_year_confirmed_records_unconfirmed_holds():
     # Both null-year wins were sent for era-evidence, exactly once.
     assert len(era_calls) == 1
     assert {i["item_id"] for i in era_calls[0]} == {"1", "2"}
+
+
+def test_build_payload_null_year_lot_is_era_checked_per_issue():
+    """BUI-1384: a null-year lot sends one era request per constituent, keyed
+    item_id#issue, and records every issue when all of them confirm."""
+    snipes = [_snipe("800", title="X-Men #1-3 lot")]
+
+    def fake_identify(titles):
+        return [_identity(series="X-Men", issue=None, year=None,
+                          is_lot=True, constituent_issues=["1", "2", "3"])]
+
+    sent = []
+
+    def fake_era(url, items):
+        sent.extend(items)
+        return {i["item_id"]: True for i in items}
+
+    payload = build_payload(
+        snipes, "http://example.test",
+        fetch_seen=lambda url: set(), identify=fake_identify,
+        fetch_era=fake_era,
+    )
+    assert [(i["item_id"], i["issue"]) for i in sent] == [
+        ("800#1", "1"), ("800#2", "2"), ("800#3", "3"),
+    ]
+    assert [w["identify_data"]["issue"] for w in payload["wins"]] == ["1", "2", "3"]
+    assert all(w["item_id"] == "800" for w in payload["wins"])
+    assert payload["needs_review"] == []
+
+
+def test_lot_constituents_dedup_with_the_store_key():
+    """BUI-1384: "6" and "06" are one book to the store's write key, so the
+    lot sends only one entry instead of a refused self_collision."""
+    win = _snipe("1")
+    identity = _identity(series="X-Men", issue=None, year=1966,
+                         is_lot=True, constituent_issues=["6", "06", "7"])
+    entries, review = entries_for_win(win, identity)
+    assert review is None
+    assert [e["identify_data"]["issue"] for e in entries] == ["6", "7"]
+
+
+def test_build_payload_null_year_lot_with_failed_era_call_holds():
+    """BUI-1384: an empty era map (a failed call) holds the lot, fail closed."""
+    snipes = [_snipe("800", title="X-Men #1-2 lot")]
+
+    def fake_identify(titles):
+        return [_identity(series="X-Men", issue=None, year=None,
+                          is_lot=True, constituent_issues=["1", "2"])]
+
+    payload = build_payload(
+        snipes, "http://example.test",
+        fetch_seen=lambda url: set(), identify=fake_identify,
+        fetch_era=lambda url, items: {},
+    )
+    assert payload["wins"] == []
+    assert payload["needs_review"][0]["era_unconfirmed_issues"] == ["1", "2"]
 
 
 def test_build_payload_only_null_year_wins_are_sent_for_era_evidence():

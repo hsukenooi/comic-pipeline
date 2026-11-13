@@ -99,7 +99,13 @@ failure or other unexpected status is a hard stop (BUI-352).
 empty/unparseable `constituent_issues`, **or** a null `year` — unconditionally,
 regardless of price (`REASON_MISSING_YEAR`, BUI-422/BUI-475: a win's era
 can't be confirmed without a year, and vintage no-year titles are
-disproportionately prone to a downstream volume mis-resolution). There is
+disproportionately prone to a downstream volume mis-resolution). A null-year
+lot is era-checked per issue (BUI-1384): it records when every issue
+confirms, and otherwise the whole lot holds with `era_unconfirmed_issues`
+naming the rest. A commit with two books on one item ID and issue returns
+`500 self_collision` with `self_collision_titles`, records only the first,
+and marks nothing seen. Stop and report it to the user: a plain re-run can
+overwrite the first book. There is
 deliberately no price threshold and no confidence threshold —
 `comic-identify`'s baseline confidence (0.5) would fire on nearly every real
 title (BUI-354; the rationale doc has the full story of both).

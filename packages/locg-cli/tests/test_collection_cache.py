@@ -403,13 +403,128 @@ def test_write_wins_intra_batch_duplicate_gixen_id_appends_once(tmp_path):
     payload = cache.load()
     dupes = [r for r in payload["comics"] if r.get("gixen_item_id") == "DUPE"]
     assert len(dupes) == 1
-    # Later row in the batch wins, matching duplicate-against-store overwrite
-    # semantics (payload["comics"][idx] = row).
-    assert dupes[0]["full_title"] == "Amazing Spider-Man #300 (variant)"
-    # BUI-367: the intra-batch collision is one insert (row_a) + one overwrite
-    # (row_b replacing row_a in place), never two inserts.
+    # BUI-1384: a DIFFERENT book on a key this commit already wrote is refused,
+    # so the first one stays and the second is reported, never written.
+    assert dupes[0]["full_title"] == "Amazing Spider-Man #300"
     assert result.inserted == 1
-    assert result.overwritten == 1
+    assert result.overwritten == 0
+    assert result.self_collisions == ("Amazing Spider-Man #300 (variant)",)
+
+
+def test_write_wins_exact_repeat_in_one_batch_overwrites_quietly(tmp_path):
+    """BUI-356: the same win twice in one call overwrites in place and is not
+    a collision, since no book is lost."""
+    cache = make_cache(tmp_path)
+    row = make_row(full_title="Amazing Spider-Man #300", seq=1, gixen_item_id="DUPE")
+
+    result = cache.write_wins([row, dict(row)])
+
+    assert len([r for r in cache.load()["comics"] if r.get("gixen_item_id") == "DUPE"]) == 1
+    assert result == (1, 1, ())
+
+
+# ---------------------------------------------------------------------------
+# write_wins: lot rows key on item ID plus issue (BUI-1384)
+# ---------------------------------------------------------------------------
+
+def test_write_wins_lot_records_every_issue(tmp_path):
+    """A 3-issue lot shares one item ID. All three rows must land (BUI-1384:
+    the Power Fantasy #1-16 lot kept only #16)."""
+    cache = make_cache(tmp_path)
+    rows = [
+        make_row(full_title=f"The Power Fantasy #{n}", seq=n, gixen_item_id="800765031857")
+        for n in (1, 2, 3)
+    ]
+
+    result = cache.write_wins(rows)
+
+    lot = [r for r in cache.load()["comics"] if r.get("gixen_item_id") == "800765031857"]
+    assert sorted(r["full_title"] for r in lot) == [
+        "The Power Fantasy #1", "The Power Fantasy #2", "The Power Fantasy #3",
+    ]
+    assert result == (3, 0, ())
+
+
+def test_write_wins_lot_re_record_overwrites_each_issue(tmp_path):
+    """A true re-record of the lot replaces each issue in place, no duplicates."""
+    cache = make_cache(tmp_path)
+    first = [make_row(full_title=f"X-Men #{n}", seq=n, gixen_item_id="LOT") for n in (1, 2)]
+    cache.write_wins(first)
+    again = [
+        make_row(full_title=f"X-Men #{n} Newsstand Edition", seq=10 + n, gixen_item_id="LOT")
+        for n in (1, 2)
+    ]
+
+    result = cache.write_wins(again)
+
+    lot = [r for r in cache.load()["comics"] if r.get("gixen_item_id") == "LOT"]
+    assert sorted(r["full_title"] for r in lot) == [
+        "X-Men #1 Newsstand Edition", "X-Men #2 Newsstand Edition",
+    ]
+    assert result.inserted == 0 and result.overwritten == 2
+    # A re-record in a NEW commit is not a self-collision.
+    assert result.self_collisions == ()
+
+
+def test_write_wins_self_collision_is_refused_across_chunks(tmp_path):
+    """A shared written_keys set catches a collision split across two chunks,
+    and the first book stays on disk."""
+    cache = make_cache(tmp_path)
+    written: set = set()
+    cache.write_wins(
+        [make_row(full_title="X-Men #6", seq=1, gixen_item_id="LOT")], written_keys=written
+    )
+
+    result = cache.write_wins(
+        [make_row(full_title="X-Men Annual #6", seq=2, gixen_item_id="LOT")],
+        written_keys=written,
+    )
+
+    assert result.self_collisions == ("X-Men Annual #6",)
+    lot = [r["full_title"] for r in cache.load()["comics"] if r.get("gixen_item_id") == "LOT"]
+    assert lot == ["X-Men #6"]
+
+
+def test_write_wins_missing_lot_issue_never_replaces_a_stored_sibling(tmp_path):
+    """A lot damaged before BUI-1384 holds one issue. Recording a missing issue
+    later (its sibling skipped as owned) must append, not overwrite."""
+    cache = make_cache(tmp_path)
+    cache.write_wins([make_row(full_title="X-Men #2", seq=1, gixen_item_id="LOT")])
+
+    result = cache.write_wins(
+        [make_row(full_title="X-Men #1", seq=2, gixen_item_id="LOT")], written_keys=set()
+    )
+
+    lot = sorted(r["full_title"] for r in cache.load()["comics"] if r.get("gixen_item_id") == "LOT")
+    assert lot == ["X-Men #1", "X-Men #2"]
+    assert result == (1, 0, ())
+
+
+def test_win_row_key_normalizes_the_issue_token():
+    from locg.collection_cache import win_row_key
+
+    assert win_row_key({"gixen_item_id": "A", "full_title": "X-Men #06,"}) == ("A", "6")
+    assert win_row_key({"gixen_item_id": "A", "full_title": "X-Men #1A Newsstand"}) == ("A", "1a")
+    assert win_row_key({"gixen_item_id": "A", "full_title": "X-Men #0"}) == ("A", "0")
+    assert win_row_key({"gixen_item_id": None, "full_title": "X-Men #1"}) is None
+
+
+def test_write_wins_lot_split_across_chunks_keeps_both_halves(tmp_path):
+    """A 2-issue lot split 1/1 across chunks must not take the single-win
+    fallback and overwrite the first half this commit just wrote."""
+    cache = make_cache(tmp_path)
+    written: set = set()
+    cache.write_wins(
+        [make_row(full_title="X-Men #1", seq=1, gixen_item_id="LOT")], written_keys=written
+    )
+
+    result = cache.write_wins(
+        [make_row(full_title="X-Men #2", seq=2, gixen_item_id="LOT")], written_keys=written
+    )
+
+    lot = [r for r in cache.load()["comics"] if r.get("gixen_item_id") == "LOT"]
+    assert sorted(r["full_title"] for r in lot) == ["X-Men #1", "X-Men #2"]
+    assert result == (1, 0, ())
 
 
 # ---------------------------------------------------------------------------

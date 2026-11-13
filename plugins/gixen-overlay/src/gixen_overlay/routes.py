@@ -3462,6 +3462,23 @@ async def api_record_win_commit(request: Request, req: RecordWinCommitRequest):
             }),
         )
 
+    if result.get("self_collision_titles"):
+        # BUI-1384: two different books in this commit share one item ID +
+        # issue key (the shape that left the 2026-11-13 Power Fantasy lot with
+        # only #16). write_wins kept the first and refused the rest. Never
+        # mark seen on it: the item stays unprocessed for a human to resolve.
+        raise HTTPException(
+            status_code=500,
+            detail=jsonable_encoder({
+                **result,
+                "error": "self_collision",
+                "message": (
+                    "two books in this commit share one item ID and issue; "
+                    "the later ones were not recorded — nothing was marked seen"
+                ),
+            }),
+        )
+
     if result.get("partial_failure"):
         # BUI-137: some chunk failed to commit partway through. Raised BEFORE
         # any mark-seen call below — never mark seen on a partial commit, so a
