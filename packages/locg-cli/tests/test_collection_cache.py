@@ -420,7 +420,7 @@ def test_write_wins_exact_repeat_in_one_batch_overwrites_quietly(tmp_path):
     result = cache.write_wins([row, dict(row)])
 
     assert len([r for r in cache.load()["comics"] if r.get("gixen_item_id") == "DUPE"]) == 1
-    assert result == (1, 1, ())
+    assert result == (1, 1, (), ())
 
 
 # ---------------------------------------------------------------------------
@@ -442,7 +442,7 @@ def test_write_wins_lot_records_every_issue(tmp_path):
     assert sorted(r["full_title"] for r in lot) == [
         "The Power Fantasy #1", "The Power Fantasy #2", "The Power Fantasy #3",
     ]
-    assert result == (3, 0, ())
+    assert result == (3, 0, (), ())
 
 
 def test_write_wins_lot_re_record_overwrites_each_issue(tmp_path):
@@ -481,6 +481,7 @@ def test_write_wins_self_collision_is_refused_across_chunks(tmp_path):
     )
 
     assert result.self_collisions == ("X-Men Annual #6",)
+    assert result.self_collision_item_ids == ("LOT",)
     lot = [r["full_title"] for r in cache.load()["comics"] if r.get("gixen_item_id") == "LOT"]
     assert lot == ["X-Men #6"]
 
@@ -497,7 +498,7 @@ def test_write_wins_missing_lot_issue_never_replaces_a_stored_sibling(tmp_path):
 
     lot = sorted(r["full_title"] for r in cache.load()["comics"] if r.get("gixen_item_id") == "LOT")
     assert lot == ["X-Men #1", "X-Men #2"]
-    assert result == (1, 0, ())
+    assert result == (1, 0, (), ())
 
 
 def test_win_row_key_normalizes_the_issue_token():
@@ -524,7 +525,7 @@ def test_write_wins_lot_split_across_chunks_keeps_both_halves(tmp_path):
 
     lot = [r for r in cache.load()["comics"] if r.get("gixen_item_id") == "LOT"]
     assert sorted(r["full_title"] for r in lot) == ["X-Men #1", "X-Men #2"]
-    assert result == (1, 0, ())
+    assert result == (1, 0, (), ())
 
 
 # ---------------------------------------------------------------------------

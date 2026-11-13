@@ -770,9 +770,60 @@ def test_record_win_commit_partial_failure_returns_500_and_marks_nothing_seen(cl
     assert "115500019999" not in seen
 
 
-def test_record_win_commit_self_collision_returns_500_and_marks_nothing_seen(client):
-    """BUI-1384: a commit that overwrote its own rows lost a book. It must 500
-    with a distinct error and mark nothing seen, so the lot comes back."""
+def test_record_win_commit_self_collision_holds_only_the_colliding_item(client, offline_metron):
+    """BUI-1387: a self-collision holds only its own item. The ordinary win in
+    the same commit lands in the collection AND the seen-set; the colliding
+    item keeps its first book on disk and stays unseen, reported in
+    `held_item_ids`."""
+    _reseed_with_index(client.store, _ASM_INDEX)
+
+    def win(item_id, series, issue, year="1988"):
+        return {
+            "item_id": item_id,
+            "current_bid": "10.00",
+            "end_date_iso": "2026-06-04T18:00:00Z",
+            "identify_data": {"series": series, "issue": issue, "year": year},
+        }
+
+    ordinary = win("115500018881", "Amazing Spider-Man", "310")
+    # Two different books on one item ID and one issue: a self-collision.
+    lot_a = win("115500018888", "Amazing Spider-Man", "311")
+    lot_b = win("115500018888", "Amazing Spider-Man Annual", "311")
+    r = client.post(
+        "/api/comics/collection/record-win/commit",
+        json={"wins": [ordinary, lot_a, lot_b], "resolved_reviews": []},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["held_item_ids"] == ["115500018888"]
+    assert len(body["self_collision_titles"]) == 1
+    assert body["committed_item_ids"] == ["115500018881"]
+    assert body["marked_seen"] == 1
+
+    seen = client.get("/api/comics/collection/record-win/seen").json()["item_ids"]
+    assert "115500018881" in seen
+    assert "115500018888" not in seen
+
+    rows = json.loads((client.store / "collection.json").read_text())["comics"]
+    by_item = {}
+    for row in rows:
+        by_item.setdefault(row.get("gixen_item_id"), []).append(row["full_title"])
+    assert len(by_item["115500018881"]) == 1
+    assert len(by_item["115500018888"]) == 1  # first book kept, second refused
+
+    # A re-run re-records the held item in place: no duplicate row.
+    r2 = client.post(
+        "/api/comics/collection/record-win/commit",
+        json={"wins": [lot_a, lot_b], "resolved_reviews": []},
+    )
+    assert r2.status_code == 200, r2.text
+    rows = json.loads((client.store / "collection.json").read_text())["comics"]
+    assert sum(1 for x in rows if x.get("gixen_item_id") == "115500018888") == 1
+
+
+def test_record_win_commit_self_collision_without_item_ids_marks_nothing_seen(client):
+    """BUI-1384 backstop: collision titles with no item IDs to hold cannot be
+    attributed, so the commit 500s and marks nothing seen."""
     result = {
         "rows_written": 2,
         "rows_inserted": 1,
@@ -781,7 +832,7 @@ def test_record_win_commit_self_collision_returns_500_and_marks_nothing_seen(cli
         "partial_failure": False,
     }
     win = {
-        "item_id": "115500018888",
+        "item_id": "115500018889",
         "current_bid": "10.00",
         "end_date_iso": "2026-06-04T18:00:00Z",
         "identify_data": {"series": "X-Men", "issue": "6", "year": "1966"},
@@ -792,12 +843,9 @@ def test_record_win_commit_self_collision_returns_500_and_marks_nothing_seen(cli
             json={"wins": [win], "resolved_reviews": []},
         )
     assert r.status_code == 500, r.text
-    detail = r.json()["detail"]
-    assert detail["error"] == "self_collision"
-    assert detail["self_collision_titles"] == ["X-Men Annual #6"]
-
+    assert r.json()["detail"]["error"] == "self_collision"
     seen = client.get("/api/comics/collection/record-win/seen").json()["item_ids"]
-    assert "115500018888" not in seen
+    assert "115500018889" not in seen
 
 
 def test_record_win_commit_partial_failure_with_non_json_value_still_renders_500(client):

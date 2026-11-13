@@ -107,6 +107,9 @@ class WriteWinsResult(NamedTuple):
     inserted: int
     overwritten: int
     self_collisions: tuple[str, ...] = ()
+    # BUI-1387: gixen_item_id of each refused row, so a caller can hold just
+    # those items instead of matching titles.
+    self_collision_item_ids: tuple[str, ...] = ()
 
 
 #: The issue token in a win row's ``full_title`` ("Power Fantasy #3 Newsstand
@@ -1635,12 +1638,14 @@ class CollectionCache:
         inserted = 0
         overwritten = 0
         self_collisions: list[str] = []
+        collision_item_ids: list[str] = []
         prior = written_keys if written_keys is not None else set()
         this_call: set[tuple[str, str | None]] = set()
 
         def mutate(payload: dict[str, Any]) -> None:
             nonlocal inserted, overwritten
             self_collisions.clear()
+            collision_item_ids.clear()
             this_call.clear()
             inserted = overwritten = 0
             idx_by_key: dict[tuple[str, str | None], int] = {}
@@ -1659,6 +1664,7 @@ class CollectionCache:
                     # Same item + issue, different book, both from this commit.
                     # Keep the first and refuse this one, never overwrite it.
                     self_collisions.append(str(row.get("full_title") or ""))
+                    collision_item_ids.append(str(row.get("gixen_item_id") or ""))
                     continue
                 if target is not None:
                     payload["comics"][target] = row
@@ -1679,6 +1685,7 @@ class CollectionCache:
             inserted=inserted,
             overwritten=overwritten,
             self_collisions=tuple(self_collisions),
+            self_collision_item_ids=tuple(collision_item_ids),
         )
 
     def append_audit(self, record: dict[str, Any]) -> None:
