@@ -394,7 +394,7 @@ def build_report(messages, ledger, days, order_days, search_max=_DEFAULT_SEARCH_
     cutoff = now - timedelta(days=days)
     orders, shipping, unparsed, skipped = classify_messages(messages, cutoff)
     truncated = False
-    rows, linked_ids, outside_window = [], set(), 0
+    rows, linked_ids, outside_window = [], set(), []
 
     for order in sorted(orders, key=lambda o: o["sent_at"] or "", reverse=True):
         trackings, ids, trunc, untracked = find_trackings(order, order_days, search_max)
@@ -414,7 +414,15 @@ def build_report(messages, ledger, days, order_days, search_max=_DEFAULT_SEARCH_
             rows.append({**row, "status": WAITING})
             continue
         if not any(_in_window(t["sent_at"], cutoff) for t in trackings):
-            outside_window += 1
+            # Named, never just counted: the ledger can't tell an order
+            # submitted on the EZShip website from one nobody submitted.
+            dates = [t["sent_at"] for t in trackings if t["sent_at"]]
+            outside_window.append({
+                "merchant": order["merchant"], "order_number": order["order_number"],
+                "last_email": max(dates)[:10] if dates else None,
+                "trackings": [t["tracking_number"] for t in trackings],
+                "in_ledger": [t["tracking_number"] for t in trackings
+                              if t["tracking_number"].upper() in ledger]})
             continue
         if len(trackings) > 1:
             rows.append({**row, "status": HOLD,
@@ -516,8 +524,14 @@ def render_table(report) -> str:
     counts = ", ".join(f"{k}={v}" for k, v in _counts(report).items() if v) or "nothing found"
     out.append(f"Summary: {counts}")
     if report["outside_window"]:
-        out.append(f"{report['outside_window']} order(s) shipped before the --days window "
-                   "and are not listed.")
+        out.append("Shipped before the --days window (confirm each one is on the "
+                   "EZShip website):")
+        for row in report["outside_window"]:
+            trackings = ", ".join(
+                t + (" (in CLI ledger)" if t in row["in_ledger"] else "")
+                for t in row["trackings"])
+            out.append(f"    {row['merchant']} #{row['order_number']}  "
+                       f"last email {row['last_email'] or '?'}  {trackings}")
     if report["truncated"]:
         out.append("WARNING: a Gmail search was truncated; this report is incomplete.")
     out.append(_LEDGER_NOTE)

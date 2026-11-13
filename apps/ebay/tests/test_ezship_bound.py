@@ -405,3 +405,17 @@ def test_old_mail_without_order_number_is_skipped(search):
     old["internalDate"] = str(int(datetime(2026, 6, 1, tzinfo=timezone.utc).timestamp() * 1000))
     rep = report([old])
     assert rep["unparsed"] == [] and rep["skipped_not_warehouse"] == 1
+
+
+def test_order_shipped_before_the_window_is_named(hart_order, search):
+    search.map["75151"] = [load("hart_shipping.json")]
+    rep = report([hart_order], ledger={HART_TRACKING}, days=45)
+    assert rep["orders"] == []
+    assert rep["outside_window"] == [{
+        "merchant": "Hart Audio Cables", "order_number": "75151",
+        "last_email": "2026-08-26", "trackings": [HART_TRACKING],
+        "in_ledger": [HART_TRACKING]}]
+    text = eb.render_table(rep)
+    assert "Shipped before the --days window" in text
+    assert (f"Hart Audio Cables #75151  last email 2026-08-26  "
+            f"{HART_TRACKING} (in CLI ledger)") in text
