@@ -110,7 +110,7 @@ _STAPLE_RE = re.compile(r"\bstaples?\b", re.IGNORECASE)
 
 # The defect term that has to share a clause with the staple word. "attached"
 # is unreachable from `detach\w*` (different letters), so a reassuring "cover
-# attached at both staples" stays clean.
+# attached at both staples" stays clean. Only a negated "attached" fires.
 _STAPLE_DEFECT_RE = re.compile(
     r"""
     \b(?:
@@ -124,6 +124,12 @@ _STAPLE_DEFECT_RE = re.compile(
       | torn[\s-]*(?:out|away|through|from|free|loose)
       | fallen | falling | fell[\s-]+(?:out|off)
       | (?:come|came)[\s-]*(?:out|away|off)
+      # "staple is not attached" / "not attached at the staple" (BUI-1382).
+      # The negator is part of the defect, so it sits inside the match and
+      # `_is_negated` only looks before it. Bare "attached" stays clean.
+      | (?:not | no[\s-]+longer | (?:is|are|was|were)n['’]t)
+        \s+ (?:(?:fully|properly|securely|firmly)\s+)? attached
+      | un-?attached
     )\b
     # NOTE: a bare `off` is deliberately absent — "off center staple" /
     # "off-centre staples" is a manufacturing note on a perfectly sound book,
