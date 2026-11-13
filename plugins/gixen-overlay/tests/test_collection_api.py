@@ -810,6 +810,8 @@ def test_record_win_commit_self_collision_holds_only_the_colliding_item(client, 
         by_item.setdefault(row.get("gixen_item_id"), []).append(row["full_title"])
     assert len(by_item["115500018881"]) == 1
     assert len(by_item["115500018888"]) == 1  # first book kept, second refused
+    kept = by_item["115500018888"][0]
+    assert "311" in kept and "Annual" not in kept  # the FIRST book (ASM #311)
 
     # A re-run re-records the held item in place: no duplicate row.
     r2 = client.post(

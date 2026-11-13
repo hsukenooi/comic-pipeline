@@ -1589,6 +1589,8 @@ def record_wins_cmd():
                 f"{len(held)} won auction(s) held on a record-win self-collision "
                 f"(item {', '.join(held)}). Run /comic:collection-add."
             )
+            # stdout line the wrapper (scripts/ebay-shipped-and-wins.sh) matches.
+            click.echo(f"record-wins: {len(held)} held (self-collision)")
             click.echo(f"WARNING: {held_msg}", err=True)
             _notify(held_msg)
 
