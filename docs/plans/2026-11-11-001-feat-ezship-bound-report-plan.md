@@ -19,6 +19,7 @@ Done when: the report lists Hart #75151 with its tracking number and proposed fi
 
 - **Gmail Query** – `newer_than:Nd ("12826" OR "Airport Way") -from:ebay.com -from:members.ebay.com -from:ezbuy.sg`. EZShip's own emails print the warehouse address too.
 - **Two Windows** – `--days` (default 45) sets the shipment window. Order confirmations use `--order-days` (default 180), because presales ship months after the order.
+- **Older Shipments** – An order whose shipping emails are all older than `--days` goes to a "Shipped before the window" list. Each entry lists the order, its tracking number, and whether the CLI ledger has it. The ledger can't tell a website submission from a forgotten order, so these orders are never just counted.
 - **Body Check** – Keep a message only if its text holds `12826` and then `Airport Way` (either `NE` or `Northeast`). "Portland, OR" alone doesn't count. Image Comics and adidas newsletters print a Portland office address.
 - **Order Email** – Keep only order confirmations, which have an order number in the subject or body. The regex starts with the word Order: `Order\s*#\s*([A-Z0-9-]+)`, so `#US-3108` matches and `#2` in an item name doesn't.
 - **Shipping Email** – Set aside messages that `is_shipping_mail` flags. Step 3 matches them to orders. A shipping email with a tracking number and no matching order becomes an `orphan_shipment` row with its tracking number. It never drops out of the report.
