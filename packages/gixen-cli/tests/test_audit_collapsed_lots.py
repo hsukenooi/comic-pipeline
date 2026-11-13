@@ -1,9 +1,11 @@
 """Unit tests for audit_collapsed_lots.py (BUI-1386)."""
 
 import os
+import subprocess
 import sys
 
 import pytest
+import requests
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -141,6 +143,10 @@ class _Session:
         return _Resp({"ok": True})
 
 
+def _same_verdicts(v):
+    return lambda url, lots, session=None: v
+
+
 def test_apply_refuses_without_bui_1384(monkeypatch):
     s, i = _pf()
     result = _run(s, i, {("The Power Fantasy", n): acl.MISSING for n in PF_ISSUES})
@@ -158,7 +164,7 @@ def test_apply_posts_only_missing_issues(monkeypatch):
     result = _run(s, i, v)
     sess = _Session()
     monkeypatch.setattr(acl, "server_has_fix", lambda sha, repo=None: True)
-    out = acl.apply_restore(result, "http://x", session=sess)
+    out = acl.apply_restore(result, "http://x", session=sess, verdicts_fn=_same_verdicts(v))
     assert out["posted"] == 1
     (url, body), = sess.posts
     assert url.endswith(acl.COMMIT)
@@ -173,7 +179,9 @@ def test_apply_null_year_lot_skips_unconfirmed(monkeypatch):
     monkeypatch.setattr(acl, "server_has_fix", lambda sha, repo=None: True)
     sess = _Session()
     era = lambda url, reqs: {r["item_id"]: r["issue"] == "1" for r in reqs}
-    out = acl.apply_restore(result, "http://x", session=sess, fetch_era=era)
+    out = acl.apply_restore(
+        result, "http://x", session=sess, fetch_era=era,
+        verdicts_fn=_same_verdicts({("Foo", "1"): acl.MISSING, ("Foo", "2"): acl.MISSING}))
     assert [w["identify_data"]["issue"] for w in sess.posts[0][1]["wins"]] == ["1"]
     assert "not restored: 2" in out["notes"][0]
 
@@ -183,10 +191,189 @@ def test_server_has_fix_rejects_bad_or_old_sha(sha):
     assert acl.server_has_fix(sha) is False
 
 
-def test_server_has_fix_accepts_fixed_commit():
-    # 30a3bc8 is the BUI-1384 commit itself; skip if history is shallow.
+def test_server_has_fix_accepts_descendant_of_fix_commit():
     import subprocess
-    ok = subprocess.run(["git", "cat-file", "-e", "30a3bc8"], capture_output=True).returncode == 0
+    ok = subprocess.run(["git", "cat-file", "-e", "4a1a651"], capture_output=True).returncode == 0
     if not ok:
-        pytest.skip("BUI-1384 commit not in local history")
-    assert acl.server_has_fix("30a3bc8") is True
+        pytest.skip("BUI-1384 fix commit not in local history")
+    assert acl.server_has_fix("4a1a651") is True
+    assert acl.server_has_fix("HEAD") is False  # not a hex sha
+
+
+def test_server_has_fix_uses_ancestry_not_grep(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(acl.subprocess, "run", fake_run)
+    assert acl.server_has_fix("abcdef1") is True
+    assert calls[0][:3] == ["git", "merge-base", "--is-ancestor"]
+    assert calls[0][3:] == ["4a1a651", "abcdef1"]
+
+
+@pytest.mark.parametrize("exc", [subprocess.TimeoutExpired("git", 30), OSError("no git")])
+def test_server_has_fix_fails_closed_on_git_error(monkeypatch, exc):
+    def boom(cmd, **kw):
+        raise exc
+
+    monkeypatch.setattr(acl.subprocess, "run", boom)
+    assert acl.server_has_fix("abcdef1") is False
+
+
+def test_server_has_fix_false_on_nonzero_exit(monkeypatch):
+    monkeypatch.setattr(
+        acl.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 128, "", "bad"))
+    assert acl.server_has_fix("abcdef1") is False
+
+
+class _BadJson(_Resp):
+    def json(self):
+        raise ValueError("not json")
+
+
+def test_apply_health_failure_refuses(monkeypatch):
+    s, i = _pf()
+    result = _run(s, i, {("The Power Fantasy", n): acl.MISSING for n in PF_ISSUES})
+
+    class Sess(_Session):
+        def get(self, url, timeout):
+            raise requests.ConnectionError("down")
+
+    sess = Sess()
+    with pytest.raises(requests.ConnectionError):
+        acl.apply_restore(result, "http://x", session=sess)
+    assert sess.posts == []
+
+
+@pytest.mark.parametrize("resp", [_BadJson({}), _Resp([1, 2]), _Resp({"git_sha": None})])
+def test_apply_malformed_health_refuses(resp):
+    s, i = _pf()
+    result = _run(s, i, {("The Power Fantasy", n): acl.MISSING for n in PF_ISSUES})
+
+    class Sess(_Session):
+        def get(self, url, timeout):
+            return resp
+
+    sess = Sess()
+    with pytest.raises(RuntimeError):
+        acl.apply_restore(result, "http://x", session=sess)
+    assert sess.posts == []
+
+
+def test_apply_rechecks_and_drops_now_owned(monkeypatch):
+    s, i = _pf()
+    result = _run(s, i, {("The Power Fantasy", n): acl.MISSING for n in PF_ISSUES})
+    monkeypatch.setattr(acl, "server_has_fix", lambda sha, repo=None: True)
+    fresh = {("The Power Fantasy", n): acl.MISSING for n in PF_ISSUES}
+    fresh[("The Power Fantasy", "3")] = acl.IN
+    fresh[("The Power Fantasy", "4")] = acl.UNSURE
+    sess = _Session()
+    out = acl.apply_restore(result, "http://x", session=sess, verdicts_fn=_same_verdicts(fresh))
+    posted = [w["identify_data"]["issue"] for w in sess.posts[0][1]["wins"]]
+    assert "3" not in posted and "4" not in posted and out["posted"] == 14
+
+
+# --- fetch_verdicts trust rules -------------------------------------------
+
+
+class _CheckSession:
+    def __init__(self, rows, status=None, resolve=None, match_kind=None):
+        self.rows = rows
+        self.status = status if status is not None else {"last_full_import": "2026-11-01", "cache_age_days": 1}
+        self.resolve = resolve or []
+        self.calls = []
+
+    def get(self, url, timeout):
+        self.calls.append(url)
+        if url.endswith("/health"):
+            return _Resp({"ok": True})
+        return _Resp(self.status)
+
+    def post(self, url, json, timeout):
+        self.calls.append(url)
+        if url.endswith(acl.CHECK_BATCH):
+            res = []
+            for it in json["items"]:
+                row = {"series": it["series"], "issue": it["issue"],
+                       "match_status": "not_in_cache"}
+                row.update(self.rows(it) if callable(self.rows) else self.rows)
+                res.append(row)
+            return _Resp({"results": res})
+        return _Resp({"results": self.resolve})
+
+
+def _lots(issues=("1", "2")):
+    lot = {"item_id": "9", "identity": {"series": "Foo", "year": 2020},
+           "constituents": list(issues)}
+    return [lot]
+
+
+def _fetch(sess, issues=("1", "2")):
+    return acl.fetch_verdicts("http://x", _lots(issues), session=sess)
+
+
+def test_definite_not_owned_is_missing():
+    assert set(_fetch(_CheckSession({})).values()) == {acl.MISSING}
+
+
+def test_wishlisted_not_in_cache_is_unsure():
+    assert set(_fetch(_CheckSession({"in_wish_list": True})).values()) == {acl.UNSURE}
+
+
+def test_stale_cache_is_unsure():
+    sess = _CheckSession({}, status={"last_full_import": "2026-01-01", "cache_age_days": 30})
+    assert set(_fetch(sess).values()) == {acl.UNSURE}
+
+
+def test_empty_cache_hard_fails():
+    sess = _CheckSession({}, status={"last_full_import": None, "cache_age_days": None})
+    with pytest.raises(RuntimeError, match="never imported"):
+        _fetch(sess)
+
+
+def test_fuzzy_series_resolution_is_unsure():
+    sess = _CheckSession({}, resolve=[{"query": "Foo", "resolved": "Foo Comics (2020)",
+                                       "match_kind": "fuzzy"}])
+    assert set(_fetch(sess).values()) == {acl.UNSURE}
+
+
+def test_exact_series_resolution_stays_missing():
+    sess = _CheckSession({}, resolve=[{"query": "Foo", "resolved": "Foo (2020)",
+                                       "match_kind": "exact"}])
+    assert set(_fetch(sess).values()) == {acl.MISSING}
+
+
+def test_non_exact_match_kind_is_unsure():
+    assert set(_fetch(_CheckSession({"match_kind": "alias"})).values()) == {acl.UNSURE}
+
+
+def test_unknown_match_status_is_error_not_missing():
+    with pytest.raises(RuntimeError, match="unknown match_status"):
+        _fetch(_CheckSession({"match_status": "weird"}))
+
+
+def test_ambiguous_is_unsure_and_owned_is_present():
+    sess = _CheckSession(lambda it: {"match_status": "in_collection" if it["issue"] == "1"
+                                     else "ambiguous_cross_volume"})
+    v = _fetch(sess)
+    assert v == {("Foo", "1"): acl.IN, ("Foo", "2"): acl.UNSURE}
+
+
+def test_untrustworthy_not_in_cache_everywhere_yields_zero_missing():
+    # Every book answers not_in_cache but wish-listed + fuzzy + stale: nothing
+    # may be restored. The pre-fix code counted every one as missing.
+    sess = _CheckSession(
+        {"in_wish_list": True},
+        status={"last_full_import": "2026-01-01", "cache_age_days": 99},
+        resolve=[{"query": "The Power Fantasy", "resolved": "Power Fantasy (2020)",
+                  "match_kind": "fuzzy"}],
+    )
+    s, i = _pf()
+    result = acl.audit(
+        s, "http://x", identify=lambda titles: i,
+        verdicts_fn=lambda url, lots: acl.fetch_verdicts(url, lots, session=sess),
+    )
+    lot = result["lots"][0]
+    assert lot["missing"] == [] and lot["unsure"] == PF_ISSUES

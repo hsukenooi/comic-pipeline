@@ -19,9 +19,10 @@ Ownership signals, in order:
      the match that also covers the BUI-1384 workaround rows (re-recorded
      without an item ID).
 
-Only a definite ``not_in_cache`` verdict counts as missing. Anything else that
-is not ``in_collection`` (``ambiguous_cross_volume``, a missing verdict) is
-"unsure" and is never restored: a false "missing" would duplicate-record an
+Only a definite ``not_in_cache`` verdict counts as missing (see
+``fetch_verdicts``: fresh cache, not wish-listed, exact match, no fuzzy series
+resolution). Anything else that is not ``in_collection`` is "unsure" and is
+never restored: a false "missing" would duplicate-record an
 owned book.
 """
 
@@ -45,8 +46,12 @@ from record_win_prep import (
 )
 
 CHECK_BATCH = "/api/comics/collection/check/batch"
+STATUS_PATH = "/api/comics/collection/status"
+RESOLVE_PATH = "/api/comics/collection/series-names/resolve"
+STALE_CACHE_DAYS = 14  # mirrors locg.check_batch.STALE_CACHE_DAYS
+KNOWN_STATUSES = frozenset({"in_collection", "not_in_cache", "ambiguous_cross_volume"})
 COMMIT = "/api/comics/collection/record-win/commit"
-REQUIRED_TOKEN = "BUI-1384"
+REQUIRED_COMMIT = "4a1a651"  # BUI-1384 collision-refusal commit
 CHECK_CHUNK = 50
 _ISSUE_RE = re.compile(r"#\s*([^\s,;:)\]]+)")
 
@@ -134,11 +139,41 @@ def classify_lot(
     }
 
 
+def _get_json(session, url: str, timeout: float) -> dict:
+    resp = session.get(url, timeout=timeout)
+    resp.raise_for_status()
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        raise RuntimeError(f"unparseable response from {url}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(f"unexpected response shape from {url}")
+    return data
+
+
+def _post_json(session, url: str, body: dict, timeout: float) -> dict:
+    resp = session.post(url, json=body, timeout=timeout)
+    resp.raise_for_status()
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        raise RuntimeError(f"unparseable response from {url}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(f"unexpected response shape from {url}")
+    return data
+
+
 def fetch_verdicts(
     server_url: str, lots: list[dict], *, session=requests, timeout: float = 60.0
 ) -> dict[tuple[str, str], str]:
-    """One check/batch round trip per CHECK_CHUNK items. Hard-fails on any
-    non-200 (R11: never read a failed call as "not owned")."""
+    """Collection check for every (series, issue), reduced to IN / MISSING / UNSURE.
+
+    Ports ``locg.check_batch``'s trust rules (gixen-cli cannot import locg).
+    A raw ``not_in_cache`` is only MISSING when it is a definite not-owned:
+    the store was imported and is fresh, the book is not wish-listed, the
+    match is not a non-exact one, and the series name does not resolve to a
+    different catalog spelling (Pattern C). Otherwise it is UNSURE. Hard-fails
+    (R11) on any non-200, malformed row, or unknown ``match_status``."""
     items, seen = [], set()
     for lot in lots:
         for issue in lot["constituents"]:
@@ -150,16 +185,57 @@ def fetch_verdicts(
             if lot["identity"].get("year") is not None:
                 item["year"] = lot["identity"]["year"]
             items.append(item)
-    out: dict[tuple[str, str], str] = {}
+    if not items:
+        return {}
+    _get_json(session, f"{server_url}/health", timeout)
+    status = _get_json(session, f"{server_url}{STATUS_PATH}", timeout)
+    if status.get("last_full_import") is None:
+        raise RuntimeError("collection is empty on the comics server (never imported)")
+    age = status.get("cache_age_days")
+    stale = isinstance(age, int) and age > STALE_CACHE_DAYS
+
+    rows: list[tuple[dict, dict]] = []
     for i in range(0, len(items), CHECK_CHUNK):
         chunk = items[i : i + CHECK_CHUNK]
-        resp = session.post(f"{server_url}{CHECK_BATCH}", json={"items": chunk}, timeout=timeout)
-        resp.raise_for_status()
-        results = resp.json().get("results") or []
+        data = _post_json(session, f"{server_url}{CHECK_BATCH}", {"items": chunk}, timeout)
+        results = data.get("results") or []
         if len(results) != len(chunk):
             raise RuntimeError(f"check/batch returned {len(results)} results for {len(chunk)} items")
         for item, res in zip(chunk, results):
-            out[(item["series"], item["issue"])] = res.get("match_status") or UNSURE
+            if not isinstance(res, dict):
+                raise RuntimeError("check/batch row was not an object")
+            if res.get("match_status") not in KNOWN_STATUSES:
+                raise RuntimeError(
+                    f"check/batch row for {item['series']} #{item['issue']} has an "
+                    f"unknown match_status {res.get('match_status')!r}"
+                )
+            rows.append((item, res))
+
+    names = sorted({it["series"] for it, r in rows if r["match_status"] == MISSING})
+    fuzzy: set[str] = set()
+    if names:
+        data = _post_json(session, f"{server_url}{RESOLVE_PATH}", {"names": names}, timeout)
+        results = data.get("results")
+        if not isinstance(results, list):
+            raise RuntimeError("series-name resolve response had a non-list 'results'")
+        for row in results:
+            if isinstance(row, dict) and row.get("match_kind") == "fuzzy" and row.get("resolved"):
+                fuzzy.add(str(row.get("query")))
+
+    out: dict[tuple[str, str], str] = {}
+    for item, res in rows:
+        verdict = res["match_status"]
+        if verdict == MISSING:
+            untrusted = (
+                stale
+                or res.get("in_wish_list")
+                or item["series"] in fuzzy
+                or res.get("match_kind") not in (None, "", "exact")
+            )
+            verdict = UNSURE if untrusted else MISSING
+        elif verdict != IN:
+            verdict = UNSURE
+        out[(item["series"], item["issue"])] = verdict
     return out
 
 
@@ -218,18 +294,21 @@ def format_report(result: dict) -> str:
 
 
 def server_has_fix(git_sha: str | None, *, repo: Path | None = None) -> bool:
-    """True only when the server's build commit has BUI-1384 in its history."""
+    """True only when the server's build commit descends from the BUI-1384 fix.
+
+    Fails closed: a bad sha, a sha unknown to the local clone, a git error, or
+    a timeout all return False."""
     if not git_sha or not re.fullmatch(r"[0-9a-f]{7,40}", git_sha):
         return False
     try:
         proc = subprocess.run(
-            ["git", "log", git_sha, f"--grep={REQUIRED_TOKEN}", "-1", "--format=%H"],
+            ["git", "merge-base", "--is-ancestor", REQUIRED_COMMIT, git_sha],
             cwd=repo or Path(__file__).resolve().parent,
             capture_output=True, text=True, timeout=30,
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
-    return proc.returncode == 0 and bool(proc.stdout.strip())
+    return proc.returncode == 0
 
 
 def build_apply_entries(
@@ -261,20 +340,37 @@ def build_apply_entries(
     return entries, notes
 
 
+def recheck_missing(
+    result: dict, server_url: str, *, session=requests, verdicts_fn=fetch_verdicts
+) -> dict:
+    """Fresh ownership check of the to-restore issues; keep only those still
+    definitely missing (a book owned since the audit must never be recorded)."""
+    lots = []
+    for lot in result["lots"]:
+        if lot["missing"]:
+            lots.append({**lot["_lot"], "constituents": list(lot["missing"])})
+    verdicts = verdicts_fn(server_url, lots, session=session) if lots else {}
+    fresh = []
+    for lot in result["lots"]:
+        keep = [i for i in lot["missing"] if verdicts.get((lot["series"], i)) == MISSING]
+        fresh.append(dict(lot, missing=keep))
+    return dict(result, lots=fresh)
+
+
 def apply_restore(
     result: dict, server_url: str, *, session=requests, health_sha: str | None = None,
-    fetch_era=fetch_era_evidence, repo: Path | None = None,
+    fetch_era=fetch_era_evidence, repo: Path | None = None, verdicts_fn=fetch_verdicts,
 ) -> dict:
-    """Guard on the server build, then POST only the missing issues."""
+    """Guard on the server build, re-check ownership, then POST only the
+    still-missing issues."""
     if health_sha is None:
-        h = session.get(f"{server_url}/health", timeout=30)
-        h.raise_for_status()
-        health_sha = h.json().get("git_sha")
+        health_sha = _get_json(session, f"{server_url}/health", 30).get("git_sha")
     if not server_has_fix(health_sha, repo=repo):
         raise RuntimeError(
-            f"refusing --apply: server git_sha {health_sha!r} does not contain "
-            f"{REQUIRED_TOKEN}; deploy it first or the write overwrites rows"
+            f"refusing --apply: server git_sha {health_sha!r} is not a descendant of "
+            f"{REQUIRED_COMMIT} (BUI-1384); deploy it first or the write overwrites rows"
         )
+    result = recheck_missing(result, server_url, session=session, verdicts_fn=verdicts_fn)
     entries, notes = build_apply_entries(result, server_url, fetch_era=fetch_era)
     if not entries:
         return {"posted": 0, "notes": notes, "response": None}
