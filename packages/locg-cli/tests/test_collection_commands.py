@@ -4496,13 +4496,10 @@ def test_record_win_rows_overwritten_only_batch(tmp_path):
     """Re-recording the same item_ids with CORRECTED identify_data is all overwrites.
 
     Modeling a real correction flow: the user re-runs record-win for the same
-    Gixen auctions with fixed series/issue values. Note the corrected issue
-    numbers (997/998/999) are disjoint from ALL three originally-owned issues
-    (300/301/302), not just their own row's original issue — reusing any of
-    300/301/302 would instead hit the BUI-34 "already owned" skip in
-    _build_win_row (keyed on (series, issue) across the whole owned set,
-    checked BEFORE write_wins is ever called), which is a different code path
-    than the write_wins-level gixen_item_id dedup this test targets. The
+    Gixen auctions with a fixed series. The corrected series differs from the
+    owned one, so the BUI-34 "already owned" skip in _build_win_row (keyed on
+    (series, issue), checked BEFORE write_wins) does not catch it, and the
+    write_wins item ID + issue key (BUI-1384) does. The
     pre-BUI-367 behavior reported
     rows_written=3 on the second call too, as though 3 new rows had been
     added — misleading a caller who reads rows_written as "new rows recorded".
@@ -4521,10 +4518,13 @@ def test_record_win_rows_overwritten_only_batch(tmp_path):
     assert first["rows_inserted"] == 3
     assert first["rows_overwritten"] == 0
 
+    # BUI-1384: the write key is item ID + issue, so the correction keeps the
+    # issue and fixes the series. A corrected ISSUE is a different book on the
+    # same item (as in a lot) and now appends instead.
     corrected_wins = [
-        _make_win(item_id="1", series="Amazing Spider-Man", issue="997"),
-        _make_win(item_id="2", series="Amazing Spider-Man", issue="998"),
-        _make_win(item_id="3", series="Amazing Spider-Man", issue="999"),
+        _make_win(item_id="1", series="Spectacular Spider-Man", issue="300"),
+        _make_win(item_id="2", series="Spectacular Spider-Man", issue="301"),
+        _make_win(item_id="3", series="Spectacular Spider-Man", issue="302"),
     ]
     second = cmd_collection_record_win(corrected_wins, cache=cache, metron=_null_metron())
 
@@ -4549,7 +4549,7 @@ def test_record_win_rows_mixed_batch_splits_inserted_and_overwritten(tmp_path):
         # Corrected issue for the same auction item_id — not caught by the
         # BUI-34 already-owned skip (issue differs from the owned #300), so it
         # reaches write_wins and overwrites the existing gixen_item_id row.
-        _make_win(item_id="EXISTING", series="Amazing Spider-Man", issue="399"),
+        _make_win(item_id="EXISTING", series="Spectacular Spider-Man", issue="300"),
         _make_win(item_id="NEW-1", series="Amazing Spider-Man", issue="301"),  # insert
         _make_win(item_id="NEW-2", series="Amazing Spider-Man", issue="302"),  # insert
     ]
@@ -4585,7 +4585,7 @@ def test_record_win_rows_intra_batch_duplicate_counts_as_overwrite(tmp_path):
     dupes = [r for r in payload["comics"] if r.get("gixen_item_id") == "DUPE"]
     assert len(dupes) == 1
     # BUI-1384: an exact repeat of one win loses no book, so it is not flagged.
-    assert result["self_overwritten_titles"] == []
+    assert result["self_collision_titles"] == []
 
 
 def test_record_win_lot_records_every_issue(tmp_path):
@@ -4604,7 +4604,7 @@ def test_record_win_lot_records_every_issue(tmp_path):
     assert len(lot) == 3
     assert result["rows_inserted"] == 3
     assert result["rows_overwritten"] == 0
-    assert result["self_overwritten_titles"] == []
+    assert result["self_collision_titles"] == []
 
 
 # --- Monotonic seq ---

@@ -124,9 +124,20 @@ def _lot_constituents(identity: dict) -> list[str] | None:
     valid = [c for c in raw if c]
     if not identity.get("series") or not raw or len(valid) != len(raw):
         return None
-    # A seller typo like "100, 100, 101" must not produce two entries sharing
-    # the same item_id + issue: that would double-record one physical book.
-    return list(dict.fromkeys(valid))
+    # A seller typo like "100, 100, 101" (or "6, 06") must not produce two
+    # entries sharing the same item_id + issue: that would double-record one
+    # physical book, and the store refuses the second as a self_collision.
+    deduped: dict[str, str] = {}
+    for issue in valid:
+        deduped.setdefault(_issue_key(str(issue)), issue)
+    return list(deduped.values())
+
+
+def _issue_key(token: str) -> str:
+    """Mirror of ``locg.collection_cache.win_issue_key`` (gixen-cli does not
+    depend on locg-cli). Keep the two in step: the store keys lot rows on it."""
+    token = token.strip().rstrip(".,;:)]")
+    return (token.lstrip("0") or token).lower()
 
 
 class RecordWinPrepError(Exception):

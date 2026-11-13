@@ -898,6 +898,17 @@ def test_build_payload_null_year_lot_is_era_checked_per_issue():
     assert payload["needs_review"] == []
 
 
+def test_lot_constituents_dedup_with_the_store_key():
+    """BUI-1384: "6" and "06" are one book to the store's write key, so the
+    lot sends only one entry instead of a refused self_collision."""
+    win = _snipe("1")
+    identity = _identity(series="X-Men", issue=None, year=1966,
+                         is_lot=True, constituent_issues=["6", "06", "7"])
+    entries, review = entries_for_win(win, identity)
+    assert review is None
+    assert [e["identify_data"]["issue"] for e in entries] == ["6", "7"]
+
+
 def test_build_payload_null_year_lot_with_failed_era_call_holds():
     """BUI-1384: an empty era map (a failed call) holds the lot, fail closed."""
     snipes = [_snipe("800", title="X-Men #1-2 lot")]

@@ -3462,19 +3462,19 @@ async def api_record_win_commit(request: Request, req: RecordWinCommitRequest):
             }),
         )
 
-    if result.get("self_overwritten_titles"):
-        # BUI-1384: this commit overwrote a row it had itself just written, so
-        # two books collapsed onto one item ID + issue and one is lost (the
-        # 2026-11-13 Power Fantasy lot kept only #16). Never mark seen on it:
-        # the item stays unprocessed for a human to resolve.
+    if result.get("self_collision_titles"):
+        # BUI-1384: two different books in this commit share one item ID +
+        # issue key (the shape that left the 2026-11-13 Power Fantasy lot with
+        # only #16). write_wins kept the first and refused the rest. Never
+        # mark seen on it: the item stays unprocessed for a human to resolve.
         raise HTTPException(
             status_code=500,
             detail=jsonable_encoder({
                 **result,
-                "error": "self_overwrite",
+                "error": "self_collision",
                 "message": (
-                    "record-win overwrote rows it wrote in this same commit; "
-                    "a book was lost — nothing was marked seen"
+                    "two books in this commit share one item ID and issue; "
+                    "the later ones were not recorded — nothing was marked seen"
                 ),
             }),
         )

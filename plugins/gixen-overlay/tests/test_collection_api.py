@@ -770,14 +770,14 @@ def test_record_win_commit_partial_failure_returns_500_and_marks_nothing_seen(cl
     assert "115500019999" not in seen
 
 
-def test_record_win_commit_self_overwrite_returns_500_and_marks_nothing_seen(client):
+def test_record_win_commit_self_collision_returns_500_and_marks_nothing_seen(client):
     """BUI-1384: a commit that overwrote its own rows lost a book. It must 500
     with a distinct error and mark nothing seen, so the lot comes back."""
     result = {
         "rows_written": 2,
         "rows_inserted": 1,
         "rows_overwritten": 1,
-        "self_overwritten_titles": ["X-Men Annual #6"],
+        "self_collision_titles": ["X-Men Annual #6"],
         "partial_failure": False,
     }
     win = {
@@ -793,8 +793,8 @@ def test_record_win_commit_self_overwrite_returns_500_and_marks_nothing_seen(cli
         )
     assert r.status_code == 500, r.text
     detail = r.json()["detail"]
-    assert detail["error"] == "self_overwrite"
-    assert detail["self_overwritten_titles"] == ["X-Men Annual #6"]
+    assert detail["error"] == "self_collision"
+    assert detail["self_collision_titles"] == ["X-Men Annual #6"]
 
     seen = client.get("/api/comics/collection/record-win/seen").json()["item_ids"]
     assert "115500018888" not in seen

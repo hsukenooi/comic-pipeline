@@ -403,15 +403,24 @@ def test_write_wins_intra_batch_duplicate_gixen_id_appends_once(tmp_path):
     payload = cache.load()
     dupes = [r for r in payload["comics"] if r.get("gixen_item_id") == "DUPE"]
     assert len(dupes) == 1
-    # Later row in the batch wins, matching duplicate-against-store overwrite
-    # semantics (payload["comics"][idx] = row).
-    assert dupes[0]["full_title"] == "Amazing Spider-Man #300 (variant)"
-    # BUI-367: the intra-batch collision is one insert (row_a) + one overwrite
-    # (row_b replacing row_a in place), never two inserts.
+    # BUI-1384: a DIFFERENT book on a key this commit already wrote is refused,
+    # so the first one stays and the second is reported, never written.
+    assert dupes[0]["full_title"] == "Amazing Spider-Man #300"
     assert result.inserted == 1
-    assert result.overwritten == 1
-    # BUI-1384: the same item ID + issue twice in one commit is reported.
-    assert result.self_overwritten == ("Amazing Spider-Man #300 (variant)",)
+    assert result.overwritten == 0
+    assert result.self_collisions == ("Amazing Spider-Man #300 (variant)",)
+
+
+def test_write_wins_exact_repeat_in_one_batch_overwrites_quietly(tmp_path):
+    """BUI-356: the same win twice in one call overwrites in place and is not
+    a collision, since no book is lost."""
+    cache = make_cache(tmp_path)
+    row = make_row(full_title="Amazing Spider-Man #300", seq=1, gixen_item_id="DUPE")
+
+    result = cache.write_wins([row, dict(row)])
+
+    assert len([r for r in cache.load()["comics"] if r.get("gixen_item_id") == "DUPE"]) == 1
+    assert result == (1, 1, ())
 
 
 # ---------------------------------------------------------------------------
@@ -453,12 +462,13 @@ def test_write_wins_lot_re_record_overwrites_each_issue(tmp_path):
         "X-Men #1 Newsstand Edition", "X-Men #2 Newsstand Edition",
     ]
     assert result.inserted == 0 and result.overwritten == 2
-    # A re-record in a NEW commit is not a self-overwrite.
-    assert result.self_overwritten == ()
+    # A re-record in a NEW commit is not a self-collision.
+    assert result.self_collisions == ()
 
 
-def test_write_wins_self_overwrite_is_reported_across_chunks(tmp_path):
-    """A shared written_keys set catches a collision split across two chunks."""
+def test_write_wins_self_collision_is_refused_across_chunks(tmp_path):
+    """A shared written_keys set catches a collision split across two chunks,
+    and the first book stays on disk."""
     cache = make_cache(tmp_path)
     written: set = set()
     cache.write_wins(
@@ -470,7 +480,33 @@ def test_write_wins_self_overwrite_is_reported_across_chunks(tmp_path):
         written_keys=written,
     )
 
-    assert result.self_overwritten == ("X-Men Annual #6",)
+    assert result.self_collisions == ("X-Men Annual #6",)
+    lot = [r["full_title"] for r in cache.load()["comics"] if r.get("gixen_item_id") == "LOT"]
+    assert lot == ["X-Men #6"]
+
+
+def test_write_wins_missing_lot_issue_never_replaces_a_stored_sibling(tmp_path):
+    """A lot damaged before BUI-1384 holds one issue. Recording a missing issue
+    later (its sibling skipped as owned) must append, not overwrite."""
+    cache = make_cache(tmp_path)
+    cache.write_wins([make_row(full_title="X-Men #2", seq=1, gixen_item_id="LOT")])
+
+    result = cache.write_wins(
+        [make_row(full_title="X-Men #1", seq=2, gixen_item_id="LOT")], written_keys=set()
+    )
+
+    lot = sorted(r["full_title"] for r in cache.load()["comics"] if r.get("gixen_item_id") == "LOT")
+    assert lot == ["X-Men #1", "X-Men #2"]
+    assert result == (1, 0, ())
+
+
+def test_win_row_key_normalizes_the_issue_token():
+    from locg.collection_cache import win_row_key
+
+    assert win_row_key({"gixen_item_id": "A", "full_title": "X-Men #06,"}) == ("A", "6")
+    assert win_row_key({"gixen_item_id": "A", "full_title": "X-Men #1A Newsstand"}) == ("A", "1a")
+    assert win_row_key({"gixen_item_id": "A", "full_title": "X-Men #0"}) == ("A", "0")
+    assert win_row_key({"gixen_item_id": None, "full_title": "X-Men #1"}) is None
 
 
 def test_write_wins_lot_split_across_chunks_keeps_both_halves(tmp_path):
