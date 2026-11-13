@@ -103,9 +103,10 @@ disproportionately prone to a downstream volume mis-resolution). A null-year
 lot is era-checked per issue (BUI-1384): it records when every issue
 confirms, and otherwise the whole lot holds with `era_unconfirmed_issues`
 naming the rest. A commit with two books on one item ID and issue returns
-`500 self_collision` with `self_collision_titles`, records only the first,
-and marks nothing seen. Stop and report it to the user: a plain re-run can
-overwrite the first book. There is
+a 200 with `held_item_ids` and `self_collision_titles` (BUI-1387): it records
+only the first book of the colliding item and leaves that item unseen. Every
+other item in the commit is recorded and marked seen. Stop and report the held
+item to the user: a plain re-run can overwrite the first book. There is
 deliberately no price threshold and no confidence threshold —
 `comic-identify`'s baseline confidence (0.5) would fire on nearly every real
 title (BUI-354; the rationale doc has the full story of both).
@@ -185,7 +186,7 @@ if [ "${code:-000}" -ge 200 ] && [ "${code:-000}" -lt 300 ]; then
   # tokens on a large batch; it stays on disk if you need it). An
   # unparseable/truncated 200 body is NOT success — exit non-zero.
   python3 -c "import json; d=json.load(open('$SCRATCH/commit_response.json')); \
-    print(json.dumps({k: d.get(k) for k in ['rows_written','skipped_already_owned','manual_variant_count','manual_series_count','metron_lookups_succeeded','marked_seen','pending_push_count','oldest_pending_days']}))" \
+    print(json.dumps({k: d.get(k) for k in ['rows_written','skipped_already_owned','manual_variant_count','manual_series_count','metron_lookups_succeeded','marked_seen','held_item_ids','self_collision_titles','pending_push_count','oldest_pending_days']}))" \
     || { echo "record-win/commit returned HTTP $code but the body could not be parsed — see $SCRATCH/commit_response.json; do NOT assume success."; exit 1; }
 elif [ "${code:-000}" = "000" ]; then
   # No HTTP response at all — could be "never connected" OR "connection cut
@@ -211,8 +212,14 @@ On 2xx, the scalar extraction above prints:
 ```json
 {"rows_written": 3, "skipped_already_owned": 0, "manual_variant_count": 0,
  "manual_series_count": 1, "metron_lookups_succeeded": 2, "marked_seen": 3,
+ "held_item_ids": [], "self_collision_titles": [],
  "pending_push_count": 7, "oldest_pending_days": 4}
 ```
+
+Check `held_item_ids` before reporting success. A non-empty list is a 200, not
+a clean run: those items hit a self-collision (two books on one item ID and
+issue), were held unseen, and need review. Name them and their
+`self_collision_titles` to the operator.
 
 `marked_seen` is the BUI-121 seen-set count, keyed off exactly what was
 merged and committed (never a client re-derivation). Carry

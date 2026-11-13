@@ -3390,7 +3390,7 @@ async def api_record_win_commit(request: Request, req: RecordWinCommitRequest):
          are therefore atomic: nothing is ever marked seen on a partial or
          failed commit.
       3. On full success (no exception, `partial_failure` is falsy), marks
-         seen exactly the item_ids THIS call merged and submitted — never a
+         seen (BUI-1387: except self-collision-held items) exactly the item_ids THIS call merged and submitted — never a
          re-derivation from a client-side file that might disagree with what
          was actually recorded (the BUI-428 bug: a bad client merge keyed
          record-win and mark-seen off two different sets).
@@ -3462,23 +3462,6 @@ async def api_record_win_commit(request: Request, req: RecordWinCommitRequest):
             }),
         )
 
-    if result.get("self_collision_titles"):
-        # BUI-1384: two different books in this commit share one item ID +
-        # issue key (the shape that left the 2026-11-13 Power Fantasy lot with
-        # only #16). write_wins kept the first and refused the rest. Never
-        # mark seen on it: the item stays unprocessed for a human to resolve.
-        raise HTTPException(
-            status_code=500,
-            detail=jsonable_encoder({
-                **result,
-                "error": "self_collision",
-                "message": (
-                    "two books in this commit share one item ID and issue; "
-                    "the later ones were not recorded — nothing was marked seen"
-                ),
-            }),
-        )
-
     if result.get("partial_failure"):
         # BUI-137: some chunk failed to commit partway through. Raised BEFORE
         # any mark-seen call below — never mark seen on a partial commit, so a
@@ -3507,11 +3490,39 @@ async def api_record_win_commit(request: Request, req: RecordWinCommitRequest):
     # processed (matched an owned row), just not re-written, matching the
     # existing BUI-121 "don't reprocess" semantics the old client-side
     # dict.fromkeys(...) derivation already relied on.
+    #
+    # BUI-1387: an item that took a self-collision (two books, one item ID +
+    # issue key; BUI-1384) is HELD: its first book is on disk but a later one
+    # was refused, so the item is never marked seen and the next run retries it
+    # (a re-record overwrites the same key in place, no duplicate). Every other
+    # item is marked seen as before. The collision stays loud through
+    # `held_item_ids` / `self_collision_titles` in a 200 body.
+    held_item_ids = list(
+        dict.fromkeys(
+            str(i).strip() for i in (result.get("self_collision_item_ids") or []) if str(i).strip()
+        )
+    )
+    if result.get("self_collision_titles") and not held_item_ids:
+        # Titles without item IDs: cannot say which item to hold, so hold the
+        # whole commit rather than mark an unrecorded book seen.
+        raise HTTPException(
+            status_code=500,
+            detail=jsonable_encoder({
+                **result,
+                "error": "self_collision",
+                "message": (
+                    "two books in this commit share one item ID and issue, and "
+                    "the colliding item could not be identified — nothing was "
+                    "marked seen"
+                ),
+            }),
+        )
+    held = set(held_item_ids)
     committed_item_ids = list(
         dict.fromkeys(
             item_id
             for w in merged_wins
-            if (item_id := str(w.get("item_id") or "").strip())
+            if (item_id := str(w.get("item_id") or "").strip()) and item_id not in held
         )
     )
     db = request.app.state.db
@@ -3521,6 +3532,7 @@ async def api_record_win_commit(request: Request, req: RecordWinCommitRequest):
     return {
         **result,
         "committed_item_ids": committed_item_ids,
+        "held_item_ids": held_item_ids,
         "marked_seen": marked,
         "pending_push_count": status.get("pending_push_count"),
         "oldest_pending_days": status.get("oldest_pending_days"),

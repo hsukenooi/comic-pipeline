@@ -70,6 +70,18 @@ def test_needs_review_only_notifies_skips_commit_and_still_pings_ok():
     assert ping.call_args.args[1] is True
 
 
+def test_held_self_collision_prints_stdout_line_for_the_wrapper():
+    result, _, ping, notify = _run(
+        _payload(wins=[{"item_id": "1"}]),
+        commit_result=(True, {"rows_written": 1, "held_item_ids": ["9"]}, None),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "record-wins: 1 held (self-collision)" in result.stdout
+    notify.assert_called_once()
+    assert ping.call_args.args[1] is True
+
+
 def test_nothing_new_pings_ok():
     result, calls, ping, notify = _run(_payload())
 

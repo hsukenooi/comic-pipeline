@@ -64,7 +64,10 @@ else
   # wins only raise a Mac Mini notification and can sit unrecorded for weeks,
   # hiding owned books from the /comic:buy collection check (BUI-1385).
   held="$(printf '%s\n' "$rw_out" | sed -n 's/^record-wins:.* \([0-9][0-9]*\) need review.*/\1/p' | head -1)"
-  if [ -n "$held" ] && [ "$held" -gt 0 ]; then
+  # BUI-1387: a record-win self-collision holds its item and exits 0.
+  collided="$(printf '%s\n' "$rw_out" | sed -n 's/^record-wins: \([0-9][0-9]*\) held (self-collision).*/\1/p' | head -1)"
+  held=$(( ${held:-0} + ${collided:-0} ))
+  if [ "$held" -gt 0 ]; then
     load_telegram_env
     if [ -f "$TELEGRAM_REPORT" ]; then
       /usr/bin/python3 "$TELEGRAM_REPORT" add-item ACTION "Comics record-wins" \
