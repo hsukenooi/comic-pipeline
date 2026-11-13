@@ -153,6 +153,19 @@ class TestLooseStapleVocabulary:
         "bottom staple torn free of the cover",
         "top staple torn loose",
         "staples have loosened over time",
+        # BUI-1382: the davesvintagecomics wording, verbatim, and variants.
+        "bottom staple is not attached",
+        "top staple is not attached",
+        "staples not attached",
+        "staples are not attached to the cover",
+        "staple isn't attached",
+        "staples aren’t attached",
+        "staple no longer attached",
+        "cover not attached at the staple",
+        "cover not attached at the bottom staple",
+        "top staple not fully attached",
+        "unattached bottom staple",
+        "staple has come off",
     ])
     def test_loose_staple_terms_fire(self, text):
         assert _codes(text) == ("loose_staple",)
@@ -177,6 +190,12 @@ class TestLooseStapleVocabulary:
         'GD condition, 2" spine split, pieces missing back cover',
         "spine split and staples tight",
         "sold separately; staples secure",
+        # BUI-1382: a reassuring "attached" is not the negated form.
+        "all pages, covers, and staples are attached",
+        "cover and pages attached at both staples",
+        "staples attached and tight",
+        # A detached cover with no staple in its clause is out of scope.
+        "cover is not attached, staples intact",
     ])
     def test_loose_staple_near_misses_stay_clean(self, text):
         assert _codes(text) == ()
@@ -337,6 +356,14 @@ class TestReturnShape:
 
 
 class TestListingFindings:
+    def test_staple_not_attached_note_is_a_loose_staple_finding(self):
+        """BUI-1382: three Nick Fury listings passed the gate with this note."""
+        findings = listing_defect_findings(
+            condition_description="bottom staple is not attached",
+        )
+        assert [f["code"] for f in findings] == ["loose_staple"]
+        assert findings[0]["phrase"] == "bottom staple is not attached"
+
     def test_condition_note_is_the_primary_source(self):
         findings = listing_defect_findings(
             condition_description="VG condition, rusty staple, staining",
