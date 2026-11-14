@@ -1954,9 +1954,11 @@ def _lot_series_text(stripped_title: str) -> str:
 # Half-Century War 1-5") is not in _LOT_RE: _LOT_RE also feeds
 # should_reject/hard_reject on the purchase-decision path (BUI-239), where a
 # false lot-reject drops a book you want.  So the bare-range signal lives HERE
-# and is consulted ONLY by identify_comic's is_lot decision, which
-# record-win-prep (comic-identify --batch) reads; the purchase-path gates are
-# untouched.  _expand_lot_issues already range-expands a bare pair (BUI-253 B1).
+# and is consulted ONLY by identify_comic's is_lot decision.  _LOT_RE and
+# should_reject/hard_reject are untouched.  identify_comic consumers
+# (record-win-prep via comic-identify --batch, autosnipe, ebay_fetch's identify
+# table) now treat a bare range as a lot, which is intended: they previously
+# priced/sniped "1-16" as issue #1.  _expand_lot_issues already range-expands a bare pair (BUI-253 B1).
 #
 # Deliberately conservative (a false lot on a single-issue title makes
 # record-win-prep record N books for a one-book win): span >= 2 (adjacent
