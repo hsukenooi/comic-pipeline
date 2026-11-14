@@ -1972,7 +1972,7 @@ _BARE_RANGE_LOT_RE = re.compile(
     r"(?![.:/]?\d)(?!\s*[" + _FMV_RANGE_DASHES + r"/:]\s*\d)",
 )
 _BARE_RANGE_PREFIX_RE = re.compile(
-    r"\b(?:vol(?:ume)?s?|v|part|pt|phase|season|book|no|issue|series|printing|print|"
+    r"\b(?:vol(?:ume)?s?|v|part|pt|phase|season|book|no|issue|printing|print|"
     r"edition|ed|page|pg|chapter|ch|grade|cgc|cbcs|pgx|"
     # grade abbreviations: "VF 8-10", "NM- 9-10", "VG/FN 4-6"
     r"(?:vf|nm|fn|vg|gd|fr|pr|fine|good|mint|near\s+mint|very\s+fine)[+/-]?)\.?\s*$",
@@ -1980,9 +1980,16 @@ _BARE_RANGE_PREFIX_RE = re.compile(
 )
 _BARE_RANGE_SUFFIX_RE = re.compile(
     r"^\s*(?:%|x\b|in\b|inch|pack|pk|weeks?|days?|hours?|yrs?|years?|mm|cm|oz|"
-    r"th\b|st\b|nd\b|rd\b|pages?|pgs?|stars?|copies|copy)",
+    r"th\b|st\b|nd\b|rd\b|pages?|pgs?|stars?|copies|copy|grade)",
     re.IGNORECASE,
 )
+
+
+# A standalone 1-3 digit number before the range is an issue number ("Batman
+# Adventures 12 1st Harley 7-9" is issue 12, the 7-9 is a grade/appearance
+# note).  4-digit tokens are deliberately ignored: they are years or titles
+# like "2099", so "Spider-Man 2099 1-10" stays a lot.
+_EARLIER_ISSUE_NUM_RE = re.compile(r"(?<![\d.:/'\u2019#-])\b\d{1,3}\b(?![.:/'\u2019-]?\d)(?!-)")
 
 
 def _bare_range_lot(title: str) -> bool:
@@ -1995,6 +2002,8 @@ def _bare_range_lot(title: str) -> bool:
         if high - low < _FMV_MIN_RANGE_SPAN or high - low > 500:
             continue
         if _BARE_RANGE_PREFIX_RE.search(title[: m.start()]):
+            continue
+        if _EARLIER_ISSUE_NUM_RE.search(title[: m.start()]):
             continue
         if _BARE_RANGE_SUFFIX_RE.match(title[m.end():]):
             continue

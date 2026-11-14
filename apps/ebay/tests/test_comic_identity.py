@@ -1467,6 +1467,8 @@ class TestBui1236RetoldKeyDescription:
     ("Power Fantasy 1-16", 16, "1", "16"),
     ("Godzilla Half-Century War 1-5", 5, "1", "5"),
     ("Saga 1-54 Image Comics Complete", 54, "1", "54"),
+    ("Wolverine Limited Series 1-4", 4, "1", "4"),
+    ("Wolverine Limited Series 1-4 Complete", 4, "1", "4"),
 ])
 def test_bare_range_title_is_lot_with_every_issue(title, count, first, last):
     ident = ci.identify_comic(title)
@@ -1488,6 +1490,11 @@ def test_bare_range_title_is_lot_with_every_issue(title, count, first, last):
     "Batman 400 CGC 9.4-9.6",
     "Batman 400 ships in 2-5 weeks",
     "Batman 10-12-2024",
+    "Batman Adventures 12 1st Harley 7-9",
+    "Batman Adventures 12 1st Harley 7-9 grade",
+    "Iron Man 55 1st Thanos 4-6",
+    "Amazing Spider-Man 129 Punisher 3-5 Raw",
+    "Hulk 181 Wolverine 6-8 VF",
 ])
 def test_bare_range_must_not_make_single_issue_a_lot(title):
     assert ci.identify_comic(title).is_lot is False
