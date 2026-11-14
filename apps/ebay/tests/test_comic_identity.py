@@ -1458,3 +1458,49 @@ class TestBui1236RetoldKeyDescription:
         assert ci.should_reject(
             "Amazing Spider-Man #94 Origin Retold", "Amazing Spider-Man", "94"
         ) is True
+
+
+# ─── BUI-1389: bare "N-M" range titles are lots on the identify path ───────
+
+
+@pytest.mark.parametrize("title,count,first,last", [
+    ("Power Fantasy 1-16", 16, "1", "16"),
+    ("Godzilla Half-Century War 1-5", 5, "1", "5"),
+    ("Saga 1-54 Image Comics Complete", 54, "1", "54"),
+    ("Wolverine Limited Series 1-4", 4, "1", "4"),
+    ("Wolverine Limited Series 1-4 Complete", 4, "1", "4"),
+])
+def test_bare_range_title_is_lot_with_every_issue(title, count, first, last):
+    ident = ci.identify_comic(title)
+    assert ident.is_lot is True
+    assert len(ident.constituent_issues) == count
+    assert ident.constituent_issues[0] == first
+    assert ident.constituent_issues[-1] == last
+    assert ident.series and ident.series[0].isalpha()
+
+
+@pytest.mark.parametrize("title", [
+    "Spider-Man 1-shot",
+    "Absolute Martian Manhunter 2025-2026",
+    "Fantastic Four 1975-1983 Kirby",
+    "Amazing Spider-Man #300 NM 9-10",
+    "Amazing Spider-Man 129 VF 8-10 1974",
+    "Batman Vol 1-3",
+    "X-Men 1-2",
+    "Batman 400 CGC 9.4-9.6",
+    "Batman 400 ships in 2-5 weeks",
+    "Batman 10-12-2024",
+    "Batman Adventures 12 1st Harley 7-9",
+    "Batman Adventures 12 1st Harley 7-9 grade",
+    "Iron Man 55 1st Thanos 4-6",
+    "Amazing Spider-Man 129 Punisher 3-5 Raw",
+    "Hulk 181 Wolverine 6-8 VF",
+])
+def test_bare_range_must_not_make_single_issue_a_lot(title):
+    assert ci.identify_comic(title).is_lot is False
+
+
+def test_bare_range_not_added_to_purchase_path_lot_re():
+    """BUI-239: _LOT_RE feeds should_reject/hard_reject; the bare range must
+    stay out of it so a purchase-path title is not hard-rejected."""
+    assert not ci._LOT_RE.search("Power Fantasy 1-16")

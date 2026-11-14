@@ -1125,3 +1125,20 @@ def test_fetch_era_evidence_truthy_non_true_confirmed_is_not_trusted():
     items = [{"item_id": "s"}, {"item_id": "n"}, {"item_id": "t"}]
     result = fetch_era_evidence("http://example.test", items, session=session)
     assert result == {"s": False, "n": False, "t": True}
+
+
+def test_range_titled_lot_yields_one_entry_per_issue_end_to_end(monkeypatch):
+    """BUI-1389: a bare "1-16" title must reach entries_for_win as a lot with
+    every issue (real comic-identify output), not as one book."""
+    import sys
+    from pathlib import Path
+
+    src = str(Path(__file__).resolve().parents[3] / "apps" / "ebay" / "src")
+    monkeypatch.syspath_prepend(src)
+    import comic_identity as ci
+    ident = ci.identify_comic("Power Fantasy 1-16")
+    identity = _identity(series=ident.series, issue=ident.issue, is_lot=ident.is_lot,
+                         constituent_issues=ident.constituent_issues)
+    entries, review = entries_for_win(_snipe("800765031857"), identity)
+    assert review is None
+    assert [e["identify_data"]["issue"] for e in entries] == [str(n) for n in range(1, 17)]

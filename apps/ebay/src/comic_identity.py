@@ -1948,6 +1948,69 @@ def _lot_series_text(stripped_title: str) -> str:
     return _LOT_BOILERPLATE_RE.sub("", text).strip()
 
 
+# ─── Bare-range lot detection (BUI-1389) ──────────────────────────────────
+
+# A BARE "N-M" issue range with no '#' ("Power Fantasy 1-16", "Godzilla
+# Half-Century War 1-5") is not in _LOT_RE: _LOT_RE also feeds
+# should_reject/hard_reject on the purchase-decision path (BUI-239), where a
+# false lot-reject drops a book you want.  So the bare-range signal lives HERE
+# and is consulted ONLY by identify_comic's is_lot decision.  _LOT_RE and
+# should_reject/hard_reject are untouched.  identify_comic consumers
+# (record-win-prep via comic-identify --batch, autosnipe, ebay_fetch's identify
+# table) now treat a bare range as a lot, which is intended: they previously
+# priced/sniped "1-16" as issue #1.  _expand_lot_issues already range-expands a bare pair (BUI-253 B1).
+#
+# Deliberately conservative (a false lot on a single-issue title makes
+# record-win-prep record N books for a one-book win): span >= 2 (adjacent
+# pairs are grade/box notation, "VG-FN 4-5"), no hash-issue anywhere in the
+# title (a '#300 ... 9-10' title is a single issue with a grade), both ends
+# 1-3 digits and not part of a longer chain/date/decimal, not apostrophe-year
+# shorthand, and not label-prefixed ("Vol 1-2", "Part 1-3") or unit-suffixed
+# ("1-3 weeks", "2-5 pack") — those are not issue runs.
+_BARE_RANGE_LOT_RE = re.compile(
+    r"(?<![\d.:/'\u2019#-])(?<!\d\s)\b(\d{1,3})\s*[" + _FMV_RANGE_DASHES + r"]\s*(\d{1,3})\b"
+    r"(?![.:/]?\d)(?!\s*[" + _FMV_RANGE_DASHES + r"/:]\s*\d)",
+)
+_BARE_RANGE_PREFIX_RE = re.compile(
+    r"\b(?:vol(?:ume)?s?|v|part|pt|phase|season|book|no|issue|printing|print|"
+    r"edition|ed|page|pg|chapter|ch|grade|cgc|cbcs|pgx|"
+    # grade abbreviations: "VF 8-10", "NM- 9-10", "VG/FN 4-6"
+    r"(?:vf|nm|fn|vg|gd|fr|pr|fine|good|mint|near\s+mint|very\s+fine)[+/-]?)\.?\s*$",
+    re.IGNORECASE,
+)
+_BARE_RANGE_SUFFIX_RE = re.compile(
+    r"^\s*(?:%|x\b|in\b|inch|pack|pk|weeks?|days?|hours?|yrs?|years?|mm|cm|oz|"
+    r"th\b|st\b|nd\b|rd\b|pages?|pgs?|stars?|copies|copy|grade)",
+    re.IGNORECASE,
+)
+
+
+# A standalone 1-3 digit number before the range is an issue number ("Batman
+# Adventures 12 1st Harley 7-9" is issue 12, the 7-9 is a grade/appearance
+# note).  4-digit tokens are deliberately ignored: they are years or titles
+# like "2099", so "Spider-Man 2099 1-10" stays a lot.
+_EARLIER_ISSUE_NUM_RE = re.compile(r"(?<![\d.:/'\u2019#-])\b\d{1,3}\b(?![.:/'\u2019-]?\d)(?!-)")
+
+
+def _bare_range_lot(title: str) -> bool:
+    """True if *title* carries a bare, hash-less issue range that is safely a
+    run ("Power Fantasy 1-16"), never a single issue (BUI-1389)."""
+    if re.search(r"#\s*\d", title):
+        return False
+    for m in _BARE_RANGE_LOT_RE.finditer(title):
+        low, high = int(m.group(1)), int(m.group(2))
+        if high - low < _FMV_MIN_RANGE_SPAN or high - low > 500:
+            continue
+        if _BARE_RANGE_PREFIX_RE.search(title[: m.start()]):
+            continue
+        if _EARLIER_ISSUE_NUM_RE.search(title[: m.start()]):
+            continue
+        if _BARE_RANGE_SUFFIX_RE.match(title[m.end():]):
+            continue
+        return True
+    return False
+
+
 # ─── identify_comic() ──────────────────────────────────────────────────────
 
 
@@ -2023,7 +2086,7 @@ def identify_comic(title: "str | None", include_graded: bool = False) -> ComicId
     # none of them should ever expand into constituent_issues.
     identity.is_lot = (
         identity.edition not in ("collected", "facsimile", "reprint")
-        and bool(_LOT_RE.search(raw_title))
+        and (bool(_LOT_RE.search(raw_title)) or _bare_range_lot(raw_title))
     )
     count_mismatch = False
     if identity.is_lot:
