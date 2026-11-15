@@ -1469,6 +1469,9 @@ class TestBui1236RetoldKeyDescription:
     ("Saga 1-54 Image Comics Complete", 54, "1", "54"),
     ("Wolverine Limited Series 1-4", 4, "1", "4"),
     ("Wolverine Limited Series 1-4 Complete", 4, "1", "4"),
+    # BUI-1398: a 4-digit token (title number / year) before the range
+    ("Spider-Man 2099 1-10", 10, "1", "10"),
+    ("Batman 1989 1-5 Movie Adaptation", 5, "1", "5"),
 ])
 def test_bare_range_title_is_lot_with_every_issue(title, count, first, last):
     ident = ci.identify_comic(title)
@@ -1495,6 +1498,13 @@ def test_bare_range_title_is_lot_with_every_issue(title, count, first, last):
     "Iron Man 55 1st Thanos 4-6",
     "Amazing Spider-Man 129 Punisher 3-5 Raw",
     "Hulk 181 Wolverine 6-8 VF",
+    # BUI-1398: a 4-digit token must not unblock a later issue number
+    "Spider-Man 2099 12 9-10",
+    "Spider-Man 2099 12 1st Miguel 7-9",
+    "Batman 1989 400 CGC 9.4-9.6",
+    "Spider-Man 2099 9.4 7-9",
+    "Spider-Man 2099 1-2",
+    "Spider-Man 2099 VF 8-10",
 ])
 def test_bare_range_must_not_make_single_issue_a_lot(title):
     assert ci.identify_comic(title).is_lot is False

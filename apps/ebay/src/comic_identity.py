@@ -1968,7 +1968,7 @@ def _lot_series_text(stripped_title: str) -> str:
 # shorthand, and not label-prefixed ("Vol 1-2", "Part 1-3") or unit-suffixed
 # ("1-3 weeks", "2-5 pack") — those are not issue runs.
 _BARE_RANGE_LOT_RE = re.compile(
-    r"(?<![\d.:/'\u2019#-])(?<!\d\s)\b(\d{1,3})\s*[" + _FMV_RANGE_DASHES + r"]\s*(\d{1,3})\b"
+    r"(?<![\d.:/'\u2019#-])(?<!(?<!\d)\d\s)\b(\d{1,3})\s*[" + _FMV_RANGE_DASHES + r"]\s*(\d{1,3})\b"
     r"(?![.:/]?\d)(?!\s*[" + _FMV_RANGE_DASHES + r"/:]\s*\d)",
 )
 _BARE_RANGE_PREFIX_RE = re.compile(
