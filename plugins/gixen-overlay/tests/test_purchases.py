@@ -169,3 +169,13 @@ def test_offer_routes(api):
     assert api.patch("/api/comics/offers/999", json={"outcome": "declined"}).status_code == 404
     assert api.patch(f"/api/comics/offers/{offer['id']}", json={"outcome": None}).status_code == 422
     assert api.post("/api/comics/offers", json={"item_id": "1234567", "offer": 0}).status_code == 422
+
+
+def test_cancelled_purchase_not_in_pending_filter(db):
+    upsert_purchases(db, [
+        _purchase("100000000008-1", "100000000008", cancelled=True),
+        _purchase("100000000009-1", "100000000009"),
+    ])
+    pending = {r["item_id"] for r in list_purchases(db, collection_status="pending")}
+    assert pending == {"100000000009"}
+    assert {r["item_id"] for r in list_purchases(db)} == {"100000000008", "100000000009"}

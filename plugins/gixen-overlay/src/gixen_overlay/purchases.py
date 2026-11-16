@@ -213,6 +213,9 @@ def list_purchases(
     out = [_refine(dict(r), won, recorded, accepted) for r in _rows(conn, sql, params)]
     if collection_status:
         out = [r for r in out if r["collection_status"] == collection_status]
+        if collection_status == "pending":
+            # A cancelled order never arrived; it must not be offered for recording.
+            out = [r for r in out if not r["cancelled"]]
     return out
 
 

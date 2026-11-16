@@ -141,7 +141,9 @@ comics-api GET '/api/comics/purchases?collection_status=pending'
 ```
 
 Snipe wins read as `snipe_win` and come through Step 1, so they are not in
-this list. Show each pending purchase's `item_id`, `title`, `seller`, and
+this list. Cancelled purchases (`cancelled: true`) are excluded from the
+pending filter and are never recorded: the book never arrived. If you list
+rows another way, show the `cancelled` flag and skip those. Show each pending purchase's `item_id`, `title`, `seller`, and
 `total` to the user. **Never record one from its eBay title alone:** a wrong
 identity, or an owned book that is still wish-listed, is the BUI-122
 data-loss trigger. For each one the user confirms is a comic to keep, get
