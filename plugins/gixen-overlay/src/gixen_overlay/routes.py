@@ -2882,7 +2882,8 @@ async def api_slab_watch(request: Request):
     one function call away.
 
     Returns ``{threshold, count, items: [{comic_id, title, issue, year,
-    raw_high, reason: "threshold"|"hand", certifier}]}``. `certifier` is
+    raw_high, reason: "threshold"|"hand", certifier, min_grade, ceiling}]}``
+    (`min_grade`/`ceiling` are the BUI-1416 targets, null when unset). `certifier` is
     always ``"cgc"`` for now (BUI-950's stated default grader to fetch) —
     there is no per-book grader override yet, so this is a flat constant,
     not a stored field; widen it if/when a book needs a different grader.
@@ -2953,6 +2954,8 @@ async def api_slab_watch(request: Request):
             "raw_high": raw_high,
             "reason": reason,
             "certifier": "cgc",
+            "min_grade": comic_row["slab_min_grade"],
+            "ceiling": comic_row["slab_ceiling"],
         }
 
     items = list(resolved.values())
@@ -2973,15 +2976,28 @@ async def api_set_slab_watch(
 
     `req.slab_watch`: `1` hand-includes the comic (always in the set,
     whatever its raw FMV), `0` hand-excludes it (always out), `null` clears
-    the override back to threshold-only. See `SlabWatchRequest` for the
-    422 boundary and `set_comic_slab_watch` for the write.
+    the override back to threshold-only. BUI-1416: `min_grade` (0.5-10.0)
+    and `ceiling` (USD > 0) store the hunt-list targets; omit to leave
+    unchanged, send `null` to clear. Returns `{comic_id, slab_watch,
+    min_grade, ceiling}`. See `SlabWatchRequest` for the 422 boundary and
+    `set_comic_slab_watch` for the write.
 
     404 when `comic_id` names no known book — mirrors
     `POST /api/comics/comps/exclude`'s contract (an id-addressed write
     against a missing row is a 404, not a bad query).
     """
     db = request.app.state.db
-    result = set_comic_slab_watch(db, comic_id, req.slab_watch)
+    sent = req.model_fields_set
+    kwargs: dict[str, Any] = {}
+    if "min_grade" in sent:
+        kwargs["min_grade"] = req.min_grade
+    if "ceiling" in sent:
+        kwargs["ceiling"] = req.ceiling
+    # Legacy: omitted/null slab_watch clears the override. A body that sets
+    # a target without slab_watch leaves the flag alone (BUI-1416).
+    if "slab_watch" in sent or not kwargs:
+        kwargs["slab_watch"] = req.slab_watch
+    result = set_comic_slab_watch(db, comic_id, **kwargs)
     if result is None:
         raise HTTPException(
             status_code=404, detail=f"comic_id {comic_id} not in DB"

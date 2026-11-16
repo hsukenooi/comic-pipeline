@@ -168,7 +168,9 @@ def test_set_comic_slab_watch_round_trips_through_1_0_and_null(db):
     comic_id = upsert_comic(db, "Invincible", "1", 2003)
 
     result = set_comic_slab_watch(db, comic_id, 1)
-    assert result == {"comic_id": comic_id, "slab_watch": 1}
+    assert result == {
+        "comic_id": comic_id, "slab_watch": 1, "min_grade": None, "ceiling": None,
+    }
     row = list_comics_for_slab_watch(db)[0]
     assert row["slab_watch"] == 1
 
@@ -280,10 +282,10 @@ def test_slab_watch_hand_include_and_exclude_round_trip_with_reasons(client):
     # Hand-include the cheap book, hand-exclude the pricey one.
     resp = client.post(f"/api/comics/{cheap}/slab-watch", json={"slab_watch": 1})
     assert resp.status_code == 200
-    assert resp.json() == {"comic_id": cheap, "slab_watch": 1}
+    assert resp.json() == {"comic_id": cheap, "slab_watch": 1, "min_grade": None, "ceiling": None}
     resp = client.post(f"/api/comics/{pricey}/slab-watch", json={"slab_watch": 0})
     assert resp.status_code == 200
-    assert resp.json() == {"comic_id": pricey, "slab_watch": 0}
+    assert resp.json() == {"comic_id": pricey, "slab_watch": 0, "min_grade": None, "ceiling": None}
 
     body = client.get("/api/comics/slab-watch").json()
     ids = {item["comic_id"]: item for item in body["items"]}
@@ -404,3 +406,81 @@ def test_post_slab_watch_422s_on_an_out_of_vocabulary_value(client):
     comic_id = _upsert(client)
     resp = client.post(f"/api/comics/{comic_id}/slab-watch", json={"slab_watch": 2})
     assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# BUI-1416: minimum grade and ceiling targets
+# ---------------------------------------------------------------------------
+
+
+def test_target_columns_migrate_onto_a_pre_bui_1416_db_idempotently(tmp_path):
+    live = tmp_path / "old.db"
+    conn = _make_db(str(live))
+    create_tables(conn)
+    upsert_comic(conn, "Invincible", "1", 2003)
+    conn.execute("UPDATE comics SET slab_watch = 1")
+    conn.execute("ALTER TABLE comics DROP COLUMN slab_min_grade")
+    conn.execute("ALTER TABLE comics DROP COLUMN slab_ceiling")
+    conn.commit()
+    assert not {"slab_min_grade", "slab_ceiling"} & _comics_columns(conn)
+
+    create_tables(conn)
+    create_tables(conn)  # idempotent
+
+    assert {"slab_min_grade", "slab_ceiling"} <= _comics_columns(conn)
+    row = list_comics_for_slab_watch(conn)[0]
+    assert row["slab_watch"] == 1  # existing override survives
+    assert row["slab_min_grade"] is None and row["slab_ceiling"] is None
+    conn.close()
+
+
+def test_set_targets_omitted_leaves_values_and_null_clears(db):
+    cid = upsert_comic(db, "Invincible", "1", 2003)
+    r = set_comic_slab_watch(db, cid, 1, min_grade=9.2, ceiling=450.0)
+    assert r == {
+        "comic_id": cid, "slab_watch": 1, "min_grade": 9.2, "ceiling": 450.0,
+    }
+    # Legacy-style call: flag only, targets untouched.
+    r = set_comic_slab_watch(db, cid, 0)
+    assert (r["min_grade"], r["ceiling"]) == (9.2, 450.0)
+    r = set_comic_slab_watch(db, cid, min_grade=None)
+    assert (r["slab_watch"], r["min_grade"], r["ceiling"]) == (0, None, 450.0)
+    with pytest.raises(sqlite3.IntegrityError):
+        set_comic_slab_watch(db, cid, min_grade=11)
+    with pytest.raises(sqlite3.IntegrityError):
+        set_comic_slab_watch(db, cid, ceiling=0)
+
+
+def test_post_slab_watch_targets_round_trip_and_get_returns_them(client):
+    cid = _upsert(client, title="Target Book", issue="1", year=2000)
+    _seed_wish_list(client.store, [{"name": "Target Book #1", "id": None}])
+    url = f"/api/comics/{cid}/slab-watch"
+    r = client.post(url, json={"slab_watch": 1, "min_grade": 9.4, "ceiling": 300})
+    assert r.status_code == 200
+    assert r.json() == {
+        "comic_id": cid, "slab_watch": 1, "min_grade": 9.4, "ceiling": 300.0,
+    }
+    # Legacy flag-only caller keeps the targets.
+    r = client.post(url, json={"slab_watch": 1})
+    assert (r.json()["min_grade"], r.json()["ceiling"]) == (9.4, 300.0)
+    # Targets without the flag leave the flag alone.
+    r = client.post(url, json={"ceiling": 250})
+    assert r.json() == {
+        "comic_id": cid, "slab_watch": 1, "min_grade": 9.4, "ceiling": 250.0,
+    }
+    items = client.get("/api/comics/slab-watch").json()["items"]
+    assert [(i["comic_id"], i["min_grade"], i["ceiling"]) for i in items] == [
+        (cid, 9.4, 250.0)
+    ]
+    # Explicit null clears.
+    r = client.post(url, json={"slab_watch": 1, "min_grade": None})
+    assert r.json()["min_grade"] is None and r.json()["ceiling"] == 250.0
+
+
+@pytest.mark.parametrize(
+    "body",
+    [{"min_grade": 0.4}, {"min_grade": 10.5}, {"ceiling": 0}, {"ceiling": -5}],
+)
+def test_post_slab_watch_422s_on_out_of_range_targets(client, body):
+    cid = _upsert(client)
+    assert client.post(f"/api/comics/{cid}/slab-watch", json=body).status_code == 422
