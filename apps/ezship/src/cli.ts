@@ -2,7 +2,7 @@
 
 import { Command } from "commander";
 import { loadConfig, saveCookie } from "./auth.js";
-import { submitNewOrder } from "./api.js";
+import { submitNewOrder, listOrders } from "./api.js";
 import { WAREHOUSE_VALUES, CARRIER_MAP } from "./types.js";
 import { exitCodeFor, EXIT_SESSION_EXPIRED } from "./exit-codes.js";
 
@@ -94,6 +94,32 @@ program
       }
     }
   );
+
+program
+  .command("orders")
+  .description("List every order on the EZShip account (read-only)")
+  .option("--json", "Print JSON")
+  .action(async (opts: { json?: boolean }) => {
+    try {
+      const orders = await listOrders(loadConfig());
+      if (opts.json) {
+        console.log(JSON.stringify({ orders }, null, 2));
+      } else {
+        for (const o of orders) {
+          console.log(`${o.orderNumber}\t${o.trackingNo}\t${o.status}`);
+        }
+        console.log(`${orders.length} orders`);
+      }
+    } catch (err) {
+      const code = exitCodeFor(err);
+      console.error(
+        code === EXIT_SESSION_EXPIRED
+          ? err instanceof Error ? err.message : String(err)
+          : `Error: ${err instanceof Error ? err.message : String(err)}`
+      );
+      process.exit(code);
+    }
+  });
 
 program
   .command("set-cookie <value>")

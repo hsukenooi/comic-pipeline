@@ -4,6 +4,12 @@ Read-only. It finds order-confirmation emails whose shipping address is the
 EZShip warehouse, links each order to its shipping email, and proposes the
 fields for `ezship new`. It never writes Gmail, the ledger, or EZShip.
 
+An order counts as already submitted when its tracking number is in the CLI
+ledger or in the EZShip account's own order list (`ezship orders --json`,
+BUI-1378), so an order entered on the EZShip website is caught too. A failed
+EZShip lookup is a hard failure: it never reports an order as ready on the
+ledger alone.
+
 Exit codes (same as `ebay-shipped`): 0 ok, 1 Gmail or ledger failure,
 2 truncated window, 3 some orders unparsed.
 
@@ -18,6 +24,7 @@ import argparse
 import json
 import re
 import shlex
+import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
@@ -84,8 +91,33 @@ ALREADY = "already_submitted"
 ORPHAN = "orphan_shipment"
 UNPARSED = "unparsed"
 
-_LEDGER_NOTE = ("The ledger covers CLI submissions only. An order submitted on "
-                "the EZShip website still reads as ready.")
+# A cancelled EZShip order never shipped onward, so its parcel still needs
+# submitting.
+_EZSHIP_NOT_SUBMITTED = {"Cancelled_Code"}
+_EZSHIP_TIMEOUT_S = 180
+
+
+def load_ezship_trackings(run=subprocess.run) -> set:
+    """Tracking numbers (upper-case) of every live order on the EZShip account."""
+    cmd = ["ezship", "orders", "--json"]
+    try:
+        done = run(cmd, capture_output=True, text=True, timeout=_EZSHIP_TIMEOUT_S)
+    except FileNotFoundError as exc:
+        raise ShippedOrdersError(
+            "ezship CLI not found on PATH; run scripts/install.sh") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise ShippedOrdersError(
+            f"`ezship orders` timed out after {_EZSHIP_TIMEOUT_S}s") from exc
+    if done.returncode != 0:
+        detail = (done.stderr or done.stdout or "").strip()
+        raise ShippedOrdersError(
+            f"`ezship orders` failed (exit {done.returncode}): {detail}")
+    try:
+        orders = json.loads(done.stdout)["orders"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise ShippedOrdersError("`ezship orders --json` printed no order list") from exc
+    return {str(o.get("trackingNo") or "").strip().upper() for o in orders
+            if o.get("trackingNo") and o.get("status") not in _EZSHIP_NOT_SUBMITTED}
 
 
 # ─── Category list ────────────────────────────────────────────────────────────
@@ -388,13 +420,18 @@ def find_trackings(order: dict, order_days: int, max_results: int):
 
 
 def build_report(messages, ledger, days, order_days, search_max=_DEFAULT_SEARCH_MAX,
-                 categories=None, now=None):
+                 categories=None, now=None, ezship=frozenset()):
     categories = categories if categories is not None else load_categories()
     now = now or datetime.now(timezone.utc)
     cutoff = now - timedelta(days=days)
     orders, shipping, unparsed, skipped = classify_messages(messages, cutoff)
     truncated = False
-    rows, linked_ids, outside_window = [], set(), []
+    rows, linked_ids = [], set()
+
+    def submitted_via(number):
+        number = number.upper()
+        return [name for name, known in (("ledger", ledger), ("ezship", ezship))
+                if number in known]
 
     for order in sorted(orders, key=lambda o: o["sent_at"] or "", reverse=True):
         trackings, ids, trunc, untracked = find_trackings(order, order_days, search_max)
@@ -413,16 +450,13 @@ def build_report(messages, ledger, days, order_days, search_max=_DEFAULT_SEARCH_
         if not trackings:
             rows.append({**row, "status": WAITING})
             continue
-        if not any(_in_window(t["sent_at"], cutoff) for t in trackings):
-            # Named, never just counted: the ledger can't tell an order
-            # submitted on the EZShip website from one nobody submitted.
-            dates = [t["sent_at"] for t in trackings if t["sent_at"]]
-            outside_window.append({
-                "merchant": order["merchant"], "order_number": order["order_number"],
-                "last_email": max(dates)[:10] if dates else None,
-                "trackings": [t["tracking_number"] for t in trackings],
-                "in_ledger": [t["tracking_number"] for t in trackings
-                              if t["tracking_number"].upper() in ledger]})
+        # Every order is checked against the ledger and EZShip, however old
+        # its shipping mail: the EZShip list replaces the old --days cut-off.
+        vias = [submitted_via(t["tracking_number"]) for t in trackings]
+        if all(vias):
+            rows.append({**row, "status": ALREADY,
+                         "tracking": trackings[0]["tracking_number"],
+                         "submitted_via": sorted({v for via in vias for v in via})})
             continue
         if len(trackings) > 1:
             rows.append({**row, "status": HOLD,
@@ -430,10 +464,6 @@ def build_report(messages, ledger, days, order_days, search_max=_DEFAULT_SEARCH_
                                    "parcel holds which items"})
             continue
         tracking = trackings[0]
-        if tracking["tracking_number"].upper() in ledger:
-            rows.append({**row, "status": ALREADY,
-                         "tracking": tracking["tracking_number"]})
-            continue
         status, fields, reason = propose(order, tracking, categories)
         rows.append({**row, "status": status,
                      **({"proposal": fields} if fields else {}),
@@ -478,8 +508,7 @@ def build_report(messages, ledger, days, order_days, search_max=_DEFAULT_SEARCH_
                 "order_number": None,
                 "reason": "shipping mail to the warehouse with no readable tracking number"})
     return {"orders": rows, "orphans": orphans, "unparsed": unparsed,
-            "skipped_not_warehouse": skipped, "outside_window": outside_window,
-            "truncated": truncated}
+            "skipped_not_warehouse": skipped, "truncated": truncated}
 
 
 # ─── Output ───────────────────────────────────────────────────────────────────
@@ -501,6 +530,8 @@ def render_table(report) -> str:
         out.append(f"    items: {'; '.join(row['items'])}")
         if row.get("trackings"):
             out.append(f"    tracking: {', '.join(row['trackings'])}")
+        if row.get("submitted_via"):
+            out.append(f"    found in: {', '.join(row['submitted_via'])}")
         if row.get("reason"):
             out.append(f"    reason: {row['reason']}")
         prop = row.get("proposal")
@@ -523,18 +554,11 @@ def render_table(report) -> str:
         out.append("")
     counts = ", ".join(f"{k}={v}" for k, v in _counts(report).items() if v) or "nothing found"
     out.append(f"Summary: {counts}")
-    if report["outside_window"]:
-        out.append("Shipped before the --days window (confirm each one is on the "
-                   "EZShip website):")
-        for row in report["outside_window"]:
-            trackings = ", ".join(
-                t + (" (in CLI ledger)" if t in row["in_ledger"] else "")
-                for t in row["trackings"])
-            out.append(f"    {row['merchant']} #{row['order_number']}  "
-                       f"last email {row['last_email'] or '?'}  {trackings}")
     if report["truncated"]:
         out.append("WARNING: a Gmail search was truncated; this report is incomplete.")
-    out.append(_LEDGER_NOTE)
+    if "ezship_orders" in report:
+        out.append(f"Submitted check: the CLI ledger plus {report['ezship_orders']} "
+                   "tracking numbers on EZShip.")
     return "\n".join(out)
 
 
@@ -550,7 +574,9 @@ def main(argv=None):
                         version=_version_string().replace("ebay-shipped", "ezship-bound"))
     parser.add_argument("--json", action="store_true", dest="json_output")
     parser.add_argument("--days", type=int, default=45, metavar="N",
-                        help="Shipment window in days (default: 45).")
+                        help="Window in days for unmatched shipping mail and "
+                             "unreadable mail (default: 45). Orders are checked "
+                             "against EZShip however old.")
     parser.add_argument("--order-days", type=int, default=180, metavar="N",
                         help="Order-confirmation window in days (default: 180); "
                              "presales ship months after the order.")
@@ -565,17 +591,19 @@ def main(argv=None):
              "-from:ebay.com -from:members.ebay.com -from:ezbuy.sg")
     try:
         ledger = load_ledger(args.ledger)
+        ezship = load_ezship_trackings()
         fetched = fetch_messages(query, args.max_results)
-        report = build_report(fetched.messages, ledger, args.days, args.order_days)
+        report = build_report(fetched.messages, ledger, args.days, args.order_days,
+                              ezship=ezship)
     except ShippedOrdersError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return _EXIT_HARD_FAILURE
     report["truncated"] = report["truncated"] or fetched.truncated
     report["query"] = query
+    report["ezship_orders"] = len(ezship)
 
     if args.json_output:
-        print(json.dumps({"counts": _counts(report), **report,
-                          "ledger_note": _LEDGER_NOTE}, indent=2))
+        print(json.dumps({"counts": _counts(report), **report}, indent=2))
     else:
         print(render_table(report))
     if report["truncated"]:

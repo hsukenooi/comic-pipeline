@@ -14,6 +14,8 @@ import shipped_orders as so
 FIX = Path(__file__).parent / "fixtures" / "ezship_bound"
 NOW = datetime(2026, 11, 12, tzinfo=timezone.utc)
 HART_TRACKING = "92001902673388000127757663"
+# Captured before the autouse fixture swaps it out.
+REAL_LOADER = eb.load_ezship_trackings
 
 
 def load(name):
@@ -71,6 +73,12 @@ def search(monkeypatch):
     handle.map = store
     handle.queries = queries
     return handle
+
+
+@pytest.fixture(autouse=True)
+def no_ezship(monkeypatch):
+    """main() never shells out to the real ezship CLI in tests."""
+    monkeypatch.setattr(eb, "load_ezship_trackings", lambda: set())
 
 
 def report(messages, ledger=frozenset(), **kw):
@@ -407,15 +415,101 @@ def test_old_mail_without_order_number_is_skipped(search):
     assert rep["unparsed"] == [] and rep["skipped_not_warehouse"] == 1
 
 
-def test_order_shipped_before_the_window_is_named(hart_order, search):
+# ─── EZShip order list (BUI-1378) ─────────────────────────────────────────────
+
+
+def test_order_on_ezship_but_not_in_ledger_is_already_submitted(hart_order, search):
+    # The ticket's case: Hart #75151 was entered on the EZShip website.
     search.map["75151"] = [load("hart_shipping.json")]
-    rep = report([hart_order], ledger={HART_TRACKING}, days=45)
-    assert rep["orders"] == []
-    assert rep["outside_window"] == [{
-        "merchant": "Hart Audio Cables", "order_number": "75151",
-        "last_email": "2026-08-26", "trackings": [HART_TRACKING],
-        "in_ledger": [HART_TRACKING]}]
-    text = eb.render_table(rep)
-    assert "Shipped before the --days window" in text
-    assert (f"Hart Audio Cables #75151  last email 2026-08-26  "
-            f"{HART_TRACKING} (in CLI ledger)") in text
+    rep = report([hart_order], ezship={HART_TRACKING.upper()})
+    row = row_for(rep, "75151")
+    assert row["status"] == eb.ALREADY
+    assert row["submitted_via"] == ["ezship"]
+    assert "proposal" not in row
+    assert "found in: ezship" in eb.render_table(rep)
+
+
+def test_ledger_and_ezship_both_named(hart_order, search):
+    search.map["75151"] = [load("hart_shipping.json")]
+    rep = report([hart_order], ledger={HART_TRACKING}, ezship={HART_TRACKING})
+    assert row_for(rep, "75151")["submitted_via"] == ["ezship", "ledger"]
+
+
+def test_old_shipment_is_checked_not_cut_off(hart_order, search):
+    # The --days window no longer hides orders: an old one on EZShip reads as
+    # submitted, and an old one nowhere reads as ready.
+    search.map["75151"] = [load("hart_shipping.json")]
+    rep = report([hart_order], days=1, ezship={HART_TRACKING})
+    assert row_for(rep, "75151")["status"] == eb.ALREADY
+    assert "outside_window" not in rep
+    rep = report([hart_order], days=1)
+    assert row_for(rep, "75151")["status"] == eb.READY
+
+
+def test_one_of_two_trackings_submitted_still_holds(hart_order, search):
+    second = make("s2", "Hart Audio Cables <orders@hartaudiocables.com>",
+                  "A shipment from order #75151 is on the way",
+                  "Order #75151\nUPS tracking number: 1Z999AA10123456784\n")
+    search.map["75151"] = [load("hart_shipping.json"), second]
+    rep = report([hart_order], ezship={HART_TRACKING})
+    assert row_for(rep, "75151")["status"] == eb.HOLD
+
+
+class _Done:
+    def __init__(self, code=0, out="", err=""):
+        self.returncode, self.stdout, self.stderr = code, out, err
+
+
+def test_load_ezship_trackings_skips_cancelled_and_uppercases():
+    out = json.dumps({"orders": [
+        {"orderNumber": "A", "trackingNo": "1z999", "status": "Complete_Code"},
+        {"orderNumber": "B", "trackingNo": "9400X", "status": "Cancelled_Code"},
+        {"orderNumber": "C", "trackingNo": "", "status": "ShipToWarehouse_Code"},
+    ]})
+    calls = []
+
+    def run(cmd, **kw):
+        calls.append(cmd)
+        return _Done(out=out)
+
+    assert REAL_LOADER(run) == {"1Z999"}
+    assert calls[-1] == ["ezship", "orders", "--json"]
+
+
+@pytest.mark.parametrize("done, match", [
+    (_Done(code=3, err="Session expired. Run: ezship set-cookie"), "set-cookie"),
+    (_Done(out="not json"), "no order list"),
+])
+def test_load_ezship_trackings_failures_raise(done, match):
+    with pytest.raises(so.ShippedOrdersError, match=match):
+        REAL_LOADER(lambda cmd, **kw: done)
+
+
+def test_missing_ezship_cli_raises():
+    def run(cmd, **kw):
+        raise FileNotFoundError("ezship")
+
+    with pytest.raises(so.ShippedOrdersError, match="install.sh"):
+        REAL_LOADER(run)
+
+
+def test_ezship_failure_exits_1_without_a_report(monkeypatch, hart_order, tmp_path, capsys):
+    def boom():
+        raise so.ShippedOrdersError("`ezship orders` failed (exit 3): Session expired")
+
+    monkeypatch.setattr(eb, "load_ezship_trackings", boom)
+    monkeypatch.setattr(eb, "fetch_messages",
+                        lambda q, m, w=8: so.Fetched([hart_order], False, 1))
+    assert eb.main(["--ledger", str(tmp_path / "none.json")]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == "" and "Session expired" in captured.err
+
+
+def test_main_passes_ezship_trackings_through(monkeypatch, hart_order, search, tmp_path, capsys):
+    search.map["75151"] = [load("hart_shipping.json")]
+    search.map["12826"] = [hart_order]
+    monkeypatch.setattr(eb, "load_ezship_trackings", lambda: {HART_TRACKING})
+    assert eb.main(["--json", "--days", "180", "--ledger", str(tmp_path / "n.json")]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert row_for(payload, "75151")["status"] == eb.ALREADY
+    assert payload["ezship_orders"] == 1
