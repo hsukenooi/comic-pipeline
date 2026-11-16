@@ -276,7 +276,10 @@ def insert_offer(conn: sqlite3.Connection, offer: dict[str, Any]) -> dict[str, A
             offer.get("notes"), offer.get("offered_at") or now, now, now,
         ),
     )
-    return get_offer(conn, cur.lastrowid)
+    assert cur.lastrowid is not None
+    stored = get_offer(conn, cur.lastrowid)
+    assert stored is not None
+    return stored
 
 
 def update_offer(
