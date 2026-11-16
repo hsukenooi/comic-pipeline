@@ -1,0 +1,172 @@
+"""BUI-1415: ebay-purchases-pull and ebay-offer-log.
+
+GetOrders XML here mirrors a live response read 2026-11-17: per-line
+TransactionPrice, ActualShippingCost, Taxes/TotalTaxAmount, OrderLineItemID;
+order-level ShippingServiceSelected/ShippingServiceCost and Total. No field
+names the listing type or a Best Offer.
+"""
+from __future__ import annotations
+
+import json
+import xml.etree.ElementTree as ET
+
+import pytest
+import requests
+
+import ebay_user_token as eut
+import offer_log
+import purchases_pull as pp
+
+NSDECL = 'xmlns="urn:ebay:apis:eBLBaseComponents"'
+
+
+def txn(item_id, txn_id="10", price="100.00", ship="5.00", tax="8.00", qty=1, line_id=True):
+    ship_el = f"<ActualShippingCost>{ship}</ActualShippingCost>" if ship is not None else ""
+    tax_el = f"<Taxes><TotalTaxAmount>{tax}</TotalTaxAmount></Taxes>" if tax is not None else ""
+    line = f"<OrderLineItemID>{item_id}-{txn_id}</OrderLineItemID>" if line_id else ""
+    return (
+        f"<Transaction><Item><ItemID>{item_id}</ItemID><Title>Book {item_id}</Title></Item>"
+        f"<QuantityPurchased>{qty}</QuantityPurchased><CreatedDate>2026-11-03T09:14:26.000Z</CreatedDate>"
+        f'<TransactionID>{txn_id}</TransactionID><TransactionPrice currencyID="USD">{price}</TransactionPrice>'
+        f"{ship_el}{tax_el}{line}</Transaction>"
+    )
+
+
+def order(order_id, txns, total=None, ship="12.40", status="Completed", cancel="NotApplicable"):
+    total_el = f"<Total>{total}</Total>" if total is not None else ""
+    return (
+        f"<Order><OrderID>{order_id}</OrderID><OrderStatus>{status}</OrderStatus>"
+        f"<CancelStatus>{cancel}</CancelStatus><SellerUserID>seller_a</SellerUserID>"
+        f"<CreatedTime>2026-11-02T00:00:00.000Z</CreatedTime>"
+        f"<ShippingServiceSelected><ShippingServiceCost>{ship}</ShippingServiceCost></ShippingServiceSelected>"
+        f"{total_el}<TransactionArray>{''.join(txns)}</TransactionArray></Order>"
+    )
+
+
+def response(orders, more=False):
+    return (
+        f'<?xml version="1.0"?><GetOrdersResponse {NSDECL}><Ack>Success</Ack>'
+        f"<HasMoreOrders>{'true' if more else 'false'}</HasMoreOrders>"
+        f"<OrderArray>{''.join(orders)}</OrderArray></GetOrdersResponse>"
+    ).encode()
+
+
+def parse(*orders):
+    return pp.parse_purchases(ET.fromstring(response(list(orders))))
+
+
+def test_one_row_per_line_item_with_totals():
+    rows, warnings = parse(order("O1", [txn("111", qty=2), txn("222", "20", ship=None, tax=None)]))
+    assert [r["order_line_item_id"] for r in rows] == ["111-10", "222-20"]
+    a, b = rows
+    assert (a["price"], a["shipping"], a["tax"], a["total"]) == (200.0, 5.0, 8.0, 213.0)
+    assert a["purchase_type"] == "unknown" and a["seller"] == "seller_a"
+    assert a["purchased_at"] == "2026-11-03T09:14:26.000Z"
+    # Multi-line order: the order-level shipping is not guessed onto one line.
+    assert (b["shipping"], b["tax"], b["total"]) == (None, None, 100.0)
+    assert warnings == []
+
+
+def test_single_line_order_falls_back_to_order_shipping_and_flags_mismatch():
+    rows, warnings = parse(order("O2", [txn("333", ship=None, tax="0.0", line_id=False)],
+                                 total="150.00"))
+    assert rows[0]["order_line_item_id"] == "333-10"
+    assert rows[0]["shipping"] == 12.4 and rows[0]["total"] == 112.4
+    assert len(warnings) == 1 and "112.40 != order total 150.00" in warnings[0]
+
+
+@pytest.mark.parametrize("status,cancel,expected", [
+    ("Completed", "NotApplicable", False),
+    ("Completed", "CancelRequested", False),  # not cancelled until it completes
+    ("Cancelled", "NotApplicable", True),
+    ("Completed", "CancelComplete", True),
+])
+def test_cancelled(status, cancel, expected):
+    rows, _ = parse(order("O3", [txn("444")], status=status, cancel=cancel))
+    assert rows[0]["cancelled"] is expected
+
+
+class FakeResp:
+    def __init__(self, content=b"", status=200, body=None):
+        self.content, self.status_code, self._body = content, status, body
+        self.text = json.dumps(body) if body is not None else ""
+
+    def json(self):
+        return self._body
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(str(self.status_code))
+
+
+@pytest.fixture
+def ebay(monkeypatch):
+    """GetOrders returns two pages; server POSTs are captured."""
+    monkeypatch.setattr(eut, "get_user_access_token", lambda: "tok")
+    pages = [response([order("O1", [txn("111")])], more=True),
+             response([order("O2", [txn("222")])])]
+    posted = []
+
+    def fake_post(url, data=None, json=None, **kw):
+        if "api.ebay.com" in url:
+            return FakeResp(pages.pop(0))
+        posted.append((url, json))
+        return FakeResp(body={"inserted": len(json["purchases"]), "updated": 0})
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    return posted
+
+
+def test_dry_run_posts_nothing(ebay, monkeypatch, capsys):
+    monkeypatch.setenv("COMICS_SERVER_URL", "http://srv")
+    assert pp.main([]) == 0
+    assert ebay == []
+    out = capsys.readouterr().out
+    assert "DRY RUN: 2 purchase line item(s)" in out and "spend 2026-11: $226.00" in out
+
+
+def test_apply_posts_every_page(ebay, monkeypatch):
+    monkeypatch.setenv("COMICS_SERVER_URL", "http://srv/")
+    assert pp.main(["--apply"]) == 0
+    assert [u for u, _ in ebay] == ["http://srv/api/comics/purchases"]
+    assert [p["item_id"] for p in ebay[0][1]["purchases"]] == ["111", "222"]
+
+
+def test_apply_without_server_is_usage_error(ebay, monkeypatch):
+    monkeypatch.delenv("COMICS_SERVER_URL", raising=False)
+    monkeypatch.delenv("GIXEN_SERVER_URL", raising=False)
+    assert pp.main(["--apply"]) == 2
+    assert pp.main(["--days", "91"]) == 2
+
+
+def test_ebay_failure_exits_1_and_posts_nothing(monkeypatch):
+    monkeypatch.setattr(eut, "get_user_access_token", lambda: "tok")
+    monkeypatch.setattr(requests, "post", lambda *a, **k: FakeResp(b"", 503))
+    monkeypatch.setenv("COMICS_SERVER_URL", "http://srv")
+    assert pp.main(["--apply"]) == 1
+
+
+def test_offer_log_add_and_update(monkeypatch, capsys):
+    monkeypatch.setenv("COMICS_SERVER_URL", "http://srv")
+    calls = []
+    row = {"id": 1, "offered_at": "2026-11-17T00:00:00", "item_id": "123456789012",
+           "ask": 300.0, "offer": 240.0, "counteroffer": None, "final_price": None,
+           "outcome": "pending", "seller": "s1"}
+
+    def fake(method):
+        def _call(url, json=None, **kw):
+            calls.append((method, url, json))
+            return FakeResp(status=201 if method == "post" else 200, body=row)
+        return _call
+
+    monkeypatch.setattr(requests, "post", fake("post"))
+    monkeypatch.setattr(requests, "patch", fake("patch"))
+    assert offer_log.main(["add", "123456789012", "--offer", "240", "--ask", "300",
+                           "--seller", "s1"]) == 0
+    assert calls[-1] == ("post", "http://srv/api/comics/offers",
+                         {"item_id": "123456789012", "offer": 240.0, "ask": 300.0, "seller": "s1"})
+    assert offer_log.main(["update", "1", "--counter", "270", "--outcome", "countered"]) == 0
+    assert calls[-1] == ("patch", "http://srv/api/comics/offers/1",
+                         {"counteroffer": 270.0, "outcome": "countered"})
+    assert offer_log.main(["update", "1"]) == 2
+    assert "#1" in capsys.readouterr().out

@@ -130,6 +130,36 @@ it to exist. **If the `needs_review` row also carries `grade`/`certifier`/
 certified win that needed manual series/issue resolution still records as
 slabbed, not raw, once resolved.
 
+## Step 2b: Purchases made outside Gixen (BUI-1415)
+
+`ebay-purchases-pull` records every eBay order line item (Buy It Now, Best
+Offer, and auctions bid by hand) in the purchase record. List the ones not
+yet in the collection:
+
+```bash
+comics-api GET '/api/comics/purchases?collection_status=pending'
+```
+
+Snipe wins read as `snipe_win` and come through Step 1, so they are not in
+this list. Show each pending purchase's `item_id`, `title`, `seller`, and
+`total` to the user. **Never record one from its eBay title alone:** a wrong
+identity, or an owned book that is still wish-listed, is the BUI-122
+data-loss trigger. For each one the user confirms is a comic to keep, get
+`series`/`issue`/`year` from the user (or `comic-identify` on the listing,
+confirmed by the user) and append it to `resolved_reviews.json` in Step 1's
+`wins` shape: `item_id`, `current_bid` as `"<price> USD"`, `end_date_iso` as
+the purchase's `purchased_at`, plus `identify_data` and any slab
+`grade`/`certifier`/`cert_number`. Step 3 records it and marks the item id
+seen, which flips its `collection_status` to `recorded`.
+
+For a purchase that is not a comic to record (supplies, a book you resold),
+mark it so it stops appearing:
+
+```bash
+comics-api POST '/api/comics/purchases/{order_line_item_id}/collection-status' \
+  -H 'Content-Type: application/json' -d '{"status": "skipped"}'
+```
+
 ## Step 3: Record + mark-seen + status (one call, BUI-428)
 
 One atomic endpoint (BUI-428) merges `wins`+`resolved_reviews`, records,

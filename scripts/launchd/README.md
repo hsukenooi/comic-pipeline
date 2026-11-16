@@ -127,6 +127,26 @@ itself. Each step pings its own heartbeat (`ebay-shipped-submit`,
 `record-wins`) and runs whether or not the other failed. Rehearse the
 second step without writing anything with `gixen record-win-prep`.
 
+## com.comics.ebay-purchases-pull.plist (BUI-1415)
+
+Runs `ebay-purchases-pull --apply --days 30` weekly. It reads the buyer's
+eBay orders (Trading `GetOrders`, read-only) and upserts one purchase record
+per order line item into `/api/comics/purchases`, keyed by
+`OrderLineItemID`, so the overlapping windows never double-count. Monthly
+spend: `GET /api/comics/purchases/spend`. It never buys, never places an
+offer, and never writes the collection. No heartbeat contract yet.
+
+Preconditions: `ebay-auth login` done (user token) and `ebay-purchases-pull`
+deployed by `scripts/deploy.sh` / `scripts/install.sh`. Rehearse first (the
+dry run posts nothing), then install:
+
+```bash
+ebay-purchases-pull
+scripts/launchd/install.sh com.comics.ebay-purchases-pull
+```
+
+Logs: `~/.comics-server/ebay-purchases-pull.log` and `.error.log`.
+
 ## com.comics.em-batch-nightly.plist (BUI-972)
 
 Runs `scripts/em-batch-nightly.sh` at 01:00 every night: picks up to
