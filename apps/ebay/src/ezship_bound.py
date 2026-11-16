@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import os
 import shlex
 import subprocess
 import sys
@@ -44,7 +45,14 @@ from shipped_orders import (
     load_ledger,
     parse_merchant,
 )
-from shipped_submit import normalize_carrier, product_name
+from shipped_submit import (
+    DEFAULT_EZSHIP_CMD,
+    DEFAULT_EZSHIP_DIR,
+    EZSHIP_CMD_ENV,
+    EZSHIP_DIR_ENV,
+    normalize_carrier,
+    product_name,
+)
 
 _EXIT_OK = 0
 _EXIT_HARD_FAILURE = 1
@@ -99,12 +107,17 @@ _EZSHIP_TIMEOUT_S = 180
 
 def load_ezship_trackings(run=subprocess.run) -> set:
     """Tracking numbers (upper-case) of every live order on the EZShip account."""
-    cmd = ["ezship", "orders", "--json"]
+    # Same launcher as ebay-shipped-submit: the ezship CLI is not installed on
+    # PATH, it runs from its source tree (EZSHIP_CMD / EZSHIP_DIR override).
+    launcher = shlex.split(os.environ.get(EZSHIP_CMD_ENV, "")) or list(DEFAULT_EZSHIP_CMD)
+    cmd = launcher + ["orders", "--json"]
+    cwd = os.environ.get(EZSHIP_DIR_ENV) or str(DEFAULT_EZSHIP_DIR)
     try:
-        done = run(cmd, capture_output=True, text=True, timeout=_EZSHIP_TIMEOUT_S)
-    except FileNotFoundError as exc:
+        done = run(cmd, cwd=cwd, capture_output=True, text=True,
+                   timeout=_EZSHIP_TIMEOUT_S)
+    except OSError as exc:
         raise ShippedOrdersError(
-            "ezship CLI not found on PATH; run scripts/install.sh") from exc
+            f"could not launch the ezship CLI ({' '.join(cmd)} in {cwd}): {exc}") from exc
     except subprocess.TimeoutExpired as exc:
         raise ShippedOrdersError(
             f"`ezship orders` timed out after {_EZSHIP_TIMEOUT_S}s") from exc
