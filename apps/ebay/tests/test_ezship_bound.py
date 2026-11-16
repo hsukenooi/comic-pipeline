@@ -473,7 +473,25 @@ def test_load_ezship_trackings_skips_cancelled_and_uppercases():
         return _Done(out=out)
 
     assert REAL_LOADER(run) == {"1Z999"}
-    assert calls[-1] == ["ezship", "orders", "--json"]
+    assert calls[-1][-2:] == ["orders", "--json"]
+
+
+def test_load_ezship_trackings_uses_the_shared_launcher(monkeypatch):
+    seen = {}
+
+    def run(cmd, **kw):
+        seen.update(cmd=cmd, cwd=kw.get("cwd"))
+        return _Done(out='{"orders": []}')
+
+    monkeypatch.delenv("EZSHIP_CMD", raising=False)
+    monkeypatch.delenv("EZSHIP_DIR", raising=False)
+    REAL_LOADER(run)
+    assert seen["cmd"] == ["npx", "tsx", "src/cli.ts", "orders", "--json"]
+    assert seen["cwd"].endswith("apps/ezship")
+    monkeypatch.setenv("EZSHIP_CMD", "my-ezship --flag")
+    monkeypatch.setenv("EZSHIP_DIR", "/tmp/ez")
+    REAL_LOADER(run)
+    assert seen == {"cmd": ["my-ezship", "--flag", "orders", "--json"], "cwd": "/tmp/ez"}
 
 
 @pytest.mark.parametrize("done, match", [
@@ -487,9 +505,9 @@ def test_load_ezship_trackings_failures_raise(done, match):
 
 def test_missing_ezship_cli_raises():
     def run(cmd, **kw):
-        raise FileNotFoundError("ezship")
+        raise FileNotFoundError("npx")
 
-    with pytest.raises(so.ShippedOrdersError, match="install.sh"):
+    with pytest.raises(so.ShippedOrdersError, match="could not launch"):
         REAL_LOADER(run)
 
 
