@@ -50,10 +50,13 @@ from lib.fallback_swallow import check_fallback_swallow  # noqa: E402
 
 
 def _registered_comics_paths() -> set[str]:
-    """Every /api/comics* path the overlay actually registers."""
+    """Every /api/comics* path the overlay actually registers (both routers
+    `plugin.register_routes` includes; BUI-1415 added the purchases one)."""
+    from gixen_overlay import purchases_routes
+
     return {
         rt.path
-        for rt in overlay_routes.router.routes
+        for rt in [*overlay_routes.router.routes, *purchases_routes.router.routes]
         if getattr(rt, "path", "").startswith("/api/comics")
     }
 

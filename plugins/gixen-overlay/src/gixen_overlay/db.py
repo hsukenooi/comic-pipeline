@@ -689,6 +689,10 @@ def create_tables(conn: sqlite3.Connection) -> None:
     # its final, stable shape here on both a fresh DB (the legacy migrations
     # above are no-ops) and an existing one (they've already run).
     _migrate_seed_fmv_history(conn)
+    # BUI-1415: the purchase record and the offer log. Two standalone tables
+    # (no FK, CREATE IF NOT EXISTS), so they have no ordering dependency.
+    from gixen_overlay.purchases import create_purchase_tables
+    create_purchase_tables(conn)
 
 
 # ---------------------------------------------------------------------------
