@@ -29,11 +29,14 @@ const REQUEST_TIMEOUT_MS = 30_000;
 // and 301/307/308 fell through to a generic error that hid the real fix.
 const REDIRECT_CODES = new Set([301, 302, 303, 307, 308]);
 
-export async function callRpc(
+// Sends one RPC and returns the parsed JSON body. It maps redirects, timeouts,
+// and HTTP errors but makes no success check: success sits in a different
+// place per endpoint (BUI-1378), so each caller checks its own.
+async function postRpc(
   config: Config,
   endpoint: string,
   body: unknown
-): Promise<ApiResponse> {
+): Promise<unknown> {
   const url = `${config.apiBaseUrl}/${endpoint}`;
   const headers = getHeaders(config);
 
@@ -81,12 +84,19 @@ export async function callRpc(
     );
   }
 
-  let result: ApiResponse;
   try {
-    result = (await response.json()) as ApiResponse;
+    return await response.json();
   } catch {
     throw new Error(`Failed to parse API response as JSON from ${endpoint}`);
   }
+}
+
+export async function callRpc(
+  config: Config,
+  endpoint: string,
+  body: unknown
+): Promise<ApiResponse> {
+  const result = (await postRpc(config, endpoint, body)) as ApiResponse;
 
   // BUI-141 / BUI-181: a SubmitNewOrder success returns `result: true`. The old
   // code only rejected an explicit `result: false`, so a 200 body of
@@ -209,4 +219,94 @@ export async function submitNewOrder(
     ledgerPath
   );
   return result;
+}
+
+// ─── Order list (BUI-1378) ───────────────────────────────────────────────────
+
+export interface EzshipOrder {
+  orderNumber: string;
+  trackingNo: string;
+  status: string;
+  createdDate: string;
+}
+
+const LIST_ENDPOINT = "ezShipOrder.OrderExpress/GetOrderListByStatus";
+// The site lists orders in two ranges: the latest three months and everything
+// older. A body with no dateGap returns only one order, so both are asked for.
+const DATE_GAPS = ["DateGapLatestThreeMonth", "DateGapBeforeThreeMonth"];
+export const ORDER_PAGE_SIZE = 30;
+// A guard against a server that ignores offset and repeats one page forever.
+const MAX_PAGES = 100;
+
+function listMessage(r: Record<string, unknown>): string {
+  const inner = r.result;
+  if (inner && typeof inner === "object") {
+    const msg = (inner as Record<string, unknown>).msg;
+    if (typeof msg === "string") return msg;
+  }
+  for (const k of ["msg", "error", "message"]) {
+    if (typeof r[k] === "string") return r[k] as string;
+  }
+  return "";
+}
+
+// The list call reports success at result.result === true (nested), unlike
+// SubmitNewOrder's top-level result:true, so it gets its own check.
+export function checkListResponse(json: unknown): Record<string, unknown> {
+  const r = (json ?? {}) as Record<string, unknown>;
+  const inner = r.result as Record<string, unknown> | undefined;
+  if (inner && typeof inner === "object" && inner.result === true) {
+    return r;
+  }
+  const msg = listMessage(r);
+  if (/log\s*in/i.test(msg)) {
+    throw new SessionExpiredError();
+  }
+  throw new Error(
+    `EZShip did not confirm the order list (no result.result:true): ${msg || JSON.stringify(json)}`
+  );
+}
+
+function ordersOf(r: Record<string, unknown>): Record<string, unknown>[] {
+  const groups = Array.isArray(r.orderGroups) ? r.orderGroups : [];
+  return groups.flatMap((g) => {
+    const orders = (g as Record<string, unknown>)?.orders;
+    return Array.isArray(orders) ? (orders as Record<string, unknown>[]) : [];
+  });
+}
+
+// Every order on the account, both date ranges, deduped by order id.
+// Read-only: it never calls a write endpoint.
+export async function listOrders(config: Config): Promise<EzshipOrder[]> {
+  const byId = new Map<string, EzshipOrder>();
+  for (const dateGap of DATE_GAPS) {
+    let page = 0;
+    for (;; page++) {
+      if (page >= MAX_PAGES) {
+        throw new Error(
+          `Order list for ${dateGap} passed ${MAX_PAGES} pages; refusing a partial list`
+        );
+      }
+      const r = checkListResponse(
+        await postRpc(config, LIST_ENDPOINT, {
+          dateGap,
+          offset: page * ORDER_PAGE_SIZE,
+          limit: ORDER_PAGE_SIZE,
+        })
+      );
+      const orders = ordersOf(r);
+      for (const o of orders) {
+        const carrier = (o.carrierCompany ?? {}) as Record<string, unknown>;
+        const id = String(o.id ?? o.orderNumber ?? "");
+        byId.set(id, {
+          orderNumber: String(o.orderNumber ?? ""),
+          trackingNo: String(carrier.trackingNo ?? ""),
+          status: String(o.status ?? ""),
+          createdDate: String(o.createdDate ?? ""),
+        });
+      }
+      if (orders.length < ORDER_PAGE_SIZE) break;
+    }
+  }
+  return [...byId.values()];
 }
