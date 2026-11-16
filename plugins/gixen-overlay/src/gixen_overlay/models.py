@@ -1114,9 +1114,34 @@ class SlabWatchRequest(BaseModel):
     — same request-model-boundary posture as `CompsExcludeRequest.code`
     above, and the same CHECK constraint (`comics.slab_watch`) backs it up
     server-side as defense in depth.
+
+    BUI-1416 adds `min_grade` (CGC scale, 0.5-10.0) and `ceiling` (USD,
+    > 0). Semantics, decided by which keys the body carries: an OMITTED
+    `min_grade`/`ceiling` leaves the stored value untouched; an explicit
+    JSON `null` clears it. `slab_watch` keeps its legacy behaviour (omitted
+    or null clears the override) EXCEPT when the body carries `min_grade`
+    or `ceiling` without `slab_watch`: then the on/off flag is left alone,
+    so setting a target never silently wipes the override. Out-of-range
+    values 422.
     """
 
     slab_watch: int | None = None
+    min_grade: float | None = None
+    ceiling: float | None = None
+
+    @field_validator("min_grade")
+    @classmethod
+    def _validate_min_grade(cls, v: float | None) -> float | None:
+        if v is not None and not (0.5 <= v <= 10.0):
+            raise ValueError("min_grade must be between 0.5 and 10.0")
+        return v
+
+    @field_validator("ceiling")
+    @classmethod
+    def _validate_ceiling(cls, v: float | None) -> float | None:
+        if v is not None and not (v > 0 and v != float("inf")):
+            raise ValueError("ceiling must be a positive, finite number")
+        return v
 
     @field_validator("slab_watch")
     @classmethod

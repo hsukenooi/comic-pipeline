@@ -518,6 +518,7 @@ def create_tables(conn: sqlite3.Connection) -> None:
     # dependency on anything else here (unlike `variant`, no later migration
     # reads or rebuilds around it).
     _migrate_add_comics_slab_watch_column(conn)
+    _migrate_add_comics_slab_target_columns(conn)
     # flag_reason column must be added AFTER the fmv-split / year-nullable rebuilds
     # above (those recreate `fmv` from the pre-BUI-132 schema), so it survives them.
     _migrate_add_fmv_flag_reason_column(conn)
@@ -757,6 +758,29 @@ def _migrate_add_comics_slab_watch_column(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE comics ADD COLUMN slab_watch INTEGER "
             "CHECK(slab_watch IN (0, 1) OR slab_watch IS NULL)"
+        )
+
+
+def _migrate_add_comics_slab_target_columns(conn: sqlite3.Connection) -> None:
+    """Add nullable `slab_min_grade` and `slab_ceiling` to comics (BUI-1416).
+
+    The hunt list needs a per-book minimum CGC grade (REAL, 0.5-10.0) and a
+    ceiling price in USD (REAL, > 0). Additive and idempotent (PRAGMA guard
+    per column, so a DB with only one of the two still converges). Existing
+    rows land on NULL, which both CHECKs admit; no backfill. NULL means "no
+    target set".
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(comics)")}
+    if "slab_min_grade" not in cols:
+        conn.execute(
+            "ALTER TABLE comics ADD COLUMN slab_min_grade REAL "
+            "CHECK(slab_min_grade IS NULL OR "
+            "(slab_min_grade >= 0.5 AND slab_min_grade <= 10.0))"
+        )
+    if "slab_ceiling" not in cols:
+        conn.execute(
+            "ALTER TABLE comics ADD COLUMN slab_ceiling REAL "
+            "CHECK(slab_ceiling IS NULL OR slab_ceiling > 0)"
         )
 
 
@@ -4051,6 +4075,7 @@ def list_comics_for_slab_watch(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute(
         """
         SELECT c.id, c.title, c.issue, c.year, c.variant, c.slab_watch,
+               c.slab_min_grade, c.slab_ceiling,
                MAX(f.high) AS raw_high
         FROM comics c
         LEFT JOIN fmv f ON f.comic_id = c.id AND f.certifier = ?
@@ -4060,37 +4085,75 @@ def list_comics_for_slab_watch(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     ).fetchall()
 
 
+_UNSET: Any = object()
+
+
 def set_comic_slab_watch(
-    conn: sqlite3.Connection, comic_id: int, slab_watch: int | None
+    conn: sqlite3.Connection,
+    comic_id: int,
+    slab_watch: Any = _UNSET,
+    *,
+    min_grade: Any = _UNSET,
+    ceiling: Any = _UNSET,
 ) -> dict[str, Any] | None:
-    """Write path for `POST /api/comics/{comic_id}/slab-watch` (BUI-950).
+    """Write path for `POST /api/comics/{comic_id}/slab-watch` (BUI-950,
+    BUI-1416).
 
     Returns None when `comic_id` names no known book — the route 404s on
     that, mirroring `stamp_comps_excluded`'s contract. `slab_watch` must be
     `1` (hand include), `0` (hand exclude), or `None` (clear the override,
-    fall back to `SLAB_WATCH_MIN_FMV`) — FastAPI/pydantic reject any other
-    value at the request-model boundary before this is ever called
-    (`SlabWatchRequest` in models.py), so the only defense-in-depth needed
-    here is the column's own CHECK constraint.
+    fall back to `SLAB_WATCH_MIN_FMV`).
+
+    `min_grade` (CGC 0.5-10.0) and `ceiling` (USD > 0) are the BUI-1416
+    hunt-list targets. For all three arguments, leaving the argument at its
+    default means "do not touch the stored value"; passing `None` clears it.
+    The pydantic request model validates ranges before this is called, and
+    the columns' CHECK constraints are defense in depth.
 
     Self-commits on the shared app singleton connection, same pattern as
     `stamp_comps_excluded` (a single-row, low-contention update) — not the
     `write_transaction`/`_write_locked()` machinery used by writes that touch
     multiple tables or gixen-cli lifecycle state.
+
+    Returns `{comic_id, slab_watch, min_grade, ceiling}` with the stored
+    values after the write.
     """
     row = conn.execute(
         "SELECT id FROM comics WHERE id = ?", (comic_id,)
     ).fetchone()
     if row is None:
         return None
-    conn.execute(
-        "UPDATE comics SET slab_watch = ? WHERE id = ?", (slab_watch, comic_id)
-    )
-    conn.commit()
+    sets: list[str] = []
+    params: list[Any] = []
+    for col, val in (
+        ("slab_watch", slab_watch),
+        ("slab_min_grade", min_grade),
+        ("slab_ceiling", ceiling),
+    ):
+        if val is not _UNSET:
+            sets.append(f"{col} = ?")
+            params.append(val)
+    if sets:
+        conn.execute(
+            f"UPDATE comics SET {', '.join(sets)} WHERE id = ?",
+            (*params, comic_id),
+        )
+        conn.commit()
+    stored = conn.execute(
+        "SELECT slab_watch, slab_min_grade, slab_ceiling FROM comics "
+        "WHERE id = ?",
+        (comic_id,),
+    ).fetchone()
     logger.info(
-        "set_comic_slab_watch: comic_id=%s slab_watch=%r", comic_id, slab_watch
+        "set_comic_slab_watch: comic_id=%s slab_watch=%r min_grade=%r "
+        "ceiling=%r", comic_id, stored[0], stored[1], stored[2],
     )
-    return {"comic_id": comic_id, "slab_watch": slab_watch}
+    return {
+        "comic_id": comic_id,
+        "slab_watch": stored[0],
+        "min_grade": stored[1],
+        "ceiling": stored[2],
+    }
 
 
 # ---------------------------------------------------------------------------
