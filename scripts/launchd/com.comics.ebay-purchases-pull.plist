@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.comics.ebay-purchases-pull</string>
+    <key>ProgramArguments</key>
+    <array>
+        <!-- BUI-1415: GetOrders (read-only) -> POST /api/comics/purchases,
+             an idempotent upsert keyed by OrderLineItemID. -->
+        <string>/Users/hsukenooi/.local/bin/ebay-purchases-pull</string>
+        <string>--apply</string>
+        <string>--days</string>
+        <string>30</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>COMICS_SERVER_URL</key>
+        <string>http://localhost:8080</string>
+        <key>PATH</key>
+        <string>/Users/hsukenooi/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <!-- Weekly (604800 s). The 30-day window overlaps four runs, so a missed
+         run or two loses nothing, and the upsert makes the overlap free.
+         StartInterval counts time awake, so a sleeping Mini runs it on wake. -->
+    <key>StartInterval</key>
+    <integer>604800</integer>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/Users/hsukenooi/.comics-server/ebay-purchases-pull.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/hsukenooi/.comics-server/ebay-purchases-pull.error.log</string>
+</dict>
+</plist>
