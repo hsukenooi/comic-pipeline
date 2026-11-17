@@ -1,6 +1,7 @@
 """ezship-bound: report non-eBay orders shipped to the EZShip warehouse (BUI-1376).
 
-Read-only. It finds order-confirmation emails whose shipping address is the
+`--submit` (BUI-1425) also submits the ready ones; see the Submit section.
+Without it the command is read-only. It finds order-confirmation emails whose shipping address is the
 EZShip warehouse, links each order to its shipping email, and proposes the
 fields for `ezship new`. It never writes Gmail, the ledger, or EZShip.
 
@@ -45,6 +46,9 @@ from shipped_orders import (
     load_ledger,
     parse_merchant,
 )
+import requests
+
+import shipped_submit as ss
 from shipped_submit import (
     DEFAULT_EZSHIP_CMD,
     DEFAULT_EZSHIP_DIR,
@@ -74,8 +78,10 @@ _WAREHOUSE = re.compile(
 _DEFAULT_SEARCH_MAX = 25
 _REPLY_SUBJECT = re.compile(r"\s*(?:re|fwd?)\s*:", re.I)
 
-# Keyword rules: whole words only, so "notebook" stays out of Books.
-# (category id, category name, pattern).
+# Curated keyword rules: whole words only, so "notebook" stays out of Books.
+# (category id, category name, pattern). They run alongside the names in the
+# full category list (BUI-1425); Books needs its own rule because comic titles
+# rarely say "book".
 CATEGORY_RULES = [
     ("1063", "Books",
      re.compile(r"\b(?:comics?|cvr|batman|books?)\b|\b\d+:\d+\s+ratio\b", re.I)),
@@ -87,6 +93,94 @@ CATEGORY_RULES = [
 # a Batman T-shirt). A name that hits one gets no Books match.
 _NOT_BOOKS = re.compile(
     r"\b(?:bags?|boards?|boxes|box|sleeves?|shirts?|t-shirts?|tees?|hoodies?)\b", re.I)
+
+_BOOKS_ID = "1063"
+
+# Words a store uses that are not in EZShip's category names (BUI-1425).
+# phrase -> subcategory id. Each id is checked against the saved list by a test.
+CATEGORY_ALIASES = {
+    "t-shirt": "869", "tshirt": "869", "tee": "869",   # Tops & Tee
+    "notebook": "1060",                                  # Note Book
+    "plush": "1094",                                     # soft toys
+    "lego": "1096",                                      # Building Blocks & lego
+    "cd": "1221",                                        # compact disc
+    "keychain": "1207", "key ring": "1207",              # Key chain
+    "enamel pin": "1055",                                # Badge
+    "tote bag": "1075",                                  # Handbag / Totebag
+    "phone case": "1017",                                # Phone Casing
+}
+
+# Category-name words too generic to match on their own: each turns up in
+# titles of something else ("printing plate", "Lord of the Rings", "light-up
+# figure", DC's Monitor) or comes from splitting a compound name ("Storage
+# Container / Box"). An alias can still map to them. An item that matches
+# nothing is held, which is the safe side.
+_NAME_STOPWORDS = {
+    "light", "glass", "ring", "nut", "zip", "rope", "pipe", "socket", "tape",
+    "pen", "lock", "ball", "tissue", "fabric", "badge", "staple", "basket",
+    "plate", "hand", "box", "house", "machine", "chop", "glue", "folder",
+    "rack", "watch", "tea", "monitor", "tablet", "bed", "apparel", "balm",
+}
+
+_WORD_EDGE_L, _WORD_EDGE_R = r"(?<![a-z0-9])", r"(?![a-z0-9])"
+
+
+def _phrase_pattern(phrase: str):
+    """Whole-word, case-blind pattern; the last word may be singular or plural."""
+    words = phrase.split()
+    last = words[-1]
+    forms = {last, last[:-1]} if last.endswith("s") and len(last) > 3 else {
+        last, last + "s", last + "es"}
+    tail = "(?:" + "|".join(re.escape(f) for f in sorted(forms, key=len, reverse=True)) + ")"
+    head = "".join(re.escape(w) + r"[\s-]+" for w in words[:-1])
+    return re.compile(_WORD_EDGE_L + head + tail + _WORD_EDGE_R, re.I)
+
+
+def build_name_index(categories: dict):
+    """[(pattern, {ids})] from every subcategory name plus CATEGORY_ALIASES.
+
+    A compound name ("Hat / Cap", "Tops & Tee") also matches each part, unless
+    that part is another subcategory's whole name ("Adapters & Cables" does not
+    claim "cables" from Cables). Names shared by two subcategories ("Hand Soap")
+    map to both, which the caller holds as ambiguous.
+    """
+    def norm(text):
+        return re.sub(r"\s+", " ", text.strip().lower())
+
+    full, parts = {}, {}
+    for cid, info in categories.items():
+        if cid == _BOOKS_ID:
+            continue  # Books matches through its curated rule and guard only.
+        name = norm(info["name"])
+        full.setdefault(name, set()).add(cid)
+        pieces = [norm(x) for x in re.split(r"/|&|,|\band\b", name) if x.strip()]
+        if len(pieces) > 1:
+            for piece in pieces:
+                parts.setdefault(piece, set()).add(cid)
+    phrases = dict(full)
+    for piece, cids in parts.items():
+        if piece not in full:
+            phrases.setdefault(piece, set()).update(cids)
+    phrases = {k: v for k, v in phrases.items() if k not in _NAME_STOPWORDS}
+    for alias, cid in CATEGORY_ALIASES.items():
+        phrases.setdefault(norm(alias), set()).add(cid)
+    return [(_phrase_pattern(k), v) for k, v in phrases.items()]
+
+
+def item_category_ids(name: str, index) -> set:
+    """Category ids one item name matches. A match inside a longer match is
+    dropped, so "Bath Towel" is not also "Towel" and "Exercise Book" not Books."""
+    spans = []
+    for cid, _cname, pat in CATEGORY_RULES:
+        if cid == _BOOKS_ID and _NOT_BOOKS.search(name):
+            continue
+        spans += [(m.start(), m.end(), cid) for m in pat.finditer(name)]
+    for pat, cids in index:
+        spans += [(m.start(), m.end(), cid) for m in pat.finditer(name) for cid in cids]
+    kept = [s for s in spans if not any(
+        o[0] <= s[0] and s[1] <= o[1] and o[1] - o[0] > s[1] - s[0] for o in spans)]
+    return {cid for _a, _b, cid in kept}
+
 
 # Row statuses.
 READY = "ready_to_submit"
@@ -105,13 +199,21 @@ _EZSHIP_NOT_SUBMITTED = {"Cancelled_Code"}
 _EZSHIP_TIMEOUT_S = 180
 
 
-def load_ezship_trackings(run=subprocess.run) -> set:
-    """Tracking numbers (upper-case) of every live order on the EZShip account."""
+class EzshipSessionExpired(ShippedOrdersError):
+    """The ezship CLI exited 3: the cookie needs a human to refresh it."""
+
+
+def _ezship_launch():
     # Same launcher as ebay-shipped-submit: the ezship CLI is not installed on
     # PATH, it runs from its source tree (EZSHIP_CMD / EZSHIP_DIR override).
     launcher = shlex.split(os.environ.get(EZSHIP_CMD_ENV, "")) or list(DEFAULT_EZSHIP_CMD)
-    cmd = launcher + ["orders", "--json"]
-    cwd = os.environ.get(EZSHIP_DIR_ENV) or str(DEFAULT_EZSHIP_DIR)
+    return launcher, os.environ.get(EZSHIP_DIR_ENV) or str(DEFAULT_EZSHIP_DIR)
+
+
+def _run_ezship_read(args, run=subprocess.run):
+    """Run one read-only ezship command and return its stdout."""
+    launcher, cwd = _ezship_launch()
+    cmd = launcher + args
     try:
         done = run(cmd, cwd=cwd, capture_output=True, text=True,
                    timeout=_EZSHIP_TIMEOUT_S)
@@ -120,13 +222,35 @@ def load_ezship_trackings(run=subprocess.run) -> set:
             f"could not launch the ezship CLI ({' '.join(cmd)} in {cwd}): {exc}") from exc
     except subprocess.TimeoutExpired as exc:
         raise ShippedOrdersError(
-            f"`ezship orders` timed out after {_EZSHIP_TIMEOUT_S}s") from exc
+            f"`ezship {args[0]}` timed out after {_EZSHIP_TIMEOUT_S}s") from exc
     if done.returncode != 0:
         detail = (done.stderr or done.stdout or "").strip()
-        raise ShippedOrdersError(
-            f"`ezship orders` failed (exit {done.returncode}): {detail}")
+        err = EzshipSessionExpired if done.returncode == 3 else ShippedOrdersError
+        raise err(f"`ezship {args[0]}` failed (exit {done.returncode}): {detail}")
+    return done.stdout
+
+
+def load_live_categories(run=subprocess.run) -> dict:
+    """EZShip's category list right now (`ezship categories --json`, BUI-1425).
+
+    The submit path uses this rather than the saved copy, so a changed minimum
+    reaches EZShip as EZShip states it.
+    """
+    out = _run_ezship_read(["categories", "--json"], run)
     try:
-        orders = json.loads(done.stdout)["orders"]
+        cats = parse_categories(json.loads(out))
+    except (ValueError, KeyError, TypeError) as exc:
+        raise ShippedOrdersError("`ezship categories --json` printed no category list") from exc
+    if not cats:
+        raise ShippedOrdersError("`ezship categories --json` printed an empty list")
+    return cats
+
+
+def load_ezship_trackings(run=subprocess.run) -> set:
+    """Tracking numbers (upper-case) of every live order on the EZShip account."""
+    out = _run_ezship_read(["orders", "--json"], run)
+    try:
+        orders = json.loads(out)["orders"]
     except (ValueError, KeyError, TypeError) as exc:
         raise ShippedOrdersError("`ezship orders --json` printed no order list") from exc
     return {str(o.get("trackingNo") or "").strip().upper() for o in orders
@@ -136,34 +260,41 @@ def load_ezship_trackings(run=subprocess.run) -> set:
 # ─── Category list ────────────────────────────────────────────────────────────
 
 def load_categories(path: Path = CATEGORIES_PATH) -> dict:
+    """The saved category list. Map subcategory id -> {"name", "declared_min"}."""
+    return parse_categories(json.loads(path.read_text()))
+
+
+def parse_categories(data: dict) -> dict:
     """Map subcategory id -> {"name", "declared_min"} (declaredMin in cents)."""
-    data = json.loads(path.read_text())
     out = {}
-    for top in data.get("categories", []):
+    for top in data["categories"]:
         for sub in top.get("subCategories") or []:
             out[str(sub["id"])] = {
                 "name": sub["name"], "declared_min": int(sub["declaredMin"])}
     return out
 
 
-def pick_category(item_names):
+def pick_category(item_names, categories=None):
     """Return (id, name, None) for one category, or (None, None, reason).
 
     EZShip takes one category per order, so every item must match and all must
-    agree. Anything else gets no proposal.
+    agree. Anything else gets no proposal: an order is held, never guessed.
     """
+    categories = categories if categories is not None else load_categories()
+    index = build_name_index(categories)
     found = set()
     for name in item_names:
-        hits = {(cid, cname) for cid, cname, pat in CATEGORY_RULES
-                if pat.search(name) and not (cid == "1063" and _NOT_BOOKS.search(name))}
+        hits = item_category_ids(name, index)
         if not hits:
-            return None, None, f"no category rule matches {name!r}"
+            return None, None, f"no category matches {name!r}"
         found |= hits
     if len(found) != 1:
-        names = ", ".join(sorted(n for _i, n in found))
+        names = ", ".join(sorted(categories.get(i, {}).get("name", i) for i in found))
         return None, None, f"items match several categories ({names})"
-    cid, cname = next(iter(found))
-    return cid, cname, None
+    cid = next(iter(found))
+    if cid not in categories:
+        return None, None, f"category {cid} is not in EZShip's list"
+    return cid, categories[cid]["name"], None
 
 
 def declared_value_cents(total_cents: int, declared_min: int) -> int:
@@ -294,16 +425,24 @@ def propose(order: dict, tracking: dict, categories: dict):
         return UNSUPPORTED, None, f"carrier {tracking['carrier']!r} is not one EZShip takes"
     names = [i["name"] if i["qty"] == 1 else f"{i['name']} x{i['qty']}"
              for i in order["items"]]
-    cid, cname, why = pick_category([i["name"] for i in order["items"]])
+    cid, cname, why = pick_category([i["name"] for i in order["items"]], categories)
     if cid is None:
         return NO_CATEGORY, None, why
-    cents = declared_value_cents(order["total_cents"], categories[cid]["declared_min"])
+    declared_min = categories[cid]["declared_min"]
+    if declared_min > order["total_cents"]:
+        # A minimum above what was paid means the match is almost surely
+        # wrong (a $30 order is not a $500 tablet). Hold it.
+        return NO_CATEGORY, None, (
+            f"{cname} minimum {_money(declared_min)} is above the order total "
+            f"{_money(order['total_cents'])}")
+    cents = declared_value_cents(order["total_cents"], declared_min)
     fields = {
         "tracking": tracking["tracking_number"],
         "carrier": carrier,
         "product": product_name(names),
         "category": cname,
         "category_id": cid,
+        "declared_min_cents": declared_min,
         "declared_value_cents": cents,
         "declared_value": _money(cents),
         "remark": f"{order['merchant']} {order['order_number']}",
@@ -316,6 +455,7 @@ def propose(order: dict, tracking: dict, categories: dict):
         "-p", shlex.quote(fields["product"]),
         "--category", shlex.quote(cname),
         "--category-id", cid,
+        "--declared-min", str(declared_min),
         "-r", shlex.quote(fields["remark"]),
     ])
     return READY, fields, None
@@ -575,13 +715,237 @@ def render_table(report) -> str:
     return "\n".join(out)
 
 
+# ─── Submit (BUI-1425) ────────────────────────────────────────────────────────
+#
+# `--submit` sends each ready_to_submit row to `ezship new` with its proposed
+# fields. It shares ebay-shipped --auto-submit's run lock and in-flight
+# quarantine file (both are keyed by tracking number), so the two jobs can
+# never submit one parcel twice or race each other. Rules:
+#
+# * Only ready_to_submit rows submit. Every row that needs a person (hold,
+#   no_category, unsupported_carrier, shipped_no_tracking, orphan_shipment,
+#   unparsed) is notified once and never submitted.
+# * The category list is read live from EZShip, so the minimum sent is the one
+#   EZShip states today.
+# * An in-flight marker is written before each `ezship new` and cleared only on
+#   a confirmed ledger entry, or on an outcome that provably sent nothing (exit
+#   3, or ezship failing to launch). Anything else quarantines the tracking
+#   number until a person checks EZShip and runs `ebay-shipped --clear-inflight`.
+# * Exit 3 (expired cookie) stops the batch.
+# * The heartbeat pings only on a run with no failure. A held order is a
+#   correct outcome and still pings.
+
+SUBMIT_EXIT_OK = 0
+SUBMIT_EXIT_FAILURE = 1
+SUBMIT_EXIT_TRUNCATED = 2
+SUBMIT_EXIT_SESSION_EXPIRED = 3
+SUBMIT_EXIT_SOME_REJECTED = 4
+
+DEFAULT_ATTENTION_STATE = Path.home() / ".config" / "ezship" / "ezship-bound-attention.json"
+ATTENTION_STATUSES = (HOLD, NO_CATEGORY, UNSUPPORTED, SHIPPED_NO_TRACKING)
+_SUBMIT_TIMEOUT_S = 120
+
+
+def submit_command(fields: dict) -> list:
+    launcher, _cwd = _ezship_launch()
+    return launcher + [
+        "new", "-t", fields["tracking"], "-c", fields["carrier"],
+        "-d", str(fields["declared_value_cents"]), "-p", fields["product"],
+        "--category", fields["category"], "--category-id", fields["category_id"],
+        "--declared-min", str(fields["declared_min_cents"]), "-r", fields["remark"],
+    ]
+
+
+def run_submit_command(fields: dict):
+    """Run one `ezship new`. Returns (exit code, last output line); the code is
+    None on a timeout and -1 when ezship could not launch."""
+    _launcher, cwd = _ezship_launch()
+    try:
+        proc = subprocess.run(submit_command(fields), cwd=cwd, capture_output=True,
+                              text=True, timeout=_SUBMIT_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return None, "timed out"
+    except OSError as exc:
+        return -1, f"could not launch ezship: {exc}"
+    tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-1:] or [""]
+    return proc.returncode, tail[0]
+
+
+def attention_items(report) -> list:
+    """(key, one-line description) for every row a person must look at."""
+    items = []
+    for row in report["orders"]:
+        if row["status"] in ATTENTION_STATUSES:
+            items.append((f"{row['status']}:{row['merchant']}#{row['order_number']}",
+                          f"{row['merchant']} #{row['order_number']} {row['status']}: "
+                          f"{row.get('reason', '')}"))
+    for row in report["orphans"]:
+        items.append((f"{ORPHAN}:{','.join(row['trackings'])}",
+                      f"{row['merchant']} {ORPHAN}: {', '.join(row['trackings'])}"))
+    for row in report["unparsed"]:
+        items.append((f"{UNPARSED}:{row['message_id']}",
+                      f"{row['merchant']} {UNPARSED}: {row['reason']}"))
+    return items
+
+
+def ping_submit_heartbeat(server_url, ok, detail):
+    """Best-effort POST to the comics server's heartbeat endpoint."""
+    if not server_url:
+        print("warning: COMICS_SERVER_URL unset; heartbeat not recorded", file=sys.stderr)
+        return
+    path = "/api/heartbeat/ezship-bound-submit" + ("" if ok else "/failure")
+    try:
+        requests.post(f"{server_url}{path}", params={"detail": detail[:300]},
+                      timeout=10).raise_for_status()
+    except requests.RequestException as exc:
+        print(f"warning: heartbeat ping failed (non-fatal): {exc}", file=sys.stderr)
+
+
+def _submit_fail(message, server_url, code=SUBMIT_EXIT_FAILURE):
+    print(f"Error: {message}", file=sys.stderr)
+    ping_submit_heartbeat(server_url, False, message)
+    return code
+
+
+def run_submit(args, server_url, inflight_path=ss.DEFAULT_INFLIGHT_STATE,
+               attention_path=DEFAULT_ATTENTION_STATE):
+    try:
+        lock = ss.acquire_run_lock(inflight_path)
+    except BlockingIOError:
+        print("an EZShip auto-submit run holds the lock; nothing done", file=sys.stderr)
+        return SUBMIT_EXIT_OK
+    except OSError as exc:
+        return _submit_fail(f"cannot take run lock: {exc}", server_url)
+    try:
+        return _run_submit_locked(args, server_url, inflight_path, attention_path)
+    finally:
+        lock.close()
+
+
+def _run_submit_locked(args, server_url, inflight_path, attention_path):
+    window = max(args.days, args.order_days)
+    try:
+        ledger = load_ledger(args.ledger)
+        inflight = ss.load_inflight(inflight_path)
+        ezship = load_ezship_trackings()
+        categories = load_live_categories()
+        fetched = fetch_messages(_search_query(window), args.max_results)
+        report = build_report(fetched.messages, ledger, args.days, args.order_days,
+                              categories=categories, ezship=ezship)
+    except EzshipSessionExpired as exc:
+        ss.notify("ezship-bound: EZShip session expired. Run: ezship set-cookie.")
+        return _submit_fail(str(exc), server_url, SUBMIT_EXIT_SESSION_EXPIRED)
+    except (ShippedOrdersError, ss.InflightError) as exc:
+        return _submit_fail(str(exc), server_url)
+    report["truncated"] = report["truncated"] or fetched.truncated
+    report["ezship_orders"] = len(ezship)
+
+    # A quarantined tracking number is held until a person clears it.
+    for row in report["orders"]:
+        mark = inflight.get(str(row.get("tracking", "")).upper())
+        if mark and row["status"] == READY:
+            row["status"] = HOLD
+            row.pop("proposal", None)
+            row["reason"] = (f"QUARANTINED since {mark.get('since', '?')} "
+                             f"({mark.get('state', '?')}): check EZShip, then run: "
+                             f"{ss.clear_command(row['tracking'])}")
+
+    print(render_table(report))
+    if report["truncated"]:
+        return _submit_fail("a Gmail search was truncated; nothing submitted",
+                            server_url, SUBMIT_EXIT_TRUNCATED)
+
+    items = attention_items(report)
+    seen = ss.load_holds_state(attention_path)
+    new = [(k, text) for k, text in items if k not in seen]
+    if new:
+        ss.notify(("ezship-bound needs you: " + "; ".join(t for _k, t in new))[:200])
+    # Keep only keys still present, so a row that clears and returns alerts again.
+    ss.save_holds_state(attention_path, {k for k, _t in items})
+
+    rejected, submitted = [], 0
+    for row in report["orders"]:
+        if row["status"] != READY:
+            continue
+        fields = row["proposal"]
+        key = fields["tracking"].upper()
+        inflight[key] = {"since": ss._now_iso(), "state": "in-flight"}
+        try:
+            ss.save_inflight(inflight_path, inflight)  # BEFORE the call: crash-safe
+        except ss.InflightError as exc:
+            return _submit_fail(f"cannot record in-flight marker, not submitting "
+                                f"{fields['tracking']}: {exc}", server_url)
+        code, detail = run_submit_command(fields)
+        if code in (SUBMIT_EXIT_SESSION_EXPIRED, -1):
+            inflight.pop(key, None)
+            ss._save_or_warn(inflight_path, inflight)
+        if code == SUBMIT_EXIT_SESSION_EXPIRED:
+            ss.notify("ezship-bound: EZShip session expired. Run: ezship set-cookie. "
+                      "Batch stopped.")
+            return _submit_fail(f"EZShip session expired (exit 3); stopped before "
+                                f"{fields['tracking']}", server_url,
+                                SUBMIT_EXIT_SESSION_EXPIRED)
+        if code == -1:
+            ss.notify(f"ezship-bound: EZShip could not be launched: {detail}"[:200])
+            return _submit_fail(f"ezship launch failure: {detail}", server_url)
+        try:
+            landed = key in load_ledger(args.ledger)
+        except ShippedOrdersError as exc:
+            return _submit_fail(f"ledger unreadable after submitting {fields['tracking']} "
+                                f"(left quarantined: {ss.clear_command(fields['tracking'])}): "
+                                f"{exc}", server_url)
+        if code == 0 and landed:
+            inflight.pop(key, None)
+            ss._save_or_warn(inflight_path, inflight)
+            submitted += 1
+            print(f"submitted {fields['tracking']} {row['merchant']} "
+                  f"#{row['order_number']} as {fields['category']} "
+                  f"({fields['category_id']}) declared {fields['declared_value']}")
+        elif code == 0 or code is None or landed:
+            inflight[key] = {"since": inflight[key]["since"],
+                             "state": f"unconfirmed exit={code}"}
+            ss._save_or_warn(inflight_path, inflight)
+            ss.notify(f"ezship-bound: submission of {fields['tracking']} is unconfirmed "
+                      f"and quarantined; batch stopped. Check EZShip, then: "
+                      f"{ss.clear_command(fields['tracking'])}"[:250])
+            return _submit_fail(f"unconfirmed submission of {fields['tracking']} "
+                                f"(exit={code}, ledger={'yes' if landed else 'no'}): "
+                                f"{detail}", server_url)
+        else:
+            inflight[key] = {"since": inflight[key]["since"], "state": f"failed exit={code}"}
+            ss._save_or_warn(inflight_path, inflight)
+            rejected.append(fields["tracking"])
+            print(f"FAILED {fields['tracking']} (exit {code}), quarantined; verify on "
+                  f"EZShip then: {ss.clear_command(fields['tracking'])}: {detail}",
+                  file=sys.stderr)
+
+    # The wrapper script reads this line to raise a Telegram alert.
+    print(f"ezship-bound: submitted={submitted} attention={len(items)} "
+          f"new_attention={len(new)}")
+    if rejected:
+        ss.notify(f"ezship-bound: EZShip rejected {len(rejected)} order(s): "
+                  f"{', '.join(rejected)}"[:200])
+        return _submit_fail(f"{len(rejected)} order(s) rejected: {', '.join(rejected)}",
+                            server_url, SUBMIT_EXIT_SOME_REJECTED)
+    ping_submit_heartbeat(server_url, True,
+                          f"submitted={submitted} attention={len(items)}")
+    return SUBMIT_EXIT_OK
+
+
+def _search_query(window: int) -> str:
+    return (f'newer_than:{window}d ("12826" OR "Airport Way") '
+            "-from:ebay.com -from:members.ebay.com -from:ezbuy.sg")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="ezship-bound",
         description=("Report non-eBay orders shipped to the EZShip warehouse and "
-                     "propose the `ezship new` fields. Read-only: never writes Gmail, "
-                     "the ledger, or EZShip."),
-        epilog="Exit codes: 0 ok; 1 Gmail or ledger failure; 2 truncated; 3 some unparsed.",
+                     "propose the `ezship new` fields. Read-only unless --submit: "
+                     "it never writes Gmail."),
+        epilog=("Exit codes (report): 0 ok; 1 Gmail or ledger failure; 2 truncated; "
+                "3 some unparsed. With --submit: 0 ok (holds included); 1 failure; "
+                "2 truncated; 3 EZShip cookie expired; 4 some orders rejected."),
     )
     parser.add_argument("--version", action="version",
                         version=_version_string().replace("ebay-shipped", "ezship-bound"))
@@ -595,13 +959,21 @@ def main(argv=None):
                              "presales ship months after the order.")
     parser.add_argument("--max-results", type=int, default=400, metavar="N")
     parser.add_argument("--ledger", type=Path, default=DEFAULT_LEDGER, metavar="PATH")
+    parser.add_argument("--submit", action="store_true",
+                        help="Submit every ready_to_submit order to EZShip and notify "
+                             "on rows that need a person (BUI-1425).")
     args = parser.parse_args(argv)
     if min(args.days, args.order_days, args.max_results) < 1:
         parser.error("--days, --order-days, and --max-results must be at least 1")
+    if args.submit:
+        if args.json_output:
+            parser.error("--submit prints a table; --json is for the report")
+        server_url = (os.environ.get("COMICS_SERVER_URL")
+                      or os.environ.get("GIXEN_SERVER_URL") or "").rstrip("/")
+        return run_submit(args, server_url)
 
     window = max(args.days, args.order_days)
-    query = (f'newer_than:{window}d ("12826" OR "Airport Way") '
-             "-from:ebay.com -from:members.ebay.com -from:ezbuy.sg")
+    query = _search_query(window)
     try:
         ledger = load_ledger(args.ledger)
         ezship = load_ezship_trackings()

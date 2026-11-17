@@ -6403,6 +6403,32 @@ JOB_CONTRACTS: dict[str, dict[str, Any]] = {
             "(every 3 days, after ebay-shipped --auto-submit)."
         ),
     },
+    "ezship-bound-submit": {
+        "cadence_hours": 72.0,
+        "success": (
+            "An `ezship-bound --submit` run (BUI-1425) that finished with no "
+            "failure: Gmail, the EZShip order list, and the live category list "
+            "all read cleanly, no Gmail search was truncated, and every order "
+            "it chose to submit was accepted by EZShip and confirmed in the "
+            "EZShip ledger. A run with nothing to submit still pings, and so "
+            "does a run that only held orders (no confident category, split "
+            "or shared parcels, an unsupported carrier, unparsed mail): a hold "
+            "is the correct outcome and notifies instead. An expired EZShip "
+            "cookie (exit 3), a rejected order (exit 4), a truncated search "
+            "(exit 2), an unconfirmable submission, or a read failure must not "
+            "ping; they POST /api/heartbeat/ezship-bound-submit/failure instead."
+        ),
+        "wired": True,
+        "ping": (
+            "apps/ebay/src/ezship_bound.py's run_submit, via "
+            "ping_submit_heartbeat on the no-failure branch: POST "
+            "/api/heartbeat/ezship-bound-submit (failure branch: /failure). "
+            "Best-effort: a failed ping never changes the run's exit code. "
+            "Scheduling: scripts/ebay-shipped-and-wins.sh, run by "
+            "scripts/launchd/com.comics.ebay-shipped-submit.plist (every 3 "
+            "days, after gixen record-wins)."
+        ),
+    },
 }
 
 # THE OUTER LAYER — WIRED (BUI-672). Read this before trusting the watchdog.

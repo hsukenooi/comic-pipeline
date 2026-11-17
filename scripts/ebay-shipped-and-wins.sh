@@ -4,10 +4,11 @@
 #
 #   1. ebay-shipped --auto-submit   shipped orders -> EZShip (BUI-1238)
 #   2. gixen record-wins            new Gixen wins -> the collection
+#   3. ezship-bound --submit        non-eBay orders -> EZShip (BUI-1425)
 #
-# Each step runs whatever the other did, and each pings its own heartbeat
-# (ebay-shipped-submit, record-wins), so one failing never hides the other.
-# The script exits non-zero if either step failed.
+# Each step runs whatever the others did, and each pings its own heartbeat
+# (ebay-shipped-submit, record-wins, ezship-bound-submit), so one failing
+# never hides another. The script exits non-zero if any step failed.
 set -u
 
 status=0
@@ -75,6 +76,33 @@ else
         --impact "The collection check will not see them, so a buy run can bid on books you own." \
         --fix "Run /comic:collection-add." --log "$LOG_FILE" --now \
         || echo "telegram held-wins alert failed" >&2
+    fi
+  fi
+fi
+
+echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) ezship-bound --submit"
+eb_out="$(ezship-bound --submit)"; rc=$?
+printf '%s\n' "$eb_out"
+if [ "$rc" -ne 0 ]; then
+  echo "ezship-bound exited $rc" >&2; status=1
+  if [ "$rc" -eq 3 ]; then
+    alert "ezship-bound" "$rc" "Non-eBay orders stop reaching EZShip." \
+      "Log in to ezbuy in the automation Chrome, then copy its cookies into the ezship config."
+  else
+    alert "ezship-bound" "$rc" "Non-eBay orders stop reaching EZShip." "Read the log and rerun ezship-bound --submit."
+  fi
+else
+  # A held order is a clean exit. Alert once per new hold (the command
+  # remembers which it already reported), or it waits unsubmitted.
+  new_attention="$(printf '%s\n' "$eb_out" | sed -n 's/^ezship-bound: .* new_attention=\([0-9][0-9]*\)$/\1/p' | head -1)"
+  if [ "${new_attention:-0}" -gt 0 ]; then
+    load_telegram_env
+    if [ -f "$TELEGRAM_REPORT" ]; then
+      /usr/bin/python3 "$TELEGRAM_REPORT" add-item ACTION "Comics ezship-bound" \
+        "$new_attention non-eBay order(s) to the EZShip warehouse need a person and were not submitted." \
+        --impact "They sit at the warehouse unsubmitted until someone enters them." \
+        --fix "Run ezship-bound and submit or fix each held row." --log "$LOG_FILE" --now \
+        || echo "telegram ezship-bound alert failed" >&2
     fi
   fi
 fi

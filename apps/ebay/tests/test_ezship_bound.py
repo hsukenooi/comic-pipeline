@@ -203,10 +203,12 @@ def test_sock_and_comic_get_no_category(search):
     assert cid is None and "several categories" in why
     cid, _n, why = eb.pick_category(["Wool Socks", "Mystery Gadget"])
     assert cid is None and "Mystery Gadget" in why
+    assert "no category matches" in why
 
 
 def test_notebook_is_not_a_book():
-    assert eb.pick_category(["Spiral notebook"])[0] is None
+    # BUI-1425: it now matches Note Book (1060), never Books (1063).
+    assert eb.pick_category(["Spiral notebook"])[:2] == ("1060", "Note Book")
 
 
 def test_sgd_total_is_unparsed(near_order, search):
@@ -404,7 +406,7 @@ def test_item_number_is_not_an_order_number():
 @pytest.mark.parametrize("name", ["Comic bags & boards", "Batman T-shirt",
                                   "Comic book box", "Batman hoodie"])
 def test_supplies_and_apparel_are_not_books(name):
-    assert eb.pick_category([name])[0] is None
+    assert eb.pick_category([name])[0] != "1063"
 
 
 def test_old_mail_without_order_number_is_skipped(search):

@@ -2,7 +2,12 @@
 
 import { Command } from "commander";
 import { loadConfig, saveCookie } from "./auth.js";
-import { submitNewOrder, listOrders } from "./api.js";
+import {
+  submitNewOrder,
+  listOrders,
+  getDeclaredCategories,
+  findSubCategory,
+} from "./api.js";
 import { WAREHOUSE_VALUES, CARRIER_MAP } from "./types.js";
 import { exitCodeFor, EXIT_SESSION_EXPIRED } from "./exit-codes.js";
 
@@ -28,6 +33,10 @@ program
   .option("-p, --product <name>", "Product name")
   .option("--category <name>", "Item category name", "Books")
   .option("--category-id <id>", "Item category ID", "1063")
+  .option(
+    "--declared-min <cents>",
+    "The category's declared minimum in cents (looked up from EZShip when omitted)"
+  )
   .option("--repack", "Request repacking (free)")
   .option("-r, --remark <text>", "Order remark")
   .action(
@@ -40,6 +49,7 @@ program
       category: string;
       categoryId: string;
       declaredValue: string;
+      declaredMin?: string;
       repack?: boolean;
       remark?: string;
     }) => {
@@ -65,6 +75,29 @@ program
           process.exit(1);
         }
 
+        // BUI-1425: a non-Books category needs its own minimum. Look it up
+        // from EZShip when the caller didn't pass one, and check the name.
+        let declaredMin = opts.declaredMin;
+        if (declaredMin === undefined && opts.categoryId !== "1063") {
+          const sub = findSubCategory(
+            await getDeclaredCategories(config),
+            opts.categoryId
+          );
+          if (!sub) {
+            console.error(
+              `Error: EZShip has no category ${opts.categoryId}. Run: ezship categories`
+            );
+            process.exit(1);
+          }
+          if (sub.name !== opts.category) {
+            console.error(
+              `Error: category ${opts.categoryId} is "${sub.name}", not "${opts.category}"`
+            );
+            process.exit(1);
+          }
+          declaredMin = String(sub.declaredMin);
+        }
+
         const result = await submitNewOrder(config, {
           trackingNo: opts.tracking,
           warehouse: opts.warehouse,
@@ -74,6 +107,7 @@ program
           categoryName: opts.category,
           categoryId: opts.categoryId,
           declaredValue: opts.declaredValue,
+          declaredMin,
           repack: opts.repack,
           remark: opts.remark,
         });
@@ -109,6 +143,33 @@ program
           console.log(`${o.orderNumber}\t${o.trackingNo}\t${o.status}`);
         }
         console.log(`${orders.length} orders`);
+      }
+    } catch (err) {
+      const code = exitCodeFor(err);
+      console.error(
+        code === EXIT_SESSION_EXPIRED
+          ? err instanceof Error ? err.message : String(err)
+          : `Error: ${err instanceof Error ? err.message : String(err)}`
+      );
+      process.exit(code);
+    }
+  });
+
+program
+  .command("categories")
+  .description("List EZShip's declared categories and their minimums (read-only)")
+  .option("--json", "Print the raw category tree as JSON")
+  .action(async (opts: { json?: boolean }) => {
+    try {
+      const categories = await getDeclaredCategories(loadConfig());
+      if (opts.json) {
+        console.log(JSON.stringify({ categories }, null, 1));
+      } else {
+        for (const top of categories) {
+          for (const sub of top.subCategories ?? []) {
+            console.log(`${sub.id}\t${sub.declaredMin}\t${top.name} / ${sub.name}`);
+          }
+        }
       }
     } catch (err) {
       const code = exitCodeFor(err);
