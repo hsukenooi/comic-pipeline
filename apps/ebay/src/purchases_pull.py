@@ -1,7 +1,8 @@
 """ebay-purchases-pull: record every eBay purchase on the comics server (BUI-1415).
 
 Reads the buyer's own orders through the Trading API's GetOrders (the same
-pull `ebay-shipped --auto-submit` uses, via `shipped_submit._fetch_page`) and
+pull `ebay-shipped --auto-submit` uses, via `shipped_submit._fetch_page`, but
+windowed on ModTime so a late refund on an older order is seen) and
 turns each order line item into one purchase record: item id, title, seller,
 purchase date, price, shipping, tax, and total. Auction wins, Buy It Now, and
 accepted Best Offers all arrive as orders, so all of them land.
@@ -31,17 +32,72 @@ import sys
 import requests
 
 import ebay_user_token as eut
-from shipped_submit import MAX_PAGES, NS, SubmitError, _fetch_page
+from shipped_submit import MAX_PAGES, NS, SubmitError, _fetch_page, ping_heartbeat
 
 EXIT_OK, EXIT_FAILURE, EXIT_USAGE = 0, 1, 2
 DEFAULT_DAYS = 30
-MAX_DAYS = 90  # GetOrders' CreateTime window limit
+MAX_DAYS = 90  # GetOrders' ModTime window limit
 POST_CHUNK = 500
 HTTP_TIMEOUT_S = 60
 # Order states that mean the money did not move. Anything else (including a
 # cancel request still pending or rejected) counts against the budget.
 CANCELLED_ORDER_STATUSES = {"Cancelled"}
 CANCELLED_CANCEL_STATUSES = {"CancelComplete", "CancelClosedWithRefund", "CancelClosedNoRefund"}
+# Order/MonetaryDetails/Refunds/Refund/RefundStatus values that mean the money
+# did not come back (assumed from the Trading API PaymentStatus enum).
+UNSETTLED_REFUND_STATUSES = {"Failed", "Pending"}
+HEARTBEAT_PATH = "/api/heartbeat/ebay-purchases-pull"
+
+
+def _allocate(amount, weights):
+    """Split `amount` across `weights` proportionally in cents; the last share
+    takes the rounding remainder so the shares sum exactly to `amount`."""
+    total_w = sum(weights)
+    shares = [round(amount * (w / total_w if total_w else 1 / len(weights)), 2)
+              for w in weights]
+    if shares:
+        shares[-1] = round(amount - sum(shares[:-1]), 2)
+    return shares
+
+
+def _order_refund(order, order_id, warnings):
+    """Settled refunds on the order as (amount, currency), or (0.0, None).
+    Assumes GetOrders' Order/MonetaryDetails/Refunds/Refund/RefundAmount."""
+    total, currency = 0.0, None
+    for ref in order.findall("e:MonetaryDetails/e:Refunds/e:Refund", NS):
+        if ref.findtext("e:RefundStatus", namespaces=NS) in UNSETTLED_REFUND_STATUSES:
+            continue
+        amt_el = ref.find("e:RefundAmount", NS)
+        try:
+            amt = float(amt_el.text)
+        except (AttributeError, TypeError, ValueError):
+            warnings.append(f"order {order_id}: refund with no readable RefundAmount ignored")
+            continue
+        cur = amt_el.get("currencyID", "USD")
+        if currency not in (None, cur):
+            warnings.append(f"order {order_id}: refunds in mixed currencies; ignored a {cur} refund")
+            continue
+        currency = cur
+        total += amt
+    return round(total, 2), currency
+
+
+def _fill_shipping(order_rows, order_shipping, order_id, warnings):
+    """Multi-line orders often carry shipping only on the order. Spread what
+    the per-line costs do not account for across the lines missing one,
+    weighted by price. With no order-level cost either, shipping stays None.
+    Either way those lines keep `shipping_estimated` set."""
+    missing = [r for r in order_rows if r["shipping_estimated"]]
+    if not missing:
+        return
+    known = sum(r["shipping"] or 0.0 for r in order_rows if not r["shipping_estimated"])
+    if order_shipping is None or order_shipping < known - 0.005:
+        warnings.append(f"order {order_id}: shipping missing on {len(missing)} line(s) and not "
+                        "derivable from the order; spend understates it")
+        return
+    for r, share in zip(missing, _allocate(round(order_shipping - known, 2),
+                                           [r["price"] for r in missing])):
+        r["shipping"] = share
 
 
 def _money(el, path):
@@ -81,16 +137,20 @@ def parse_purchases(root):
             price_el = txn.find("e:TransactionPrice", NS)
             currency = price_el.get("currencyID", "USD") if price_el is not None else "USD"
             shipping = _money(txn, "e:ActualShippingCost")
-            handling = _money(txn, "e:ActualHandlingCost")
+            handling = _money(txn, "e:ActualHandlingCost") or 0.0
+            estimated = False
             if shipping is None and len(txns) == 1:
                 shipping = order_shipping
-            if handling:
-                shipping = (shipping or 0.0) + handling
+            elif shipping is None:
+                estimated = True  # multi-line, no per-line cost: _fill_shipping
+            if shipping is None and len(txns) == 1:
+                estimated = True  # single line, no cost anywhere: flag, never silent
+                warnings.append(f"order {o('e:OrderID')} item {item_id}: no shipping cost on the "
+                                "line or the order; spend understates it")
             tax = _money(txn, "e:Taxes/e:TotalTaxAmount")
             if tax is None and len(txns) == 1:
                 tax = order_tax
             price = round(unit * qty, 2)
-            total = round(price + (shipping or 0.0) + (tax or 0.0), 2)
             order_rows.append({
                 "order_line_item_id": (t("e:OrderLineItemID") or f"{item_id}-{txn_id}").strip(),
                 "order_id": o("e:OrderID"),
@@ -103,11 +163,32 @@ def parse_purchases(root):
                 "price": price,
                 "shipping": shipping,
                 "tax": tax,
-                "total": total,
+                "total": 0.0,
                 "currency": currency,
                 "purchase_type": "unknown",
                 "cancelled": cancelled,
+                "refunded": 0.0,
+                "shipping_estimated": estimated,
+                "_handling": handling,
             })
+        order_id = o("e:OrderID")
+        _fill_shipping(order_rows, order_shipping, order_id, warnings)
+        for r in order_rows:
+            if r["shipping"] is not None or r["_handling"]:
+                r["shipping"] = round((r["shipping"] or 0.0) + r["_handling"], 2)
+            del r["_handling"]
+            r["total"] = round(r["price"] + (r["shipping"] or 0.0) + (r["tax"] or 0.0), 2)
+        refund, refund_cur = _order_refund(order, order_id, warnings)
+        if refund and order_rows:
+            if any(r["currency"] != refund_cur for r in order_rows):
+                warnings.append(f"order {order_id}: refund currency {refund_cur} differs from "
+                                "the line currency; not netted")
+            else:
+                # eBay reports refunds per order; spread by line total, never past it.
+                if refund > round(sum(r["total"] for r in order_rows), 2) + 0.005:
+                    warnings.append(f"order {order_id}: refund {refund:.2f} exceeds the line totals; capped")
+                for r, share in zip(order_rows, _allocate(refund, [r["total"] for r in order_rows])):
+                    r["refunded"] = round(min(share, r["total"]), 2)
         order_total = _money(order, "e:Total")
         line_sum = round(sum(r["total"] for r in order_rows), 2)
         if order_rows and order_total is not None and abs(line_sum - order_total) > 0.01:
@@ -122,7 +203,7 @@ def fetch_purchases(token, now=None, days=DEFAULT_DAYS):
     now = now or dt.datetime.now(dt.timezone.utc)
     rows, warnings = [], []
     for page in range(1, MAX_PAGES + 1):
-        root, has_more = _fetch_page(token, page, now, days)
+        root, has_more = _fetch_page(token, page, now, days, time_field="mod")
         r, w = parse_purchases(root)
         rows.extend(r)
         warnings.extend(w)
@@ -152,6 +233,10 @@ def render(rows, warnings, dry_run):
     lines = [f"{'DRY RUN: ' if dry_run else ''}{len(rows)} purchase line item(s)"]
     for r in sorted(rows, key=lambda r: r["purchased_at"] or ""):
         flag = " CANCELLED" if r["cancelled"] else ""
+        if r["refunded"]:
+            flag += f" REFUNDED ${r['refunded']:.2f}"
+        if r["shipping_estimated"]:
+            flag += " SHIPPING-ESTIMATED" if r["shipping"] is not None else " SHIPPING-MISSING"
         lines.append(
             f"  {(r['purchased_at'] or '')[:10]}  {r['item_id']}  ${r['total']:>8.2f}  "
             f"{r['seller'] or '?':<20.20} {(r['title'] or '')[:60]}{flag}")
@@ -159,11 +244,18 @@ def render(rows, warnings, dry_run):
     for r in rows:
         if not r["cancelled"]:
             m = (r["purchased_at"] or "")[:7]
-            by_month[m] = round(by_month.get(m, 0.0) + r["total"], 2)
+            by_month[m] = round(by_month.get(m, 0.0) + r["total"] - r["refunded"], 2)
     for m in sorted(by_month):
         lines.append(f"  spend {m}: ${by_month[m]:.2f}")
     lines.extend(f"  warning: {w}" for w in warnings)
     return "\n".join(lines)
+
+
+def _fail(args, base, detail):
+    """Exit 1; an --apply run also tells the watchdog (a dry run never pings)."""
+    if args.apply:
+        ping_heartbeat(base, False, detail, path=HEARTBEAT_PATH)
+    return EXIT_FAILURE
 
 
 def main(argv=None):
@@ -185,10 +277,10 @@ def main(argv=None):
         rows, warnings = fetch_purchases(token, days=args.days)
     except eut.UserTokenError as exc:
         print(f"error: eBay user token: {exc}", file=sys.stderr)
-        return EXIT_FAILURE
+        return _fail(args, base, f"eBay user token: {exc}")
     except SubmitError as exc:
         print(f"error: {exc}", file=sys.stderr)
-        return EXIT_FAILURE
+        return _fail(args, base, str(exc))
     if args.json:
         print(json.dumps({"dry_run": not args.apply, "purchases": rows, "warnings": warnings}, indent=2))
     else:
@@ -199,8 +291,10 @@ def main(argv=None):
         result = post_purchases(base, rows)
     except (requests.RequestException, ValueError, KeyError) as exc:
         print(f"error: posting purchases to {base} failed: {exc}", file=sys.stderr)
-        return EXIT_FAILURE
+        return _fail(args, base, f"posting purchases failed: {exc}")
     print(f"recorded: {result['inserted']} new, {result['updated']} refreshed", file=sys.stderr)
+    ping_heartbeat(base, True, f"{result['inserted']} new, {result['updated']} refreshed",
+                   path=HEARTBEAT_PATH)
     return EXIT_OK
 
 

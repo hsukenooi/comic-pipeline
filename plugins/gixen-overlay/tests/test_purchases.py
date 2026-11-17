@@ -113,9 +113,72 @@ def test_monthly_spend_excludes_cancelled(db):
         ("2026-11", "GBP"), ("2026-11", "USD"), ("2026-10", "USD")]
     spend = [m for m in spend if m["currency"] == "USD"]
     assert spend[0] == {"month": "2026-11", "currency": "USD", "count": 2, "total": 325.0,
+                        "gross": 325.0, "refunded": 0.0, "shipping_estimated_count": 0,
                         "price": 300.0, "shipping": 10.0, "tax": 15.0}
     assert {m["month"] for m in monthly_spend(db, months=1)} == {"2026-11"}
     assert len(list_purchases(db, month="2026-10")) == 1
+
+
+def test_refunds_net_out_of_spend(db):
+    upsert_purchases(db, [
+        _purchase("100000000001-1", "100000000001", refunded=225.0),  # full refund
+        _purchase("100000000002-1", "100000000002", refunded=40.5, shipping_estimated=True),
+        _purchase("100000000003-1", "100000000003"),
+    ])
+    m = monthly_spend(db)[0]
+    assert (m["count"], m["gross"], m["refunded"], m["total"]) == (3, 675.0, 265.5, 409.5)
+    assert m["shipping_estimated_count"] == 1
+
+
+def test_refund_lands_on_repull(db):
+    upsert_purchases(db, [_purchase()])
+    assert monthly_spend(db)[0]["total"] == 225.0
+    assert upsert_purchases(db, [_purchase(refunded=100.0)]) == {"inserted": 0, "updated": 1}
+    assert monthly_spend(db)[0]["total"] == 125.0
+    assert list_purchases(db)[0]["refunded"] == 100.0
+
+
+def test_old_schema_gains_columns_and_old_rows_read(tmp_path):
+    conn = sqlite3.connect(tmp_path / "old.db")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "CREATE TABLE bids (id INTEGER PRIMARY KEY, item_id TEXT NOT NULL, "
+        "max_bid REAL NOT NULL, fmv_id INTEGER)"
+    )
+    conn.execute(
+        "CREATE TABLE purchases (id INTEGER PRIMARY KEY, order_line_item_id TEXT NOT NULL UNIQUE, "
+        "order_id TEXT, item_id TEXT NOT NULL, transaction_id TEXT, title TEXT, seller TEXT, "
+        "purchased_at TEXT NOT NULL, quantity INTEGER NOT NULL DEFAULT 1, price REAL NOT NULL, "
+        "shipping REAL, tax REAL, total REAL NOT NULL, currency TEXT NOT NULL DEFAULT 'USD', "
+        "purchase_type TEXT NOT NULL DEFAULT 'unknown', cancelled INTEGER NOT NULL DEFAULT 0, "
+        "collection_status TEXT NOT NULL DEFAULT 'pending', notes TEXT, "
+        "created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO purchases (order_line_item_id, item_id, purchased_at, price, total, "
+        "created_at, updated_at) VALUES ('1-1', '1', '2026-11-03T00:00:00Z', 50, 50, 'x', 'x')"
+    )
+    create_tables(conn)
+    create_tables(conn)  # idempotent
+    row = list_purchases(conn)[0]
+    assert (row["refunded"], row["shipping_estimated"]) == (0.0, False)
+    m = monthly_spend(conn)[0]
+    assert (m["total"], m["gross"], m["refunded"]) == (50.0, 50.0, 0.0)
+
+def test_missing_refunded_keeps_stored_value_and_explicit_overwrites(db):
+    upsert_purchases(db, [_purchase(refunded=100.0)])
+    upsert_purchases(db, [_purchase()])  # older client: key absent
+    assert list_purchases(db)[0]["refunded"] == 100.0
+    upsert_purchases(db, [_purchase(refunded=None)])
+    assert list_purchases(db)[0]["refunded"] == 100.0
+    upsert_purchases(db, [_purchase(refunded=0.0)])
+    assert list_purchases(db)[0]["refunded"] == 0.0
+
+
+def test_route_omitting_refunded_keeps_stored_refund(api):
+    api.post("/api/comics/purchases", json={"purchases": [_purchase(refunded=100.0)]})
+    api.post("/api/comics/purchases", json={"purchases": [_purchase()]})
+    assert api.get("/api/comics/purchases/spend").json()["months"][0]["total"] == 125.0
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +204,7 @@ def test_purchase_routes_round_trip(api):
 
 @pytest.mark.parametrize("bad", [
     {"item_id": "abc"}, {"price": -1}, {"purchase_type": "steal"},
-    {"purchased_at": "yesterday"},
+    {"purchased_at": "yesterday"}, {"refunded": 225.5}, {"refunded": -1},
 ])
 def test_purchase_validation(api, bad):
     r = api.post("/api/comics/purchases", json={"purchases": [_purchase(**bad)]})

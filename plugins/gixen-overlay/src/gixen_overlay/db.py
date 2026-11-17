@@ -6381,6 +6381,27 @@ JOB_CONTRACTS: dict[str, dict[str, Any]] = {
             "days; the 30-day GetOrders window covers the gap)."
         ),
     },
+    "ebay-purchases-pull": {
+        "cadence_hours": 216.0,
+        "success": (
+            "An `ebay-purchases-pull --apply` run (BUI-1415, BUI-1421) that "
+            "read eBay GetOrders cleanly and got a 2xx from POST "
+            "/api/comics/purchases for every chunk. A window with no orders "
+            "still pings ('zero results is a success'). A failed eBay token "
+            "or GetOrders read, or a failed POST, must not ping; they POST "
+            "/api/heartbeat/ebay-purchases-pull/failure instead. A dry run "
+            "never pings."
+        ),
+        "wired": True,
+        "ping": (
+            "apps/ebay/src/purchases_pull.py's main, via ping_heartbeat after "
+            "a successful --apply POST: POST /api/heartbeat/ebay-purchases-pull "
+            "(failure branch: /failure). Best-effort: a failed ping never "
+            "changes the run's exit code. Scheduling: "
+            "scripts/launchd/com.comics.ebay-purchases-pull.plist (weekly; "
+            "216 h is nine days, so one missed run is slack, two are stale)."
+        ),
+    },
     "record-wins": {
         "cadence_hours": 72.0,
         "success": (

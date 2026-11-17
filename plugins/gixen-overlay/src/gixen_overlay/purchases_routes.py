@@ -13,7 +13,7 @@ import re
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from gixen_overlay.ledger import LedgerRoute
 from gixen_overlay.purchases import (
@@ -61,6 +61,9 @@ class PurchaseIn(BaseModel):
     currency: str = Field(default="USD", min_length=3, max_length=3)
     purchase_type: PurchaseType = "unknown"
     cancelled: bool = False
+    # None = the client did not say (older wheel); the stored refund is kept.
+    refunded: float | None = Field(default=None, ge=0)
+    shipping_estimated: bool = False
 
     _item = field_validator("item_id")(_check_item_id)
 
@@ -70,6 +73,12 @@ class PurchaseIn(BaseModel):
         if not re.match(r"^\d{4}-\d{2}-\d{2}", v):
             raise ValueError("purchased_at must be an ISO 8601 timestamp")
         return v
+
+    @model_validator(mode="after")
+    def _refund_within_total(self) -> "PurchaseIn":
+        if self.refunded is not None and self.refunded > self.total + 0.005:
+            raise ValueError("refunded cannot exceed the line total")
+        return self
 
 
 class PurchaseBatch(BaseModel):
@@ -149,8 +158,10 @@ async def api_list_purchases(
 async def api_purchase_spend(
     request: Request, months: int | None = Query(default=None, ge=1, le=120)
 ) -> dict[str, Any]:
-    """Monthly spend totals (price + shipping + tax), newest month first,
-    cancelled line items excluded. `?months=N` keeps the newest N."""
+    """Monthly spend (price + shipping + tax), newest month first, cancelled
+    line items excluded. `gross` is what was charged, `refunded` what eBay
+    gave back, `total` the net (gross - refunded). `shipping_estimated_count`
+    counts lines whose shipping was allocated from the order or is missing. `?months=N` keeps the newest N."""
     return {"months": monthly_spend(request.app.state.db, months=months)}
 
 

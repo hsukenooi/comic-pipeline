@@ -45,7 +45,14 @@ _sql_list = lambda vals: ", ".join(f"'{v}'" for v in vals)  # noqa: E731
 _PURCHASE_FIELDS = (
     "order_line_item_id", "order_id", "item_id", "transaction_id", "title",
     "seller", "purchased_at", "quantity", "price", "shipping", "tax", "total",
-    "currency", "purchase_type", "cancelled",
+    "currency", "purchase_type", "cancelled", "refunded", "shipping_estimated",
+)
+
+# Columns added after the table first shipped (BUI-1421): ALTERed in on an
+# existing DB, since CREATE TABLE IF NOT EXISTS leaves a live table alone.
+_ADDED_COLUMNS = (
+    ("refunded", "REAL NOT NULL DEFAULT 0"),
+    ("shipping_estimated", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 
@@ -74,6 +81,8 @@ def create_purchase_tables(conn: sqlite3.Connection) -> None:
             purchase_type      TEXT NOT NULL DEFAULT 'unknown'
                                CHECK(purchase_type IN ({_sql_list(PURCHASE_TYPES)})),
             cancelled          INTEGER NOT NULL DEFAULT 0,
+            refunded           REAL NOT NULL DEFAULT 0,
+            shipping_estimated INTEGER NOT NULL DEFAULT 0,
             collection_status  TEXT NOT NULL DEFAULT 'pending'
                                CHECK(collection_status IN ({_sql_list(COLLECTION_STATUSES)})),
             notes              TEXT,
@@ -81,6 +90,10 @@ def create_purchase_tables(conn: sqlite3.Connection) -> None:
             updated_at         TEXT NOT NULL
         )
     """)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(purchases)")}
+    for name, ddl in _ADDED_COLUMNS:
+        if name not in cols:
+            conn.execute(f"ALTER TABLE purchases ADD COLUMN {name} {ddl}")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_purchases_item ON purchases(item_id)")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_purchases_purchased_at ON purchases(purchased_at)"
@@ -126,13 +139,16 @@ def upsert_purchases(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> di
         values = {f: r.get(f) for f in _PURCHASE_FIELDS}
         values["purchase_type"] = values["purchase_type"] or "unknown"
         values["cancelled"] = 1 if values["cancelled"] else 0
+        values["shipping_estimated"] = 1 if values["shipping_estimated"] else 0
+        refunded = values["refunded"]  # None/absent: keep the stored value on update
         values["quantity"] = values["quantity"] or 1
         values["currency"] = values["currency"] or "USD"
         existing = conn.execute(
-            "SELECT purchase_type FROM purchases WHERE order_line_item_id = ?",
+            "SELECT purchase_type, refunded FROM purchases WHERE order_line_item_id = ?",
             (values["order_line_item_id"],),
         ).fetchone()
         if existing is None:
+            values["refunded"] = round(refunded or 0.0, 2)
             cols = ", ".join(_PURCHASE_FIELDS)
             marks = ", ".join("?" for _ in _PURCHASE_FIELDS)
             conn.execute(
@@ -144,6 +160,7 @@ def upsert_purchases(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> di
             continue
         if values["purchase_type"] == "unknown":
             values["purchase_type"] = existing[0]
+        values["refunded"] = existing[1] if refunded is None else round(refunded, 2)
         sets = ", ".join(f"{f} = ?" for f in _PURCHASE_FIELDS if f != "order_line_item_id")
         conn.execute(
             f"UPDATE purchases SET {sets}, updated_at = ? WHERE order_line_item_id = ?",
@@ -189,6 +206,7 @@ def _refine(row: dict[str, Any], won: set[str], recorded: set[str], accepted: se
         elif item in won:
             row["collection_status"] = "snipe_win"
     row["cancelled"] = bool(row["cancelled"])
+    row["shipping_estimated"] = bool(row["shipping_estimated"])
     return row
 
 
@@ -221,13 +239,19 @@ def list_purchases(
 
 def monthly_spend(conn: sqlite3.Connection, *, months: int | None = None) -> list[dict[str, Any]]:
     """Spend per `YYYY-MM` (UTC) and currency, newest first. Cancelled line
-    items are excluded. `total` is price + shipping + tax as the client
-    computed it. Currencies are never summed together: a month with a non-USD
+    items are excluded. `gross` is price + shipping + tax as the client
+    computed it, `refunded` is what eBay gave back, and `total` is the net
+    (gross - refunded; a fully refunded line nets to 0 and still counts).
+    `shipping_estimated_count` is the lines whose shipping was allocated from
+    the order total or is missing. Currencies are never summed together: a month with a non-USD
     purchase gets a second entry. `months=N` keeps the newest N months."""
     rows = _rows(
         conn,
         "SELECT substr(purchased_at, 1, 7) AS month, currency, COUNT(*) AS count, "
-        "ROUND(SUM(total), 2) AS total, ROUND(SUM(price), 2) AS price, "
+        "ROUND(SUM(total) - SUM(refunded), 2) AS total, "
+        "ROUND(SUM(total), 2) AS gross, ROUND(SUM(refunded), 2) AS refunded, "
+        "SUM(shipping_estimated) AS shipping_estimated_count, "
+        "ROUND(SUM(price), 2) AS price, "
         "ROUND(SUM(COALESCE(shipping, 0)), 2) AS shipping, "
         "ROUND(SUM(COALESCE(tax, 0)), 2) AS tax "
         "FROM purchases WHERE cancelled = 0 GROUP BY month, currency "

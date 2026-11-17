@@ -122,13 +122,19 @@ class SubmitError(Exception):
 AUTH_ERROR_CODES = {"931", "932", "21916984", "21917053"}
 
 
-def _request_body(page, now, days):
+def _request_body(page, now, days, time_field="create"):
+    """`time_field` picks the window: "create" (CreateTimeFrom/To, the default)
+    or "mod" (ModTimeFrom/To, which also returns older orders changed since,
+    e.g. refunded)."""
+    if time_field not in ("create", "mod"):
+        raise ValueError(f"time_field must be 'create' or 'mod', got {time_field!r}")
+    tag = "CreateTime" if time_field == "create" else "ModTime"
     f = lambda d: d.strftime("%Y-%m-%dT%H:%M:%S.000Z")  # noqa: E731
     return (
         '<?xml version="1.0" encoding="utf-8"?>'
         '<GetOrdersRequest xmlns="urn:ebay:apis:eBLBaseComponents">'
-        f"<CreateTimeFrom>{f(now - dt.timedelta(days=days))}</CreateTimeFrom>"
-        f"<CreateTimeTo>{f(now)}</CreateTimeTo>"
+        f"<{tag}From>{f(now - dt.timedelta(days=days))}</{tag}From>"
+        f"<{tag}To>{f(now)}</{tag}To>"
         "<OrderRole>Buyer</OrderRole><OrderStatus>All</OrderStatus>"
         "<DetailLevel>ReturnAll</DetailLevel>"
         f"<Pagination><EntriesPerPage>{PER_PAGE}</EntriesPerPage>"
@@ -136,11 +142,11 @@ def _request_body(page, now, days):
     )
 
 
-def _fetch_page(token, page, now, days):
+def _fetch_page(token, page, now, days, time_field="create"):
     try:
         resp = requests.post(
             ENDPOINT,
-            data=_request_body(page, now, days).encode(),
+            data=_request_body(page, now, days, time_field).encode(),
             headers={
                 "X-EBAY-API-CALL-NAME": "GetOrders",
                 "X-EBAY-API-SITEID": "0",

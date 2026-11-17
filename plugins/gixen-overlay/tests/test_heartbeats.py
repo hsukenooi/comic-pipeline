@@ -65,6 +65,7 @@ def test_the_six_named_jobs_are_declared():
         "ebay-shipped-submit",
         "record-wins",
         "ezship-bound-submit",
+        "ebay-purchases-pull",
     }
 
 
