@@ -108,7 +108,7 @@ def test_submit_command_carries_every_field(monkeypatch):
         "tracking": "T1", "carrier": "USPS", "declared_value_cents": 5450,
         "product": "Logo T-shirt", "category": "Tops & Tee", "category_id": "869",
         "declared_min_cents": 500, "remark": "Hart Audio Cables 75151"})
-    assert cmd[3:] == ["new", "-t", "T1", "-c", "USPS", "-d", "5450", "-p", "Logo T-shirt",
+    assert cmd[cmd.index("new"):] == ["new", "-t", "T1", "-c", "USPS", "-d", "5450", "-p", "Logo T-shirt",
                        "--category", "Tops & Tee", "--category-id", "869",
                        "--declared-min", "500", "-r", "Hart Audio Cables 75151"]
 
@@ -202,6 +202,72 @@ def test_live_categories_parse_and_expired_cookie(monkeypatch):
         eb.load_live_categories(lambda cmd, **kw: Done(0, "{}"))
 
 
+@pytest.mark.parametrize("code, state", [
+    (None, "unconfirmed exit=None"),          # timeout
+    (-1, "failed exit=-1"),                   # killed by a signal: not "never launched"
+])
+def test_timeout_and_signal_keep_the_marker(monkeypatch, tmp_path, code, state):
+    h = Harness(monkeypatch, tmp_path, [with_item(load("hart_order.json"), "Logo T-shirt")],
+                codes=[code])
+    assert h.main() in (1, 4)
+    assert json.loads(h.inflight.read_text())[HART_TRACKING]["state"] == state
+    assert h.pings[-1][0] is False
+
+
+def test_launch_failure_clears_the_marker_and_exits_1(monkeypatch, tmp_path):
+    h = Harness(monkeypatch, tmp_path, [with_item(load("hart_order.json"), "Logo T-shirt")])
+    monkeypatch.setattr(eb, "run_submit_command",
+                        lambda fields: (eb.LAUNCH_FAILED, "no npx"))
+    assert h.main() == 1
+    assert json.loads(h.inflight.read_text()) == {}
+
+
+def test_nonzero_exit_that_wrote_the_ledger_is_unconfirmed(monkeypatch, tmp_path):
+    h = Harness(monkeypatch, tmp_path, [with_item(load("hart_order.json"), "Logo T-shirt")])
+
+    def run(fields):
+        h.ledger.write_text(json.dumps({fields["tracking"]: {}}))
+        return 1, "connection dropped"
+
+    monkeypatch.setattr(eb, "run_submit_command", run)
+    assert h.main() == 1
+    assert "unconfirmed" in json.loads(h.inflight.read_text())[HART_TRACKING]["state"]
+
+
+def test_summary_line_prints_when_the_run_fails(monkeypatch, tmp_path, capsys):
+    # The wrapper raises the hold alert from this line, whatever the exit code.
+    h = Harness(monkeypatch, tmp_path, [with_item(load("hart_order.json"), "Logo T-shirt")],
+                codes=[1])
+    monkeypatch.setattr(eb, "attention_items", lambda report: [("k", "held order")])
+    assert h.main() == 4
+    assert "ezship-bound: submitted=0 attention=1 new_attention=1" in capsys.readouterr().out
+
+
+def test_first_failure_stops_the_batch(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(eb, "run_submit_command", lambda f: (calls.append(f), (1, "no"))[1])
+    monkeypatch.setattr(eb, "ping_submit_heartbeat", lambda *a: None)
+    monkeypatch.setattr(ss, "notify", lambda m: None)
+    rows = [{"status": eb.READY, "merchant": "M", "order_number": str(i),
+             "proposal": {"tracking": f"T{i}", "category": "Socks", "category_id": "875",
+                          "declared_value": "$2.00"}} for i in range(2)]
+    args = type("A", (), {"ledger": tmp_path / "ledger.json"})()
+    inflight_path = tmp_path / "inflight.json"
+    code = eb._submit_ready({"orders": rows}, args, "", {}, inflight_path, {"submitted": 0})
+    assert code == 4 and [c["tracking"] for c in calls] == ["T0"]
+    assert set(json.loads(inflight_path.read_text())) == {"T0"}   # T1 untouched
+
+
+def test_unexpected_crash_pings_failure(monkeypatch, tmp_path):
+    h = Harness(monkeypatch, tmp_path, [load("hart_order.json")])
+
+    def boom(*a, **k):
+        raise KeyError("surprise")
+
+    monkeypatch.setattr(eb, "build_report", boom)
+    assert h.main() == 1 and h.pings[-1][0] is False
+
+
 # ─── Category matching ────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("name, expected", [
@@ -216,6 +282,8 @@ def test_live_categories_parse_and_expired_cookie(monkeypatch):
     ("Plush Pikachu", ("1094", "soft toys")),              # alias
     ("Canvas Tote Bag", ("1075", "Handbag / Totebag")),    # alias
     ("Batman #1 comic", ("1063", "Books")),
+    ("Exercise Book A5", ("1066", "Excercise Book")),      # alias for EZShip's spelling
+    ("Wireless Mouse", ("1178", "Mouse")),                 # alias; bare "mouse" is held
 ])
 def test_full_list_matches(name, expected):
     assert eb.pick_category([name])[:2] == expected
@@ -226,6 +294,12 @@ def test_full_list_matches(name, expected):
     "Lord of the Rings Box Set",     # "ring" and "box" are too generic
     "Light-up Figure",
     "Hand Soap",                     # two subcategories share the name
+    # Comic titles with a category word (review of BUI-1425).
+    "The Umbrella Academy #1", "Mickey Mouse #1", "Witchblade #1 Top Cow",
+    "Black Mirror", "Spider-Man Uniform", "Mouse Guard Vol. 1",
+    # Comic-shop merchandise carrying a Books keyword.
+    "Batman Statue", "Funko Pop Batman Figure", "Comic Art Print", "Batman Mug",
+    "Comic Book Storage Bin", "Batman Poster",
 ])
 def test_doubtful_items_get_no_category(name):
     assert eb.pick_category([name])[0] is None

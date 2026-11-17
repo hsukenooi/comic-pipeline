@@ -46,8 +46,6 @@ from shipped_orders import (
     load_ledger,
     parse_merchant,
 )
-import requests
-
 import shipped_submit as ss
 from shipped_submit import (
     DEFAULT_EZSHIP_CMD,
@@ -89,10 +87,22 @@ CATEGORY_RULES = [
     ("1013", "Cables", re.compile(r"\bcables?\b", re.I)),
 ]
 
-# Supplies and apparel that carry a Books keyword ("Comic bags & boards",
-# a Batman T-shirt). A name that hits one gets no Books match.
+# Supplies, apparel, and merchandise that carry a Books keyword ("Comic bags
+# & boards", a Batman T-shirt, a Batman mug). A name that hits one gets no
+# Books match, so it is held unless another category claims it (BUI-1425).
 _NOT_BOOKS = re.compile(
-    r"\b(?:bags?|boards?|boxes|box|sleeves?|shirts?|t-shirts?|tees?|hoodies?)\b", re.I)
+    r"\b(?:bags?|boards?|boxes|box|sleeves?|shirts?|t-shirts?|tees?|hoodies?|"
+    r"figures?|figurines?|funko|statues?|busts?|mugs?|cups?|posters?|prints?|"
+    r"pins?|stickers?|masks?|jackets?|frames?|bins?|replicas?|plush|toys?|"
+    r"vinyl|hats?|caps?|socks?|keychains?|magnets?|cards?)\b", re.I)
+
+# A title that reads as a comic or a book ("Mickey Mouse #1", "Saga Vol. 2",
+# "Umbrella Academy TPB"). Such an item may only be Books: any other category
+# hit is a title word, not the product, and the order is held (BUI-1425).
+_BOOK_SIGNAL = re.compile(
+    r"#\s*\d|\bvol(?:ume)?\.?\s*\d|(?<![\w-])(?:tpb?|hc|hardcover|paperback|"
+    r"omnibus|graphic\s+novel|trade\s+paperback|variant|cvr|cover\s+[a-z])(?![\w-])",
+    re.I)
 
 _BOOKS_ID = "1063"
 
@@ -108,29 +118,38 @@ CATEGORY_ALIASES = {
     "enamel pin": "1055",                                # Badge
     "tote bag": "1075",                                  # Handbag / Totebag
     "phone case": "1017",                                # Phone Casing
+    "exercise book": "1066",                             # EZShip spells it Excercise
+    "computer mouse": "1178", "wireless mouse": "1178",  # Mouse
 }
 
 # Category-name words too generic to match on their own: each turns up in
-# titles of something else ("printing plate", "Lord of the Rings", "light-up
-# figure", DC's Monitor) or comes from splitting a compound name ("Storage
-# Container / Box"). An alias can still map to them. An item that matches
-# nothing is held, which is the safe side.
+# titles of something else ("printing plate", "Lord of the Rings", "Mickey
+# Mouse", "The Umbrella Academy", "Black Mirror", DC's Monitor) or comes from
+# splitting a compound name ("Storage Container / Box"). An alias can still map
+# to them. An item that matches nothing is held, which is the safe side.
 _NAME_STOPWORDS = {
     "light", "glass", "ring", "nut", "zip", "rope", "pipe", "socket", "tape",
     "pen", "lock", "ball", "tissue", "fabric", "badge", "staple", "basket",
     "plate", "hand", "box", "house", "machine", "chop", "glue", "folder",
     "rack", "watch", "tea", "monitor", "tablet", "bed", "apparel", "balm",
+    "mouse", "umbrella", "mirror", "uniform", "coat", "shirt", "belt", "lamp",
+    "tops", "pant", "chair", "battery", "camera", "speaker", "pendant",
+    "necklace", "helmet", "lens", "bicycle", "tent", "mask", "game console",
 }
 
 _WORD_EDGE_L, _WORD_EDGE_R = r"(?<![a-z0-9])", r"(?![a-z0-9])"
 
 
 def _phrase_pattern(phrase: str):
-    """Whole-word, case-blind pattern; the last word may be singular or plural."""
+    """Whole-word, case-blind pattern. A singular name also matches its plural.
+    Only a multi-word plural name matches its singular ("Board Games" ->
+    "board game"): a one-word one would turn "Tops" into "top" (Top Cow)."""
     words = phrase.split()
     last = words[-1]
-    forms = {last, last[:-1]} if last.endswith("s") and len(last) > 3 else {
-        last, last + "s", last + "es"}
+    if last.endswith("s") and len(last) > 3:
+        forms = {last, last[:-1]} if len(words) > 1 else {last}
+    else:
+        forms = {last, last + "s", last + "es"}
     tail = "(?:" + "|".join(re.escape(f) for f in sorted(forms, key=len, reverse=True)) + ")"
     head = "".join(re.escape(w) + r"[\s-]+" for w in words[:-1])
     return re.compile(_WORD_EDGE_L + head + tail + _WORD_EDGE_R, re.I)
@@ -287,6 +306,11 @@ def pick_category(item_names, categories=None):
         hits = item_category_ids(name, index)
         if not hits:
             return None, None, f"no category matches {name!r}"
+        if hits - {_BOOKS_ID} and _BOOK_SIGNAL.search(name):
+            other = ", ".join(sorted(categories.get(i, {}).get("name", i)
+                                     for i in hits - {_BOOKS_ID}))
+            return None, None, (f"{name!r} reads as a comic or book title but "
+                                f"matched {other}")
         found |= hits
     if len(found) != 1:
         names = ", ".join(sorted(categories.get(i, {}).get("name", i) for i in found))
@@ -731,7 +755,7 @@ def render_table(report) -> str:
 #   a confirmed ledger entry, or on an outcome that provably sent nothing (exit
 #   3, or ezship failing to launch). Anything else quarantines the tracking
 #   number until a person checks EZShip and runs `ebay-shipped --clear-inflight`.
-# * Exit 3 (expired cookie) stops the batch.
+# * Exit 3 (expired cookie), and any other failure, stops the batch.
 # * The heartbeat pings only on a run with no failure. A held order is a
 #   correct outcome and still pings.
 
@@ -756,9 +780,14 @@ def submit_command(fields: dict) -> list:
     ]
 
 
+# Not an int, so a child killed by a signal (a negative returncode) can never
+# be mistaken for "never launched" and have its in-flight marker cleared.
+LAUNCH_FAILED = "launch-failed"
+
+
 def run_submit_command(fields: dict):
     """Run one `ezship new`. Returns (exit code, last output line); the code is
-    None on a timeout and -1 when ezship could not launch."""
+    None on a timeout and LAUNCH_FAILED when ezship could not start."""
     _launcher, cwd = _ezship_launch()
     try:
         proc = subprocess.run(submit_command(fields), cwd=cwd, capture_output=True,
@@ -766,7 +795,7 @@ def run_submit_command(fields: dict):
     except subprocess.TimeoutExpired:
         return None, "timed out"
     except OSError as exc:
-        return -1, f"could not launch ezship: {exc}"
+        return LAUNCH_FAILED, f"could not launch ezship: {exc}"
     tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-1:] or [""]
     return proc.returncode, tail[0]
 
@@ -789,16 +818,8 @@ def attention_items(report) -> list:
 
 
 def ping_submit_heartbeat(server_url, ok, detail):
-    """Best-effort POST to the comics server's heartbeat endpoint."""
-    if not server_url:
-        print("warning: COMICS_SERVER_URL unset; heartbeat not recorded", file=sys.stderr)
-        return
-    path = "/api/heartbeat/ezship-bound-submit" + ("" if ok else "/failure")
-    try:
-        requests.post(f"{server_url}{path}", params={"detail": detail[:300]},
-                      timeout=10).raise_for_status()
-    except requests.RequestException as exc:
-        print(f"warning: heartbeat ping failed (non-fatal): {exc}", file=sys.stderr)
+    """Best-effort POST to /api/heartbeat/ezship-bound-submit (or /failure)."""
+    ss.ping_heartbeat(server_url, ok, detail, path="/api/heartbeat/ezship-bound-submit")
 
 
 def _submit_fail(message, server_url, code=SUBMIT_EXIT_FAILURE):
@@ -818,6 +839,8 @@ def run_submit(args, server_url, inflight_path=ss.DEFAULT_INFLIGHT_STATE,
         return _submit_fail(f"cannot take run lock: {exc}", server_url)
     try:
         return _run_submit_locked(args, server_url, inflight_path, attention_path)
+    except Exception as exc:  # noqa: BLE001  # any crash must still alert, never fail green
+        return _submit_fail(f"unexpected {type(exc).__name__}: {exc}", server_url)
     finally:
         lock.close()
 
@@ -863,72 +886,77 @@ def _run_submit_locked(args, server_url, inflight_path, attention_path):
     # Keep only keys still present, so a row that clears and returns alerts again.
     ss.save_holds_state(attention_path, {k for k, _t in items})
 
-    rejected, submitted = [], 0
+    done = {"submitted": 0}
+    try:
+        code = _submit_ready(report, args, server_url, inflight, inflight_path, done)
+    finally:
+        # The wrapper reads this line on every exit to raise the Telegram hold
+        # alert, so a failed submit never swallows a new hold.
+        print(f"ezship-bound: submitted={done['submitted']} attention={len(items)} "
+              f"new_attention={len(new)}")
+    if code == SUBMIT_EXIT_OK:
+        ping_submit_heartbeat(server_url, True,
+                              f"submitted={done['submitted']} attention={len(items)}")
+    return code
+
+
+def _submit_ready(report, args, server_url, inflight, inflight_path, done):
+    """Submit every READY row. Any failure stops the batch: the rows after it
+    stay READY and unmarked for the next run, instead of each being tried
+    against an EZShip that is failing for every order."""
     for row in report["orders"]:
         if row["status"] != READY:
             continue
         fields = row["proposal"]
-        key = fields["tracking"].upper()
+        tracking = fields["tracking"]
+        key = tracking.upper()
         inflight[key] = {"since": ss._now_iso(), "state": "in-flight"}
         try:
             ss.save_inflight(inflight_path, inflight)  # BEFORE the call: crash-safe
         except ss.InflightError as exc:
             return _submit_fail(f"cannot record in-flight marker, not submitting "
-                                f"{fields['tracking']}: {exc}", server_url)
+                                f"{tracking}: {exc}", server_url)
         code, detail = run_submit_command(fields)
-        if code in (SUBMIT_EXIT_SESSION_EXPIRED, -1):
+        if code in (SUBMIT_EXIT_SESSION_EXPIRED, LAUNCH_FAILED):
+            # Treated as nothing sent: exit 3 is EZShip refusing the session,
+            # and LAUNCH_FAILED means ezship never started.
             inflight.pop(key, None)
             ss._save_or_warn(inflight_path, inflight)
         if code == SUBMIT_EXIT_SESSION_EXPIRED:
             ss.notify("ezship-bound: EZShip session expired. Run: ezship set-cookie. "
                       "Batch stopped.")
             return _submit_fail(f"EZShip session expired (exit 3); stopped before "
-                                f"{fields['tracking']}", server_url,
-                                SUBMIT_EXIT_SESSION_EXPIRED)
-        if code == -1:
+                                f"{tracking}", server_url, SUBMIT_EXIT_SESSION_EXPIRED)
+        if code == LAUNCH_FAILED:
             ss.notify(f"ezship-bound: EZShip could not be launched: {detail}"[:200])
             return _submit_fail(f"ezship launch failure: {detail}", server_url)
         try:
             landed = key in load_ledger(args.ledger)
         except ShippedOrdersError as exc:
-            return _submit_fail(f"ledger unreadable after submitting {fields['tracking']} "
-                                f"(left quarantined: {ss.clear_command(fields['tracking'])}): "
+            return _submit_fail(f"ledger unreadable after submitting {tracking} "
+                                f"(left quarantined: {ss.clear_command(tracking)}): "
                                 f"{exc}", server_url)
         if code == 0 and landed:
             inflight.pop(key, None)
             ss._save_or_warn(inflight_path, inflight)
-            submitted += 1
-            print(f"submitted {fields['tracking']} {row['merchant']} "
+            done["submitted"] += 1
+            print(f"submitted {tracking} {row['merchant']} "
                   f"#{row['order_number']} as {fields['category']} "
                   f"({fields['category_id']}) declared {fields['declared_value']}")
-        elif code == 0 or code is None or landed:
-            inflight[key] = {"since": inflight[key]["since"],
-                             "state": f"unconfirmed exit={code}"}
-            ss._save_or_warn(inflight_path, inflight)
-            ss.notify(f"ezship-bound: submission of {fields['tracking']} is unconfirmed "
-                      f"and quarantined; batch stopped. Check EZShip, then: "
-                      f"{ss.clear_command(fields['tracking'])}"[:250])
-            return _submit_fail(f"unconfirmed submission of {fields['tracking']} "
-                                f"(exit={code}, ledger={'yes' if landed else 'no'}): "
-                                f"{detail}", server_url)
-        else:
-            inflight[key] = {"since": inflight[key]["since"], "state": f"failed exit={code}"}
-            ss._save_or_warn(inflight_path, inflight)
-            rejected.append(fields["tracking"])
-            print(f"FAILED {fields['tracking']} (exit {code}), quarantined; verify on "
-                  f"EZShip then: {ss.clear_command(fields['tracking'])}: {detail}",
-                  file=sys.stderr)
-
-    # The wrapper script reads this line to raise a Telegram alert.
-    print(f"ezship-bound: submitted={submitted} attention={len(items)} "
-          f"new_attention={len(new)}")
-    if rejected:
-        ss.notify(f"ezship-bound: EZShip rejected {len(rejected)} order(s): "
-                  f"{', '.join(rejected)}"[:200])
-        return _submit_fail(f"{len(rejected)} order(s) rejected: {', '.join(rejected)}",
-                            server_url, SUBMIT_EXIT_SOME_REJECTED)
-    ping_submit_heartbeat(server_url, True,
-                          f"submitted={submitted} attention={len(items)}")
+            continue
+        unconfirmed = code == 0 or code is None or landed
+        state = "unconfirmed" if unconfirmed else "failed"
+        inflight[key] = {"since": inflight[key]["since"], "state": f"{state} exit={code}"}
+        ss._save_or_warn(inflight_path, inflight)
+        ss.notify(f"ezship-bound: {tracking} {state} (exit {code}) and quarantined; "
+                  f"batch stopped. Check EZShip, then: {ss.clear_command(tracking)}"[:250])
+        if unconfirmed:
+            # Exit 0 with no ledger entry, a timeout, or a failure that still
+            # wrote the ledger: the outcome is unknown.
+            return _submit_fail(f"unconfirmed submission of {tracking} (exit={code}, "
+                                f"ledger={'yes' if landed else 'no'}): {detail}", server_url)
+        return _submit_fail(f"EZShip rejected {tracking} (exit {code}); quarantined: "
+                            f"{detail}", server_url, SUBMIT_EXIT_SOME_REJECTED)
     return SUBMIT_EXIT_OK
 
 

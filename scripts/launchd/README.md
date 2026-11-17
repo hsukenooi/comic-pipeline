@@ -127,6 +127,14 @@ itself. Each step pings its own heartbeat (`ebay-shipped-submit`,
 `record-wins`) and runs whether or not the other failed. Rehearse the
 second step without writing anything with `gixen record-win-prep`.
 
+Since BUI-1425 a third step runs `ezship-bound --submit`. It submits non-eBay
+orders shipped to the EZShip warehouse (found in Gmail) and holds any order
+it can't place in one EZShip category with confidence. A new hold raises one
+Telegram alert, and an expired cookie (exit 3) raises the same alert as
+`ebay-shipped`. It pings the `ezship-bound-submit` heartbeat and shares
+`ebay-shipped`'s run lock and in-flight quarantine. Rehearse it without
+submitting by running plain `ezship-bound`, which reports only.
+
 ## com.comics.ebay-purchases-pull.plist (BUI-1415)
 
 Runs `ebay-purchases-pull --apply --days 30` weekly. It reads the buyer's

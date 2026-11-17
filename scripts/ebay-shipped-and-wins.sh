@@ -91,19 +91,19 @@ if [ "$rc" -ne 0 ]; then
   else
     alert "ezship-bound" "$rc" "Non-eBay orders stop reaching EZShip." "Read the log and rerun ezship-bound --submit."
   fi
-else
-  # A held order is a clean exit. Alert once per new hold (the command
-  # remembers which it already reported), or it waits unsubmitted.
-  new_attention="$(printf '%s\n' "$eb_out" | sed -n 's/^ezship-bound: .* new_attention=\([0-9][0-9]*\)$/\1/p' | head -1)"
-  if [ "${new_attention:-0}" -gt 0 ]; then
-    load_telegram_env
-    if [ -f "$TELEGRAM_REPORT" ]; then
-      /usr/bin/python3 "$TELEGRAM_REPORT" add-item ACTION "Comics ezship-bound" \
-        "$new_attention non-eBay order(s) to the EZShip warehouse need a person and were not submitted." \
-        --impact "They sit at the warehouse unsubmitted until someone enters them." \
-        --fix "Run ezship-bound and submit or fix each held row." --log "$LOG_FILE" --now \
-        || echo "telegram ezship-bound alert failed" >&2
-    fi
+fi
+# A held order needs a person. ezship-bound prints its summary line on every
+# exit once holds are known, and remembers what it reported, so this alerts
+# once per new hold even when the run also failed.
+new_attention="$(printf '%s\n' "$eb_out" | sed -n 's/^ezship-bound: .* new_attention=\([0-9][0-9]*\)$/\1/p' | head -1)"
+if [ "${new_attention:-0}" -gt 0 ]; then
+  load_telegram_env
+  if [ -f "$TELEGRAM_REPORT" ]; then
+    /usr/bin/python3 "$TELEGRAM_REPORT" add-item ACTION "Comics ezship-bound" \
+      "$new_attention non-eBay order(s) to the EZShip warehouse need a person and were not submitted." \
+      --impact "They sit at the warehouse unsubmitted until someone enters them." \
+      --fix "Run ezship-bound and submit or fix each held row." --log "$LOG_FILE" --now \
+      || echo "telegram ezship-bound alert failed" >&2
   fi
 fi
 
