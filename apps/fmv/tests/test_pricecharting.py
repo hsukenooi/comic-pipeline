@@ -239,9 +239,11 @@ def test_scrape_failure_warns_falls_back_and_is_not_cached(pc_on, monkeypatch, t
     assert len(calls) == 2
 
 
-def test_missing_firecrawl_is_a_reported_failure(pc_on, monkeypatch):
+def test_missing_firecrawl_is_a_reported_failure(pc_on, monkeypatch, tmp_path):
     monkeypatch.undo()  # restore the real scrape; keep the env below
     monkeypatch.setenv("FMV_PRICECHARTING", "1")
+    # undo() also restored the real cache dir; a cached page would skip the scrape
+    monkeypatch.setenv("FMV_PRICECHARTING_CACHE_DIR", str(tmp_path / "pc-cache"))
     monkeypatch.setattr(pc, "_FAILED_THIS_PROCESS", {})
     monkeypatch.setattr(pc.shutil, "which", lambda name: None)
     got = pc.fetch_book_sales("X-Men", "96", 1975)
