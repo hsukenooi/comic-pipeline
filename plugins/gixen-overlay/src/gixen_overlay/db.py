@@ -693,6 +693,15 @@ def create_tables(conn: sqlite3.Connection) -> None:
     # (no FK, CREATE IF NOT EXISTS), so they have no ordering dependency.
     from gixen_overlay.purchases import create_purchase_tables
     create_purchase_tables(conn)
+    # BUI-1419: the slab-alert seen-set and Act/Pass ratings. Standalone.
+    _migrate_add_slab_alerts_table(conn)
+
+
+def _migrate_add_slab_alerts_table(conn: sqlite3.Connection) -> None:
+    """BUI-1419: additive `slab_alerts` table. CREATE IF NOT EXISTS only, so
+    it is a no-op on a DB that already has it and never touches other rows."""
+    from gixen_overlay.slab_alerts import create_slab_alert_tables
+    create_slab_alert_tables(conn)
 
 
 # ---------------------------------------------------------------------------

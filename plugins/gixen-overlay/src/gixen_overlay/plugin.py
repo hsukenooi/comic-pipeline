@@ -24,8 +24,10 @@ class GixenOverlayPlugin:
     def register_routes(self, app: "FastAPI") -> None:
         from gixen_overlay.purchases_routes import router as purchases_router
         from gixen_overlay.routes import router
+        from gixen_overlay.slab_alerts_routes import router as slab_alerts_router
         app.include_router(router)
         app.include_router(purchases_router)
+        app.include_router(slab_alerts_router)
 
     @hookimpl
     def register_dashboard_tabs(self) -> list[dict]:

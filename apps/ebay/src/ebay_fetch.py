@@ -1200,7 +1200,33 @@ def parse_item_summary(item):
         "end_date_iso": end_date_iso,
         "listing_url": item.get("itemWebUrl", f"https://www.ebay.com/itm/{item_id}"),
         "seller": seller,
+        # BUI-1419: additive. Best Offer flag and the cheapest USD shipping
+        # cost the summary shows (None when absent or not USD: unknown, not free).
+        "best_offer": "BEST_OFFER" in buying_options,
+        "shipping": summary_shipping_usd(item),
     }
+
+
+def summary_shipping_usd(item):
+    """Cheapest USD `shippingOptions[].shippingCost` on a Browse item or
+    itemSummary, or None when no option states a USD cost (calculated or
+    missing shipping is unknown, never read as free). A CALCULATED option is
+    skipped even when eBay reports it as 0.00: that is not a quote."""
+    costs = []
+    opts = item.get("shippingOptions") if isinstance(item, dict) else None
+    for opt in opts if isinstance(opts, list) else []:
+        if not isinstance(opt, dict):
+            continue
+        if str(opt.get("shippingCostType") or "").upper() == "CALCULATED":
+            continue
+        cost = opt.get("shippingCost")
+        if not isinstance(cost, dict) or cost.get("currency", "USD") != "USD":
+            continue
+        try:
+            costs.append(float(cost.get("value")))
+        except (TypeError, ValueError):
+            continue
+    return min(costs) if costs else None
 
 
 def _seller_filter_rejected(data):

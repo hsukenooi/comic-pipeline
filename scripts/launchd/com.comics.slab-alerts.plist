@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.comics.slab-alerts</string>
+    <key>ProgramArguments</key>
+    <array>
+        <!-- BUI-1419: one scan of the slab hunt list. Reads Act/Pass presses
+             (getUpdates), searches eBay, prices with comic-fmv graded mode,
+             and sends at most one Telegram message. Never bids or buys.
+             Telegram creds come from ~/.config/tasks-to-linear.env (only the
+             TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID lines are read). -->
+        <string>/Users/hsukenooi/.local/bin/ebay-slab-alerts</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>COMICS_SERVER_URL</key>
+        <string>http://localhost:8080</string>
+        <key>PATH</key>
+        <string>/Users/hsukenooi/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <!-- Probe-sized caps for the first kickstart. Raise SLAB_ALERT_MAX_BOOKS
+             to 0 (every book) and SLAB_ALERT_MAX_ITEM_FETCHES to 40 once the
+             first run's log looks right. -->
+        <key>SLAB_ALERT_MAX_BOOKS</key>
+        <string>3</string>
+        <key>SLAB_ALERT_MAX_ITEM_FETCHES</key>
+        <string>5</string>
+    </dict>
+    <!-- Every 12 hours (43200 s). StartInterval counts time awake, so a
+         sleeping Mini runs it on wake. -->
+    <key>StartInterval</key>
+    <integer>43200</integer>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/Users/hsukenooi/.comics-server/slab-alerts.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/hsukenooi/.comics-server/slab-alerts.error.log</string>
+</dict>
+</plist>
