@@ -27,6 +27,8 @@
         <string>3</string>
         <key>SLAB_ALERT_MAX_ITEM_FETCHES</key>
         <string>5</string>
+        <key>SLAB_ALERT_READ_BUTTONS</key>
+        <string>0</string>
     </dict>
     <!-- Every 12 hours (43200 s). StartInterval counts time awake, so a
          sleeping Mini runs it on wake. -->
