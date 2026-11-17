@@ -30,8 +30,13 @@
         <string>0</string>
         <key>SLAB_ALERT_MAX_ITEM_FETCHES</key>
         <string>20</string>
+        <!-- Act/Pass buttons read getUpdates on the shared daily-automations
+             bot (BUI-1419). The only other getUpdates caller is
+             telegram_report.py's one-time chat-id helper. Both read one
+             update queue, so avoid running that helper while presses are
+             unread. -->
         <key>SLAB_ALERT_READ_BUTTONS</key>
-        <string>0</string>
+        <string>1</string>
     </dict>
     <!-- Once a day (86400 s): every hunt-list book twice a day would exceed
          the ~50 calls/day budget. StartInterval counts time awake, so a
