@@ -8,7 +8,9 @@
     <key>ProgramArguments</key>
     <array>
         <!-- BUI-1267: the wrapper runs ebay-shipped --auto-submit, then
-             gixen record-wins (new wins -> the collection). -->
+             gixen record-wins (new wins -> the collection), then (BUI-1425)
+             ezship-bound --submit (non-eBay orders -> EZShip; reads Gmail
+             through gws in /opt/homebrew/bin). -->
         <string>/bin/bash</string>
         <string>/Users/hsukenooi/Projects/comic-pipeline/scripts/ebay-shipped-and-wins.sh</string>
     </array>

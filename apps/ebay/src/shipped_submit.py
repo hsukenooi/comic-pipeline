@@ -470,12 +470,13 @@ def run_ezship(group):
     return proc.returncode, tail[0]
 
 
-def ping_heartbeat(server_url, ok, detail):
-    """Best-effort POST to the comics server's heartbeat endpoints."""
+def ping_heartbeat(server_url, ok, detail, path=HEARTBEAT_PATH):
+    """Best-effort POST to a comics server heartbeat endpoint (default: this
+    job's; ezship-bound --submit passes its own)."""
     if not server_url:
         print("warning: COMICS_SERVER_URL unset; heartbeat not recorded", file=sys.stderr)
         return
-    path = HEARTBEAT_PATH + ("" if ok else "/failure")
+    path = path + ("" if ok else "/failure")
     try:
         requests.post(f"{server_url}{path}", params={"detail": detail[:300]},
                       timeout=10).raise_for_status()

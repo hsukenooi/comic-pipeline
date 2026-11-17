@@ -134,6 +134,9 @@ export interface NewOrderOptions {
   categoryId?: string;
   categoryName?: string;
   declaredValue?: string;
+  // The chosen category's own minimum, in cents (BUI-1425). Required for any
+  // category other than Books: a wrong minimum is sent to EZShip as-is.
+  declaredMin?: string;
   repack?: boolean;
   remark?: string;
 }
@@ -159,6 +162,30 @@ export async function submitNewOrder(
         `${prior.submittedAt}${prior.orderId ? ` (order ${prior.orderId})` : ""}. ` +
         `Refusing to submit a duplicate. To override, remove that entry from ` +
         `${ledgerPath}.`
+    );
+  }
+
+  const categoryId = opts.categoryId ?? DEFAULT_CATEGORY.id;
+  // BUI-1425: every order used to carry the Books minimum (200), whatever its
+  // category. Send the category's own minimum, and refuse to guess one.
+  let declaredMin = opts.declaredMin;
+  if (declaredMin === undefined) {
+    if (categoryId !== DEFAULT_CATEGORY.id) {
+      throw new Error(
+        `No declared minimum for category ${categoryId}. Pass --declared-min ` +
+          `(see \`ezship categories\`).`
+      );
+    }
+    declaredMin = DEFAULT_CATEGORY.declaredMin;
+  }
+  if (!/^\d+$/.test(declaredMin)) {
+    throw new Error(`Declared minimum must be whole cents, got "${declaredMin}"`);
+  }
+  const declaredValue = opts.declaredValue ?? "1000";
+  if (/^\d+$/.test(declaredValue) && Number(declaredValue) < Number(declaredMin)) {
+    throw new Error(
+      `Declared value ${declaredValue} is below category ${categoryId}'s ` +
+        `minimum of ${declaredMin} cents`
     );
   }
 
@@ -188,12 +215,12 @@ export async function submitNewOrder(
           productName: opts.productName ?? "",
           qty: 1,
           category: {
-            id: opts.categoryId ?? DEFAULT_CATEGORY.id,
+            id: categoryId,
             name: opts.categoryName ?? DEFAULT_CATEGORY.name,
             isDefault: DEFAULT_CATEGORY.isDefault,
-            declaredMin: DEFAULT_CATEGORY.declaredMin,
+            declaredMin,
           },
-          declaredValue: opts.declaredValue ?? "1000",
+          declaredValue,
         },
       ],
       remark: opts.remark ?? "",
@@ -309,4 +336,56 @@ export async function listOrders(config: Config): Promise<EzshipOrder[]> {
     }
   }
   return [...byId.values()];
+}
+
+// ─── Declared categories (BUI-1425) ─────────────────────────────────────────
+
+export interface DeclaredSubCategory {
+  id: string;
+  name: string;
+  isDefault: boolean;
+  declaredMin: string;
+}
+
+export interface DeclaredCategory extends DeclaredSubCategory {
+  subCategories: DeclaredSubCategory[];
+}
+
+const CATEGORIES_ENDPOINT = "ezShipOrder.OrderPublic/GetDeclaredCategories";
+
+// The category list carries no result flag: a good body is a non-empty
+// `categories` array. Anything else is a failure, never an empty list.
+export function checkCategoriesResponse(json: unknown): DeclaredCategory[] {
+  const r = (json ?? {}) as Record<string, unknown>;
+  if (Array.isArray(r.categories) && r.categories.length > 0) {
+    return r.categories as DeclaredCategory[];
+  }
+  const msg = listMessage(r);
+  if (/log\s*in/i.test(msg)) {
+    throw new SessionExpiredError();
+  }
+  throw new Error(
+    `EZShip returned no category list: ${msg || JSON.stringify(json)}`
+  );
+}
+
+// Read-only: EZShip's full declared-category tree, in the same shape as
+// apps/ebay/src/ezship_categories.json (`{"categories": [...]}`).
+export async function getDeclaredCategories(
+  config: Config
+): Promise<DeclaredCategory[]> {
+  return checkCategoriesResponse(await postRpc(config, CATEGORIES_ENDPOINT, {}));
+}
+
+// The subcategory with this id, or undefined.
+export function findSubCategory(
+  categories: DeclaredCategory[],
+  id: string
+): DeclaredSubCategory | undefined {
+  for (const top of categories) {
+    for (const sub of top.subCategories ?? []) {
+      if (String(sub.id) === id) return sub;
+    }
+  }
+  return undefined;
 }
