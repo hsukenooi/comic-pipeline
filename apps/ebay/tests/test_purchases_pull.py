@@ -32,14 +32,14 @@ def txn(item_id, txn_id="10", price="100.00", ship="5.00", tax="8.00", qty=1, li
     )
 
 
-def order(order_id, txns, total=None, ship="12.40", status="Completed", cancel="NotApplicable"):
+def order(order_id, txns, total=None, ship="12.40", status="Completed", cancel="NotApplicable", refunds=""):
     total_el = f"<Total>{total}</Total>" if total is not None else ""
     return (
         f"<Order><OrderID>{order_id}</OrderID><OrderStatus>{status}</OrderStatus>"
         f"<CancelStatus>{cancel}</CancelStatus><SellerUserID>seller_a</SellerUserID>"
         f"<CreatedTime>2026-11-02T00:00:00.000Z</CreatedTime>"
         f"<ShippingServiceSelected><ShippingServiceCost>{ship}</ShippingServiceCost></ShippingServiceSelected>"
-        f"{total_el}<TransactionArray>{''.join(txns)}</TransactionArray></Order>"
+        f"{total_el}{refunds}<TransactionArray>{''.join(txns)}</TransactionArray></Order>"
     )
 
 
@@ -62,9 +62,59 @@ def test_one_row_per_line_item_with_totals():
     assert (a["price"], a["shipping"], a["tax"], a["total"]) == (200.0, 5.0, 8.0, 213.0)
     assert a["purchase_type"] == "unknown" and a["seller"] == "seller_a"
     assert a["purchased_at"] == "2026-11-03T09:14:26.000Z"
-    # Multi-line order: the order-level shipping is not guessed onto one line.
-    assert (b["shipping"], b["tax"], b["total"]) == (None, None, 100.0)
+    # Multi-line order: the part of the order shipping the other line does not
+    # account for (12.40 - 5.00) lands on the line with no ActualShippingCost.
+    assert (b["shipping"], b["tax"], b["total"]) == (7.4, None, 107.4)
+    assert (a["shipping_estimated"], b["shipping_estimated"]) == (False, True)
+    assert (a["refunded"], b["refunded"]) == (0.0, 0.0)
     assert warnings == []
+
+
+def test_multi_line_shipping_split_by_price_and_sums_exactly():
+    rows, _ = parse(order("O5", [txn("1", "1", price="300.00", ship=None, tax=None),
+                                 txn("2", "2", price="100.00", ship=None, tax=None),
+                                 txn("3", "3", price="100.00", ship=None, tax=None)],
+                          ship="10.00", total="510.00"))
+    assert [r["shipping"] for r in rows] == [6.0, 2.0, 2.0]
+    assert all(r["shipping_estimated"] for r in rows)
+
+
+def test_multi_line_shipping_with_no_order_cost_is_flagged_missing():
+    xml = order("O6", [txn("1", "1", ship=None), txn("2", "2", ship=None)]).replace(
+        "<ShippingServiceSelected><ShippingServiceCost>12.40</ShippingServiceCost>"
+        "</ShippingServiceSelected>", "")
+    rows, warnings = parse(xml)
+    assert [r["shipping"] for r in rows] == [None, None]
+    assert all(r["shipping_estimated"] for r in rows)
+    assert any("not derivable" in w for w in warnings)
+
+
+def refund(amount, status="Succeeded", cur="USD"):
+    return (f"<MonetaryDetails><Refunds><Refund><RefundStatus>{status}</RefundStatus>"
+            f'<RefundAmount currencyID="{cur}">{amount}</RefundAmount></Refund></Refunds></MonetaryDetails>')
+
+
+def test_refund_is_spread_over_lines_and_never_exceeds_a_line():
+    rows, _ = parse(order("O7", [txn("1", "1", price="100.00", ship="0", tax="0"),
+                                 txn("2", "2", price="300.00", ship="0", tax="0")],
+                          refunds=refund("100.00")))
+    assert [r["refunded"] for r in rows] == [25.0, 75.0]
+    rows, _ = parse(order("O8", [txn("3", "3", price="50.00", ship="0", tax="0")],
+                          refunds=refund("80.00")))
+    assert rows[0]["refunded"] == 50.0  # capped at the line total
+
+
+def test_full_refund_keeps_the_line_with_net_zero():
+    rows, _ = parse(order("O9", [txn("4", "4")], refunds=refund("113.00")))
+    assert rows[0]["total"] == 113.0 and rows[0]["refunded"] == 113.0
+    assert rows[0]["cancelled"] is False
+
+
+def test_unsettled_and_foreign_currency_refunds_are_not_netted():
+    rows, _ = parse(order("O10", [txn("5", "5")], refunds=refund("50.00", status="Pending")))
+    assert rows[0]["refunded"] == 0.0
+    rows, warnings = parse(order("O11", [txn("6", "6")], refunds=refund("50.00", cur="GBP")))
+    assert rows[0]["refunded"] == 0.0 and any("currency" in w for w in warnings)
 
 
 def test_single_line_order_falls_back_to_order_shipping_and_flags_mismatch():
@@ -111,6 +161,8 @@ def ebay(monkeypatch):
         if "api.ebay.com" in url:
             return FakeResp(pages.pop(0))
         posted.append((url, json))
+        if json is None:  # a heartbeat ping
+            return FakeResp()
         return FakeResp(body={"inserted": len(json["purchases"]), "updated": 0})
 
     monkeypatch.setattr(requests, "post", fake_post)
@@ -128,8 +180,23 @@ def test_dry_run_posts_nothing(ebay, monkeypatch, capsys):
 def test_apply_posts_every_page(ebay, monkeypatch):
     monkeypatch.setenv("COMICS_SERVER_URL", "http://srv/")
     assert pp.main(["--apply"]) == 0
-    assert [u for u, _ in ebay] == ["http://srv/api/comics/purchases"]
+    assert [u for u, _ in ebay] == ["http://srv/api/comics/purchases",
+                                    "http://srv/api/heartbeat/ebay-purchases-pull"]
     assert [p["item_id"] for p in ebay[0][1]["purchases"]] == ["111", "222"]
+
+
+def test_failed_apply_pings_failure_heartbeat(ebay, monkeypatch):
+    monkeypatch.setenv("COMICS_SERVER_URL", "http://srv")
+    real = requests.post
+
+    def post(url, **kw):
+        if url.endswith("/api/comics/purchases"):
+            return FakeResp(status=500)
+        return real(url, **kw)
+
+    monkeypatch.setattr(requests, "post", post)
+    assert pp.main(["--apply"]) == 1
+    assert [u for u, _ in ebay] == ["http://srv/api/heartbeat/ebay-purchases-pull/failure"]
 
 
 def test_apply_without_server_is_usage_error(ebay, monkeypatch):

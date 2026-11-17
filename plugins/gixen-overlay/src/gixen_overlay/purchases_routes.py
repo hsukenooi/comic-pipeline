@@ -61,6 +61,8 @@ class PurchaseIn(BaseModel):
     currency: str = Field(default="USD", min_length=3, max_length=3)
     purchase_type: PurchaseType = "unknown"
     cancelled: bool = False
+    refunded: float = Field(default=0.0, ge=0)
+    shipping_estimated: bool = False
 
     _item = field_validator("item_id")(_check_item_id)
 
@@ -149,8 +151,10 @@ async def api_list_purchases(
 async def api_purchase_spend(
     request: Request, months: int | None = Query(default=None, ge=1, le=120)
 ) -> dict[str, Any]:
-    """Monthly spend totals (price + shipping + tax), newest month first,
-    cancelled line items excluded. `?months=N` keeps the newest N."""
+    """Monthly spend (price + shipping + tax), newest month first, cancelled
+    line items excluded. `gross` is what was charged, `refunded` what eBay
+    gave back, `total` the net (gross - refunded). `shipping_estimated_count`
+    counts lines whose shipping was allocated from the order or is missing. `?months=N` keeps the newest N."""
     return {"months": monthly_spend(request.app.state.db, months=months)}
 
 
