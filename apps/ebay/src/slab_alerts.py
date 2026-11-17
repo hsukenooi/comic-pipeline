@@ -427,8 +427,8 @@ def fmv_of_row(row: dict) -> dict:
 
 def market_of(fmv: dict) -> tuple[float | None, str | None, str | None]:
     """(market, confidence, skip reason). Market is the band median; a
-    failed, advisory, refused, uncapped, or below-MEDIUM row has no usable
-    market."""
+    failed, advisory, refused, uncapped (auction only), or below-MEDIUM row
+    has no usable market."""
     conf = str(fmv.get("confidence") or "").upper() or None
     if fmv.get("fmv_failed"):
         return None, conf, str(fmv["fmv_failed"])
@@ -441,7 +441,10 @@ def market_of(fmv: dict) -> tuple[float | None, str | None, str | None]:
     med = fmv.get("median")
     if not isinstance(med, (int, float)) or isinstance(med, bool) or med <= 0:
         return None, conf, "no median"
-    if fmv.get("max_bid") is None:  # comic-fmv withholds a cap it will not stand behind
+    # comic-fmv withholds a cap it will not stand behind. A Buy It Now row is
+    # the exception: R34 nulls its max_bid by design and tags it `bin_listing`
+    # (there is no auction to snipe), and its band still stands (BUI-1423).
+    if fmv.get("max_bid") is None and not fmv.get("bin_listing"):
         return None, conf, "no max bid"
     return float(med), conf, None
 
