@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>comic-pipeline ▸ hunt list</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/v2.css">
+<style>
+  /* BUI-1420: hunt list tab. Shared chrome in v2.css. */
+  td.title { max-width: 380px; color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .conf { font-size: 10px; letter-spacing: 0.04em; margin-left: 6px; color: var(--fg-dim); }
+  .conf.high { color: var(--green); }
+  .conf.medium { color: var(--yellow); }
+  .conf.low { color: var(--orange); }
+  .spend { padding: 10px 14px; color: var(--fg-dim); }
+  .spend b { color: var(--fg); }
+  .empty { padding: 16px 14px; color: var(--fg-mute); }
+  .live0 { color: var(--fg-mute); }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="seg brand">▎ comic-pipeline</div>
+  <div class="seg"><a href="/comics">comics</a></div>
+  <div class="seg">hunt list</div>
+  <div class="spacer"></div>
+</div>
+
+<div class="wrap">
+  <div id="spend-section"></div>
+  <div id="books-section"></div>
+</div>
+
+<script>
+const REFRESH_MS = 60000;
+const URL_ = "/api/comics/hunt-list";
+
+const esc = s => String(s ?? "").replace(/[&<>"']/g,
+  c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const usd = n => n == null ? "-" : "$" + Number(n).toLocaleString(undefined, {maximumFractionDigits: 2});
+
+// Timestamps arrive as UTC ISO 8601; show them in the viewer's local time.
+function fmtWhen(iso) {
+  if (!iso) return '<span class="mute">never</span>';
+  const d = new Date(iso);
+  if (isNaN(d)) return esc(iso);
+  return esc(d.toLocaleString(undefined, {month: "short", day: "numeric",
+    hour: "numeric", minute: "2-digit", timeZoneName: "short"}));
+}
+
+function fmtMarket(b) {
+  if (!b.scanned) return '<span class="mute">not scanned yet</span>';
+  if (!b.market) return '<span class="mute">no market yet</span>';
+  const m = b.market;
+  const g = m.grade != null ? ` <span class="mute">@ ${esc(m.grade)}</span>` : "";
+  const c = m.confidence
+    ? `<span class="conf ${esc(String(m.confidence).toLowerCase())}">${esc(m.confidence)}</span>` : "";
+  return `${usd(m.value)}${g}${c}`;
+}
+
+function renderSpend(spend) {
+  const parts = (spend.entries || []).map(e =>
+    `<b>${usd(e.total)}</b> ${esc(e.currency)} (${e.count} purchase${e.count === 1 ? "" : "s"})`);
+  const spent = parts.length ? parts.join(", ") : "<b>$0</b>";
+  document.getElementById("spend-section").innerHTML =
+    `<div class="panel"><div class="spend">spend ${esc(spend.month)}: ${spent}
+     <span class="mute">- no cap set</span></div></div>`;
+}
+
+function renderBooks(data) {
+  const el = document.getElementById("books-section");
+  const head = `<div class="panel-head"><span class="label">hunt list</span>
+    <span class="count">${data.count} books</span></div>`;
+  if (!data.books.length) {
+    el.innerHTML = `<div class="panel">${head}<div class="empty">No hunt-list books yet. Set a min grade and ceiling on a slab-watch book.</div></div>`;
+    return;
+  }
+  const rows = data.books.map(b => {
+    const book = `${esc(b.title)} #${esc(b.issue)}${b.year ? ` (${esc(b.year)})` : ""}`;
+    const live = b.scanned
+      ? `<span class="${b.live_copies ? "" : "live0"}">${b.live_copies}</span>`
+      : '<span class="mute">-</span>';
+    return `<tr>
+      <td class="title" title="${book}">${book}</td>
+      <td class="right">${esc(b.min_grade)}+</td>
+      <td class="right">${usd(b.ceiling)}</td>
+      <td class="right">${fmtMarket(b)}</td>
+      <td class="right">${live}</td>
+      <td>${fmtWhen(b.last_alerted_at)}</td>
+    </tr>`;
+  }).join("");
+  el.innerHTML = `<div class="panel">${head}
+    <div class="scroll"><table><thead><tr>
+      <th>book</th><th class="right">min grade</th><th class="right">ceiling</th>
+      <th class="right">market (at grade)</th><th class="right">live copies</th>
+      <th>last alert</th>
+    </tr></thead><tbody>${rows}</tbody></table></div></div>`;
+}
+
+async function load() {
+  try {
+    const r = await fetch(URL_, {cache: "no-store"});
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const data = await r.json();
+    renderSpend(data.spend);
+    renderBooks(data);
+  } catch (e) {
+    document.getElementById("books-section").innerHTML =
+      `<div class="panel"><div class="empty">Could not load the hunt list: ${esc(e.message)}</div></div>`;
+  }
+}
+load();
+setInterval(load, REFRESH_MS);
+</script>
+</body>
+</html>

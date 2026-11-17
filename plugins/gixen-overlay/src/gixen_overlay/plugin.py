@@ -22,16 +22,21 @@ class GixenOverlayPlugin:
 
     @hookimpl
     def register_routes(self, app: "FastAPI") -> None:
+        from gixen_overlay.hunt_list_routes import router as hunt_list_router
         from gixen_overlay.purchases_routes import router as purchases_router
         from gixen_overlay.routes import router
         from gixen_overlay.slab_alerts_routes import router as slab_alerts_router
         app.include_router(router)
         app.include_router(purchases_router)
         app.include_router(slab_alerts_router)
+        app.include_router(hunt_list_router)
 
     @hookimpl
     def register_dashboard_tabs(self) -> list[dict]:
-        return [{"label": "comics", "path": "/comics"}]
+        return [
+            {"label": "comics", "path": "/comics"},
+            {"label": "hunt list", "path": "/comics/hunt-list"},
+        ]
 
     @hookimpl
     def on_sync_observed(self, conn: sqlite3.Connection, snipe_count: int) -> None:

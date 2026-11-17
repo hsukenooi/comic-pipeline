@@ -2151,8 +2151,10 @@ def test_dashboard_tabs_returns_comics_tab(api):
     assert r.status_code == 200
     tabs = r.json()
     assert isinstance(tabs, list)
-    assert len(tabs) == 1
-    assert tabs[0] == {"label": "comics", "path": "/comics"}
+    assert tabs == [
+        {"label": "comics", "path": "/comics"},
+        {"label": "hunt list", "path": "/comics/hunt-list"},  # BUI-1420
+    ]
 
 
 # ---------------------------------------------------------------------------
