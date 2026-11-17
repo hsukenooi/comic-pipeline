@@ -9,19 +9,23 @@ Checks, and the verdict:
   * seller  - `seller.feedbackPercentage` and `seller.feedbackScore`. "Weak"
               when feedback % is below SLAB_MIN_FEEDBACK_PCT (default 98.0) or
               score is below SLAB_MIN_FEEDBACK_SCORE (default 50).
-  * returns - `returnTerms.returnsAccepted`. No returns -> drop.
+  * returns - `returnTerms.returnsAccepted`. No returns (or unknown) is a
+              FLAG, never a drop (BUI-1419): most high-grade slab sellers
+              refuse returns, so dropping them starved the alerts. The flag
+              rides along in `flags` so the alert can say "no returns".
   * cert    - cert number, grader, and grade from `localizedAspects`
               ("Certification Number", "Professional Grader", "Grade"); the
               grader falls back to the title (CGC/CBCS/PGX). No cert number ->
               the listing passes, marked unverified.
 
-Verdict: `drop` (reasons listed), `pass`, or `pass_unverified`.
+Verdict: `drop` (only a weak seller drops; `reasons` lists why), `pass`, or
+`pass_unverified`. `flags` lists the returns caveat ("returns not accepted" or
+"returns unknown") on any verdict.
 
 Safe reading of missing data: a field eBay does not return is NOT read as
-good. A missing `returnTerms.returnsAccepted` counts as "no returns" and a
-missing feedback percentage or score counts as weak, each with a reason that
-says "unknown". A false drop costs one look at a listing; a false pass can cost
-a book from a seller with no recourse.
+good. A missing `returnTerms.returnsAccepted` is flagged "returns unknown"
+(never shown as returns accepted), and a missing feedback percentage or score
+counts as weak, with a reason that says "unknown".
 
 Env overrides (also shown in --help):
     SLAB_MIN_FEEDBACK_PCT    default 98.0
@@ -117,8 +121,7 @@ def check_returns(item: dict) -> dict:
         return {"accepted": True, "reasons": []}
     if accepted is False:
         return {"accepted": False, "reasons": ["returns not accepted"]}
-    return {"accepted": None,
-            "reasons": ["returns unknown (no returnTerms), treated as no returns"]}
+    return {"accepted": None, "reasons": ["returns unknown"]}
 
 
 def check_cert(item: dict) -> dict:
@@ -145,7 +148,9 @@ def check_listing(item: dict, *, min_pct: float | None = None,
     seller = check_seller(item, min_pct, min_score)
     returns = check_returns(item)
     cert = check_cert(item)
-    reasons = seller["reasons"] + returns["reasons"]
+    # BUI-1419: only a weak seller drops. Returns are a flag the alert shows.
+    reasons = list(seller["reasons"])
+    flags = list(returns["reasons"])
     if reasons:
         verdict = "drop"
     elif cert["number"] is None:
@@ -154,7 +159,7 @@ def check_listing(item: dict, *, min_pct: float | None = None,
         verdict = "pass"
     return {"item_id": item.get("legacyItemId") or item.get("itemId"),
             "title": item.get("title"), "verdict": verdict, "reasons": reasons,
-            "seller": seller, "returns": returns, "cert": cert}
+            "flags": flags, "seller": seller, "returns": returns, "cert": cert}
 
 
 def render(results: list[dict]) -> str:
@@ -169,7 +174,7 @@ def render(results: list[dict]) -> str:
         ret = {True: "yes", False: "no", None: "unknown"}[r["returns"]["accepted"]]
         cert = " ".join(x for x in (c["grader"], c["grade"], c["number"]) if x) or "none"
         rows.append((str(r["item_id"]), r["verdict"], f"{pct}% / {score}", ret, cert,
-                     "; ".join(r["reasons"])))
+                     "; ".join(r["reasons"] + r.get("flags", []))))
     w = [max(len(row[i]) for row in rows) for i in range(5)]
     return "\n".join("  ".join(row[i].ljust(w[i]) for i in range(5)) + "  " + row[5]
                      for row in rows).rstrip()
@@ -197,8 +202,9 @@ def main(argv: list[str] | None = None) -> None:
         description="Pre-alert checks on eBay slab listings: seller feedback, returns, "
                     "cert. Reads only the eBay listing; never calls a CGC site.",
         epilog="Env: SLAB_MIN_FEEDBACK_PCT (default 98.0) and SLAB_MIN_FEEDBACK_SCORE "
-               "(default 50) set the weak-seller thresholds. Missing returnTerms is "
-               "treated as no returns; missing feedback as weak.")
+               "(default 50) set the weak-seller thresholds. Only a weak seller drops; "
+               "no returns (or missing returnTerms) is flagged, never dropped. "
+               "Missing feedback counts as weak.")
     p.add_argument("items", nargs="+", metavar="ITEM_ID_OR_URL")
     p.add_argument("--json", action="store_true", help="JSON instead of a table")
     args = p.parse_args(argv)

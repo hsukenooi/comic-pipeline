@@ -59,22 +59,28 @@ def test_no_localized_aspects_key_and_no_title_grader():
     assert r["verdict"] == "pass_unverified" and r["cert"]["grader"] is None
 
 
-def test_drop_no_returns():
+def test_no_returns_is_flagged_not_dropped():
     r = sc.check_listing(item(returnTerms={"returnsAccepted": False}))
-    assert r["verdict"] == "drop" and r["reasons"] == ["returns not accepted"]
+    assert r["verdict"] == "pass" and r["reasons"] == []
+    assert r["flags"] == ["returns not accepted"]
 
 
 def test_missing_return_terms_is_not_accepted():
     d = item()
     del d["returnTerms"]
     r = sc.check_listing(d)
-    assert r["verdict"] == "drop" and r["returns"]["accepted"] is None
-    assert "unknown" in r["reasons"][0]
+    assert r["verdict"] == "pass" and r["returns"]["accepted"] is None
+    assert r["flags"] == ["returns unknown"]
 
 
 def test_returns_accepted_must_be_literal_true():
-    assert sc.check_listing(item(returnTerms={"returnsAccepted": "false"}))["verdict"] == "drop"
-    assert sc.check_listing(item(returnTerms={}))["verdict"] == "drop"
+    for terms in ({"returnsAccepted": "false"}, {}, {"returnsAccepted": "true"}):
+        r = sc.check_listing(item(returnTerms=terms))
+        assert r["verdict"] == "pass" and r["flags"] == ["returns unknown"]
+
+
+def test_returns_accepted_has_no_flags():
+    assert sc.check_listing(item())["flags"] == []
 
 
 def test_weak_feedback_pct():
@@ -102,7 +108,8 @@ def test_missing_seller_is_weak():
 def test_multiple_reasons():
     r = sc.check_listing(item(seller={"feedbackPercentage": "90", "feedbackScore": 5},
                               returnTerms={"returnsAccepted": False}))
-    assert len(r["reasons"]) == 3
+    assert r["verdict"] == "drop" and len(r["reasons"]) == 2
+    assert r["flags"] == ["returns not accepted"]
 
 
 def test_env_overrides(monkeypatch):
