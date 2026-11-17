@@ -165,6 +165,21 @@ def test_old_schema_gains_columns_and_old_rows_read(tmp_path):
     m = monthly_spend(conn)[0]
     assert (m["total"], m["gross"], m["refunded"]) == (50.0, 50.0, 0.0)
 
+def test_missing_refunded_keeps_stored_value_and_explicit_overwrites(db):
+    upsert_purchases(db, [_purchase(refunded=100.0)])
+    upsert_purchases(db, [_purchase()])  # older client: key absent
+    assert list_purchases(db)[0]["refunded"] == 100.0
+    upsert_purchases(db, [_purchase(refunded=None)])
+    assert list_purchases(db)[0]["refunded"] == 100.0
+    upsert_purchases(db, [_purchase(refunded=0.0)])
+    assert list_purchases(db)[0]["refunded"] == 0.0
+
+
+def test_route_omitting_refunded_keeps_stored_refund(api):
+    api.post("/api/comics/purchases", json={"purchases": [_purchase(refunded=100.0)]})
+    api.post("/api/comics/purchases", json={"purchases": [_purchase()]})
+    assert api.get("/api/comics/purchases/spend").json()["months"][0]["total"] == 125.0
+
 
 # ---------------------------------------------------------------------------
 # Routes
@@ -189,7 +204,7 @@ def test_purchase_routes_round_trip(api):
 
 @pytest.mark.parametrize("bad", [
     {"item_id": "abc"}, {"price": -1}, {"purchase_type": "steal"},
-    {"purchased_at": "yesterday"},
+    {"purchased_at": "yesterday"}, {"refunded": 225.5}, {"refunded": -1},
 ])
 def test_purchase_validation(api, bad):
     r = api.post("/api/comics/purchases", json={"purchases": [_purchase(**bad)]})

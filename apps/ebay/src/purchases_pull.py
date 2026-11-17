@@ -1,7 +1,8 @@
 """ebay-purchases-pull: record every eBay purchase on the comics server (BUI-1415).
 
 Reads the buyer's own orders through the Trading API's GetOrders (the same
-pull `ebay-shipped --auto-submit` uses, via `shipped_submit._fetch_page`) and
+pull `ebay-shipped --auto-submit` uses, via `shipped_submit._fetch_page`, but
+windowed on ModTime so a late refund on an older order is seen) and
 turns each order line item into one purchase record: item id, title, seller,
 purchase date, price, shipping, tax, and total. Auction wins, Buy It Now, and
 accepted Best Offers all arrive as orders, so all of them land.
@@ -35,7 +36,7 @@ from shipped_submit import MAX_PAGES, NS, SubmitError, _fetch_page, ping_heartbe
 
 EXIT_OK, EXIT_FAILURE, EXIT_USAGE = 0, 1, 2
 DEFAULT_DAYS = 30
-MAX_DAYS = 90  # GetOrders' CreateTime window limit
+MAX_DAYS = 90  # GetOrders' ModTime window limit
 POST_CHUNK = 500
 HTTP_TIMEOUT_S = 60
 # Order states that mean the money did not move. Anything else (including a
@@ -142,6 +143,10 @@ def parse_purchases(root):
                 shipping = order_shipping
             elif shipping is None:
                 estimated = True  # multi-line, no per-line cost: _fill_shipping
+            if shipping is None and len(txns) == 1:
+                estimated = True  # single line, no cost anywhere: flag, never silent
+                warnings.append(f"order {o('e:OrderID')} item {item_id}: no shipping cost on the "
+                                "line or the order; spend understates it")
             tax = _money(txn, "e:Taxes/e:TotalTaxAmount")
             if tax is None and len(txns) == 1:
                 tax = order_tax
@@ -180,6 +185,8 @@ def parse_purchases(root):
                                 "the line currency; not netted")
             else:
                 # eBay reports refunds per order; spread by line total, never past it.
+                if refund > round(sum(r["total"] for r in order_rows), 2) + 0.005:
+                    warnings.append(f"order {order_id}: refund {refund:.2f} exceeds the line totals; capped")
                 for r, share in zip(order_rows, _allocate(refund, [r["total"] for r in order_rows])):
                     r["refunded"] = round(min(share, r["total"]), 2)
         order_total = _money(order, "e:Total")
@@ -196,7 +203,7 @@ def fetch_purchases(token, now=None, days=DEFAULT_DAYS):
     now = now or dt.datetime.now(dt.timezone.utc)
     rows, warnings = [], []
     for page in range(1, MAX_PAGES + 1):
-        root, has_more = _fetch_page(token, page, now, days)
+        root, has_more = _fetch_page(token, page, now, days, time_field="mod")
         r, w = parse_purchases(root)
         rows.extend(r)
         warnings.extend(w)

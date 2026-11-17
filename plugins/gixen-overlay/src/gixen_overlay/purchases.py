@@ -140,14 +140,15 @@ def upsert_purchases(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> di
         values["purchase_type"] = values["purchase_type"] or "unknown"
         values["cancelled"] = 1 if values["cancelled"] else 0
         values["shipping_estimated"] = 1 if values["shipping_estimated"] else 0
-        values["refunded"] = round(values["refunded"] or 0.0, 2)
+        refunded = values["refunded"]  # None/absent: keep the stored value on update
         values["quantity"] = values["quantity"] or 1
         values["currency"] = values["currency"] or "USD"
         existing = conn.execute(
-            "SELECT purchase_type FROM purchases WHERE order_line_item_id = ?",
+            "SELECT purchase_type, refunded FROM purchases WHERE order_line_item_id = ?",
             (values["order_line_item_id"],),
         ).fetchone()
         if existing is None:
+            values["refunded"] = round(refunded or 0.0, 2)
             cols = ", ".join(_PURCHASE_FIELDS)
             marks = ", ".join("?" for _ in _PURCHASE_FIELDS)
             conn.execute(
@@ -159,6 +160,7 @@ def upsert_purchases(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> di
             continue
         if values["purchase_type"] == "unknown":
             values["purchase_type"] = existing[0]
+        values["refunded"] = existing[1] if refunded is None else round(refunded, 2)
         sets = ", ".join(f"{f} = ?" for f in _PURCHASE_FIELDS if f != "order_line_item_id")
         conn.execute(
             f"UPDATE purchases SET {sets}, updated_at = ? WHERE order_line_item_id = ?",

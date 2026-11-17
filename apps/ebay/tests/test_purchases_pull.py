@@ -237,3 +237,44 @@ def test_offer_log_add_and_update(monkeypatch, capsys):
                          {"counteroffer": 270.0, "outcome": "countered"})
     assert offer_log.main(["update", "1"]) == 2
     assert "#1" in capsys.readouterr().out
+
+
+def test_single_line_with_no_shipping_anywhere_is_flagged():
+    xml = order("O7", [txn("1", "1", ship=None)]).replace(
+        "<ShippingServiceSelected><ShippingServiceCost>12.40</ShippingServiceCost>"
+        "</ShippingServiceSelected>", "")
+    rows, warnings = parse(xml)
+    assert rows[0]["shipping"] is None and rows[0]["shipping_estimated"]
+    assert any("no shipping cost" in w for w in warnings)
+
+
+def test_refund_over_line_totals_warns_and_caps():
+    rows, warnings = parse(order("O8", [txn("1", "1")], refunds=refund("999.00")))
+    assert rows[0]["refunded"] == rows[0]["total"]
+    assert any("exceeds the line totals" in w for w in warnings)
+
+
+def test_pull_windows_on_mod_time_but_shipped_submit_keeps_create_time(monkeypatch):
+    import shipped_submit as ss
+    bodies = []
+
+    def fake_post(url, data=None, **kw):
+        bodies.append(data.decode())
+        return FakeResp(response([]))
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    pp.fetch_purchases("tok")
+    ss.fetch_transactions("tok")
+    assert "<ModTimeFrom>" in bodies[0] and "CreateTimeFrom" not in bodies[0]
+    assert "<CreateTimeFrom>" in bodies[1] and "ModTimeFrom" not in bodies[1]
+
+
+def test_late_refund_on_an_older_order_flows_through_parse_and_post(monkeypatch):
+    """A re-pull returns the same order (created before the window) with a
+    refund now settled; the posted row keeps its id and carries the refund."""
+    monkeypatch.setattr(requests, "post", lambda url, data=None, **kw: FakeResp(response(
+        [order("O9", [txn("9")], refunds=refund("50.00"))])))
+    rows, _ = pp.fetch_purchases("tok")
+    assert rows[0]["order_line_item_id"] == "9-10"
+    assert rows[0]["purchased_at"] == "2026-11-03T09:14:26.000Z"
+    assert rows[0]["refunded"] == 50.0
