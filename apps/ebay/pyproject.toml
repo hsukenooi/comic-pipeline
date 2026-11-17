@@ -31,6 +31,7 @@ comic-autosnipe = "autosnipe:main"
 ebay-bid-status = "ebay_bid_status:main"
 ebay-purchases-pull = "purchases_pull:main"
 ebay-offer-log = "offer_log:main"
+ebay-slab-alerts = "slab_alerts:main"
 
 [tool.hatch.build.targets.wheel]
 # BUI-332: glob-based include so every src/*.py is shipped automatically —
