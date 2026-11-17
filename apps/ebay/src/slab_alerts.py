@@ -47,6 +47,9 @@ Env:
     SLAB_ALERT_MAX_BOOKS         default 0 = every hunt-list book
     SLAB_ALERT_MAX_ITEM_FETCHES  default 40 (Browse getItem calls per scan)
     SLAB_ALERT_STATE_FILE        default ~/.comics-server/slab-alerts-state.json
+    SLAB_ALERT_READ_BUTTONS      default 1. 0 = send-only: no getUpdates and no
+                                 Act/Pass buttons, for a bot shared with other
+                                 jobs (getUpdates would consume their updates)
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID  (else read from
                                  ~/.config/tasks-to-linear.env, those two lines only)
 """
@@ -105,6 +108,16 @@ def _env_float(name: str, default: float, lo: float, hi: float) -> float:
     if not lo <= val <= hi:
         raise SlabAlertError(f"{name}={raw!r} is outside {lo}-{hi}")
     return val
+
+
+def read_buttons() -> bool:
+    """SLAB_ALERT_READ_BUTTONS: 1 (default) reads Act/Pass presses; 0 is send-only."""
+    raw = os.environ.get("SLAB_ALERT_READ_BUTTONS", "1").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    raise SlabAlertError(f"SLAB_ALERT_READ_BUTTONS={raw!r} is not 0 or 1")
 
 
 def config() -> dict[str, float]:
@@ -653,10 +666,12 @@ def scan(*, dry_run: bool, max_books: int | None = None, now: datetime | None = 
     state_path = _state_file()
     rated = 0
     warnings: list[str] = []
+    buttons = read_buttons()
     if not dry_run:
         _lock(state_path)
-        token, chat_id = telegram_creds()
-        rated = process_ratings(base, token, chat_id, state_path, warnings)
+        if buttons:
+            token, chat_id = telegram_creds()
+            rated = process_ratings(base, token, chat_id, state_path, warnings)
     books = hunt_list(base)
     if cfg["max_books"]:
         books = books[:cfg["max_books"]]
@@ -697,9 +712,10 @@ def scan(*, dry_run: bool, max_books: int | None = None, now: datetime | None = 
         _post(base, "/api/comics/slab-alerts", {"copies": observations})
     if shown:
         token, chat_id = telegram_creds()
-        telegram_call(token, "sendMessage", {"chat_id": chat_id, "text": text,
-                                             "reply_markup": markup,
-                                             "disable_web_page_preview": True})
+        payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
+        if buttons:  # send-only mode: no buttons nobody would answer
+            payload["reply_markup"] = markup
+        telegram_call(token, "sendMessage", payload)
         stamp = now.isoformat()
         _post(base, "/api/comics/slab-alerts", {"copies": [
             {"item_id": c["item_id"], "last_alerted_at": stamp,

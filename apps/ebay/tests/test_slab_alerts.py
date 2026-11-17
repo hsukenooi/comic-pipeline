@@ -424,6 +424,20 @@ def test_scan_sends_one_message_then_marks_alerted(server):
     assert mark["alerted_expected"] == 910.0 and mark["last_alerted_at"]
 
 
+def test_send_only_mode_skips_getupdates_and_buttons(server, monkeypatch):
+    monkeypatch.setenv("SLAB_ALERT_READ_BUTTONS", "0")
+    s, _ = _scan(server)
+    assert s["alerts"] == 1 and s["ratings"] == 0
+    assert [m for m, _ in server["tg"]] == ["sendMessage"]
+    assert "reply_markup" not in server["tg"][0][1]
+
+
+def test_read_buttons_rejects_garbage(monkeypatch):
+    monkeypatch.setenv("SLAB_ALERT_READ_BUTTONS", "maybe")
+    with pytest.raises(sa.SlabAlertError):
+        sa.read_buttons()
+
+
 def test_scan_does_not_realert_unchanged_copy(server):
     server["prev"] = [{"item_id": "111111111111", "comic_id": 7, "ended_at": None,
                        "last_alerted_at": "x", "alerted_expected": 910.0,
