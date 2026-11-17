@@ -36,8 +36,33 @@ def full_item(returns=True, pct="99.9", score=900):
             "localizedAspects": [{"name": "Certification Number", "value": "123"}]}
 
 
-def fmv(median=1200.0, conf="MEDIUM", flag=None):
-    return {"median": median, "confidence": conf, "flag_reason": flag}
+def fmv(median=1200.0, conf="MEDIUM", flag=None, max_bid=1100):
+    return {"median": median, "confidence": conf, "flag_reason": flag, "max_bid": max_bid}
+
+
+ITEM_INPUT = {"item_id": "111111111111", "title": "Amazing Spider-Man", "issue": "23",
+              "year": 1965, "grade": 6.5, "certifier": "cgc", "label": "universal"}
+
+
+def error_row():
+    """fmv_runner._graded_error_row with the BUI-536 fetch-err message."""
+    return {"input": ITEM_INPUT, "fmv": None, "comp_count_total": 0, "queries_used": [],
+            "db_row": None, "comic_id": None, "fmv_id": None, "source": "error",
+            "breaker_tripped": False,
+            "error": "fetch-err: all tiers failed; fmv DB row left untouched (BUI-536)"}
+
+
+def advisory_row():
+    """The graded BUI-663 advisory row (fmv_runner ~3180): the error row,
+    re-sourced, with a priced band whose max_bid is withheld."""
+    band = dict(fmv(conf="MEDIUM", max_bid=None), fmv_low=1000.0, fmv_high=1400.0,
+                ledger_advisory=True, live_slab_count=0, ledger_slab_count=4)
+    return {**error_row(), "fmv": band, "source": "ledger-advisory",
+            "ledger_comic_id": 7, "ledger_rows": 4,
+            "error": "fetch-err: all tiers failed; fmv DB row left untouched (BUI-536). "
+                     "ADVISORY band priced from the SLAB comps ledger instead "
+                     "(BUI-663/930): NOT a live price, NOT persisted, and it carries "
+                     "NO max_bid."}
 
 
 # --- parse + pricing -------------------------------------------------------
@@ -51,6 +76,23 @@ def test_summary_parse_tolerates_missing_fields():
     bad = {"shippingOptions": [{"shippingCost": {"value": "x"}}, "junk",
                                {"shippingCost": {"value": "5", "currency": "GBP"}}]}
     assert ebay_fetch.summary_shipping_usd(bad) is None
+
+
+def test_calculated_shipping_is_not_free():
+    calc = {"shippingCostType": "CALCULATED",
+            "shippingCost": {"value": "0.00", "currency": "USD"}}
+    assert ebay_fetch.summary_shipping_usd({"shippingOptions": [calc]}) is None
+    assert ebay_fetch.summary_shipping_usd({"shippingOptions": [
+        calc, {"shippingCostType": "FIXED"},
+        {"shippingCostType": "FIXED", "shippingCost": {"value": "12.50", "currency": "USD"}},
+    ]}) == 12.5
+    # a calculated-only copy falls back to the default shipping estimate
+    raw = {"itemId": "v1|123456|0", "price": {"value": "100", "currency": "USD"},
+           "shippingOptions": [calc]}
+    s = ebay_fetch.parse_item_summary(raw)
+    assert s["shipping"] is None
+    assert sa.expected_price({"price": 100.0, "shipping": s["shipping"],
+                              "listing_type": "BIN"}, CFG) == (115.0, 15.0)
 
 
 def test_expected_price_bin_best_offer_tax_and_default_shipping():
@@ -69,10 +111,38 @@ def test_expected_price_bin_best_offer_tax_and_default_shipping():
     (fmv(), True), (fmv(conf="MEDIUM-HIGH"), True), (fmv(conf="high"), True),
     (fmv(conf="MEDIUM-LOW"), False), (fmv(conf="LOW"), False), (fmv(conf=None), False),
     (fmv(flag="too_wide"), False), (fmv(median=None), False), (fmv(median=0), False),
+    (fmv(max_bid=None), False), (dict(fmv(), ledger_advisory=True), False),
     ({}, False),
 ])
 def test_market_gate(row, ok):
     assert (sa.market_of(row)[0] is not None) is ok
+
+
+@pytest.mark.parametrize("row", [advisory_row(), error_row(),
+                                 dict(advisory_row(), fmv=dict(fmv(), ledger_advisory=False)),
+                                 dict(error_row(), fmv=fmv())])
+def test_degraded_fmv_rows_are_unpriced(row, monkeypatch, tmp_path):
+    """Real comic-fmv row shapes through run_fmv: an advisory or error row
+    exits 0 yet never prices, even when its band looks alertable."""
+    class P:
+        returncode, stderr = 0, ""
+
+    def run(cmd, **k):
+        out = cmd[cmd.index("--out") + 1]
+        with open(out, "w") as f:
+            json.dump([row], f)
+        return P()
+    monkeypatch.setattr(sa.subprocess, "run", run)
+    fmvs = sa.run_fmv([{"item_id": "111111111111"}], probe=False)
+    market, _conf, skip = sa.market_of(fmvs["111111111111"])
+    assert market is None and skip.startswith("comic-fmv ")
+    c = {"item_id": "111111111111", "expected": 10.0, "ceiling": 1500.0}
+    assert sa.gate([c], fmvs, CFG) == [] and c["unpriced"] and c["fmv_failed"]
+
+
+def test_good_fmv_row_prices(monkeypatch):
+    good = {"input": ITEM_INPUT, "fmv": fmv(), "source": "fresh", "error": None}
+    assert sa.market_of(sa.fmv_of_row(good))[0] == 1200.0
 
 
 def test_failed_fmv_never_reads_cheap():
@@ -159,7 +229,32 @@ def test_checks_flag_no_returns_and_drop_weak_seller():
 
 
 def test_checks_failed_fetch_never_alerts():
-    assert sa.check_copies([_passed()], CFG, lambda _id: None) == []
+    stats = {}
+    assert sa.check_copies([_passed()], CFG, lambda _id: None, stats=stats) == []
+    assert stats["fetch_failed"] == 1
+
+    def boom(_id):
+        raise ConnectionError("eBay down")
+    assert sa.check_copies([_passed()], CFG, boom, stats=stats) == []
+    assert stats["fetch_failed"] == 2
+
+
+@pytest.mark.parametrize("aspect,kept", [
+    ("6.5", True), ("FN+ 6.5", True), ("6.5 FN+", True), (None, True), ("Ungraded", True),
+    ("7.0", False), ("VF 8.0", False),
+])
+def test_checks_grade_aspect_must_match_title_grade(aspect, kept):
+    item = full_item()
+    if aspect is not None:
+        item["localizedAspects"].append({"name": "Grade", "value": aspect})
+    stats = {}
+    out = sa.check_copies([_passed()], CFG, lambda _id: item, stats=stats)
+    assert bool(out) is kept and stats["grade_mismatch"] == (0 if kept else 1)
+
+
+def test_aspect_grade_parse():
+    assert sa.aspect_grade("NM/M 9.8") == 9.8 and sa.aspect_grade("10") == 10.0
+    assert sa.aspect_grade("9.8 / 9.6") is None and sa.aspect_grade("") is None
 
 
 def test_checks_reprice_from_item_shipping_regates_seen_set():
@@ -247,9 +342,11 @@ def test_process_ratings_offset_only_after_store(monkeypatch, tmp_path):
     def fail(*a):
         raise sa.SlabAlertError("server down")
     monkeypatch.setattr(sa, "_post", fail)
-    with pytest.raises(sa.SlabAlertError):
-        sa.process_ratings("http://x", "T", "42", state)
-    assert not state.exists()
+    warnings = []
+    # a failed store warns, keeps the offset (the presses replay), answers nothing
+    assert sa.process_ratings("http://x", "T", "42", state, warnings) == 0
+    assert not state.exists() and warnings == ["1 ratings not stored: server down"]
+    assert [m for m, _ in calls] == ["getUpdates"]
     monkeypatch.setattr(sa, "_post", lambda *a: {"recorded": 1})
     assert sa.process_ratings("http://x", "T", "42", state) == 1
     assert json.loads(state.read_text()) == {"telegram_offset": 6}
@@ -389,3 +486,80 @@ def test_run_fmv_nonzero_exit_is_hard(monkeypatch):
     with pytest.raises(sa.SlabAlertError):
         sa.run_fmv([{"item_id": "1"}], probe=True)
     assert sa.run_fmv([], probe=False) == {}
+
+
+# --- failure notice -----------------------------------------------------------
+
+
+def _main(monkeypatch, scan_fn, argv=()):
+    monkeypatch.setattr(sa, "scan", scan_fn)
+    with pytest.raises(SystemExit) as e:
+        sa.main(list(argv))
+    return e.value.code
+
+
+def _summary(**kw):
+    s = {"books": 3, "copies": 4, "eligible": 2, "unpriced": 0, "fmv_failed": 0,
+         "priced_pass": 1, "fetch_failed": 0, "grade_mismatch": 0, "alerts": 1,
+         "ratings": 0, "errors": [], "warnings": []}
+    s.update(kw)
+    return s
+
+
+@pytest.mark.parametrize("exc", [sa.SlabAlertError("GET /api/comics/slab-watch HTTP 500"),
+                                 SystemExit(1), KeyError("copies")])
+def test_failed_scan_sends_notice(server, monkeypatch, exc):
+    def bad(**k):
+        raise exc
+    assert _main(monkeypatch, bad) == 1
+    (method, payload), = server["tg"]
+    assert method == "sendMessage" and payload["text"].startswith("Slab alerts scan failed.")
+    assert "reply_markup" not in payload
+
+
+def test_partial_scan_notice_has_counts(server, monkeypatch):
+    s = _summary(errors=["X #1: browse 503"], fetch_failed=2, unpriced=3, fmv_failed=1,
+                 warnings=["1 ratings not stored: down"])
+    assert _main(monkeypatch, lambda **k: s) == 2
+    text = server["tg"][0][1]["text"]
+    for part in ("ran partial", "1 of 3 searches failed", "browse 503", "2 getItem failed",
+                 "1 comic-fmv failed", "3 unpriced", "ratings not stored", "1 alerts sent"):
+        assert part in text
+
+
+def test_clean_scan_sends_no_notice(server, monkeypatch):
+    monkeypatch.setattr(sa, "scan", lambda **k: _summary(unpriced=2, grade_mismatch=1))
+    sa.main([])
+    assert server["tg"] == []
+
+
+def test_notice_send_failure_goes_to_stderr(server, monkeypatch, capsys):
+    def tg(*a, **k):
+        raise sa.SlabAlertError("telegram sendMessage HTTP 401: Unauthorized")
+    monkeypatch.setattr(sa, "telegram_call", tg)
+
+    def bad(**k):
+        raise sa.SlabAlertError("comic-fmv exited 1")
+    assert _main(monkeypatch, bad) == 1
+    err = capsys.readouterr().err
+    assert "comic-fmv exited 1" in err and "failure notice not sent" in err
+
+
+def test_dry_run_failure_sends_no_notice(server, monkeypatch):
+    def bad(**k):
+        raise sa.SlabAlertError("boom")
+    assert _main(monkeypatch, bad, ["--dry-run"]) == 1
+    assert server["tg"] == []
+
+
+def test_scan_counts_unpriced_and_fetch_failed(server):
+    s, _ = _scan(server, fmv_fn=lambda rows, probe: {
+        r["item_id"]: sa.fmv_of_row(advisory_row()) for r in rows})
+    assert s["unpriced"] == 1 and s["fmv_failed"] == 1 and s["alerts"] == 0
+    assert [m for m, _ in server["tg"]] == ["getUpdates"]
+    assert sa.partial_problems(s)
+    # dry run: the first scan still holds the process lock
+    s = sa.scan(dry_run=True, now=NOW, search=lambda *a, **k: [summary("111111111119")],
+                fetch=lambda _id: None, out=lambda *_: None,
+                fmv=lambda rows, probe: {r["item_id"]: fmv() for r in rows})
+    assert s["fetch_failed"] == 1 and s["alerts"] == 0

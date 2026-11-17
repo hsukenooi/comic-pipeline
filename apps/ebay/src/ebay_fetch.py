@@ -1210,11 +1210,16 @@ def parse_item_summary(item):
 def summary_shipping_usd(item):
     """Cheapest USD `shippingOptions[].shippingCost` on a Browse item or
     itemSummary, or None when no option states a USD cost (calculated or
-    missing shipping is unknown, never read as free)."""
+    missing shipping is unknown, never read as free). A CALCULATED option is
+    skipped even when eBay reports it as 0.00: that is not a quote."""
     costs = []
     opts = item.get("shippingOptions") if isinstance(item, dict) else None
     for opt in opts if isinstance(opts, list) else []:
-        cost = opt.get("shippingCost") if isinstance(opt, dict) else None
+        if not isinstance(opt, dict):
+            continue
+        if str(opt.get("shippingCostType") or "").upper() == "CALCULATED":
+            continue
+        cost = opt.get("shippingCost")
         if not isinstance(cost, dict) or cost.get("currency", "USD") != "USD":
             continue
         try:

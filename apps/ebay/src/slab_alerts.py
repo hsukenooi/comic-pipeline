@@ -32,6 +32,11 @@ first and last seen, and ended when a complete search no longer finds it.
 The alert state is written only after Telegram accepts the message, so a
 failed send retries next scan rather than going silent.
 
+A failed scan (exit 1) or a partial one (exit 2: a search, getItem, or
+comic-fmv row failed) sends a short Telegram notice with the counts, so a
+broken scan never reads as a quiet one. If Telegram is the failure, the
+notice goes to stderr (the launchd log).
+
 `--dry-run` prints the message and writes nothing: no server writes, no
 Telegram calls, and `comic-fmv --probe`.
 
@@ -73,6 +78,9 @@ MAX_IN_MESSAGE = 15
 MESSAGE_BUDGET = 3800  # Telegram caps a message at 4096 characters
 LAST_DAY = timedelta(hours=24)
 ALERT_CONFIDENCE = {"MEDIUM", "MEDIUM-HIGH", "HIGH"}
+# comic-fmv's BUI-663 ledger-advisory row (fmv_runner.SOURCE_LEDGER_ADVISORY):
+# a failed live fetch priced from stored comps, with `max_bid` withheld.
+ADVISORY_SOURCES = {"ledger-advisory", "ledger_advisory"}
 CALLBACK_RE = re.compile(r"^sa:(act|pass):(\d{6,20})$")
 TELEGRAM_ENV_FILE = Path.home() / ".config" / "tasks-to-linear.env"
 FMV_TIMEOUT = 3600
@@ -228,22 +236,33 @@ def parse_ratings(updates: list, chat_id: str) -> tuple[list[dict], list[str], i
     return ratings, answers, (last_id + 1 if last_id is not None else None)
 
 
-def process_ratings(base: str, token: str, chat_id: str, state_path: Path) -> int:
+def process_ratings(base: str, token: str, chat_id: str, state_path: Path,
+                    warnings: list[str] | None = None) -> int:
     """Store button presses, then advance the offset, then answer them.
     Storing first means a crash replays the presses next scan (idempotent
-    on the server) instead of losing them."""
+    on the server) instead of losing them. A failed read or store warns and
+    returns 0: ratings wait for the next scan, alerts still go."""
+    warnings = warnings if warnings is not None else []
     state = load_state(state_path)
     payload: dict[str, Any] = {"timeout": 0}
     if isinstance(state.get("telegram_offset"), int):
         payload["offset"] = state["telegram_offset"]
     try:
         updates = telegram_call(token, "getUpdates", payload)
-    except SlabAlertError as e:  # ratings wait for the next scan; alerts still go
-        print(f"warning: ratings not read: {e}", file=sys.stderr)
+    except SlabAlertError as e:
+        warnings.append(f"ratings not read: {e}")
+        print(f"warning: {warnings[-1]}", file=sys.stderr)
         return 0
     ratings, answers, offset = parse_ratings(updates, chat_id)
     if ratings:
-        _post(base, "/api/comics/slab-alerts/ratings", {"ratings": ratings})
+        try:
+            _post(base, "/api/comics/slab-alerts/ratings", {"ratings": ratings})
+        except SlabAlertError as e:
+            # Offset left where it was and nothing answered: Telegram keeps the
+            # presses (24 h, two scans) and the next scan stores them.
+            warnings.append(f"{len(ratings)} ratings not stored: {e}")
+            print(f"warning: {warnings[-1]}", file=sys.stderr)
+            return 0
     if offset is not None:
         state["telegram_offset"] = offset
         save_state(state_path, state)
@@ -378,14 +397,30 @@ def run_fmv(rows: list[dict], *, probe: bool) -> dict[str, dict]:
             continue
         item_id = (r.get("input") or {}).get("item_id")
         if item_id:
-            by_item[str(item_id)] = r.get("fmv") or {}
+            by_item[str(item_id)] = fmv_of_row(r)
     return by_item
+
+
+def fmv_of_row(row: dict) -> dict:
+    """The fmv dict of one comic-fmv batch row. A degraded row (`error` set,
+    or a BUI-663 ledger-advisory band) exits 0 yet is not a live price, so it
+    is tagged `fmv_failed` and `market_of` never prices from it."""
+    fmv = row.get("fmv") if isinstance(row.get("fmv"), dict) else {}
+    if row.get("error") or row.get("source") in ADVISORY_SOURCES:
+        why = "ledger advisory" if row.get("source") in ADVISORY_SOURCES else "error"
+        return {**fmv, "fmv_failed": f"comic-fmv {why}: {str(row.get('error') or '')[:120]}"}
+    return fmv
 
 
 def market_of(fmv: dict) -> tuple[float | None, str | None, str | None]:
     """(market, confidence, skip reason). Market is the band median; a
-    refused, unpriced, or below-MEDIUM row has no usable market."""
+    failed, advisory, refused, uncapped, or below-MEDIUM row has no usable
+    market."""
     conf = str(fmv.get("confidence") or "").upper() or None
+    if fmv.get("fmv_failed"):
+        return None, conf, str(fmv["fmv_failed"])
+    if fmv.get("ledger_advisory"):
+        return None, conf, "ledger advisory band"
     if fmv.get("flag_reason"):
         return None, conf, f"fmv refused ({fmv['flag_reason']})"
     if conf not in ALERT_CONFIDENCE:
@@ -393,6 +428,8 @@ def market_of(fmv: dict) -> tuple[float | None, str | None, str | None]:
     med = fmv.get("median")
     if not isinstance(med, (int, float)) or isinstance(med, bool) or med <= 0:
         return None, conf, "no median"
+    if fmv.get("max_bid") is None:  # comic-fmv withholds a cap it will not stand behind
+        return None, conf, "no max bid"
     return float(med), conf, None
 
 
@@ -468,9 +505,12 @@ def gate(copies: list[dict], fmvs: dict[str, dict], cfg: dict) -> list[dict]:
     """Copies that clear the confidence and margin gates, with market added."""
     out = []
     for c in copies:
-        market, conf, _skip = market_of(fmvs.get(c["item_id"]) or {})
+        row = fmvs.get(c["item_id"])
+        market, conf, skip = market_of(row or {"fmv_failed": "no comic-fmv row"})
         c["confidence"] = conf
         if market is None:
+            c["unpriced"] = skip
+            c["fmv_failed"] = not row or bool(row.get("fmv_failed"))
             continue
         c["market"] = market
         c["threshold"] = round((1 - cfg["margin"]) * market, 2)
@@ -480,23 +520,49 @@ def gate(copies: list[dict], fmvs: dict[str, dict], cfg: dict) -> list[dict]:
     return out
 
 
+_GRADE_NUM_RE = re.compile(r"(?<![\d.])(10(?:\.0)?|\d\.\d|\d)(?![\d.])")
+
+
+def aspect_grade(raw: Any) -> float | None:
+    """The numeric grade in a Grade aspect ("9.8", "NM/M 9.8"), or None when
+    it holds no single 0.5-10 number."""
+    nums = {float(m) for m in _GRADE_NUM_RE.findall(str(raw or ""))}
+    nums = {n for n in nums if 0.5 <= n <= 10.0}
+    return nums.pop() if len(nums) == 1 else None
+
+
 def check_copies(copies: list[dict], cfg: dict, fetch,
                  prev_rows: dict[str, dict] | None = None,
-                 now: datetime | None = None) -> list[dict]:
+                 now: datetime | None = None,
+                 stats: dict[str, int] | None = None) -> list[dict]:
     """Pre-alert checks on the full item, largest discount first, up to
-    SLAB_ALERT_MAX_ITEM_FETCHES. A failed fetch never alerts. When the item
-    shows shipping the summary did not, the copy is re-priced and re-gated,
-    including the seen-set rule (else a default-shipping estimate below the
-    real cost would read as a price drop every scan)."""
+    SLAB_ALERT_MAX_ITEM_FETCHES. A failed fetch never alerts (`fetch_failed`).
+    A Grade aspect that disagrees with the title grade the copy was priced
+    at skips it (`grade_mismatch`). When the item shows shipping the
+    summary did not, the copy is re-priced and re-gated, including the
+    seen-set rule (else a default-shipping estimate below the real cost
+    would read as a price drop every scan)."""
     prev_rows = prev_rows or {}
     now = now or datetime.now(timezone.utc)
+    stats = stats if stats is not None else {}
+    for k in ("fetch_failed", "grade_mismatch"):
+        stats.setdefault(k, 0)
     out = []
     for c in sorted(copies, key=lambda c: -c["discount"])[:cfg["max_item_fetches"]]:
-        item = fetch(c["item_id"])
+        try:
+            item = fetch(c["item_id"])
+        except Exception as e:  # noqa: BLE001 - one bad getItem must not sink the scan
+            print(f"warning: getItem {c['item_id']} failed: {e}", file=sys.stderr)
+            item = None
         if not isinstance(item, dict):
+            stats["fetch_failed"] += 1
             continue
         verdict = slab_checks.check_listing(item)
         if verdict["verdict"] == "drop":
+            continue
+        cert_grade = aspect_grade(verdict["cert"].get("grade"))
+        if cert_grade is not None and abs(cert_grade - c["grade"]) > 0.01:
+            stats["grade_mismatch"] += 1
             continue
         if c.get("shipping") is None:
             from ebay_fetch import summary_shipping_usd
@@ -586,10 +652,11 @@ def scan(*, dry_run: bool, max_books: int | None = None, now: datetime | None = 
         raise SlabAlertError(str(e)) from e
     state_path = _state_file()
     rated = 0
+    warnings: list[str] = []
     if not dry_run:
         _lock(state_path)
         token, chat_id = telegram_creds()
-        rated = process_ratings(base, token, chat_id, state_path)
+        rated = process_ratings(base, token, chat_id, state_path, warnings)
     books = hunt_list(base)
     if cfg["max_books"]:
         books = books[:cfg["max_books"]]
@@ -612,13 +679,16 @@ def scan(*, dry_run: bool, max_books: int | None = None, now: datetime | None = 
         c = next((e for e in eligible if e["item_id"] == o["item_id"]), None)
         if c and c.get("market"):
             o["market"], o["confidence"] = c["market"], c["confidence"]
-    alerts = (check_copies(passed, cfg, fetch or _default_fetch(), prev_rows, now)
+    stats = {"fetch_failed": 0, "grade_mismatch": 0}
+    alerts = (check_copies(passed, cfg, fetch or _default_fetch(), prev_rows, now, stats)
               if passed else [])
     text, markup, shown = render(alerts, month_spend(base, now), cfg, now) if alerts \
         else ("", {}, [])
     summary = {"books": len(books), "copies": len(observations), "eligible": len(eligible),
-               "priced_pass": len(passed), "alerts": len(shown), "ratings": rated,
-               "errors": errors}
+               "unpriced": sum(1 for c in eligible if c.get("unpriced")),
+               "fmv_failed": sum(1 for c in eligible if c.get("fmv_failed")),
+               "priced_pass": len(passed), **stats, "alerts": len(shown),
+               "ratings": rated, "errors": errors, "warnings": warnings}
     if dry_run:
         out(text or "No copies qualify; no message would be sent.")
         out(json.dumps(summary))
@@ -656,12 +726,59 @@ def main(argv: list[str] | None = None) -> None:
     args = p.parse_args(argv)
     try:
         summary = scan(dry_run=args.dry_run, max_books=args.max_books)
+    except SystemExit as e:  # ebay_fetch.load_config exits on missing eBay creds
+        if e.code in (0, None):
+            raise
+        _fail(f"Error: exited {e.code} (see log)", dry_run=args.dry_run, code=1)
+    except Exception as e:  # noqa: BLE001 - every failure must be heard
+        msg = str(e) if isinstance(e, SlabAlertError) else f"{type(e).__name__}: {e}"
+        _fail(f"Error: {msg}", dry_run=args.dry_run, code=1)
+    problems = partial_problems(summary)
+    if problems:
+        _fail("Incomplete: " + "; ".join(problems), dry_run=args.dry_run, code=2)
+
+
+def partial_problems(summary: dict) -> list[str]:
+    """What made a finished scan incomplete, or [] for a clean (maybe quiet) one.
+    Search errors, getItem failures, and failed comic-fmv rows each could hide
+    a deal; `unpriced`, `grade_mismatch`, and warnings ride along as context."""
+    errors = summary.get("errors") or []
+    if not (errors or summary.get("fetch_failed") or summary.get("fmv_failed")):
+        return []
+    out = []
+    if errors:
+        out.append(f"{len(errors)} of {summary.get('books', '?')} searches failed "
+                   f"({'; '.join(errors)[:300]})")
+    for key, label in (("fetch_failed", "getItem failed"),
+                       ("fmv_failed", "comic-fmv failed (error or advisory)"),
+                       ("unpriced", "unpriced"), ("grade_mismatch", "grade mismatch")):
+        if summary.get(key):
+            out.append(f"{summary[key]} {label}")
+    out += summary.get("warnings") or []
+    out.append(f"{summary.get('alerts', 0)} alerts sent")
+    return out
+
+
+def notify_failure(text: str) -> bool:
+    """One short Telegram notice that the scan failed or ran partial, so a
+    broken scan never reads as a quiet one. A Telegram failure goes to
+    stderr (the launchd log) instead. True when Telegram accepted it."""
+    try:
+        token, chat_id = telegram_creds()
+        telegram_call(token, "sendMessage",
+                      {"chat_id": chat_id, "text": text[:1000],
+                       "disable_web_page_preview": True}, retries=2)
+        return True
     except SlabAlertError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
-    if summary["errors"]:
-        print("search errors: " + "; ".join(summary["errors"]), file=sys.stderr)
-        sys.exit(2)
+        print(f"failure notice not sent: {e}", file=sys.stderr)
+        return False
+
+
+def _fail(msg: str, *, dry_run: bool, code: int) -> None:
+    print(msg, file=sys.stderr)
+    if not dry_run:
+        notify_failure(f"Slab alerts scan {'failed' if code == 1 else 'ran partial'}. {msg}")
+    sys.exit(code)
 
 
 if __name__ == "__main__":
