@@ -112,10 +112,40 @@ def test_expected_price_bin_best_offer_tax_and_default_shipping():
     (fmv(conf="MEDIUM-LOW"), False), (fmv(conf="LOW"), False), (fmv(conf=None), False),
     (fmv(flag="too_wide"), False), (fmv(median=None), False), (fmv(median=0), False),
     (fmv(max_bid=None), False), (dict(fmv(), ledger_advisory=True), False),
+    (dict(fmv(max_bid=None), bin_listing=True), True),
+    (dict(fmv(max_bid=None, conf="LOW"), bin_listing=True), False),
+    (dict(fmv(max_bid=None), bin_listing=True, ledger_advisory=True), False),
     ({}, False),
 ])
 def test_market_gate(row, ok):
     assert (sa.market_of(row)[0] is not None) is ok
+
+
+def bin_row():
+    """fmv_runner._graded_upsert_row for a BIN listing: `_apply_bin_rule` (R34)
+    nulls max_bid and sets bin_listing; the band and confidence stand."""
+    inp = dict(ITEM_INPUT, listing_type="BIN")
+    band = dict(fmv(conf="MEDIUM", max_bid=None), fmv_low=1000.0, fmv_high=1400.0,
+                graded=True, bin_listing=True)
+    return {"input": inp, "fmv": band, "comp_count_total": 6, "queries_used": [],
+            "db_row": {"id": 1}, "comic_id": 7, "fmv_id": 1, "source": "fresh",
+            "breaker_tripped": False, "slab_comps": [], "comps_posted": 0}
+
+
+def test_bin_row_is_priced_without_max_bid(monkeypatch):
+    """BUI-1423: a real BIN row shape through run_fmv prices and alerts."""
+    class P:
+        returncode, stderr = 0, ""
+
+    def run(cmd, **k):
+        with open(cmd[cmd.index("--out") + 1], "w") as f:
+            json.dump([bin_row()], f)
+        return P()
+    monkeypatch.setattr(sa.subprocess, "run", run)
+    fmvs = sa.run_fmv([{"item_id": "111111111111"}], probe=False)
+    assert sa.market_of(fmvs["111111111111"]) == (1200.0, "MEDIUM", None)
+    c = {"item_id": "111111111111", "expected": 500.0, "ceiling": 1500.0}
+    assert sa.gate([c], fmvs, CFG) == [c] and c["market"] == 1200.0
 
 
 @pytest.mark.parametrize("row", [advisory_row(), error_row(),
