@@ -42,6 +42,9 @@ import fmv_math
 ENV_SWITCH = "FMV_PRICECHARTING"
 ENV_CACHE_DIR = "FMV_PRICECHARTING_CACHE_DIR"
 FIRECRAWL_BIN = "firecrawl"
+# The firecrawl CLI lives under nvm on the Mac Mini, which only interactive
+# shells put on PATH. launchd jobs name it here instead (BUI-1424).
+ENV_FIRECRAWL_BIN = "FMV_FIRECRAWL_BIN"
 CLASSIFY_BIN = "ebay-sold-comps"
 BASE_URL = "https://www.pricecharting.com/game/"
 PAGE_TTL_SEC = 7 * 24 * 3600        # a verified page is reused for a week
@@ -301,12 +304,16 @@ def _cache_write(path: Path, entry: dict) -> str | None:
 
 def scrape(url: str) -> str:
     """The page markdown via `firecrawl scrape`. Raises RuntimeError."""
-    if shutil.which(FIRECRAWL_BIN) is None:
+    override = os.environ.get(ENV_FIRECRAWL_BIN, "").strip()
+    firecrawl = shutil.which(override or FIRECRAWL_BIN)
+    if firecrawl is None:
+        if override:
+            raise RuntimeError(f"{ENV_FIRECRAWL_BIN}={override} is not an executable")
         raise RuntimeError(f"{FIRECRAWL_BIN} not on PATH")
     with tempfile.TemporaryDirectory() as td:
         out = Path(td) / "page.md"
         try:
-            proc = subprocess.run([FIRECRAWL_BIN, "scrape", url, "-o", str(out)],
+            proc = subprocess.run([firecrawl, "scrape", url, "-o", str(out)],
                                   capture_output=True, text=True,
                                   timeout=SCRAPE_TIMEOUT_SEC)
         except subprocess.TimeoutExpired as e:

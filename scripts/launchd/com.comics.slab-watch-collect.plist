@@ -19,6 +19,10 @@
              shells out to (BUI-27). -->
         <key>PATH</key>
         <string>/Users/hsukenooi/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <!-- PriceCharting's firecrawl CLI is an nvm global, off this PATH
+             (BUI-1424). Update the path when the nvm node version changes. -->
+        <key>FMV_FIRECRAWL_BIN</key>
+        <string>/Users/hsukenooi/.nvm/versions/node/v22.22.0/bin/firecrawl</string>
         <!-- Optional (BUI-951): override the default 80-request-per-run
              cap without a code deploy. Uncomment and set a value, then
              `launchctl unload`/`launchctl load -w` to pick it up. -->
