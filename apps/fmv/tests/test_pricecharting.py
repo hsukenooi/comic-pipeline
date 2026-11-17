@@ -565,3 +565,19 @@ class TestFetchLedgerCompsExcluded:
                 "http://s", title="X", issue="1", year=1975, pool="slab")
         assert "include_excluded" not in g.call_args.kwargs["params"]
         assert [r["product_id"] for r in out] == ["a"]
+
+
+def test_firecrawl_bin_override(pc_on, monkeypatch, tmp_path):
+    """BUI-1424: FMV_FIRECRAWL_BIN names a firecrawl that is not on PATH."""
+    monkeypatch.undo()
+    monkeypatch.setenv("FMV_PRICECHARTING", "1")
+    monkeypatch.setattr(pc, "_FAILED_THIS_PROCESS", {})
+    fake = tmp_path / "firecrawl"
+    fake.write_text("#!/bin/sh\nprintf '# page' > \"$4\"\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("FMV_FIRECRAWL_BIN", str(fake))
+    assert pc.scrape("https://example.test/") == "# page"
+    monkeypatch.setenv("FMV_FIRECRAWL_BIN", str(tmp_path / "missing"))
+    with pytest.raises(RuntimeError, match="FMV_FIRECRAWL_BIN"):
+        pc.scrape("https://example.test/")
