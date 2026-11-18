@@ -206,6 +206,17 @@ def test_apply_without_server_is_usage_error(ebay, monkeypatch):
     assert pp.main(["--days", "91"]) == 2
 
 
+def test_days_cap_is_30_and_refused_before_network(monkeypatch, capsys):
+    def boom():
+        raise AssertionError("network touched before --days validation")
+
+    monkeypatch.setattr(eut, "get_user_access_token", boom)
+    assert pp.MAX_DAYS == 30
+    for days in ("31", "90"):
+        assert pp.main(["--days", days]) == 2
+        assert "1-30" in capsys.readouterr().err
+
+
 def test_ebay_failure_exits_1_and_posts_nothing(monkeypatch):
     monkeypatch.setattr(eut, "get_user_access_token", lambda: "tok")
     monkeypatch.setattr(requests, "post", lambda *a, **k: FakeResp(b"", 503))
