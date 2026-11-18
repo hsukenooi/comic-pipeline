@@ -36,7 +36,7 @@ from shipped_submit import MAX_PAGES, NS, SubmitError, _fetch_page, ping_heartbe
 
 EXIT_OK, EXIT_FAILURE, EXIT_USAGE = 0, 1, 2
 DEFAULT_DAYS = 30
-MAX_DAYS = 90  # GetOrders' ModTime window limit
+MAX_DAYS = 30  # GetOrders caps a ModTime window at 30 days
 POST_CHUNK = 500
 HTTP_TIMEOUT_S = 60
 # Order states that mean the money did not move. Anything else (including a
