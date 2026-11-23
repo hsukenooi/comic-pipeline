@@ -241,7 +241,9 @@ def _passed(**kw):
          "listing_type": "BIN", "best_offer": False, "price": 900.0, "shipping": 10.0,
          "ship_used": 10.0, "expected": 910.0, "market": 1200.0, "threshold": 1080.0,
          "ceiling": 1500.0, "confidence": "MEDIUM", "discount": 0.2417,
-         "url": "https://www.ebay.com/itm/111111111111"}
+         "url": "https://www.ebay.com/itm/111111111111",
+         "title": "Amazing Spider-Man #23 CGC 6.5 1965", "series": "Amazing Spider-Man",
+         "issue": "23", "year": 1965}
     c.update(kw)
     return c
 
@@ -607,3 +609,88 @@ def test_scan_counts_unpriced_and_fetch_failed(server):
                 fetch=lambda _id: None, out=lambda *_: None,
                 fmv=lambda rows, probe: {r["item_id"]: fmv() for r in rows})
     assert s["fetch_failed"] == 1 and s["alerts"] == 0
+
+
+# --- BUI-1437: edition drops, vintage price guard, auction hold ---------------
+
+
+def test_scan_book_drops_variant_title_and_logs(capsys):
+    stats = {}
+    bad = summary("111111111113", title="Amazing Spider-Man #23 CGC 6.5 Sig Series 1965")
+    good = summary()
+    obs, elig, _ = sa.scan_book(BOOK, CFG, {}, NOW, search=lambda *a, **k: [bad, good],
+                                stats=stats)
+    assert [o["item_id"] for o in obs] == ["111111111111"]
+    assert [e["item_id"] for e in elig] == ["111111111111"]
+    assert stats["edition_dropped"] == {"signature": 1}
+    err = capsys.readouterr().err
+    assert "111111111113" in err and "Amazing Spider-Man #23" in err and "signature:" in err
+
+
+def test_check_copies_drops_on_publication_year_specifics(capsys):
+    item = full_item()
+    item["localizedAspects"].append({"name": "Publication Year", "value": "1990"})
+    stats = {}
+    assert sa.check_copies([_passed()], CFG, lambda _id: item, stats=stats) == []
+    assert stats["edition_dropped"] == {"pubyear 1990": 1}
+    assert "pubyear" in capsys.readouterr().err
+    item["localizedAspects"][-1]["value"] = "1965"
+    assert len(sa.check_copies([_passed()], CFG, lambda _id: item)) == 1
+
+
+def test_vintage_price_rule_only_pre_1975_with_market(capsys):
+    old = _passed(grade=9.8, price=400.0, market=1200.0)
+    stats = {}
+    assert sa.check_copies([old], CFG, lambda _id: full_item(), stats=stats) == []
+    assert stats["edition_dropped"] == {"vintage_price": 1}
+    newer = _passed(grade=9.8, price=400.0, market=1200.0, year=1980)
+    assert len(sa.check_copies([newer], CFG, lambda _id: full_item())) == 1
+    unpriced = _passed(grade=9.8, price=400.0, market=None)
+    assert len(sa.check_copies([unpriced], CFG, lambda _id: full_item())) == 1
+
+
+def _auction_book_scan(hours, stats):
+    end = (NOW + timedelta(hours=hours)).isoformat().replace("+00:00", "Z")
+    s = summary(options=("AUCTION",), end=end)
+    return sa.scan_book(BOOK, CFG, {}, NOW, search=lambda *a, **k: [s], stats=stats)
+
+
+def test_auction_hold_30h_held_20h_eligible_stays_observed():
+    stats = {}
+    obs, elig, _ = _auction_book_scan(30, stats)
+    assert len(obs) == 1 and elig == [] and stats["auction_held"] == 1
+    obs, elig, _ = _auction_book_scan(20, stats)
+    assert len(elig) == 1 and stats["auction_held"] == 1
+
+
+def test_auction_unknown_end_held_and_bin_far_end_alerts():
+    stats = {}
+    s = summary(options=("AUCTION",), end=None)
+    _, elig, _ = sa.scan_book(BOOK, CFG, {}, NOW, search=lambda *a, **k: [s], stats=stats)
+    assert elig == [] and stats["auction_held"] == 1
+    bin_copy = summary()
+    bin_copy["end_date"] = (NOW + timedelta(days=20)).isoformat()
+    _, elig, _ = sa.scan_book(BOOK, CFG, {}, NOW, search=lambda *a, **k: [bin_copy], stats=stats)
+    assert len(elig) == 1 and stats["auction_held"] == 1
+
+
+def test_held_auction_alerts_once_in_last_day():
+    """First alert inside the last day: seen-set lets it through, then marks it."""
+    prev = {"111111111111": {"comic_id": 7, "ended_at": None, "last_alerted_at": None}}
+    end = (NOW + timedelta(hours=20)).isoformat().replace("+00:00", "Z")
+    s = summary(options=("AUCTION",), end=end)
+    _, elig, _ = sa.scan_book(BOOK, CFG, prev, NOW, search=lambda *a, **k: [s])
+    assert len(elig) == 1 and sa.in_last_day(elig[0], NOW)
+
+
+def test_dry_run_summary_counts_drops_and_holds(server):
+    end = (NOW + timedelta(hours=30)).isoformat().replace("+00:00", "Z")
+    listings = [summary("111111111113", title="Amazing Spider-Man #23 CGC 6.5 Sig Series"),
+                summary("111111111114", options=("AUCTION",), end=end), summary()]
+    out = []
+    s = sa.scan(dry_run=True, now=NOW, search=lambda *a, **k: listings,
+                fetch=lambda _id: full_item(),
+                fmv=lambda rows, probe: {r["item_id"]: fmv() for r in rows}, out=out.append)
+    assert s["edition_dropped"] == {"signature": 1}
+    assert s["auction_held"] == 1 and s["eligible"] == 1 and s["alerts"] == 1
+    assert json.loads(out[-1])["edition_dropped"] == {"signature": 1}

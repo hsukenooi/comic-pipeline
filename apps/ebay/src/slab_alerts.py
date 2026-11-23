@@ -71,6 +71,7 @@ import requests
 
 import slab_checks
 import slab_deals
+from comic_identity import slab_edition_reason
 from seller_scan import _server_base
 
 DEFAULT_MARGIN = 0.10
@@ -456,9 +457,33 @@ def _keyword(title: str, issue: str) -> str:
     return f"{slab_deals._LEADING_ARTICLE_RE.sub('', title)} #{issue} CGC"
 
 
+def _log_drop(item_id: str, book: str, reason: str, stats: dict | None) -> None:
+    """Log a slab-edition drop to stderr and tally it by reason prefix
+    ("signature", "lot", "vintage_price", ...) in stats["edition_dropped"]."""
+    print(f"edition drop: {item_id} {book}: {reason}", file=sys.stderr)
+    if stats is not None:
+        by = stats.setdefault("edition_dropped", {})
+        key = reason.split(":")[0].strip()
+        by[key] = by.get(key, 0) + 1
+
+
+def _specifics(item: dict) -> dict[str, str]:
+    """The item's localizedAspects as {name: value} (the checker reads "Publication Year")."""
+    raw = item.get("localizedAspects")
+    out: dict[str, str] = {}
+    for a in raw if isinstance(raw, list) else []:
+        if isinstance(a, dict) and a.get("name") and a.get("value") not in (None, ""):
+            out[str(a["name"]).strip()] = str(a["value"]).strip()
+    return out
+
+
 def scan_book(book: dict, cfg: dict, prev_rows: dict[str, dict], now: datetime,
-              search=slab_deals.search_listings) -> tuple[list[dict], list[dict], list[dict]]:
-    """(observations, eligible copies, ended observations) for one book."""
+              search=slab_deals.search_listings,
+              stats: dict | None = None) -> tuple[list[dict], list[dict], list[dict]]:
+    """(observations, eligible copies, ended observations) for one book.
+    A copy whose title fails the slab edition checker is logged, counted in
+    `stats`, and not observed. An auction with more than LAST_DAY left, or no
+    end date, is observed but held out of `eligible` (counted `auction_held`)."""
     title, issue = book["title"], str(book["issue"])
     try:
         year = int(book["year"]) if book.get("year") not in (None, "") else None
@@ -473,6 +498,11 @@ def scan_book(book: dict, cfg: dict, prev_rows: dict[str, dict], now: datetime,
     for c in kept:
         item_id = str(c.get("item_id") or "")
         if not item_id or c.get("grade") is None:
+            continue
+        reason = slab_edition_reason(
+            c.get("title") or "", {"title": title, "issue": issue, "year": year})
+        if reason:
+            _log_drop(item_id, f"{title} #{issue}", reason, stats)
             continue
         seen.add(item_id)
         src = by_id.get(item_id, {})
@@ -498,6 +528,10 @@ def scan_book(book: dict, cfg: dict, prev_rows: dict[str, dict], now: datetime,
         observations.append(obs)
         if (copy["grade"] >= copy["min_grade"] and copy["expected"] <= copy["ceiling"]
                 and needs_alert(copy, prev, now)):
+            if copy["listing_type"] == "Auction" and not in_last_day(copy, now):
+                if stats is not None:  # held until its last day
+                    stats["auction_held"] = stats.get("auction_held", 0) + 1
+                continue
             eligible.append(copy)
     ended = []
     if len(raw) < slab_deals.DEFAULT_MAX_RESULTS:  # a capped search proves nothing
@@ -572,6 +606,16 @@ def check_copies(copies: list[dict], cfg: dict, fetch,
             item = None
         if not isinstance(item, dict):
             stats["fetch_failed"] += 1
+            continue
+        vintage = ({"grade": c["grade"], "price": c["price"], "price_floor": c["market"]}
+                   if c.get("year") is not None and c["year"] < 1975
+                   and c.get("market") is not None else {})
+        reason = slab_edition_reason(
+            c.get("title") or "",
+            {"title": c["series"], "issue": c["issue"], "year": c["year"]},
+            _specifics(item), **vintage)
+        if reason:
+            _log_drop(c["item_id"], c["book"], reason, stats)
             continue
         verdict = slab_checks.check_listing(item)
         if verdict["verdict"] == "drop":
@@ -682,9 +726,12 @@ def scan(*, dry_run: bool, max_books: int | None = None, now: datetime | None = 
     prev_rows = {str(r["item_id"]): r for r in (listed.get("copies") or [])
                  if isinstance(r, dict) and r.get("item_id")}
     observations, eligible, errors = [], [], []
+    stats: dict[str, Any] = {"fetch_failed": 0, "grade_mismatch": 0,
+                             "auction_held": 0, "edition_dropped": {}}
     for book in books:
         try:
-            obs, elig, ended = scan_book(book, cfg, prev_rows, now, search=search)
+            obs, elig, ended = scan_book(book, cfg, prev_rows, now, search=search,
+                                         stats=stats)
         except slab_deals.SlabDealsError as e:
             errors.append(f"{book.get('title')} #{book.get('issue')}: {e}")
             continue
@@ -697,7 +744,6 @@ def scan(*, dry_run: bool, max_books: int | None = None, now: datetime | None = 
         c = next((e for e in eligible if e["item_id"] == o["item_id"]), None)
         if c and c.get("market"):
             o["market"], o["confidence"] = c["market"], c["confidence"]
-    stats = {"fetch_failed": 0, "grade_mismatch": 0}
     alerts = (check_copies(passed, cfg, fetch or _default_fetch(), prev_rows, now, stats)
               if passed else [])
     text, markup, shown = render(alerts, month_spend(base, now), cfg, now) if alerts \
