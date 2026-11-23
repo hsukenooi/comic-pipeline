@@ -14,6 +14,11 @@ dashboard reads:
   `alerted_last_day` freeze the state at the last alert. The scan re-alerts a
   copy only when its expected price dropped below `alerted_expected`, a Best
   Offer appeared, or an auction entered its last day.
+* `dropped_reason`, `dropped_at`, and `dropped_price` (BUI-1449) remember a
+  copy the scan dropped after getItem (edition, slab_checks, grade_mismatch,
+  shipping). The scan skips a copy whose price still equals `dropped_price`.
+  Sending `dropped_reason: null` clears the memory. Older DBs gain the three
+  columns through an idempotent ALTER in `create_slab_alert_tables`.
 * `rating` (`act` / `pass`) and `rated_at` come from the Telegram buttons.
 
 Upsert semantics: only the keys a client sends change. Nothing here bids,
@@ -33,7 +38,7 @@ UPSERT_FIELDS = (
     "comic_id", "title", "grade", "listing_type", "best_offer", "price",
     "shipping", "expected", "market", "confidence", "end_date", "last_seen_at",
     "ended_at", "last_alerted_at", "alerted_expected", "alerted_best_offer",
-    "alerted_last_day",
+    "alerted_last_day", "dropped_reason", "dropped_at", "dropped_price",
 )
 _BOOL_FIELDS = ("best_offer", "alerted_best_offer", "alerted_last_day")
 
@@ -69,6 +74,9 @@ def create_slab_alert_tables(conn: sqlite3.Connection) -> None:
             alert_count        INTEGER NOT NULL DEFAULT 0,
             rating             TEXT CHECK(rating IS NULL OR rating IN ('act', 'pass')),
             rated_at           TEXT,
+            dropped_reason     TEXT,
+            dropped_at         TEXT,
+            dropped_price      REAL,
             created_at         TEXT NOT NULL,
             updated_at         TEXT NOT NULL
         )
@@ -76,6 +84,12 @@ def create_slab_alert_tables(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_slab_alerts_comic ON slab_alerts(comic_id)"
     )
+    # BUI-1449: additive columns for a table created before they existed.
+    have = {r[1] for r in conn.execute("PRAGMA table_info(slab_alerts)")}
+    for col, typ in (("dropped_reason", "TEXT"), ("dropped_at", "TEXT"),
+                     ("dropped_price", "REAL")):
+        if col not in have:
+            conn.execute(f"ALTER TABLE slab_alerts ADD COLUMN {col} {typ}")
 
 
 def upsert_slab_alerts(

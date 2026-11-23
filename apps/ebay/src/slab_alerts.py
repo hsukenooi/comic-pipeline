@@ -27,6 +27,13 @@ One scan, run every 12 hours by `com.comics.slab-alerts`:
      buttons per copy. No message when nothing qualifies. This month's spend
      (`/api/comics/purchases/spend`) is shown for information only.
 
+  10. Drop memory (BUI-1449). A copy dropped after getItem (edition or
+     vintage-price reason, a slab_checks drop, grade_mismatch, or the
+     shipping re-gate) is stamped on the server (`dropped_reason`,
+     `dropped_at`, `dropped_price`). Later scans keep observing it but do not
+     send it to comic-fmv or getItem again until its price changes. A failed
+     getItem is transient and is never stamped.
+
 Every copy seen is logged on the server (`POST /api/comics/slab-alerts`):
 first and last seen, and ended when a complete search no longer finds it.
 The alert state is written only after Telegram accepts the message, so a
@@ -539,6 +546,14 @@ def scan_book(book: dict, cfg: dict, prev_rows: dict[str, dict], now: datetime,
         elif prev.get("ended_at"):
             obs["ended_at"] = None  # seen again: a search missed it once
         observations.append(obs)
+        # Old/new skew: an old server returns rows without the drop keys, and
+        # .get() reads that as "no drop".
+        if (prev and prev.get("dropped_reason")
+                and prev.get("dropped_price") is not None
+                and abs(float(prev["dropped_price"]) - copy["price"]) < 0.005):
+            if stats is not None:  # dropped before at this price: skip the refetch
+                stats["drop_remembered"] = stats.get("drop_remembered", 0) + 1
+            continue
         if (copy["grade"] >= copy["min_grade"] and copy["expected"] <= copy["ceiling"]
                 and needs_alert(copy, prev, now)):
             if copy["listing_type"] == "Auction" and not in_last_day(copy, now):
@@ -610,6 +625,11 @@ def check_copies(copies: list[dict], cfg: dict, fetch,
     stats = stats if stats is not None else {}
     for k in ("fetch_failed", "grade_mismatch"):
         stats.setdefault(k, 0)
+    drops: list[dict] = stats.setdefault("drops", [])  # BUI-1449 stamps for scan()
+
+    def drop(c: dict, why: str) -> None:
+        drops.append({"item_id": c["item_id"], "dropped_reason": why[:40],
+                      "dropped_at": now.isoformat(), "dropped_price": c["price"]})
     out = []
     for c in sorted(copies, key=lambda c: -c["discount"])[:cfg["max_item_fetches"]]:
         try:
@@ -629,13 +649,16 @@ def check_copies(copies: list[dict], cfg: dict, fetch,
             _specifics(item), **vintage)
         if reason:
             _log_drop(c["item_id"], c["book"], reason, stats)
+            drop(c, reason)
             continue
         verdict = slab_checks.check_listing(item)
         if verdict["verdict"] == "drop":
+            drop(c, "slab_checks")
             continue
         cert_grade = aspect_grade(verdict["cert"].get("grade"))
         if cert_grade is not None and abs(cert_grade - c["grade"]) > 0.01:
             stats["grade_mismatch"] += 1
+            drop(c, "grade_mismatch")
             continue
         if c.get("shipping") is None:
             from ebay_fetch import summary_shipping_usd
@@ -645,6 +668,7 @@ def check_copies(copies: list[dict], cfg: dict, fetch,
                 c["expected"], c["ship_used"] = expected_price(c, cfg)
                 if (c["expected"] > min(c["threshold"], c["ceiling"])
                         or not needs_alert(c, prev_rows.get(c["item_id"]), now)):
+                    drop(c, "shipping")
                     continue
                 c["discount"] = round(1 - c["expected"] / c["market"], 4)
         c["checks"] = verdict
@@ -740,7 +764,8 @@ def scan(*, dry_run: bool, max_books: int | None = None, now: datetime | None = 
                  if isinstance(r, dict) and r.get("item_id")}
     observations, eligible, errors = [], [], []
     stats: dict[str, Any] = {"fetch_failed": 0, "grade_mismatch": 0,
-                             "auction_held": 0, "edition_dropped": {}}
+                             "auction_held": 0, "drop_remembered": 0,
+                             "edition_dropped": {}}
     for book in books:
         try:
             obs, elig, ended = scan_book(book, cfg, prev_rows, now, search=search,
@@ -759,6 +784,7 @@ def scan(*, dry_run: bool, max_books: int | None = None, now: datetime | None = 
             o["market"], o["confidence"] = c["market"], c["confidence"]
     alerts = (check_copies(passed, cfg, fetch or _default_fetch(), prev_rows, now, stats)
               if passed else [])
+    drops = stats.pop("drops", [])
     text, markup, shown = render(alerts, month_spend(base, now), cfg, now) if alerts \
         else ("", {}, [])
     summary = {"books": len(books), "copies": len(observations), "eligible": len(eligible),
@@ -772,6 +798,8 @@ def scan(*, dry_run: bool, max_books: int | None = None, now: datetime | None = 
         return summary
     if observations:
         _post(base, "/api/comics/slab-alerts", {"copies": observations})
+    if drops:  # after the observations: a new copy's row exists first
+        _post(base, "/api/comics/slab-alerts", {"copies": drops})
     if shown:
         token, chat_id = telegram_creds()
         payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
