@@ -463,7 +463,7 @@ def _log_drop(item_id: str, book: str, reason: str, stats: dict | None) -> None:
     print(f"edition drop: {item_id} {book}: {reason}", file=sys.stderr)
     if stats is not None:
         by = stats.setdefault("edition_dropped", {})
-        key = reason.split(":")[0].strip()
+        key = re.split(r"[:\s]", reason.strip(), maxsplit=1)[0]
         by[key] = by.get(key, 0) + 1
 
 
@@ -501,10 +501,10 @@ def scan_book(book: dict, cfg: dict, prev_rows: dict[str, dict], now: datetime,
             continue
         reason = slab_edition_reason(
             c.get("title") or "", {"title": title, "issue": issue, "year": year})
+        seen.add(item_id)  # a live drop is not an ended listing
         if reason:
             _log_drop(item_id, f"{title} #{issue}", reason, stats)
             continue
-        seen.add(item_id)
         src = by_id.get(item_id, {})
         copy = {
             "item_id": item_id, "comic_id": book["comic_id"], "book": f"{title} #{issue}",

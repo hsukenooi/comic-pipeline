@@ -632,7 +632,7 @@ def test_check_copies_drops_on_publication_year_specifics(capsys):
     item["localizedAspects"].append({"name": "Publication Year", "value": "1990"})
     stats = {}
     assert sa.check_copies([_passed()], CFG, lambda _id: item, stats=stats) == []
-    assert stats["edition_dropped"] == {"pubyear 1990": 1}
+    assert stats["edition_dropped"] == {"pubyear": 1}
     assert "pubyear" in capsys.readouterr().err
     item["localizedAspects"][-1]["value"] = "1965"
     assert len(sa.check_copies([_passed()], CFG, lambda _id: item)) == 1
