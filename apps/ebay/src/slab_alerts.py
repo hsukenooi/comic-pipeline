@@ -457,13 +457,26 @@ def _keyword(title: str, issue: str) -> str:
     return f"{slab_deals._LEADING_ARTICLE_RE.sub('', title)} #{issue} CGC"
 
 
+_EDITION_RULES = {"signature", "marker", "lot", "mmyy", "pubyear", "vintage_price"}
+# BUI-1437: a pre-1975 CGC 9.6+ listed under this fraction of market is
+# treated as a wrong edition (rule 8 price floor).
+VINTAGE_PRICE_FLOOR_FRACTION = 0.5
+
+
+def _unarticled(title: str) -> str:
+    return slab_deals._LEADING_ARTICLE_RE.sub("", title)
+
+
 def _log_drop(item_id: str, book: str, reason: str, stats: dict | None) -> None:
-    """Log a slab-edition drop to stderr and tally it by reason prefix
-    ("signature", "lot", "vintage_price", ...) in stats["edition_dropped"]."""
+    """Log a slab-edition drop to stderr and tally it by rule in
+    stats["edition_dropped"]: signature, marker, lot, mmyy, pubyear,
+    vintage_price, or adjacency (any series/issue-adjacency reason)."""
     print(f"edition drop: {item_id} {book}: {reason}", file=sys.stderr)
     if stats is not None:
         by = stats.setdefault("edition_dropped", {})
         key = re.split(r"[:\s]", reason.strip(), maxsplit=1)[0]
+        if key not in _EDITION_RULES:
+            key = "adjacency"
         by[key] = by.get(key, 0) + 1
 
 
@@ -500,7 +513,7 @@ def scan_book(book: dict, cfg: dict, prev_rows: dict[str, dict], now: datetime,
         if not item_id or c.get("grade") is None:
             continue
         reason = slab_edition_reason(
-            c.get("title") or "", {"title": title, "issue": issue, "year": year})
+            c.get("title") or "", {"title": _unarticled(title), "issue": issue, "year": year})
         seen.add(item_id)  # a live drop is not an ended listing
         if reason:
             _log_drop(item_id, f"{title} #{issue}", reason, stats)
@@ -607,12 +620,12 @@ def check_copies(copies: list[dict], cfg: dict, fetch,
         if not isinstance(item, dict):
             stats["fetch_failed"] += 1
             continue
-        vintage = ({"grade": c["grade"], "price": c["price"], "price_floor": c["market"]}
+        vintage = ({"grade": c["grade"], "price": c["price"], "price_floor": VINTAGE_PRICE_FLOOR_FRACTION * c["market"]}
                    if c.get("year") is not None and c["year"] < 1975
                    and c.get("market") is not None else {})
         reason = slab_edition_reason(
             c.get("title") or "",
-            {"title": c["series"], "issue": c["issue"], "year": c["year"]},
+            {"title": _unarticled(c["series"]), "issue": c["issue"], "year": c["year"]},
             _specifics(item), **vintage)
         if reason:
             _log_drop(c["item_id"], c["book"], reason, stats)

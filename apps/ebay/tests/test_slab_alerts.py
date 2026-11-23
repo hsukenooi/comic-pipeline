@@ -643,6 +643,9 @@ def test_vintage_price_rule_only_pre_1975_with_market(capsys):
     stats = {}
     assert sa.check_copies([old], CFG, lambda _id: full_item(), stats=stats) == []
     assert stats["edition_dropped"] == {"vintage_price": 1}
+    for price, kept in ((540.0, False), (720.0, True)):  # 45% drops, 60% alerts
+        c = _passed(grade=9.8, price=price, market=1200.0)
+        assert bool(sa.check_copies([c], CFG, lambda _id: full_item())) is kept
     newer = _passed(grade=9.8, price=400.0, market=1200.0, year=1980)
     assert len(sa.check_copies([newer], CFG, lambda _id: full_item())) == 1
     unpriced = _passed(grade=9.8, price=400.0, market=None)
@@ -694,3 +697,54 @@ def test_dry_run_summary_counts_drops_and_holds(server):
     assert s["edition_dropped"] == {"signature": 1}
     assert s["auction_held"] == 1 and s["eligible"] == 1 and s["alerts"] == 1
     assert json.loads(out[-1])["edition_dropped"] == {"signature": 1}
+
+
+def test_drop_tally_is_per_rule_not_per_value():
+    stats = {}
+    for reason in ("pubyear 1990", "pubyear 1991", "mmyy 05/95", "series absent",
+                   "no adjacent series+issue", "lot", "signature:SS", "marker:Edition",
+                   "vintage_price: 9.8 at $1 under $2 floor"):
+        sa._log_drop("1", "b", reason, stats)
+    assert stats["edition_dropped"] == {"pubyear": 2, "mmyy": 1, "adjacency": 2, "lot": 1,
+                                        "signature": 1, "marker": 1, "vintage_price": 1}
+
+
+def test_leading_article_in_book_title_is_not_a_drop():
+    book = dict(BOOK, title="The Amazing Spider-Man")
+    stats = {}
+    _, elig, _ = sa.scan_book(book, CFG, {}, NOW, search=lambda *a, **k: [summary()], stats=stats)
+    assert len(elig) == 1 and not stats.get("edition_dropped")
+    c = _passed(series="The Amazing Spider-Man")
+    assert len(sa.check_copies([c], CFG, lambda _id: full_item())) == 1
+
+
+def test_held_auction_alerts_in_last_day_marks_it_and_does_not_realert(server, monkeypatch):
+    monkeypatch.setattr(sa, "_lock", lambda path: None)  # the real lock lives per process
+    far = (NOW + timedelta(hours=30)).isoformat().replace("+00:00", "Z")
+    near = (NOW + timedelta(hours=20)).isoformat().replace("+00:00", "Z")
+
+    def run(end, now):
+        return sa.scan(dry_run=False, now=now,
+                       search=lambda *a, **k: [summary(options=("AUCTION",), end=end)],
+                       fetch=lambda _id: full_item(),
+                       fmv=lambda rows, probe: {r["item_id"]: fmv() for r in rows},
+                       out=lambda *_: None)
+    s = run(far, NOW)
+    assert s["alerts"] == 0 and s["auction_held"] == 1
+    server["posts"].clear()
+    s = run(near, NOW + timedelta(hours=10))  # 10h later: 10h left
+    assert s["alerts"] == 1
+    mark = server["posts"][-1][1]["copies"][0]
+    assert mark["alerted_last_day"] is True
+    server["prev"] = [{"item_id": "111111111111", "comic_id": 7, "ended_at": None,
+                       "last_alerted_at": mark["last_alerted_at"],
+                       "alerted_expected": mark["alerted_expected"],
+                       "alerted_best_offer": 0, "alerted_last_day": 1}]
+    assert run(near, NOW + timedelta(hours=10))["alerts"] == 0
+
+
+def test_live_edition_drop_is_not_marked_ended():
+    prev = {"111111111113": {"comic_id": 7, "ended_at": None}}
+    bad = summary("111111111113", title="Amazing Spider-Man #23 CGC 6.5 Sig Series 1965")
+    obs, elig, ended = sa.scan_book(BOOK, CFG, prev, NOW, search=lambda *a, **k: [bad])
+    assert obs == [] and elig == [] and ended == []
