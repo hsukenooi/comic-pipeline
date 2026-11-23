@@ -3416,7 +3416,7 @@ class TestEditionWarning:
         # cover year that conflicts with Publication Year, so the pubyear rule
         # only fires when a caller supplies both.
         reason = ebay_fetch.edition_warning(
-            "Amazing Spider-Man #300 CGC 9.8 1988", {"Publication Year": "2019"}, 1988,
+            "Amazing Spider-Man #300 CGC 9.8 1988", {"Publication Year": "2019"},
         )
         assert reason == "pubyear 2019"
 
@@ -3425,10 +3425,31 @@ class TestEditionWarning:
                        "no adjacent series+issue"):
             monkeypatch.setattr(ebay_fetch, "slab_edition_reason",
                                 lambda *a, _r=reason, **k: _r)
-            assert ebay_fetch.edition_warning("Amazing Spider-Man #300 CGC 9.8", {}, 1988) is None
+            assert ebay_fetch.edition_warning("Amazing Spider-Man #300 CGC 9.8", {}) is None
 
     def test_lot_is_not_double_warned(self):
         item = _identify_item(title="Amazing Spider-Man #298-#300 lot", edition_warning="lot")
         row = ebay_fetch.identify_row(1, item, self.NOW)
         assert "Edition:" not in row
-        assert ebay_fetch.edition_warning("Amazing Spider-Man lot #298-#300", {}, 1988) is None
+        assert ebay_fetch.edition_warning("Amazing Spider-Man lot #298-#300", {}) is None
+
+    def test_pubyear_conflict_warns_through_parse_item(self):
+        item = self._parse("Amazing Spider-Man #300 (1984) CGC 9.8",
+                           [{"name": "Publication Year", "value": "2015"}])
+        assert item["edition_warning"] == "pubyear 2015"
+
+    def test_mmyy_conflict_warns_through_parse_item(self):
+        item = self._parse("Fantastic Four #48 (1964) 3/91 CGC 7.0")
+        assert item["edition_warning"].startswith("mmyy")
+
+    def test_matching_publication_year_is_clean(self):
+        item = self._parse("Amazing Spider-Man #300 (1988) CGC 9.8",
+                           [{"name": "Publication Year", "value": "1988"}])
+        assert item["edition_warning"] is None
+
+    def test_marker_not_masked_by_adjacency_miss(self, monkeypatch):
+        monkeypatch.setattr(ebay_fetch, "slab_edition_reason",
+                            lambda *a, **k: "series absent")
+        reason = ebay_fetch.edition_warning(
+            "Amazing Spider-Man #300 CGC 9.8 Virgin Variant", {})
+        assert reason and reason.startswith("marker:")

@@ -17,7 +17,11 @@ import requests
 from urllib.parse import quote
 
 import grade_tokens
-from comic_identity import confident_cover_year, identify_comic, slab_edition_reason
+from comic_identity import (
+    _slab_ed_marker, _slab_ed_mmyy, _slab_ed_pubyear,
+    confident_cover_year, identify_comic, slab_edition_reason,
+)
+from comic_identity_year import _all_title_years
 from condition_defects import format_defect_cell, listing_defect_findings
 
 
@@ -887,28 +891,36 @@ def format_end_date(iso_str):
 _ADJACENCY_REASONS = ("series absent", "another #", "no adjacent series+issue")
 
 
-def edition_warning(title, item_specifics, cover_year):
+def edition_warning(title, item_specifics):
     """BUI-1438: why a listing may not be the original edition, else None.
 
-    Runs the shared slab edition checker with the parsed identity as target.
-    Adjacency reasons are suppressed (the parser normalizes series names, so
-    they say nothing about the edition), and a lot is skipped (it has its own
-    note). Advisory only: the listing is never dropped.
+    Runs the shared slab edition checker with the parsed identity as target
+    and the title's own year. Adjacency is suppressed (the parser normalizes
+    series names, so a miss says nothing about the edition); because adjacency
+    runs first and short-circuits the checker, a miss re-runs the remaining
+    rules directly so a variant or reprint marker is not masked. A lot is
+    skipped (it has its own note). Advisory only: never drops a listing.
     """
+    title = title or ""
     ident = identify_comic(title)
     if ident.is_lot or not ident.series or not ident.issue:
         return None
-    try:
-        year = int(cover_year) if cover_year is not None else None
-    except (TypeError, ValueError):
-        year = None
+    # The title's own stated year, not confident_cover_year: that is None
+    # exactly when Publication Year conflicts with the title, which is the
+    # case the pubyear rule exists to flag.
+    years = _all_title_years(title)
+    year = years[0] if years else None
     reason = slab_edition_reason(
-        title or "",
+        title,
         {"title": ident.series, "issue": ident.issue, "year": year},
         item_specifics,
     )
     if reason and reason.startswith(_ADJACENCY_REASONS):
-        return None
+        return (
+            _slab_ed_marker(title)
+            or _slab_ed_mmyy(title, year)
+            or _slab_ed_pubyear(item_specifics, year)
+        )
     return reason
 
 
@@ -1065,7 +1077,7 @@ def parse_item(data):
         # unconditionally; confident_cover_year only consults it when
         # certified=True, so a raw listing is unaffected regardless.
         "cover_year": cover_year,
-        "edition_warning": edition_warning(title, item_specifics, cover_year),
+        "edition_warning": edition_warning(title, item_specifics),
         "item_specifics": item_specifics,
         "description_snippet": description_snippet,
         "listing_url": listing_url,
