@@ -17,7 +17,11 @@ import requests
 from urllib.parse import quote
 
 import grade_tokens
-from comic_identity import confident_cover_year, identify_comic
+from comic_identity import (
+    _slab_ed_lot, _slab_ed_marker, _slab_ed_mmyy, _slab_ed_pubyear,
+    confident_cover_year, identify_comic, slab_edition_reason,
+)
+from comic_identity_year import _all_title_years
 from condition_defects import format_defect_cell, listing_defect_findings
 
 
@@ -884,6 +888,60 @@ def format_end_date(iso_str):
         return iso_str
 
 
+_ADJACENCY_REASONS = ("series absent", "another #", "no adjacent series+issue")
+
+
+_ED_BARE_YEAR_RE = re.compile(
+    r"(?<!vol\s)(?<!vol\.\s)(?<!volume\s)\b(19[3-9]\d|20[0-3]\d)\b(?!\s*series)",
+    re.IGNORECASE,
+)
+
+
+def _edition_target_year(title, cover_year):
+    """Year the edition rules compare against, else None.
+
+    The confident cover year first; else a bare (unparenthesized) title year
+    not read as a volume ("Vol 1") or series start ("1963 Series"). A
+    parenthesized year is never used: it is ambiguous between the series
+    start year and the cover year.
+    """
+    if cover_year is not None:
+        return cover_year
+    m = _ED_BARE_YEAR_RE.search(re.sub(r"\([^)]*\)", " ", title or ""))
+    return int(m.group(1)) if m else None
+
+
+def edition_warning(title, item_specifics, cover_year=None):
+    """BUI-1438: why a listing may not be the original edition, else None.
+
+    Runs the shared slab edition checker with the parsed identity as target
+    and the year from _edition_target_year. Adjacency is suppressed (the parser
+    normalizes series names, so a miss says nothing about the edition); because
+    adjacency runs first and short-circuits the checker, a miss re-runs the
+    remaining rules in checker order so a lot, variant, or reprint marker is
+    not masked. A lot (per the parser) is skipped: it has its own note.
+    Advisory only: never drops a listing.
+    """
+    title = title or ""
+    ident = identify_comic(title)
+    if ident.is_lot or not ident.series or not ident.issue:
+        return None
+    year = _edition_target_year(title, cover_year)
+    reason = slab_edition_reason(
+        title,
+        {"title": ident.series, "issue": ident.issue, "year": year},
+        item_specifics,
+    )
+    if reason and reason.startswith(_ADJACENCY_REASONS):
+        return (
+            ("lot" if _slab_ed_lot(title) else None)
+            or _slab_ed_marker(title)
+            or _slab_ed_mmyy(title, year)
+            or _slab_ed_pubyear(item_specifics, year)
+        )
+    return reason
+
+
 def parse_item(data):
     """Parse Browse API response into structured output."""
     item_id_raw = data.get("itemId", "")
@@ -986,6 +1044,11 @@ def parse_item(data):
 
     end_date_iso = data.get("itemEndDate")  # raw ISO 8601 with timezone, e.g. "2025-05-01T12:34:56.000Z"
 
+    cover_year = confident_cover_year(
+        title, item_specifics,
+        certified=bool(certification.certifier),
+        era_range=_parse_era_range(item_specifics.get("Era")),
+    )
     return {
         "item_id": item_id,
         "title": title,
@@ -1031,11 +1094,8 @@ def parse_item(data):
         # carry a Publication Year but zero title-stated years). Parsed
         # unconditionally; confident_cover_year only consults it when
         # certified=True, so a raw listing is unaffected regardless.
-        "cover_year": confident_cover_year(
-            title, item_specifics,
-            certified=bool(certification.certifier),
-            era_range=_parse_era_range(item_specifics.get("Era")),
-        ),
+        "cover_year": cover_year,
+        "edition_warning": edition_warning(title, item_specifics, cover_year),
         "item_specifics": item_specifics,
         "description_snippet": description_snippet,
         "listing_url": listing_url,
@@ -1944,6 +2004,10 @@ def identify_row(index, item, now):
 
     if item.get("grade_mismatch_note"):
         notes.append(item["grade_mismatch_note"])
+
+    # BUI-1438: advisory only; a lot already carries its own note above.
+    if item.get("edition_warning") and not ident.is_lot:
+        notes.append(f"{_WARN} Edition: {item['edition_warning']}")
 
     listing_type = item.get("listing_type")
     if listing_type == "BIN":

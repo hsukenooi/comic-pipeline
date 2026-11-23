@@ -30,7 +30,7 @@ Notes | Defects | Cert | PQ`, with the `#` cell linking to the eBay listing. The
 contract (confidence-gating, Ends computation, grade signals, no extra API call
 for price/bids) is owned by `ebay-fetch --identify` in
 `apps/ebay/src/ebay_fetch.py` (BUI-900); the agent passes its output through. Present the
-table as-is; four column groups carry weight downstream:
+table as-is; five column groups carry weight downstream:
 
 - **Year** — forward it verbatim into `/comic:collection-check` (blank stays
   blank, never backfill a guess). It's a confidence-gated per-issue cover year
@@ -62,6 +62,15 @@ table as-is; four column groups carry weight downstream:
   title-only "CGC ready" with no certification aspect stays raw at
   `grade_source: "missing"`). A specifics-vs-title grade disagreement keeps the
   specifics value and surfaces as a `grade_mismatch_note` in the Notes column.
+
+- **Edition warning (BUI-1438)** — a Notes entry `⚠️ Edition: <reason>` (e.g.
+  `⚠️ Edition: marker:variant`) means the shared slab edition checker
+  (`slab_edition_reason`) thinks the listing may not be the original edition:
+  a reprint, facsimile, variant or signature marker, a lot-style title, an MM/YY
+  cover date that disagrees with the year, or a later Publication Year. `--json`
+  carries it as `edition_warning` (`null` when clean). It is advisory: keep the
+  row and the Notes entry in the table, never drop or block the listing, and let
+  the user decide. Lots keep their own lot note instead.
 
 Flag Buy It Now listings — they're skipped at the Gixen step.
 

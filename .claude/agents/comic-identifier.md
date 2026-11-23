@@ -65,8 +65,11 @@ never add, drop or reorder one:
 - **Year** is the confidence-gated cover year and is blank (`—`) whenever the gate did
   not fire; that blank is what `/comic:collection-check` forwards, so never fill it in.
 - **Notes** carries the flags: no grade anywhere, description-only grade, grade taken
-  from the title, Buy It Now (skipped at the Gixen step), lot listings, and titles the
-  parser could not identify.
+  from the title, Buy It Now (skipped at the Gixen step), lot listings, titles the
+  parser could not identify, and an edition warning (BUI-1438, `⚠️ Edition: <reason>`,
+  e.g. `⚠️ Edition: marker:variant`) when the title or item specifics suggest a
+  reprint, variant, signed, or later-printed copy. Keep that entry verbatim and never
+  drop the row: it is advisory, and the user decides.
 - **Defects** (BUI-919) carries the seller's own condition text classified against the
   standing buy rule — moisture damage, rust, or a loose/detached staple — with the
   phrase that fired. `/comic:buy` Step 1.5 drops those rows before FMV, so never
