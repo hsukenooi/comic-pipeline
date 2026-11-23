@@ -31,7 +31,9 @@ One scan, run every 12 hours by `com.comics.slab-alerts`:
      vintage-price reason, a slab_checks drop, grade_mismatch, or the
      shipping re-gate) is stamped on the server (`dropped_reason`,
      `dropped_at`, `dropped_price`). Later scans keep observing it but do not
-     send it to comic-fmv or getItem again until its price changes. A failed
+     send it to comic-fmv or getItem again until its price changes or
+     SLAB_ALERT_DROP_TTL_DAYS pass (market, ceiling, and seller terms can
+     change without a price change). A failed
      getItem is transient and is never stamped.
 
 Every copy seen is logged on the server (`POST /api/comics/slab-alerts`):
@@ -53,6 +55,8 @@ Env:
     SLAB_ALERT_DEFAULT_SHIPPING  default 15.0 (used when the listing shows none)
     SLAB_ALERT_MAX_BOOKS         default 0 = every hunt-list book
     SLAB_ALERT_MAX_ITEM_FETCHES  default 40 (Browse getItem calls per scan)
+    SLAB_ALERT_DROP_TTL_DAYS     default 7 (how long a remembered drop skips the
+                                 copy at an unchanged price)
     SLAB_ALERT_STATE_FILE        default ~/.comics-server/slab-alerts-state.json
     SLAB_ALERT_READ_BUTTONS      default 1. 0 = send-only: no getUpdates and no
                                  Act/Pass buttons, for a bot shared with other
@@ -85,6 +89,7 @@ DEFAULT_MARGIN = 0.10
 DEFAULT_TAX_RATE = 0.08
 DEFAULT_SHIPPING = 15.0
 DEFAULT_MAX_ITEM_FETCHES = 40
+DEFAULT_DROP_TTL_DAYS = 7.0
 MAX_IN_MESSAGE = 15
 MESSAGE_BUDGET = 3800  # Telegram caps a message at 4096 characters
 LAST_DAY = timedelta(hours=24)
@@ -137,7 +142,27 @@ def config() -> dict[str, float]:
         "max_books": int(_env_float("SLAB_ALERT_MAX_BOOKS", 0, 0, 10000)),
         "max_item_fetches": int(_env_float("SLAB_ALERT_MAX_ITEM_FETCHES",
                                            DEFAULT_MAX_ITEM_FETCHES, 0, 10000)),
+        "drop_ttl_days": _env_float("SLAB_ALERT_DROP_TTL_DAYS", DEFAULT_DROP_TTL_DAYS,
+                                    0.0, 365.0),
     }
+
+
+def drop_remembered(prev: dict | None, price: float, cfg: dict, now: datetime) -> bool:
+    """True when `prev` holds a drop at this price younger than the TTL.
+    Missing or unparseable `dropped_at` means no skip (an old server's rows
+    carry none of the drop keys)."""
+    if not prev or not prev.get("dropped_reason") or prev.get("dropped_price") is None:
+        return False
+    try:
+        if abs(float(prev["dropped_price"]) - price) >= 0.005:
+            return False
+        at = datetime.fromisoformat(str(prev.get("dropped_at")).replace("Z", "+00:00"))
+        if at.tzinfo is None:
+            at = at.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return False
+    ttl = cfg.get("drop_ttl_days", DEFAULT_DROP_TTL_DAYS)
+    return timedelta(0) <= now - at < timedelta(days=ttl)
 
 
 def _state_file() -> Path:
@@ -548,9 +573,7 @@ def scan_book(book: dict, cfg: dict, prev_rows: dict[str, dict], now: datetime,
         observations.append(obs)
         # Old/new skew: an old server returns rows without the drop keys, and
         # .get() reads that as "no drop".
-        if (prev and prev.get("dropped_reason")
-                and prev.get("dropped_price") is not None
-                and abs(float(prev["dropped_price"]) - copy["price"]) < 0.005):
+        if drop_remembered(prev, copy["price"], cfg, now):
             if stats is not None:  # dropped before at this price: skip the refetch
                 stats["drop_remembered"] = stats.get("drop_remembered", 0) + 1
             continue
@@ -666,9 +689,10 @@ def check_copies(copies: list[dict], cfg: dict, fetch,
             if ship is not None:
                 c["shipping"] = ship
                 c["expected"], c["ship_used"] = expected_price(c, cfg)
-                if (c["expected"] > min(c["threshold"], c["ceiling"])
-                        or not needs_alert(c, prev_rows.get(c["item_id"]), now)):
-                    drop(c, "shipping")
+                if c["expected"] > min(c["threshold"], c["ceiling"]):
+                    drop(c, "shipping")  # price-driven only; an already-alerted skip is not stamped
+                    continue
+                if not needs_alert(c, prev_rows.get(c["item_id"]), now):
                     continue
                 c["discount"] = round(1 - c["expected"] / c["market"], 4)
         c["checks"] = verdict
@@ -798,8 +822,6 @@ def scan(*, dry_run: bool, max_books: int | None = None, now: datetime | None = 
         return summary
     if observations:
         _post(base, "/api/comics/slab-alerts", {"copies": observations})
-    if drops:  # after the observations: a new copy's row exists first
-        _post(base, "/api/comics/slab-alerts", {"copies": drops})
     if shown:
         token, chat_id = telegram_creds()
         payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
@@ -810,7 +832,14 @@ def scan(*, dry_run: bool, max_books: int | None = None, now: datetime | None = 
         _post(base, "/api/comics/slab-alerts", {"copies": [
             {"item_id": c["item_id"], "last_alerted_at": stamp,
              "alerted_expected": c["expected"], "alerted_best_offer": c["best_offer"],
-             "alerted_last_day": in_last_day(c, now)} for c in shown]})
+             "alerted_last_day": in_last_day(c, now),
+             "dropped_reason": None, "dropped_at": None, "dropped_price": None}
+            for c in shown]})
+    if drops:  # last, so bookkeeping never delays an alert
+        alerted = {c["item_id"] for c in shown}
+        drops = [d for d in drops if d["item_id"] not in alerted]
+    if drops:
+        _post(base, "/api/comics/slab-alerts", {"copies": drops})
     out(json.dumps(summary))
     return summary
 
@@ -822,7 +851,8 @@ def main(argv: list[str] | None = None) -> None:
                     "priced at or under the margin below market. Never bids or buys.",
         epilog="Env: SLAB_ALERT_MARGIN (0.10), SLAB_ALERT_TAX_RATE (0.08), "
                "SLAB_ALERT_DEFAULT_SHIPPING (15), SLAB_ALERT_MAX_BOOKS (0 = all), "
-               "SLAB_ALERT_MAX_ITEM_FETCHES (40), SLAB_ALERT_STATE_FILE, "
+               "SLAB_ALERT_MAX_ITEM_FETCHES (40), SLAB_ALERT_DROP_TTL_DAYS (7), "
+               "SLAB_ALERT_STATE_FILE, "
                "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID.")
     p.add_argument("--dry-run", action="store_true",
                    help="Print the message; write nothing and call no Telegram API "

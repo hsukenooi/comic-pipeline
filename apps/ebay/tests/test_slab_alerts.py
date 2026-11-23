@@ -812,3 +812,35 @@ def test_dry_run_stamps_nothing(server):
             fetch=lambda _id: wrong_grade,
             fmv=lambda rows, probe: {r["item_id"]: fmv() for r in rows}, out=lambda _s: None)
     assert server["posts"] == []
+
+
+def test_drop_memory_expires_after_ttl(server, monkeypatch):
+    monkeypatch.setattr(sa, "_lock", lambda path: None)
+    stamp = {"dropped_reason": "slab_checks", "dropped_price": 900.0}
+    row = {"item_id": "111111111111", "comic_id": 7, "ended_at": None, **stamp}
+    for age_days, skipped in ((6, True), (8, False)):
+        server["prev"] = [dict(row, dropped_at=(NOW - timedelta(days=age_days)).isoformat())]
+        calls = {"fetch": [], "fmv": []}
+        _scan_with(server, full_item(returns=False), calls)
+        assert bool(calls["fetch"]) is not skipped
+    server["prev"] = [dict(row)]  # no dropped_at: no skip
+    calls = {"fetch": [], "fmv": []}
+    _scan_with(server, full_item(returns=False), calls)
+    assert calls["fetch"] == ["111111111111"]
+
+
+def test_alerted_copy_clears_drop_fields_and_drops_post_last(server, monkeypatch):
+    monkeypatch.setattr(sa, "_lock", lambda path: None)
+    calls = {"fetch": [], "fmv": []}
+    s = _scan_with(server, full_item(returns=False), calls)
+    assert s["alerts"] == 1
+    mark = server["posts"][-1][1]["copies"][0]
+    assert mark["last_alerted_at"] and mark["dropped_reason"] is None
+    assert mark["dropped_at"] is None and mark["dropped_price"] is None
+
+
+def test_drop_stamps_post_after_alert_stamps(server):
+    wrong = full_item()
+    wrong["localizedAspects"].append({"name": "Grade", "value": "7.0"})
+    _scan_with(server, wrong, {"fetch": [], "fmv": []})
+    assert "dropped_reason" in server["posts"][-1][1]["copies"][0]
