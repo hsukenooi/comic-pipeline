@@ -2269,3 +2269,152 @@ def later_printing_examples() -> str:
     """
     later_printing = {m for m in _REPRINT_MARKERS if "printing" in m}
     return _joined_markers(later_printing)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BUI-1436: shared slab edition checker.
+#
+# Ported verbatim from the frozen reference rules
+# (comic-slab-fixtures/edition-rules-2026-11-20/rules_final.py) so every slab
+# caller drops the same wrong-edition listings with the same reason strings.
+# Self-contained on purpose: every private name carries the _SLAB_ED_ /
+# _slab_ed_ prefix and nothing here reuses _LOT_RE, lot_count_mismatch, or the
+# edition / foreign-edition helpers above.
+# ═══════════════════════════════════════════════════════════════════════════
+
+_SLAB_ED_ALIASES = {
+    "x men": ["uncanny x men"],
+    "iron man": ["invincible iron man"],
+    "amazing spider man": ["amazing spiderman"],
+    "green lantern": ["green lantern green arrow"],
+    "detective comics": ["detective comics batman and robin", "detective comics batman"],
+}
+_SLAB_ED_PREFIX_DENY = {
+    "ultimate", "invincible", "uncanny", "new", "all", "spectacular", "superior",
+    "sensational", "giant", "size", "tales", "featuring", "untold", "web", "astonishing",
+    "young", "mighty", "savage", "marvels", "what", "if", "edition", "milestone",
+    "annual", "king", "silver", "age", "adventures", "pre",
+}
+_SLAB_ED_NOISE_AFTER = re.compile(r"""^(?:\s*(?:\([^)]*\)|\b(?:19|20)\d\d\b|\bv(?:ol)?\.?\s*1\b|\b1st\s+series\b
+   |\bseries\b|\bno\.?|\bissue\b|\bcomics?\b|\bmarvel\b|\bdc\b|\bimage\b|\bcomic\s+book\b|\bbook\b
+   |[,:\-|]))*\s*\#?\s*""", re.X)
+
+_SLAB_ED_MARKERS = re.compile(r"""comic\s*fest|\bhcf\b|convention|\bcon\s+ed|\bnycc\b|\bsdcc\b|heroes\s*con
+  |shattered|exclusive|reprint|facsimile|\b(?:2nd|3rd|second|third)\s+print|marmara|cizgi
+  |\bsig(?:ned)?\b|\bss\b|\bs\.s\.|\bvirgin\b|\bvariants?\b|\bvar\b
+  |milestone\s+edition|edition\s+[a-e]\b|\b[a-e]\s+cover\b|original\s+art|whatnot|\bdisney\b|\balpha\b
+  |\b(?:second|2nd)\s+series\b
+  |\b(?:russian|turkish|korean|japanese|chinese|polish|portuguese|indian|greek|german|italian|spanish|french|mexican|brazilian|foreign)\b
+  |\b(?:russian|foreign|italian|spanish|german)\s+ed\b
+  |(?<!newsstand\s)(?<!direct\s)(?<!first\s)(?<!1st\s)(?<!special\s)\bedition\b""", re.I | re.X)
+# words that may precede "cover" without meaning a variant cover
+_SLAB_ED_COVER_OK = {
+    "double", "wrap", "wraparound", "classic", "iconic", "kirby", "black", "white", "first",
+    "1st", "key", "famous", "the", "on", "original", "newsstand", "front", "back",
+}
+_SLAB_ED_MMYY = re.compile(r"(?<![\d/])(0?[1-9]|1[0-2])/(\d{2})(?![\d/])")
+
+# Rule 8 (opt-in): vintage books graded this high sell for far more than the
+# price floor when they are the genuine edition.
+_SLAB_ED_VINTAGE_BEFORE_YEAR = 1975
+_SLAB_ED_VINTAGE_MIN_GRADE = 9.6
+
+
+def _slab_ed_toks(s):
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9#()\s,:|-]+", " ", s.lower().replace("-", " ")))
+
+
+def _slab_ed_adjacent(title, series, issue):
+    text = _slab_ed_toks(title)
+    base = _slab_ed_toks(series).strip()
+    names = sorted([base] + _SLAB_ED_ALIASES.get(base, []), key=len, reverse=True)
+    hits = []
+    for nm in names:
+        for m in re.finditer(rf"(?<![a-z0-9]){re.escape(nm)}(?![a-z0-9])", text):
+            if not any(a <= m.start() < b for a, b in hits):
+                hits.append((m.start(), m.end()))
+    if not hits:
+        return "series absent"
+    first = min(a for a, _ in hits)
+    # another issue number (#N) before the series name: the title leads with another book
+    if re.search(r"#\s*\d+", text[:first]):
+        return "another #N before series"
+    for a, b in sorted(hits):
+        before = text[:a].split()
+        if before and before[-1] in _SLAB_ED_PREFIX_DENY:
+            continue
+        rest = text[b:]
+        n = _SLAB_ED_NOISE_AFTER.match(rest)
+        m = re.match(r"(\d+)(?![\d.])", rest[n.end():])
+        if m and m.group(1).lstrip("0") == str(issue).lstrip("0"):
+            return None
+    return "no adjacent series+issue"
+
+
+def _slab_ed_marker(title):
+    for m in _SLAB_ED_MARKERS.finditer(title):
+        s = m.group(0).lower()
+        if s.endswith("cover") and not re.match(r"[a-e]\s+cover", s):
+            if s.split()[0] in _SLAB_ED_COVER_OK:
+                continue
+        return ("signature:" if re.match(r"(?i)sig|ss|s\.s\.", m.group(0)) else "marker:") + m.group(0)
+    return None
+
+
+def _slab_ed_lot(title):
+    t = title.lower()
+    if len(re.findall(r"\bcgc\s*(?:10|\d\.\d|\d)(?![\d.])", t)) > 1 or re.search(r"\b\d+x\b", t):
+        return True
+    # a run of consecutive issue numbers: "655 656 657" (consecutive = a lot)
+    for m in re.finditer(r"#?\s*(\d{1,4})[\s,&/]+#?\s*(\d{1,4})\b", t):
+        a = int(m.group(1))
+        if int(m.group(2)) == a + 1 and 9 < a and not 1930 <= a <= 2039:
+            return True
+    return False
+
+
+def _slab_ed_mmyy(title, year):
+    if not year:
+        return None
+    for m in _SLAB_ED_MMYY.finditer(title):
+        yy = int(m.group(2))
+        y = (1900 if yy >= 30 else 2000) + yy
+        if abs(y - year) > 1:
+            return "mmyy " + m.group(0)
+    return None
+
+
+def _slab_ed_pubyear(sp, year):
+    sp = sp or {}
+    y = str(sp.get("Publication Year") or "")
+    if year and y.isdigit() and int(y) > year + 1:
+        return "pubyear " + y
+    return None
+
+
+def _slab_ed_vintage_price(year, grade, price, price_floor):
+    if price_floor is None or year is None or grade is None or price is None:
+        return None
+    if year < _SLAB_ED_VINTAGE_BEFORE_YEAR and grade >= _SLAB_ED_VINTAGE_MIN_GRADE and price < price_floor:
+        return f"vintage_price: {grade:g} at ${price:g} under ${price_floor:g} floor"
+    return None
+
+
+def slab_edition_reason(title, target, specifics=None, *, grade=None, price=None, price_floor=None):
+    """Return why a slab listing is not the target's original edition, else None.
+
+    target = {"title", "issue", "year"} (year may be None); specifics is the
+    eBay item-specifics dict (only "Publication Year" is read). Rules run in
+    order: adjacency, lot, markers (a signature hit returns "signature:..."),
+    MM/YY cover date, Publication Year, then the opt-in vintage-price rule,
+    which is active only when price_floor is not None.
+    """
+    year = target.get("year")
+    return (
+        _slab_ed_adjacent(title, target["title"], target["issue"])
+        or ("lot" if _slab_ed_lot(title) else None)
+        or _slab_ed_marker(title)
+        or _slab_ed_mmyy(title, year)
+        or _slab_ed_pubyear(specifics, year)
+        or _slab_ed_vintage_price(year, grade, price, price_floor)
+    )
