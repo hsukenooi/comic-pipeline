@@ -65,6 +65,27 @@ def test_pre_migration_db_gains_table_and_keeps_rows(tmp_path):
     conn.close()
 
 
+def test_pre_bui1449_table_gains_drop_columns_and_keeps_rows(tmp_path):
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    conn.execute(_BIDS)
+    create_tables(conn)
+    upsert_slab_alerts(conn, [_copy()])
+    # Rebuild the table in its BUI-1419 shape, without the three drop columns.
+    for col in ("dropped_reason", "dropped_at", "dropped_price"):
+        conn.execute(f"ALTER TABLE slab_alerts DROP COLUMN {col}")
+    conn.commit()
+    assert "dropped_price" not in {r[1] for r in conn.execute("PRAGMA table_info(slab_alerts)")}
+    create_tables(conn)
+    create_tables(conn)  # idempotent
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(slab_alerts)")}
+    assert {"dropped_reason", "dropped_at", "dropped_price"} <= cols
+    (row,) = list_slab_alerts(conn)
+    assert row["item_id"] == "123456789012" and row["dropped_reason"] is None
+    conn.close()
+
+
 def test_upsert_idempotent_and_partial(db):
     assert upsert_slab_alerts(db, [_copy()]) == {"inserted": 1, "updated": 0}
     assert upsert_slab_alerts(db, [_copy()]) == {"inserted": 0, "updated": 1}
@@ -137,3 +158,20 @@ def test_route_new_item_without_comic_id_is_422(api):
     r = api.post("/api/comics/slab-alerts/ratings",
                  json={"ratings": [{"item_id": "123456789012", "rating": "meh"}]})
     assert r.status_code == 422
+
+
+def test_routes_drop_stamp_round_trip_and_clear(api):
+    api.post("/api/comics/slab-alerts", json={"copies": [_copy()]})
+    stamp = {"item_id": "123456789012", "dropped_reason": "grade_mismatch",
+             "dropped_at": "2026-11-17T01:00:00+00:00", "dropped_price": 900.0}
+    assert api.post("/api/comics/slab-alerts", json={"copies": [stamp]}).status_code == 200
+    # An observation-only write leaves the stamp alone.
+    api.post("/api/comics/slab-alerts", json={"copies": [_copy(price=900.0)]})
+    (row,) = api.get("/api/comics/slab-alerts").json()["copies"]
+    assert (row["dropped_reason"], row["dropped_price"]) == ("grade_mismatch", 900.0)
+    api.post("/api/comics/slab-alerts", json={"copies": [
+        {"item_id": "123456789012", "dropped_reason": None}]})
+    (row,) = api.get("/api/comics/slab-alerts").json()["copies"]
+    assert row["dropped_reason"] is None
+    bad = dict(stamp, dropped_at="yesterday")
+    assert api.post("/api/comics/slab-alerts", json={"copies": [bad]}).status_code == 422

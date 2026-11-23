@@ -60,10 +60,14 @@ class SlabAlertIn(BaseModel):
     alerted_expected: float | None = Field(default=None, ge=0)
     alerted_best_offer: bool | None = None
     alerted_last_day: bool | None = None
+    dropped_reason: str | None = Field(default=None, max_length=40)
+    dropped_at: str | None = Field(default=None, max_length=40)
+    dropped_price: float | None = Field(default=None, ge=0)
 
     _item = field_validator("item_id")(_check_item_id)
     _ts = field_validator(
-        "end_date", "first_seen_at", "last_seen_at", "ended_at", "last_alerted_at"
+        "end_date", "first_seen_at", "last_seen_at", "ended_at", "last_alerted_at",
+        "dropped_at",
     )(_check_iso)
 
 
