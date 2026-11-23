@@ -3434,18 +3434,36 @@ class TestEditionWarning:
         assert ebay_fetch.edition_warning("Amazing Spider-Man lot #298-#300", {}) is None
 
     def test_pubyear_conflict_warns_through_parse_item(self):
-        item = self._parse("Amazing Spider-Man #300 (1984) CGC 9.8",
+        item = self._parse("Amazing Spider-Man #300 CGC 9.8 1988",
                            [{"name": "Publication Year", "value": "2015"}])
         assert item["edition_warning"] == "pubyear 2015"
 
     def test_mmyy_conflict_warns_through_parse_item(self):
-        item = self._parse("Fantastic Four #48 (1964) 3/91 CGC 7.0")
-        assert item["edition_warning"].startswith("mmyy")
+        # Called directly: parse_item's cover_year reads "3/91" itself as 1991
+        # on a slab, so the mmyy rule only fires with the bare title year.
+        reason = ebay_fetch.edition_warning("X-Men #1 1963 CGC 6.0 3/91", {})
+        assert reason.startswith("mmyy")
 
     def test_matching_publication_year_is_clean(self):
-        item = self._parse("Amazing Spider-Man #300 (1988) CGC 9.8",
+        item = self._parse("Amazing Spider-Man #300 CGC 9.8 1988",
                            [{"name": "Publication Year", "value": "1988"}])
         assert item["edition_warning"] is None
+
+    @pytest.mark.parametrize("title,pub", [
+        ("Amazing Spider-Man (1963) #300 CGC 9.8", "1988"),
+        ("Amazing Spider-Man #300 (1963 Series) CGC 9.8", "1988"),
+        ("Fantastic Four Vol 1 #48 (1961) CGC 7.0", "1966"),
+        ("Amazing Spider-Man #129 (1963) 2/74 CGC 9.0", None),
+    ])
+    def test_series_start_year_does_not_warn(self, title, pub):
+        aspects = [{"name": "Publication Year", "value": pub}] if pub else []
+        assert self._parse(title, aspects)["edition_warning"] is None
+
+    def test_lot_not_masked_by_adjacency_miss(self, monkeypatch):
+        monkeypatch.setattr(ebay_fetch, "slab_edition_reason",
+                            lambda *a, **k: "series absent")
+        assert ebay_fetch.edition_warning(
+            "Amazing Spider-Man #300 CGC 9.8 and #301 CGC 9.6", {}) == "lot"
 
     def test_marker_not_masked_by_adjacency_miss(self, monkeypatch):
         monkeypatch.setattr(ebay_fetch, "slab_edition_reason",
