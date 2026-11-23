@@ -37,6 +37,7 @@ Loaded by the `/em-batch` skill (`~/.claude/skills/em-batch/SKILL.md`). The doct
 
 - The doctrine's generic full-fan-out classes apply literally here: **money, concurrency, correctness gates, external/data behavior** — this is where the 6×/$2k over-bid, the seen-set data-loss, and the batch-crash were caught.
 - Persona starting map (chosen post-implementation, off the actual diff): a schema/migration change → correctness + adversarial + data-migration; a concurrency change → correctness + adversarial + reliability; a money-math change → correctness + adversarial.
+- **An `em-worker` cannot wait on `/code-review`: the skill forks to the background and the worker ends before it returns** (2026-11-23, BUI-1436..1438: all three workers reported "review not completed", even when told to wait). Don't ask workers for it. After the worker reports, spawn one read-only `opus` `ce-correctness-reviewer` on the commit range with the ticket's intent and a temp `git worktree add` for tests. That review caught a P1 in BUI-1438 (a parenthesized series start year used as the cover year) and a seen-set gap in BUI-1437.
 
 ## CI reality
 
