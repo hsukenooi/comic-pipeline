@@ -3385,3 +3385,50 @@ class TestIdentifyAnnualSeries:
     def test_non_annual_series_untouched(self):
         row = ebay_fetch.identify_row(1, _identify_item(), self.NOW)
         assert "Annual" not in row
+
+
+class TestEditionWarning:
+    """BUI-1438: advisory edition warning in parse_item JSON and identify Notes."""
+    NOW = datetime(2026, 9, 7, 12, 0, 0, tzinfo=timezone.utc)
+
+    def _parse(self, title, aspects=()):
+        return ebay_fetch.parse_item({
+            "itemId": "v1|123|0", "title": title,
+            "buyingOptions": ["AUCTION"],
+            "currentBidPrice": {"value": "50.00", "currency": "USD"},
+            "itemEndDate": "2026-09-09T13:00:00.000Z",
+            "localizedAspects": list(aspects),
+        })
+
+    def test_variant_title_warns_in_json_and_notes(self):
+        item = self._parse("Amazing Spider-Man #300 CGC 9.8 Virgin Variant 1988")
+        assert item["edition_warning"] and item["edition_warning"].startswith("marker:")
+        row = ebay_fetch.identify_row(1, item, self.NOW)
+        assert f"{ebay_fetch._WARN} Edition: {item['edition_warning']}" in row
+
+    def test_plain_copy_is_clean(self):
+        item = self._parse("Amazing Spider-Man #300 CGC 9.8 1988")
+        assert item["edition_warning"] is None
+        assert "Edition:" not in ebay_fetch.identify_row(1, item, self.NOW)
+
+    def test_publication_year_far_after_cover_year_warns(self):
+        # Called directly: parse_item's confident_cover_year already nulls a
+        # cover year that conflicts with Publication Year, so the pubyear rule
+        # only fires when a caller supplies both.
+        reason = ebay_fetch.edition_warning(
+            "Amazing Spider-Man #300 CGC 9.8 1988", {"Publication Year": "2019"}, 1988,
+        )
+        assert reason == "pubyear 2019"
+
+    def test_adjacency_reasons_are_suppressed(self, monkeypatch):
+        for reason in ("series absent", "another #299 before series",
+                       "no adjacent series+issue"):
+            monkeypatch.setattr(ebay_fetch, "slab_edition_reason",
+                                lambda *a, _r=reason, **k: _r)
+            assert ebay_fetch.edition_warning("Amazing Spider-Man #300 CGC 9.8", {}, 1988) is None
+
+    def test_lot_is_not_double_warned(self):
+        item = _identify_item(title="Amazing Spider-Man #298-#300 lot", edition_warning="lot")
+        row = ebay_fetch.identify_row(1, item, self.NOW)
+        assert "Edition:" not in row
+        assert ebay_fetch.edition_warning("Amazing Spider-Man lot #298-#300", {}, 1988) is None
