@@ -2549,6 +2549,18 @@ class TestApplyConditionDefectGate:
         assert "Amazing Spider-Man #300 NM" in err
         assert "rusty staple" in err
 
+    def test_defect_in_description_drops_with_description_source(self, monkeypatch):
+        monkeypatch.setattr(
+            seller_scan, "get_condition_texts",
+            lambda item_id, token, base_url: (None, "Off-White pages. Covers detached from interior."),
+        )
+        clean, dropped = seller_scan.apply_condition_defect_gate(
+            [self._match()], "tok", "http://x",
+        )
+        assert clean == []
+        assert dropped[0]["condition_defects"][0]["source"] == "description"
+        assert dropped[0]["condition_defects"][0]["code"] == "loose_staple"
+
     def test_moisture_damage_drops(self, monkeypatch):
         monkeypatch.setattr(
             seller_scan, "get_condition_texts",

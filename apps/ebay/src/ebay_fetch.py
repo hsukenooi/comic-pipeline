@@ -1761,6 +1761,9 @@ def _condition_payload(legacy_item_id, token, base_url, *, retries=3, need_descr
     cached = _condition_cache_get(legacy_item_id)
     if cached is not None and (not need_description or "description" in cached):
         return cached
+    # An old payload (no `description`) is still worth its condition note if
+    # the refetch fails: fall back to it rather than failing the gate open.
+    stale = cached and {"condition_description": cached.get("condition_description"), "description": None}
 
     url = f"{base_url}/buy/browse/v1/item/get_item_by_legacy_id"
     headers = {
@@ -1777,15 +1780,15 @@ def _condition_payload(legacy_item_id, token, base_url, *, retries=3, need_descr
             retry_network_errors=False,
         )
     except (requests.exceptions.RequestException, RetryExhausted):
-        return None  # network error or retry-exhausted → fail-open
+        return stale or None  # network error or retry-exhausted → fail-open
 
     if resp.status_code != 200:
-        return None  # non-retryable status → fail-open
+        return stale or None  # non-retryable status → fail-open
 
     try:
         data = resp.json()
     except (ValueError, AttributeError):
-        return None
+        return stale or None
 
     payload = {
         "condition_description": data.get("conditionDescription"),

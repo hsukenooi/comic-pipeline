@@ -373,6 +373,12 @@ class TestParseItem:
         assert result["grade"] is None
         assert result["grade_source"] == "missing"
 
+    def test_description_html_is_scanned_for_defects(self, auction_response):
+        """BUI-1471: getItem's `description` feeds the defect gate."""
+        auction_response["description"] = "<p>Light wear.</p><p>Covers detached from interior.</p>"
+        findings = ebay_fetch.parse_item(auction_response)["condition_defects"]
+        assert [(f["code"], f["source"]) for f in findings] == [("loose_staple", "description")]
+
     def test_auction_uses_current_bid_price(self, auction_response):
         """Auction should use currentBidPrice, not price."""
         result = ebay_fetch.parse_item(auction_response)
@@ -3115,6 +3121,19 @@ class TestGetConditionDescription:
             texts = ebay_fetch.get_condition_texts("51", "tok", "https://api.ebay.com")
         mock_get.assert_called_once()
         assert texts == ("old note", "Covers detached from interior.")
+
+    def test_failed_refetch_keeps_old_cached_condition_note(self, tmp_path, monkeypatch):
+        """BUI-1471 review: an old payload plus a failed refetch must still
+        return the cached note, not fail the safety gate open."""
+        monkeypatch.setattr(ebay_fetch, "_CONDITION_CACHE_DIR", tmp_path / "condition")
+        path = ebay_fetch._condition_cache_path("52")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"condition_description": "rusty staple"}))
+        bad = MagicMock()
+        bad.status_code = 500
+        with patch("requests.get", return_value=bad):
+            texts = ebay_fetch.get_condition_texts("52", "tok", "https://api.ebay.com")
+        assert texts == ("rusty staple", None)
 
     def test_uses_separate_cache_namespace_from_aspects(self, tmp_path, monkeypatch):
         """The condition-description cache and the aspects cache never
