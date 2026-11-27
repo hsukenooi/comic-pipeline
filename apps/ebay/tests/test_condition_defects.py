@@ -355,6 +355,76 @@ class TestReturnShape:
         assert phrases == ("rust at top staple", "rust at bottom")
 
 
+# Real blissard description sentences (BUI-1471), each ending in the store's
+# "Raw Comic Terms" boilerplate, which must never fire on its own.
+_BOILERPLATE = (
+    "Raw Comic Terms ( updated November 2026 ): *U.S. I run weekly auctions "
+    "every Sunday/Monday night; any CGC graded books received during the week "
+    "will be listed that coming weekend."
+)
+
+
+class TestDetachedCovers:
+    @pytest.mark.parametrize("text", [
+        "Covers only attached on left side of bottom staple (otherwise detached from interior).",
+        "Covers only attached on right side of bottom staple, otherwise detached from interior.",
+        "Covers detached from interior.",
+        "Covers re-attached to interior with two extra, tiny staples on spine.",
+        "Heavy tape inside full spine to re-attach detached covers to interior.",
+        "Covers detached on right side of bottom staple.",
+    ])
+    def test_detached_cover_phrasings_are_loose_staple(self, text):
+        codes, phrases = detect_condition_defects(
+            f"Off-White to White Pages. Light spine wear. {text} {_BOILERPLATE}"
+        )
+        assert codes == ("loose_staple",)
+        assert phrases
+
+    @pytest.mark.parametrize("text", [
+        "Small stress tears to covers at staples.",
+        "Light spine wear.",
+        "Heavy tape inside full spine.",
+        "Small tape outer covers over both staples.",
+        "2'' spine split. Cover attached at both staples.",
+        "Covers not detached, staples tight.",
+        "No detached covers.",
+        "Light staining along cover edges.",
+    ])
+    def test_out_of_scope_notes_stay_clean(self, text):
+        assert detect_condition_defects(f"{text} {_BOILERPLATE}") == ((), ())
+
+    def test_boilerplate_alone_is_clean(self):
+        assert detect_condition_defects(_BOILERPLATE) == ((), ())
+
+
+class TestDescriptionSource:
+    def test_description_is_scanned_html_stripped_and_labelled(self):
+        findings = listing_defect_findings(
+            condition_description=None,
+            title="Amazing Spider-Man #1",
+            description="<div><p>Off-White pages.</p><p>Covers detached from interior.</p></div>",
+        )
+        assert [(f["code"], f["source"]) for f in findings] == [("loose_staple", "description")]
+        assert findings[0]["phrase"] == "Covers detached from interior"
+
+    def test_description_tags_do_not_leak_into_matches(self):
+        """A tag attribute is not seller text."""
+        assert listing_defect_findings(
+            description='<img alt="rusty" src="x"><span class="water damage">fine</span>',
+        ) == []
+
+    def test_condition_note_wins_over_description_for_same_defect(self):
+        findings = listing_defect_findings(
+            condition_description="rusty staple", description="rusty staple",
+        )
+        assert [f["source"] for f in findings] == ["condition_description"]
+
+    def test_clean_description_adds_nothing(self):
+        assert listing_defect_findings(
+            description=f"<p>Light spine wear.</p><p>{_BOILERPLATE}</p>",
+        ) == []
+
+
 class TestListingFindings:
     def test_staple_not_attached_note_is_a_loose_staple_finding(self):
         """BUI-1382: three Nick Fury listings passed the gate with this note."""

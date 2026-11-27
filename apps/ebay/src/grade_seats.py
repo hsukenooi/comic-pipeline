@@ -29,7 +29,6 @@ Two seats that agree give the lower grade and the union of their ranges.
 
 import argparse
 import concurrent.futures
-import html
 import importlib.metadata
 import json
 import os
@@ -40,6 +39,8 @@ import sys
 import threading
 import time
 from pathlib import Path
+
+from condition_defects import html_to_text
 
 MODEL = "claude-fable-5-1"
 HARNESS = (
@@ -217,9 +218,7 @@ def description_excerpt(raw, limit=DESC_MAX):
     """
     if not raw or not isinstance(raw, str):
         return None
-    text = re.sub(r"(?is)<(script|style)\b.*?</\1>", " ", raw)
-    text = re.sub(r"(?s)<[^>]*>", " ", text)
-    text = re.sub(r"\s+", " ", html.unescape(text)).strip()
+    text = html_to_text(raw)
     if not text:
         return None
     if len(text) <= limit:

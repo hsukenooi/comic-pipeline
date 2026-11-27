@@ -2533,8 +2533,8 @@ class TestApplyConditionDefectGate:
 
     def test_rust_in_condition_description_drops_the_match(self, monkeypatch, capsys):
         monkeypatch.setattr(
-            seller_scan, "get_condition_description",
-            lambda item_id, token, base_url: "VG condition, rusty staple",
+            seller_scan, "get_condition_texts",
+            lambda item_id, token, base_url: ("VG condition, rusty staple", None),
         )
         clean, dropped = seller_scan.apply_condition_defect_gate(
             [self._match()], "tok", "http://x",
@@ -2551,8 +2551,8 @@ class TestApplyConditionDefectGate:
 
     def test_moisture_damage_drops(self, monkeypatch):
         monkeypatch.setattr(
-            seller_scan, "get_condition_description",
-            lambda item_id, token, base_url: "some water damage to back cover",
+            seller_scan, "get_condition_texts",
+            lambda item_id, token, base_url: ("some water damage to back cover", None),
         )
         clean, dropped = seller_scan.apply_condition_defect_gate(
             [self._match()], "tok", "http://x",
@@ -2562,8 +2562,8 @@ class TestApplyConditionDefectGate:
 
     def test_loose_staple_drops(self, monkeypatch):
         monkeypatch.setattr(
-            seller_scan, "get_condition_description",
-            lambda item_id, token, base_url: "cover detached both staples",
+            seller_scan, "get_condition_texts",
+            lambda item_id, token, base_url: ("cover detached both staples", None),
         )
         clean, dropped = seller_scan.apply_condition_defect_gate(
             [self._match()], "tok", "http://x",
@@ -2574,8 +2574,8 @@ class TestApplyConditionDefectGate:
     def test_plain_staining_does_not_drop(self, monkeypatch):
         """Out of scope by design (condition_defects.py) — mirrors Step 1.5."""
         monkeypatch.setattr(
-            seller_scan, "get_condition_description",
-            lambda item_id, token, base_url: "some staining on back cover",
+            seller_scan, "get_condition_texts",
+            lambda item_id, token, base_url: ("some staining on back cover", None),
         )
         clean, dropped = seller_scan.apply_condition_defect_gate(
             [self._match()], "tok", "http://x",
@@ -2587,8 +2587,8 @@ class TestApplyConditionDefectGate:
         """The common case — no seller note at all — is NOT a drop, and the
         title alone (no defect words here) is also clean."""
         monkeypatch.setattr(
-            seller_scan, "get_condition_description",
-            lambda item_id, token, base_url: None,
+            seller_scan, "get_condition_texts",
+            lambda item_id, token, base_url: (None, None),
         )
         clean, dropped = seller_scan.apply_condition_defect_gate(
             [self._match()], "tok", "http://x",
@@ -2600,8 +2600,8 @@ class TestApplyConditionDefectGate:
         """A fetch failure/absent note doesn't blind the gate to a defect the
         seller named directly in the title."""
         monkeypatch.setattr(
-            seller_scan, "get_condition_description",
-            lambda item_id, token, base_url: None,
+            seller_scan, "get_condition_texts",
+            lambda item_id, token, base_url: (None, None),
         )
         clean, dropped = seller_scan.apply_condition_defect_gate(
             [self._match(title="Amazing Spider-Man #300 rusty staple")],
@@ -2616,8 +2616,8 @@ class TestApplyConditionDefectGate:
             "2": None,
         }
         monkeypatch.setattr(
-            seller_scan, "get_condition_description",
-            lambda item_id, token, base_url: by_item.get(item_id),
+            seller_scan, "get_condition_texts",
+            lambda item_id, token, base_url: (by_item.get(item_id), None),
         )
         clean, dropped = seller_scan.apply_condition_defect_gate(
             [self._match(item_id="1"), self._match(item_id="2", wish_name="Other")],
@@ -2628,8 +2628,8 @@ class TestApplyConditionDefectGate:
 
     def test_no_drops_prints_nothing(self, monkeypatch, capsys):
         monkeypatch.setattr(
-            seller_scan, "get_condition_description",
-            lambda item_id, token, base_url: None,
+            seller_scan, "get_condition_texts",
+            lambda item_id, token, base_url: (None, None),
         )
         seller_scan.apply_condition_defect_gate([self._match()], "tok", "http://x")
         assert capsys.readouterr().err == ""
@@ -2637,7 +2637,7 @@ class TestApplyConditionDefectGate:
     def test_empty_matches_returns_empty(self, monkeypatch):
         called = []
         monkeypatch.setattr(
-            seller_scan, "get_condition_description",
+            seller_scan, "get_condition_texts",
             lambda *a, **k: called.append(1),
         )
         clean, dropped = seller_scan.apply_condition_defect_gate([], "tok", "http://x")
@@ -2670,8 +2670,8 @@ class TestScanOneSellerConditionDefectGate:
             lambda ids, seller: recorded.setdefault(seller, []).extend(ids),
         )
         monkeypatch.setattr(
-            seller_scan, "get_condition_description",
-            lambda item_id, token, base_url: condition_description,
+            seller_scan, "get_condition_texts",
+            lambda item_id, token, base_url: (condition_description, None),
         )
         return recorded
 
