@@ -22,7 +22,7 @@ from comic_identity import (
     confident_cover_year, identify_comic, slab_edition_reason,
 )
 from comic_identity_year import _all_title_years
-from condition_defects import format_defect_cell, listing_defect_findings
+from condition_defects import format_defect_cell, html_to_text, listing_defect_findings
 
 
 def _version_string() -> str:
@@ -994,8 +994,13 @@ def parse_item(data):
     condition_description = data.get("conditionDescription")
     # Classify the FULL text, then truncate only what is echoed out — a cap
     # applied first could hide a defect named at the end of a long note.
+    # BUI-1471: the full item `description` (HTML) rides on the same getItem
+    # payload, so scanning it costs no extra call. Sellers put defects there
+    # that they leave out of the condition note ("Covers detached from
+    # interior"). Not `shortDescription`, which is store boilerplate.
     condition_defects = listing_defect_findings(
         condition_description=condition_description, title=title,
+        description=data.get("description"),
     )
     if isinstance(condition_description, str) and len(condition_description) > 1000:
         condition_description = condition_description[:1000]
@@ -1744,22 +1749,21 @@ def _condition_cache_put(item_id: str, payload: dict) -> None:
     atomic_write_json(_condition_cache_path(item_id), payload)
 
 
-def get_condition_description(legacy_item_id: str, token: str, base_url: str, *, retries: int = 3) -> "str | None":
-    """Fetch one item's raw `conditionDescription` text (BUI-968).
+def _condition_payload(legacy_item_id, token, base_url, *, retries=3, need_description=False):
+    """Fetch (or read from cache) one item's `{"condition_description",
+    "description"}` payload; None on any failure (fail-open).
 
-    Same `get_item_by_legacy_id` call as get_item_aspects() above, but reads a
-    different field. Disk-cached 7 days, keyed by item_id, in a namespace
-    separate from the aspects cache (see the comment above _CONDITION_CACHE_DIR).
-
-    Fail-open: returns None on any HTTP/network/parse error, AND when the
-    seller simply wrote no condition note at all (the common case). A caller
-    cannot and must not treat None as "verified clean" — see
-    condition_defects.py's own warning that a blank Defects cell is not a
-    clean bill of health, only "nothing to read".
+    `description` is the listing body already stripped to plain text (BUI-1471),
+    so the cache never holds raw HTML. A cache file written before BUI-1471
+    lacks the key: that is a hit for a caller that only wants the condition
+    note, and a miss (refetch, rewrite) for one that needs the description.
     """
     cached = _condition_cache_get(legacy_item_id)
-    if cached is not None:
-        return cached.get("condition_description")
+    if cached is not None and (not need_description or "description" in cached):
+        return cached
+    # An old payload (no `description`) is still worth its condition note if
+    # the refetch fails: fall back to it rather than failing the gate open.
+    stale = cached and {"condition_description": cached.get("condition_description"), "description": None}
 
     url = f"{base_url}/buy/browse/v1/item/get_item_by_legacy_id"
     headers = {
@@ -1776,19 +1780,52 @@ def get_condition_description(legacy_item_id: str, token: str, base_url: str, *,
             retry_network_errors=False,
         )
     except (requests.exceptions.RequestException, RetryExhausted):
-        return None  # network error or retry-exhausted → fail-open
+        return stale or None  # network error or retry-exhausted → fail-open
 
     if resp.status_code != 200:
-        return None  # non-retryable status → fail-open
+        return stale or None  # non-retryable status → fail-open
 
     try:
         data = resp.json()
     except (ValueError, AttributeError):
-        return None
+        return stale or None
 
-    condition_description = data.get("conditionDescription")
-    _condition_cache_put(legacy_item_id, {"condition_description": condition_description})
-    return condition_description
+    payload = {
+        "condition_description": data.get("conditionDescription"),
+        "description": html_to_text(data.get("description")),
+    }
+    _condition_cache_put(legacy_item_id, payload)
+    return payload
+
+
+def get_condition_description(legacy_item_id: str, token: str, base_url: str, *, retries: int = 3) -> "str | None":
+    """Fetch one item's raw `conditionDescription` text (BUI-968).
+
+    Same `get_item_by_legacy_id` call as get_item_aspects() above, but reads a
+    different field. Disk-cached 7 days, keyed by item_id, in a namespace
+    separate from the aspects cache (see the comment above _CONDITION_CACHE_DIR).
+
+    Fail-open: returns None on any HTTP/network/parse error, AND when the
+    seller simply wrote no condition note at all (the common case). A caller
+    cannot and must not treat None as "verified clean" — see
+    condition_defects.py's own warning that a blank Defects cell is not a
+    clean bill of health, only "nothing to read".
+    """
+    payload = _condition_payload(legacy_item_id, token, base_url, retries=retries)
+    return payload.get("condition_description") if payload else None
+
+
+def get_condition_texts(legacy_item_id: str, token: str, base_url: str, *, retries: int = 3) -> "tuple[str | None, str | None]":
+    """`(condition_description, description_text)` for one item (BUI-1471).
+
+    Same fetch, cache, and fail-open contract as get_condition_description();
+    `description_text` is the listing body as plain text. Both are None on a
+    failure or when the seller wrote nothing.
+    """
+    payload = _condition_payload(legacy_item_id, token, base_url, retries=retries, need_description=True)
+    if not payload:
+        return None, None
+    return payload.get("condition_description"), payload.get("description")
 
 
 def truncate(text, width):

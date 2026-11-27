@@ -373,6 +373,12 @@ class TestParseItem:
         assert result["grade"] is None
         assert result["grade_source"] == "missing"
 
+    def test_description_html_is_scanned_for_defects(self, auction_response):
+        """BUI-1471: getItem's `description` feeds the defect gate."""
+        auction_response["description"] = "<p>Light wear.</p><p>Covers detached from interior.</p>"
+        findings = ebay_fetch.parse_item(auction_response)["condition_defects"]
+        assert [(f["code"], f["source"]) for f in findings] == [("loose_staple", "description")]
+
     def test_auction_uses_current_bid_price(self, auction_response):
         """Auction should use currentBidPrice, not price."""
         result = ebay_fetch.parse_item(auction_response)
@@ -3072,7 +3078,7 @@ class TestGetConditionDescription:
             ebay_fetch.get_condition_description("42", "tok", "https://api.ebay.com")
 
         cached = ebay_fetch._condition_cache_get("42")
-        assert cached == {"condition_description": "mildew smell"}
+        assert cached == {"condition_description": "mildew smell", "description": None}
 
     def test_no_note_result_also_written_to_disk_cache(self, tmp_path, monkeypatch):
         """A successful fetch with NO conditionDescription still writes a
@@ -3084,8 +3090,50 @@ class TestGetConditionDescription:
             ebay_fetch.get_condition_description("43", "tok", "https://api.ebay.com")
 
         cached = ebay_fetch._condition_cache_get("43")
-        assert cached == {"condition_description": None}
+        assert cached == {"condition_description": None, "description": None}
         assert ebay_fetch._condition_cache_path("43").exists()
+
+    def test_get_condition_texts_returns_stripped_description(self, tmp_path, monkeypatch):
+        """BUI-1471: the listing body rides the same getItem call, is stripped
+        to text, and is cached as text (never raw HTML)."""
+        monkeypatch.setattr(ebay_fetch, "_CONDITION_CACHE_DIR", tmp_path / "condition")
+        resp = self._mock_200("note")
+        resp.json.return_value["description"] = "<p>Covers detached &amp; loose</p><script>x()</script>"
+        with patch("requests.get", return_value=resp):
+            texts = ebay_fetch.get_condition_texts("50", "tok", "https://api.ebay.com")
+        assert texts == ("note", "Covers detached & loose")
+        assert ebay_fetch._condition_cache_get("50")["description"] == "Covers detached & loose"
+
+    def test_old_cache_payload_is_a_miss_for_description_but_a_hit_for_the_note(self, tmp_path, monkeypatch):
+        """A pre-BUI-1471 cache file has no `description` key. Reading only the
+        note still skips the network; reading the description refetches."""
+        monkeypatch.setattr(ebay_fetch, "_CONDITION_CACHE_DIR", tmp_path / "condition")
+        path = ebay_fetch._condition_cache_path("51")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"condition_description": "old note"}))
+        with patch("requests.get") as mock_get:
+            assert ebay_fetch.get_condition_description("51", "tok", "https://api.ebay.com") == "old note"
+        mock_get.assert_not_called()
+
+        resp = self._mock_200("old note")
+        resp.json.return_value["description"] = "<b>Covers detached from interior.</b>"
+        with patch("requests.get", return_value=resp) as mock_get:
+            texts = ebay_fetch.get_condition_texts("51", "tok", "https://api.ebay.com")
+        mock_get.assert_called_once()
+        assert texts == ("old note", "Covers detached from interior.")
+
+    def test_failed_refetch_keeps_old_cached_condition_note(self, tmp_path, monkeypatch):
+        """BUI-1471 review: an old payload plus a failed refetch must still
+        return the cached note, not fail the safety gate open."""
+        monkeypatch.setattr(ebay_fetch, "_CONDITION_CACHE_DIR", tmp_path / "condition")
+        path = ebay_fetch._condition_cache_path("52")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"condition_description": "rusty staple"}))
+        bad = MagicMock()
+        bad.status_code = 500
+        with patch("requests.get", return_value=bad):
+            texts = ebay_fetch.get_condition_texts("52", "tok", "https://api.ebay.com")
+        assert texts == ("rusty staple", None)
 
     def test_uses_separate_cache_namespace_from_aspects(self, tmp_path, monkeypatch):
         """The condition-description cache and the aspects cache never

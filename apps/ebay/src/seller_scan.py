@@ -52,7 +52,7 @@ from condition_defects import (  # BUI-968: extends BUI-919's standing rule here
 from ebay_fetch import (
     UnknownSellerError,
     atomic_write_json,
-    get_condition_description,
+    get_condition_texts,
     get_token,
     load_config,
     load_seller_aliases,
@@ -1133,7 +1133,7 @@ def apply_condition_defect_gate(matches, token, base_url):
     Callers pass only their FINAL, already-verified match list (post fuzzy
     match, post Claude/Haiku verify) — this function pays one extra getItem
     call per candidate (disk-cached 7 days via
-    ebay_fetch.get_condition_description(), so a repeat scan of the same
+    ebay_fetch.get_condition_texts(), so a repeat scan of the same
     listing is free), so it runs on the smallest possible set, the same
     reasoning wishlist_sellers.py's item-specifics era gate already applies
     ("avoids paying getItem calls for singleton-seller or already-owned
@@ -1162,7 +1162,7 @@ def apply_condition_defect_gate(matches, token, base_url):
 
     A fetch failure (network error, non-200, or the seller simply wrote no
     condition note — by far the common case) is NOT a drop: `get_condition_
-    description()` fail-opens to None, `listing_defect_findings()` then finds
+    texts()` fail-opens to (None, None), `listing_defect_findings()` then finds
     nothing in an absent note, and the match passes through to `clean`. This
     mirrors Step 1.5's own warning that a blank Defects cell means "nothing
     to read", never "verified clean" — the classifier still separately scans
@@ -1182,9 +1182,10 @@ def apply_condition_defect_gate(matches, token, base_url):
     dropped = []
     for cand in matches:
         item_id = cand.get("item_id")
-        condition_description = get_condition_description(item_id, token, base_url)
+        condition_description, description = get_condition_texts(item_id, token, base_url)
         findings = listing_defect_findings(
             condition_description=condition_description, title=cand.get("title"),
+            description=description,
         )
         if not findings:
             clean.append(cand)

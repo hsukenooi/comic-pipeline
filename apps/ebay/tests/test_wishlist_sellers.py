@@ -98,7 +98,7 @@ def _run_main(
 
     BUI-968: `condition_description_by_item_id`, when given, feeds the
     Step 11.5 condition-defect gate — `apply_condition_defect_gate()` calls
-    `seller_scan.get_condition_description(item_id, ...)` once per survivor,
+    `seller_scan.get_condition_texts(item_id, ...)` once per survivor,
     which this maps by item_id (default None: no note, matching the tests/
     conftest.py autouse fixture that already pins that call to a no-op for
     every other test in this suite).
@@ -134,8 +134,8 @@ def _run_main(
         patch.object(ws, "verify_with_claude", mock_verify),
         patch.object(ws, "record_items_seen", mock_record),
         patch(
-            "seller_scan.get_condition_description",
-            side_effect=lambda item_id, *a, **k: condition_description_by_item_id.get(item_id),
+            "seller_scan.get_condition_texts",
+            side_effect=lambda item_id, *a, **k: (condition_description_by_item_id.get(item_id), None),
         ),
     ):
         buf = io.StringIO()

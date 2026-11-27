@@ -45,11 +45,11 @@ table as-is; five column groups carry weight downstream:
   matched — most often because the seller wrote no condition note at all, so it is
   not a clean bill of health. `--json` carries the same finding as
   `condition_defects` (a list of `{code, phrase, source}`, `code` ∈ `moisture` /
-  `rust` / `loose_staple`, `source` ∈ `condition_description` / `title`; an empty
+  `rust` / `loose_staple`, `source` ∈ `condition_description` / `title` / `description` (full item description); an empty
   list means "scanned, nothing found") plus the raw note as
   `condition_description`. `/comic:buy` Step 1.5 drops these rows before FMV;
   standalone, surface the column and let the user decide. Plain "staining",
-  "foxing", "tanning", spine tape and spine splits are deliberately **not**
+  "foxing", "tanning", spine tape alone and spine splits are deliberately **not**
   triggers — `apps/ebay/src/condition_defects.py` is the one tested definition.
 - **Cert / PQ (BUI-923)** — `Cert` renders the certifier plus a non-Universal label
   (e.g. `CGC`, `CGC SS`); `PQ` renders the page quality (e.g. `OW/W`); both are

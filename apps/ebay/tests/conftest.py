@@ -66,10 +66,10 @@ def _no_condition_defect_network_calls(monkeypatch):
     get_item_by_legacy_id endpoint (fail-open on the resulting 401/timeout,
     so it wouldn't fail the test outright, but it's a real external network
     dependency and a real API call neither test intends to make). Tests that
-    exercise the gate itself re-patch seller_scan.get_condition_description
+    exercise the gate itself re-patch seller_scan.get_condition_texts
     after this fixture runs.
     """
-    monkeypatch.setattr(seller_scan, "get_condition_description", lambda *a, **k: None)
+    monkeypatch.setattr(seller_scan, "get_condition_texts", lambda *a, **k: (None, None))
 
 
 @pytest.fixture(autouse=True)

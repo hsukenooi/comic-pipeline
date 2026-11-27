@@ -225,7 +225,7 @@ The gate runs on the **final verified matches only** (after the Claude pass abov
 
 A dropped listing is **never marked seen** — like a never-verified candidate, it resurfaces on every re-scan so it stays visible if the seller edits the listing or the drop turns out to be a misread. It does **not** count toward `incomplete` or the exit code: it's a completed verdict, not a failed verification.
 
-Plain "staining", "foxing", and "tanning" are **not** triggers, and neither are spine tape, a spine split, or a missing piece of cover — those are `/comic:grade` calls. Most listings carry no seller-written condition note at all, so a blank/absent `defect_dropped` entry is not proof a listing is clean; the classifier also scans the title, but structural damage visible only in photos is still a job for `/comic:grade`.
+Plain "staining", "foxing", and "tanning" are **not** triggers, and neither are spine tape alone, a spine split, or a missing piece of cover — those are `/comic:grade` calls. Most listings carry no seller-written condition note at all, so a blank/absent `defect_dropped` entry is not proof a listing is clean; the classifier also scans the title and the full item description (BUI-1471), but structural damage visible only in photos is still a job for `/comic:grade`.
 
 ## Feed matches into /comic:buy
 

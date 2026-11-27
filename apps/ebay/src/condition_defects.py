@@ -45,9 +45,11 @@ printed with its matched phrase, so a wrong drop is one the user can override
 on sight rather than one that disappears.
 """
 
+import html
 import re
 
 __all__ = [
+    "html_to_text",
     "DEFECT_CODES",
     "DEFECT_LABELS",
     "detect_condition_defects",
@@ -134,6 +136,27 @@ _STAPLE_DEFECT_RE = re.compile(
     # NOTE: a bare `off` is deliberately absent — "off center staple" /
     # "off-centre staples" is a manufacturing note on a perfectly sound book,
     # and it is common enough in vintage listings to matter.
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+# --- detached / re-attached cover (BUI-1471) --------------------------------
+# A cover that has come off the staples is the same defect as a loose staple,
+# but sellers write it without the word "staple" ("Covers detached from
+# interior", "Covers re-attached to interior with two extra, tiny staples",
+# "Heavy tape inside full spine to re-attach detached covers"), so the
+# staple-scoped rule above never sees it. Needs the cover word itself next to
+# the defect verb: a bare "attached" ("cover attached at both staples") stays
+# clean, as do spine tape, a spine split and stress tears at the staples.
+# Plural "covers" only: the pair of covers coming off the interior. A lone
+# "front cover detached" stays a hand-grading call (pinned by
+# test_a_defect_without_a_staple_word_is_out_of_scope).
+_COVER_DETACHED_RE = re.compile(
+    r"""
+    \b(?:
+        covers \s+ (?: detached | re-?attached | only\s+attached )
+      | (?:detached | re-?attach\w*) \s+ (?:the\s+|both\s+)? (?:(?:front|back|outer)\s+)? covers
+    )\b
     """,
     re.IGNORECASE | re.VERBOSE,
 )
@@ -270,6 +293,12 @@ def _findings(text):
                     continue
                 hits[code].append(_phrase(clause, match.start(), match.end()))
 
+        for match in _COVER_DETACHED_RE.finditer(clause):
+            if _is_negated(text, span_start + match.start(), span_start + match.end()):
+                continue
+            hits[LOOSE_STAPLE].append(_phrase(clause, match.start(), match.end()))
+            break
+
         if not _STAPLE_RE.search(clause):
             continue
         for match in _STAPLE_DEFECT_RE.finditer(clause):
@@ -310,18 +339,35 @@ def detect_condition_defects(text):
     return tuple(codes), tuple(phrases)
 
 
-def listing_defect_findings(condition_description=None, title=None):
+def html_to_text(raw):
+    """Plain text of an HTML listing description: scripts/styles and tags
+    dropped, entities unescaped, whitespace collapsed. None for empty input.
+
+    The one HTML stripper shared by the defect gate and the grader's
+    description excerpt (grade_seats), so both read the same words.
+    """
+    if not raw or not isinstance(raw, str):
+        return None
+    text = re.sub(r"(?is)<(script|style)\b.*?</\1>", " ", raw)
+    text = re.sub(r"(?s)<[^>]*>", " ", text)
+    text = re.sub(r"\s+", " ", html.unescape(text)).strip()
+    return text or None
+
+
+def listing_defect_findings(condition_description=None, title=None, description=None):
     """Per-listing findings, as a JSON-ready list of dicts.
 
-    Scans the seller's free-text condition note first, then the title — a
+    Scans the seller's free-text condition note first, then the title, then
+    the full item description (BUI-1471, HTML stripped) — a
     seller who hides the grade behind "see condition description" still
     sometimes names the defect in the title, and vice versa. Each entry is
-    ``{"code", "phrase", "source"}``; ``source`` is ``"condition_description"``
-    or ``"title"``, so a drop can say where the evidence came from and the
+    ``{"code", "phrase", "source"}``; ``source`` is ``"condition_description"``,
+    ``"title"`` or ``"description"``, so a drop can say where the evidence came from and the
     user can judge an override on sight (a title hit on "Rusty" the New
     Mutants character reads very differently from a condition note reading
     "rusty staple").
 
+    The ``description`` is the full listing body, not ``shortDescription``.
     ``shortDescription`` is deliberately NOT scanned: on the listings that
     motivated this rule it returns the store's return-policy boilerplate,
     identical across every listing, so one template sentence mentioning water
@@ -332,6 +378,7 @@ def listing_defect_findings(condition_description=None, title=None):
     for source, text in (
         ("condition_description", condition_description),
         ("title", title),
+        ("description", html_to_text(description)),
     ):
         for code, phrase in _findings(text):
             key = (code, phrase.lower())
